@@ -4,35 +4,6 @@ using Moshi.Data: @data
 
 const IDLValue = Any
 
-@data Binop begin 
-    Or
-    Xor
-    And
-    Lshift
-    Rshift
-    Add
-    Sub
-    Mul
-    Div
-    Mod
-end
-@derive Binop[Eq, Hash, Show]
-@data Unop begin 
-    Plus # +
-    Neg # -
-    Inv # ~
-end
-@derive Unop[Eq, Hash, Show]
-@data Literal begin 
-    F32(Float32)
-    F64(Float64)
-    Intg(Int64)
-    Ch(Char)
-    St(String)
-    Bl(Bool)
-end
-@derive Literal[Eq, Hash, Show]
-
 @data ScopedName begin
     Name(Vector{Symbol}, Symbol, Bool)
 end
@@ -51,6 +22,7 @@ end
 @derive ModuleDecl[Eq, Hash, Show]
 
 @data TypeSpec begin
+    TRef(ScopedName.Type)
     TFloat(Int)
     TInt(Int)
     TUInt(Int)

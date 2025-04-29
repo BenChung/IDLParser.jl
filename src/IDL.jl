@@ -10,4 +10,8 @@ module ConstResolution
     include("const_resolution/const_resolve.jl") 
 end
 
+module Generation
+    include("generation/gen.jl")
+end
+
 end

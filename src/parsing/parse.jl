@@ -121,7 +121,7 @@ mklit(f::Bool) = Literal.Bl(f)
 @rule annotation_appl = ( r"@" & scoped_name & (r"\("p & annotation_appl_params & r"\)"p |> nth(2))[:?] ) > 
     (_, annotation_name, annotation_params) -> (subject -> Annotated.Annotation(annotation_name, isempty(annotation_params) ? Pair{Symbol, ConstExpr.Type}[] : annotation_params[1], subject))
 @rule annotation_appl_params = ((annotation_appl_param & (r","p & annotation_appl_param |> nth(2))[*]) > (a,b) -> Pair{Symbol, ConstExpr.Type}[a;b], const_expr)
-@rule annotation_appl_param = ( identifier & r"="p & const_expr ) > (n,_,e) -> Symbol(n)=>e
+@rule annotation_appl_param = ( identifier & r"="p & (const_expr & const_expr[*] > (a,b) -> a) ) > (n,_,e) -> Symbol(n)=>e
 
 @rule const_expr = unary_expr & (or_expr, xor_expr, and_expr, lshift_expr, rshift_expr, add_expr, sub_expr, mul_expr, div_expr, mod_expr)[:?] > (uex, binop) -> isempty(binop) ? uex : binop[1](uex)
 @rule or_expr = r"\|"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Or(), l, r))
