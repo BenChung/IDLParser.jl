@@ -75,8 +75,8 @@ generate_struct(definition::CR.TypeDecl.Type, genmod) = @match definition begin
             @kwdef struct $name
                 $(fields...)
             end
-            Base.read(rdr::CDR.CDRReader, ::Type{$name}) = $name(; $(deserializer_body...))
-            Base.write(dst::CDR.CDRWriter, o::$name) = begin $(serializer_body...) end
+            Base.read(rdr::CDRSerialization.CDRReader, ::Type{$name}) = $name(; $(deserializer_body...))
+            Base.write(dst::CDRSerialization.CDRWriter, o::$name) = begin $(serializer_body...) end
         end
     end
 end
@@ -104,7 +104,7 @@ end
 
 function build_modules(name, mod_dict)
     out = []
-    push!(out, :(import StaticArrays, CDR))
+    push!(out, :(import StaticArrays, CDRSerialization))
     for (k,v) in mod_dict
         if v isa AbstractDict
             push!(out, build_modules(k, v))

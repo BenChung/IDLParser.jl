@@ -10,7 +10,7 @@ function preprocessor(idl, include_resolver=resolve_file, directive_resolver=x->
         r"(//[^\n\r]*)(\r{0,1}\n)" => s"\2",
         r"/\*.*\*/"s => "")
     resolve_includes = replace(no_comments, include_rgx => inc -> include_resolver(inc, idl -> preprocessor(idl, include_resolver, directive_resolver)))
-    resolve_directives = replace(resolve_includes, r"#[^\n\r]*" => inc -> directive_resolver(inc))
+    resolve_directives = resolve_includes #replace(resolve_includes, r"#[^\n\r]*" => inc -> directive_resolver(inc))
     return resolve_directives
 end
 
