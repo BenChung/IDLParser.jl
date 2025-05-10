@@ -1,4 +1,4 @@
-module IDL
+module IDLParser
 
 module Parse
     include("parsing/types.jl")

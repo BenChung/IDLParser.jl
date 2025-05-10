@@ -1,5 +1,5 @@
-import IDL.ConstResolution as CR
-import IDL.Parse as Parse
+import IDLParser.ConstResolution as CR
+import IDLParser.Parse as Parse
 using OrderedCollections
 using Moshi.Match: @match
 
