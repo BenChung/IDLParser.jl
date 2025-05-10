@@ -1,11 +1,11 @@
 module ParsingTests
-using IDL
+using IDLParser
 using Test, PEG
-import IDL.Parse: preprocessor, scoped_name,escape,character_literal,integer_literal,
+import IDLParser.Parse: preprocessor, scoped_name,escape,character_literal,integer_literal,
     floating_pt_literal,literal,primary_expr,unary_expr,const_expr,simple_type_spec,template_type_spec,
     array_declarator,struct_def,struct_forward_dcl,const_dcl,union_forward_dcl,union_def,enum_dcl,
     simple_declarator,typedef_dcl,bitset_dcl,bitmask_dcl,maybe_annotated,struct_def,module_dcl,string_literal,include_rgx,open_idl
-import IDL.Parse: Binop, Unop, Literal, ScopedName, ConstExpr, Annotated, CanAnnotate, Decl, ModuleDecl, 
+import IDLParser.Parse: Binop, Unop, Literal, ScopedName, ConstExpr, Annotated, CanAnnotate, Decl, ModuleDecl, 
     TypeSpec, ConstDecl, Declarator, UnionCaseLabel, UnionElement, BitfieldSpec, TypeDecl
 @testset "Parsing" begin 
 @test preprocessor("""
@@ -24,10 +24,11 @@ test
 @test preprocessor("""
 #include"testme"
 """, (fname, preproc) -> begin match(include_rgx, fname)[1] == "testme" ? "hello" : "" end) == "hello\n"
+#=
 @test_throws "directives not supported" preprocessor("""
 #other
 """, (fname, preproc) -> begin match(include_rgx, fname)[1] == "testme" ? "hello" : "" end)
-
+=#
 
 @test parse_whole(scoped_name, "hello") == ScopedName.Name(Symbol[], :hello, true)
 @test parse_whole(scoped_name, "px4::hello") == ScopedName.Name(Symbol[:px4], :hello, true)

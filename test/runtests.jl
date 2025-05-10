@@ -1,4 +1,4 @@
-using IDL
+using IDLParser
 using Test
 
 include("parse.jl")

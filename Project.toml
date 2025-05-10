@@ -4,6 +4,7 @@ authors = ["Benjamin Chung <ckfinite@gmail.com> and contributors"]
 version = "1.0.0-DEV"
 
 [deps]
+CDRSerialization = "cbcadc0d-0faf-4c71-82b5-fceb8cc36223"
 Moshi = "2e0e35c7-a2e4-4343-998d-7ef72827ed2d"
 OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
 PEG = "12d937ae-5f68-53be-93c9-3a6f997a20a8"
