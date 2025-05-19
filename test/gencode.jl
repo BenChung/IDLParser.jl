@@ -1,16 +1,16 @@
 module Gencode
-using IDL
-using CDR: CDRReader, CDRWriter
+using IDLParser
+using CDRSerialization: CDRReader, CDRWriter
 using StaticArrays
 using Test, PEG
-import IDL.Parse: open_idl
-import IDL.ConstResolution: resolve_constants
-import IDL.Generation: generate_code
+import IDLParser.Parse: open_idl
+import IDLParser.ConstResolution: resolve_constants
+import IDLParser.Generation: generate_code
 
 module Tester
 end
 @testset "vehicle odometry" begin
-    code = generate_code(resolve_constants(convert(Vector{IDL.Parse.Decl}, open_idl(joinpath(@__DIR__, "files/VehicleOdometry.idl")))))[1]
+    code = generate_code(resolve_constants(convert(Vector{IDLParser.Parse.Decl}, open_idl(joinpath(@__DIR__, "files/VehicleOdometry.idl")))))[1]
     Tester.eval(code)
 
     data = Gencode.Tester.px4.msg.VehicleOdometry(
