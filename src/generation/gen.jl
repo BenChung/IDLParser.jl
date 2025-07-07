@@ -45,7 +45,7 @@ resolve_type(typ::CR.TypeSpec.Type) = @match typ begin
 end
 
 resolve_declarator(decl::CR.Declarator.Type, jltype) = @match decl begin 
-    CR.Declarator.DArray(name, dims) => (name, :(StaticArrays.SArray{Tuple{$(dims...),}, $jltype}))
+    CR.Declarator.DArray(name, dims) => (name, :(StaticArrays.SArray{Tuple{$(dims...),}, $jltype, $(length(dims)), $(prod(dims))}))
     CR.Declarator.DIdent(name) => (name, jltype)
 end
 function generate_struct_field(ts::CR.TypeSpec.Type, decls::CR.Declarator.Type, f, s, des)
