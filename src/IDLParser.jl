@@ -15,4 +15,9 @@ module Generation
     include("generation/gen.jl")
 end
 
+module ROS2
+    import ..Parse
+    include("ros2/ros2.jl")
+end
+
 end
