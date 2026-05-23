@@ -4,7 +4,8 @@ using Test, PEG
 import IDLParser.Parse: preprocessor, scoped_name,escape,character_literal,integer_literal,
     floating_pt_literal,literal,primary_expr,unary_expr,const_expr,simple_type_spec,template_type_spec,
     array_declarator,struct_def,struct_forward_dcl,const_dcl,union_forward_dcl,union_def,enum_dcl,
-    simple_declarator,typedef_dcl,bitset_dcl,bitmask_dcl,maybe_annotated,struct_def,module_dcl,string_literal,include_rgx,open_idl
+    simple_declarator,typedef_dcl,bitset_dcl,bitmask_dcl,maybe_annotated,struct_def,module_dcl,string_literal,include_rgx,open_idl,
+    specification,format_parse_error
 import IDLParser.Parse: Binop, Unop, Literal, ScopedName, ConstExpr, Annotated, CanAnnotate, Decl, ModuleDecl, 
     TypeSpec, ConstDecl, Declarator, UnionCaseLabel, UnionElement, BitfieldSpec, TypeDecl
 @testset "Parsing" begin 
@@ -17,18 +18,17 @@ foo /*
 test
 test
 */bar
-""") == "foo bar\n"
+""") == "foo \n\n\nbar\n"  # block comments preserve newline count so error line numbers stay aligned
+# Adjacent block comments don't merge (non-greedy match)
+@test preprocessor("foo /* a */ keep /* b */ bar") == "foo  keep  bar"
 @test preprocessor("""
 #include<testme>
 """, (fname, preproc) -> begin match(include_rgx, fname)[1] == "testme" ? "hello" : "" end) == "hello\n"
 @test preprocessor("""
 #include"testme"
 """, (fname, preproc) -> begin match(include_rgx, fname)[1] == "testme" ? "hello" : "" end) == "hello\n"
-#=
-@test_throws "directives not supported" preprocessor("""
-#other
-""", (fname, preproc) -> begin match(include_rgx, fname)[1] == "testme" ? "hello" : "" end)
-=#
+# Unknown `#` directives (e.g. `#pragma`) are silently stripped instead of crashing the parser
+@test strip(preprocessor("#pragma example\nmodule M{};\n")) == "module M{};"
 
 @test parse_whole(scoped_name, "hello") == ScopedName.Name(Symbol[], :hello, true)
 @test parse_whole(scoped_name, "px4::hello") == ScopedName.Name(Symbol[:px4], :hello, true)
@@ -244,6 +244,8 @@ example }""") == TypeDecl.EnumDecl(:testme, [:example, :example])
 
 @test parse_whole(maybe_annotated, "")("hi") == "hi"
 @test parse_whole(maybe_annotated, "@foobar(baz=2)")("hi") == Annotated.Annotation(ScopedName.Name(Symbol[], :foobar, true), [:baz => ConstExpr.Lit(Literal.Intg(2))], "hi")
+# Single positional argument — surfaces under `:value` key (regression: previously crashed with MethodError)
+@test parse_whole(maybe_annotated, "@key(42)")("hi") == Annotated.Annotation(ScopedName.Name(Symbol[], :key, true), [:value => ConstExpr.Lit(Literal.Intg(42))], "hi")
 @test parse_whole(maybe_annotated, "@foobar(baz=2)\n@bing(bar=3)")("hi") == 
     Annotated.Annotation(ScopedName.Name(Symbol[], :foobar, true), [:baz => ConstExpr.Lit(Literal.Intg(2))], 
     Annotated.Annotation(ScopedName.Name(Symbol[], :bing, true), [:bar => ConstExpr.Lit(Literal.Intg(3))], "hi"))
@@ -379,7 +381,7 @@ module VehicleOdometry_Constants {
 end
 
 @testset "Files" begin 
-    @test open_idl("files/VehicleOdometry.idl") == [ModuleDecl.MDecl(:px4, [
+    @test open_idl(joinpath(@__DIR__, "files/VehicleOdometry.idl")) == [ModuleDecl.MDecl(:px4, [
         ModuleDecl.MDecl(:msg, [
             TypeDecl.TypedefDecl(TypeSpec.TFloat(32), [Declarator.DArray(:float__3, [ConstExpr.Lit(Literal.Intg(3))])]), 
             TypeDecl.TypedefDecl(TypeSpec.TFloat(32), [Declarator.DArray(:float__4, [ConstExpr.Lit(Literal.Intg(4))])]), 
@@ -442,7 +444,51 @@ end
                     TypeSpec.TRef(ScopedName.Name(Symbol[], :float__3, true)) => [Declarator.DIdent(:position_variance)], 
                     TypeSpec.TRef(ScopedName.Name(Symbol[], :float__3, true)) => [Declarator.DIdent(:orientation_variance)], 
                     TypeSpec.TRef(ScopedName.Name(Symbol[], :float__3, true)) => [Declarator.DIdent(:velocity_variance)], 
-                    TypeSpec.TUInt(8) => [Declarator.DIdent(:reset_counter)], 
+                    TypeSpec.TUInt(8) => [Declarator.DIdent(:reset_counter)],
                     TypeSpec.TInt(8) => [Declarator.DIdent(:quality)]]))])])]
+end
+
+@testset "Error reporting" begin
+    # format_parse_error extracts keyword literals from raw regex strings and
+    # drops noisy wrapper rule names, leaving a short, readable list.
+    raw = try
+        parse_whole(specification, "broken!")
+        ""
+    catch e
+        e.msg
+    end
+    formatted = format_parse_error(raw)
+    @test occursin("`module`", formatted)
+    @test occursin("`struct`", formatted)
+    @test occursin("`const`", formatted)
+    # Wrapper rule names that just expand to a keyword in the same list are dropped.
+    @test !occursin("module_dcl", formatted)
+    @test !occursin("annotated_definition", formatted)
+    # Raw regex strings are gone.
+    @test !occursin("r\"", formatted)
+
+    # Line numbers survive block comments (regression: previously collapsed to 1 blank line)
+    src = "module M {\n/*\nline 3\nline 4\n*/\n@\n}\n"
+    err = try
+        parse_whole(specification, strip(preprocessor(src)))
+        ""
+    catch e
+        e.msg
+    end
+    @test occursin("On line 6", err)
+
+    # open_idl prefixes errors with the file path
+    path, io = mktemp()
+    write(io, "module M {\n@\n}\n")
+    close(io)
+    file_err = try
+        open_idl(path)
+        ""
+    catch e
+        e.msg
+    end
+    rm(path; force=true)
+    @test occursin("In $path:", file_err)
+    @test occursin("On line 2", file_err)
 end
 end

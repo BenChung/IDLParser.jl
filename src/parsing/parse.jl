@@ -5,19 +5,82 @@ function resolve_file(file, preproc)
     contents = read(match(include_rgx, file)[1], String)
     return preproc(contents)
 end
-function preprocessor(idl, include_resolver=resolve_file, directive_resolver=x->throw("directives not supported"))
+function preprocessor(idl, include_resolver=resolve_file)
+    # Block comments use non-greedy `.*?` so adjacent comments don't merge into
+    # one match, and are replaced with the same number of newlines so source
+    # line numbers survive into parse errors.
     no_comments = replace(idl,
         r"(//[^\n\r]*)(\r{0,1}\n)" => s"\2",
-        r"/\*.*\*/"s => "")
-    resolve_includes = replace(no_comments, include_rgx => inc -> include_resolver(inc, idl -> preprocessor(idl, include_resolver, directive_resolver)))
-    resolve_directives = resolve_includes #replace(resolve_includes, r"#[^\n\r]*" => inc -> directive_resolver(inc))
-    return resolve_directives
+        r"/\*.*?\*/"s => m -> "\n"^count(==('\n'), m))
+    resolve_includes = replace(no_comments, include_rgx => inc -> include_resolver(inc, idl -> preprocessor(idl, include_resolver)))
+    # Drop any remaining `#`-directives (e.g. `#pragma`). IDL doesn't define
+    # semantics for these, but they appear in real-world IDL files (often
+    # emitted by ROS / DDS tooling), so silently ignore rather than fail.
+    no_directives = replace(resolve_includes, r"#[^\n\r]*" => "")
+    return no_directives
 end
 
 function open_idl(file)
     inp = read(file, String)
     preproc = preprocessor(inp)
-    return parse_whole(specification, strip(preproc))
+    try
+        return parse_whole(specification, strip(preproc))
+    catch e
+        e isa Base.Meta.ParseError || rethrow()
+        throw(Base.Meta.ParseError("In $file:\n" * format_parse_error(e.msg)))
+    end
+end
+
+# Rule names that name a terminal-ish category the user might recognize
+# (identifier, string_literal, ...). Wrapper/structural rules (definition,
+# annotated_definition, struct_dcl wrapping struct_def + struct_forward_dcl)
+# are noise next to the literal keyword they expand to, so they are dropped.
+const _DISPLAYABLE_RULES = Set([
+    "identifier", "scoped_name",
+    "string_literal", "character_literal", "wide_string_literal", "wide_character_literal",
+    "integer_literal", "floating_pt_literal", "fixed_pt_literal", "boolean_literal", "literal",
+    "const_expr", "type_spec", "primary_expr",
+])
+
+# Matches the regex-literal strings PEG.jl prints in its "expected one of"
+# list — patterns like `r"^(module)\s*"`, `r"^\b(union)\b\s*"`, `r"^(::)\s*"`.
+# Captures the keyword/punctuation inside the inner parens.
+const _PEG_LITERAL_RE = r"^r\"\^(?:\\b)?\(([^()\\]+)\)(?:\\b)?\\s\*?\"[ip]*$"
+
+function _extract_literal(s::AbstractString)
+    m = match(_PEG_LITERAL_RE, s)
+    m === nothing && return nothing
+    lit = String(m[1])
+    # Reject anything that still contains regex metacharacters (e.g. `[a-zA-Z]`)
+    occursin(r"[\\\[\]|+*?{}^$]", lit) && return nothing
+    return lit
+end
+
+"""
+    format_parse_error(msg::AbstractString) -> String
+
+Rewrite a PEG.jl `Meta.ParseError` message: dedupe the "expected one of"
+list, extract keyword/punctuation literals out of raw regex strings, and
+drop noisy wrapper rule names.
+"""
+function format_parse_error(msg::AbstractString)
+    m = match(r"^(.*?expected one of the following: )(.+?)\n?$"s, msg)
+    m === nothing && return msg
+    items = strip.(split(m[2], ", "))
+    literals = String[]
+    rules = String[]
+    for it in items
+        lit = _extract_literal(it)
+        if lit !== nothing
+            push!(literals, "`" * lit * "`")
+        elseif it in _DISPLAYABLE_RULES
+            push!(rules, it)
+        end
+    end
+    unique!(sort!(literals))
+    unique!(sort!(rules))
+    parts = filter(!isempty, [join(literals, ", "), join(rules, ", ")])
+    return m[1] * (isempty(parts) ? "(no candidates)" : join(parts, " or "))
 end
 
 # 7.2 lexical conventions
@@ -53,10 +116,12 @@ drop(x) = []
 @rule wide_character_literal = "L'" & (-"'" & (escape, r".") |> nth(2)) & r"'"p |> x -> x[2][1]
 @rule wide_string_literal = "L\"" & ((-"\"" & (escape, r".") |> nth(2))[*] |> sjoin) & r"\""p |> x -> x[2]
 
+# Hex/octal literals parse via the full UInt64 range then reinterpret to Int64,
+# so values like 0xFFFFFFFFFFFFFFFF (a valid IDL uint64 constant) don't overflow.
 @rule integer_literal = (hex_integer_literal, octal_integer_literal, decimal_integer_literal)
 @rule decimal_integer_literal = r"[0-9]+"p |> x -> parse(Int, x)
-@rule octal_integer_literal = r"0[0-7]+"p |> x -> parse(Int, x; base=8)
-@rule hex_integer_literal = r"(?:0x)([0-9a-fA-F]+)"ip |> x -> parse(Int, x[3:end]; base=16)
+@rule octal_integer_literal = r"0[0-7]+"p |> x -> reinterpret(Int64, parse(UInt64, x; base=8))
+@rule hex_integer_literal = r"(?:0x)([0-9a-fA-F]+)"ip |> x -> reinterpret(Int64, parse(UInt64, x[3:end]; base=16))
 
 @rule fixed_pt_literal = floating_pt_literal
 parse_idl_float(f) = 
@@ -114,26 +179,39 @@ mklit(f::Char) = Literal.Ch(f)
 mklit(f::String) = Literal.St(f)
 mklit(f::Bool) = Literal.Bl(f)
 
-@rule scoped_name = (r"::"p[:?] |> isempty) & identifier & (r"::"p & identifier |> nth(2))[*] > (is_global, prefix, path) -> let fullpath = [prefix ; path]; ScopedName.Name(Symbol.(fullpath[1:end-1]), Symbol(fullpath[end]), is_global) end
+@rule scoped_name = (r"::"p[:?] |> isempty) & identifier & (r"::"p & identifier |> nth(2))[*] > (is_local, prefix, path) -> let fullpath = [prefix ; path]; ScopedName.Name(Symbol.(fullpath[1:end-1]), Symbol(fullpath[end]), is_local) end
 
 @rule maybe_annotated = annotated[:?] |> f -> isempty(f) ? x->x : f[1]
 @rule annotated = (annotation_appl & annotated > (fun, next) -> (subject) -> fun(next(subject))), (annotation_appl)
 @rule annotation_appl = ( r"@" & scoped_name & (r"\("p & annotation_appl_params & r"\)"p |> nth(2))[:?] ) > 
     (_, annotation_name, annotation_params) -> (subject -> Annotated.Annotation(annotation_name, isempty(annotation_params) ? Pair{Symbol, ConstExpr.Type}[] : annotation_params[1], subject))
-@rule annotation_appl_params = ((annotation_appl_param & (r","p & annotation_appl_param |> nth(2))[*]) > (a,b) -> Pair{Symbol, ConstExpr.Type}[a;b], const_expr)
-@rule annotation_appl_param = ( identifier & r"="p & (const_expr & const_expr[*] > (a,b) -> a) ) > (n,_,e) -> Symbol(n)=>e
+@rule annotation_appl_params = (
+    (annotation_appl_param & (r","p & annotation_appl_param |> nth(2))[*]) > (a,b) -> Pair{Symbol, ConstExpr.Type}[a;b],
+    # Single positional argument like `@key(SOMECONST)` — surface it under the synthetic `:value` key.
+    const_expr |> e -> Pair{Symbol, ConstExpr.Type}[:value => e])
+@rule annotation_appl_param = ( identifier & r"="p & const_expr ) > (n,_,e) -> Symbol(n)=>e
 
-@rule const_expr = unary_expr & (or_expr, xor_expr, and_expr, lshift_expr, rshift_expr, add_expr, sub_expr, mul_expr, div_expr, mod_expr)[:?] > (uex, binop) -> isempty(binop) ? uex : binop[1](uex)
-@rule or_expr = r"\|"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Or(), l, r))
-@rule xor_expr = r"\^"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Xor(), l, r))
-@rule and_expr = r"\&"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.And(), l, r))
-@rule lshift_expr = r"<<"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Lshift(), l, r))
-@rule rshift_expr = r">>"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Rshift(), l, r))
-@rule add_expr = r"\+"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Add(), l, r))
-@rule sub_expr = r"\-"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Sub(), l, r))
-@rule mul_expr = r"\*"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Mul(), l, r))
-@rule div_expr = r"/"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Div(), l, r))
-@rule mod_expr = r"%"p & const_expr > (_, r) -> ((l) -> ConstExpr.BinApp(Binop.Mod(), l, r))
+# Operator precedence (low → high) and left-associativity follow OMG IDL v4 (C-style):
+#   or | xor ^ and & shift (<< >>) add (+ -) mul (* / %) unary (- + ~)
+fold_binop(first, rest) = foldl(rest; init=first) do l, oprhs
+    ConstExpr.BinApp(oprhs[1], l, oprhs[2])
+end
+
+@rule or_op    = r"\|"p |> lit(Binop.Or())
+@rule xor_op   = r"\^"p |> lit(Binop.Xor())
+@rule and_op   = r"\&"p |> lit(Binop.And())
+@rule shift_op = (r"<<"p |> lit(Binop.Lshift()), r">>"p |> lit(Binop.Rshift()))
+@rule add_op   = (r"\+"p |> lit(Binop.Add()),    r"\-"p |> lit(Binop.Sub()))
+@rule mul_op   = (r"\*"p |> lit(Binop.Mul()),    r"/"p  |> lit(Binop.Div()), r"%"p |> lit(Binop.Mod()))
+
+@rule const_expr  = or_expr
+@rule or_expr     = xor_expr   & (or_op    & xor_expr   |> x -> (x[1], x[2]))[*] > fold_binop
+@rule xor_expr    = and_expr   & (xor_op   & and_expr   |> x -> (x[1], x[2]))[*] > fold_binop
+@rule and_expr    = shift_expr & (and_op   & shift_expr |> x -> (x[1], x[2]))[*] > fold_binop
+@rule shift_expr  = add_expr   & (shift_op & add_expr   |> x -> (x[1], x[2]))[*] > fold_binop
+@rule add_expr    = mul_expr   & (add_op   & mul_expr   |> x -> (x[1], x[2]))[*] > fold_binop
+@rule mul_expr    = unary_expr & (mul_op   & unary_expr |> x -> (x[1], x[2]))[*] > fold_binop
+
 @rule unary_expr = ((unary_operator & primary_expr > (op, pex) -> ConstExpr.UnApp(op, pex)), primary_expr)
 @rule unary_operator = (r"\-"p > lit(Unop.Neg())), (r"\+"p > lit(Unop.Plus())), (r"~"p > lit(Unop.Inv()))
 @rule primary_expr = (literal |> ConstExpr.Lit, scoped_name |> ConstExpr.Var, r"\("p & const_expr & r"\)"p |> nth(2))
@@ -206,7 +284,7 @@ mklit(f::Bool) = Literal.Bl(f)
 
 @rule typedef_dcl = ( r"typedef"p & type_declarator ) |> nth(2)
 @rule type_declarator = ( (template_type_spec, constr_type_dcl, simple_type_spec) & any_declarators ) > (def, declarators) -> TypeDecl.TypedefDecl(def, declarators)
-@rule any_declarators = ( any_declarator & (r","w & any_declarator |> nth(2))[:*] ) > (a,b) -> [a ; b]
+@rule any_declarators = ( any_declarator & (r","p & any_declarator |> nth(2))[:*] ) > (a,b) -> [a ; b]
 @rule any_declarator = ( array_declarator, simple_declarator )
 
 @rule bitset_dcl = ( r"bitset"p & identifier & ((r":"p & scoped_name |> nth(2))[:?] |> (x -> isempty(x) ? nothing : x[1])) & r"{"p & bitfield[*] & r"}"p ) > (_, id, super, _, fields, _) -> TypeDecl.BitsetDecl(Symbol(id), super, fields) 

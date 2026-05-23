@@ -23,7 +23,7 @@ end
 resolve_type(typ::CR.TypeSpec.Type) = @match typ begin 
     CR.TypeSpec.TRef(CR.ScopedName.Name([], name, true)) => name
     CR.TypeSpec.TRef(CR.ScopedName.Name(path, name, true)) => foldl((a,n)->:($a.$n), [path; name])
-    CR.TypeSpec.TRef(CR.ScopedName.Name(path, name, false)) => throw("Global type references not supported")
+    CR.TypeSpec.TRef(CR.ScopedName.Name(path, name, false)) => error("Global type references not supported")
     CR.TypeSpec.TFloat(16) => Float16
     CR.TypeSpec.TFloat(32) => Float32
     CR.TypeSpec.TFloat(64) => Float64
@@ -40,7 +40,7 @@ resolve_type(typ::CR.TypeSpec.Type) = @match typ begin
     CR.TypeSpec.TBool() => Bool
     CR.TypeSpec.TOctet() => UInt8
     CR.TypeSpec.TString(nothing) => String
-    _ => throw("unsupported type $typ")
+    _ => error("unsupported type $typ")
 
 end
 
@@ -80,26 +80,27 @@ generate_struct(definition::CR.TypeDecl.Type, genmod) = @match definition begin
         end
     end
 end
-generate_typedef(definition::CR.TypeDecl.Type, genmod) = @match definition begin 
-    CR.TypeDecl.TypedefDecl(ts::CR.TypeSpec.Type, declarators) => begin 
-        jltype = resolve_type(ts)
-        for decl in declarators 
-            (name, jltype) = resolve_declarator(decl, jltype)
-            genmod[name] = :(const $name = $jltype)
+generate_typedef(definition::CR.TypeDecl.Type, genmod) = @match definition begin
+    CR.TypeDecl.TypedefDecl(ts::CR.TypeSpec.Type, declarators) => begin
+        base_jltype = resolve_type(ts)
+        for decl in declarators
+            (name, decl_jltype) = resolve_declarator(decl, base_jltype)
+            genmod[name] = :(const $name = $decl_jltype)
         end
     end
-    _ => throw("Anonymous typedefs not supported")
+    _ => error("Anonymous typedefs not supported")
 end
 
-generate_code(definition::CR.TypeDecl.Type, genmod) = @match definition begin 
+generate_code(definition::CR.TypeDecl.Type, genmod) = @match definition begin
     CR.TypeDecl.StructDecl(name, nothing, decls) => generate_struct(definition, genmod)
-    CR.TypeDecl.StructFwdDecl(name) => throw("forward declarations not supported")
-    CR.TypeDecl.UnionDecl(name, disc, cases) => throw("unions not supported")
-    CR.TypeDecl.UnionFwdDecl(name) => throw("forward declarations not supported")
-    CR.TypeDecl.EnumDecl(name, cases) => throw("enums not supported")
+    CR.TypeDecl.StructDecl(name, super, decls) => error("struct inheritance not supported")
+    CR.TypeDecl.StructFwdDecl(name) => error("forward declarations not supported")
+    CR.TypeDecl.UnionDecl(name, disc, cases) => error("unions not supported")
+    CR.TypeDecl.UnionFwdDecl(name) => error("forward declarations not supported")
+    CR.TypeDecl.EnumDecl(name, cases) => error("enums not supported")
     CR.TypeDecl.TypedefDecl(def, decls) => generate_typedef(definition, genmod)
-    CR.TypeDecl.BitsetDecl(name, super, bfs) => throw("bitsets not supported")
-    CR.TypeDecl.BitmaskDecl(name, cases) => throw("bitmasks not supported")
+    CR.TypeDecl.BitsetDecl(name, super, bfs) => error("bitsets not supported")
+    CR.TypeDecl.BitmaskDecl(name, cases) => error("bitmasks not supported")
 end
 
 function build_modules(name, mod_dict)

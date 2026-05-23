@@ -36,4 +36,20 @@ end
     readback = read(r, Gencode.Tester.px4.msg.VehicleOdometry)
     @test readback == data
 end
+
+# Regression: gen.jl reassigned `jltype` inside the typedef loop, so a typedef
+# with multiple declarators corrupted the base type after the first one.
+module TypedefMulti
+    import StaticArrays, CDRSerialization
+end
+@testset "typedef with multiple declarators" begin
+    import IDLParser.Parse: specification
+    parsed = parse_whole(specification, "typedef float a[3], b[5];")
+    resolved = resolve_constants(convert(Vector{IDLParser.Parse.Decl}, parsed))
+    for c in generate_code(resolved)
+        TypedefMulti.eval(c)
+    end
+    @test TypedefMulti.a == SVector{3, Float32}
+    @test TypedefMulti.b == SVector{5, Float32}
+end
 end
