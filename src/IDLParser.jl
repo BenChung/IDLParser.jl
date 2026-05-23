@@ -3,6 +3,7 @@ module IDLParser
 module Parse
     include("parsing/types.jl")
     include("parsing/parse.jl")
+    include("parsing/unparse.jl")
 end
 
 module ConstResolution
