@@ -1,34 +1,18 @@
-# ROS2 interface-file parser. Reads `.msg` / `.srv` / `.action` text and emits
-# the existing IDL AST (`Parse.Decl` types), so that piping the result through
-# `Parse.unparse` produces valid OMG IDL v4. Implements the rosidl projection:
-# cross-package message references resolve to `<package>::msg::Type`, and
-# constants are hoisted out of structs into a sibling `<Name>_Constants` module
-# (IDL doesn't allow `const` inside `struct`).
-#
-# Line-level structure (blank lines as separators, `#` line comments, `---`
-# section markers in .srv/.action) is handled by a small driver; the per-line
-# grammar — types, array suffixes, field names, scalar values — is a PEG.jl
-# grammar reusing the same parser-combinator dialect as `src/parsing/parse.jl`.
+# ROS2 .msg / .srv / .action → `Parse.Decl` AST. Constants are hoisted into
+# a sibling `<Name>_Constants` module because IDL forbids `const` inside
+# `struct`. Cross-package refs (`pkg/Name`) project to `pkg::msg::Name`.
 
 using PEG
 using Moshi.Match: @match
 
-# ---- PEG grammar for a single ROS2 line ------------------------------------
-
-# Whitespace-eater. ROS2 lines may end in trailing spaces/tabs; consume those.
 @rule _ws = r"[ \t]*"p
 @rule _ws1 = r"[ \t]+"p
-
-# Identifiers and unsigned integer literals (for use in array bounds, etc.)
 @rule _ident = r"[a-zA-Z_][a-zA-Z0-9_]*"p
 @rule _uint_dec = r"[0-9]+"p |> s -> parse(Int, s)
 
-# Primitive type names. Ordering matters: longer names ("float32") must precede
-# shorter names ("float") if there's a prefix relationship — there isn't here,
-# but PEG is ordered choice so list them explicitly.
 @rule _prim_bool    = r"bool\b"p     |> _ -> Parse.TypeSpec.TBool()
 @rule _prim_byte    = r"byte\b"p     |> _ -> Parse.TypeSpec.TOctet()
-# `char` per ROS2 spec is an unsigned 8-bit integer ([0,255]).
+# `char` per ROS2 spec is an unsigned 8-bit integer.
 @rule _prim_char    = r"char\b"p     |> _ -> Parse.TypeSpec.TUInt(8)
 @rule _prim_int8    = r"int8\b"p     |> _ -> Parse.TypeSpec.TInt(8)
 @rule _prim_uint8   = r"uint8\b"p    |> _ -> Parse.TypeSpec.TUInt(8)
@@ -47,7 +31,6 @@ using Moshi.Match: @match
     _prim_int32, _prim_uint32, _prim_int64, _prim_uint64,
     _prim_f32, _prim_f64)
 
-# `string<=N` and `wstring<=N` (and the unbounded forms).
 @rule _string_bounded  = r"string<="p   & _uint_dec  > (_, n) ->
     Parse.TypeSpec.TString(Parse.ConstExpr.Lit(Parse.Literal.Intg(n)))
 @rule _wstring_bounded = r"wstring<="p  & _uint_dec  > (_, n) ->
@@ -55,19 +38,13 @@ using Moshi.Match: @match
 @rule _string_unbounded  = r"string\b"p   |> _ -> Parse.TypeSpec.TString(nothing)
 @rule _wstring_unbounded = r"wstring\b"p  |> _ -> Parse.TypeSpec.TWString(nothing)
 
-# `pkg/Name` is the rosidl convention for a cross-package message reference —
-# the projection routes through `::msg::`, since cross-package refs in
-# .msg/.srv/.action always point to message types living under
-# `<package>::msg::Type` in the IDL projection.
 @rule _absolute_ref = _ident & r"/"p & _ident > (pkg, _, name) ->
     Parse.TypeSpec.TRef(Parse.ScopedName.Name(
         [Symbol(pkg), :msg], Symbol(name), true))
 
-# Legacy aliases preserved from ROS1. `rosidl_adapter` (the upstream tool
-# that normalizes .msg files into .idl) unconditionally rewrites these,
-# regardless of any same-package type with the same name; if a user wants
-# their own `Header` they must write `<pkg>/Header` explicitly. We mirror
-# that behavior verbatim.
+# Legacy ROS1 aliases. `rosidl_adapter` rewrites these unconditionally even
+# in the presence of a same-package type with the same name, so we do too;
+# a user wanting their own `Header` must spell it `<pkg>/Header`.
 @rule _builtin_time     = r"time\b"p     |> _ ->
     Parse.TypeSpec.TRef(Parse.ScopedName.Name([:builtin_interfaces, :msg], :Time, true))
 @rule _builtin_duration = r"duration\b"p |> _ ->
@@ -78,10 +55,10 @@ using Moshi.Match: @match
 @rule _relative_ref = _ident |> s ->
     Parse.TypeSpec.TRef(Parse.ScopedName.Name(Symbol[], Symbol(s), true))
 
-# Element type — primitive, string-with-bound, or reference. Ordered so that
-# bounded forms win over unbounded, absolute over relative, and the legacy
-# `time`/`duration` builtins are tried before the generic relative_ref
-# (which would otherwise swallow them as plain identifier refs).
+# Order matters: PEG alternation is first-match. Bounded forms must precede
+# unbounded, absolute_ref must precede relative_ref, and the legacy builtin
+# aliases must precede relative_ref or it'd swallow `time`/`duration`/`Header`
+# as plain identifier refs.
 @rule _element_type = (
     _prim_scalar,
     _string_bounded, _wstring_bounded,
@@ -90,10 +67,6 @@ using Moshi.Match: @match
     _builtin_time, _builtin_duration, _builtin_header,
     _relative_ref)
 
-# Array suffixes attached to the type token: `[N]`, `[]`, `[<=N]`.
-# Each evaluates to a tagged tuple consumed by `_apply_array`. Use regex
-# literals (with `p` to eat trailing whitespace) since PEG.jl's plain-string
-# matchers don't anchor cleanly on the boundary between `int32` and `[3]`.
 @rule _suffix_static    = r"\["p & _uint_dec & r"\]"p   > (_, n, _) -> (:static, n)
 @rule _suffix_bounded   = r"\[<="p & _uint_dec & r"\]"p > (_, n, _) -> (:bounded, n)
 @rule _suffix_unbounded = r"\[\]"p                      |> _ -> :unbounded
@@ -102,12 +75,10 @@ using Moshi.Match: @match
 @rule _field_type = _element_type & _array_suffix[:?] > (base, suf) ->
     (base, isempty(suf) ? nothing : suf[1])
 
-# `_field_type` (just the type token, used by constants which never have suffixes
-# in valid ROS2). We still allow the suffix to parse so we don't fail; ignore it.
+# Constants never carry an array suffix in valid ROS2; accept and ignore one
+# so a malformed line errors at the value-side rules instead of the type-side.
 @rule _const_type = _element_type & _array_suffix[:?] > (base, _) -> base
 
-# Combine a base type with the array suffix into the final
-# `(TypeSpec, Declarator)` for a field.
 function _apply_array(base_ts, suffix, field_name::Symbol)
     if suffix === nothing
         return (base_ts, Parse.Declarator.DIdent(field_name))
