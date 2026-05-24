@@ -1,1 +1,6 @@
 /Manifest*.toml
+
+# Vendored ROS2 interface files — repopulate with test/files/vendor_ros2.sh.
+# Only NOTICE.md (provenance) and vendor_ros2.sh (the script) stay tracked.
+/test/files/ros2_standard/*/
+/test/files/ros2_ecosystem/*/

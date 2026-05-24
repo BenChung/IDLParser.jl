@@ -17,8 +17,15 @@ end
 
 module ROS2
     import ..Parse
+    import ..ConstResolution
+    import ..Generation
     include("ros2/ros2.jl")
     include("ros2/rihs01.jl")
+    include("ros2/macros.jl")
+    export @ros_msg, @ros_msgs
 end
+
+using .ROS2: @ros_msg, @ros_msgs
+export @ros_msg, @ros_msgs
 
 end
