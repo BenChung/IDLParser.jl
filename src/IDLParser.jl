@@ -18,6 +18,7 @@ end
 module ROS2
     import ..Parse
     include("ros2/ros2.jl")
+    include("ros2/rihs01.jl")
 end
 
 end

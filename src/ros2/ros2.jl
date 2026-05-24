@@ -62,16 +62,33 @@ using Moshi.Match: @match
 @rule _absolute_ref = _ident & r"/"p & _ident > (pkg, _, name) ->
     Parse.TypeSpec.TRef(Parse.ScopedName.Name(
         [Symbol(pkg), :msg], Symbol(name), true))
+
+# Legacy aliases preserved from ROS1. `rosidl_adapter` (the upstream tool
+# that normalizes .msg files into .idl) unconditionally rewrites these,
+# regardless of any same-package type with the same name; if a user wants
+# their own `Header` they must write `<pkg>/Header` explicitly. We mirror
+# that behavior verbatim.
+@rule _builtin_time     = r"time\b"p     |> _ ->
+    Parse.TypeSpec.TRef(Parse.ScopedName.Name([:builtin_interfaces, :msg], :Time, true))
+@rule _builtin_duration = r"duration\b"p |> _ ->
+    Parse.TypeSpec.TRef(Parse.ScopedName.Name([:builtin_interfaces, :msg], :Duration, true))
+@rule _builtin_header   = r"Header\b"p   |> _ ->
+    Parse.TypeSpec.TRef(Parse.ScopedName.Name([:std_msgs, :msg], :Header, true))
+
 @rule _relative_ref = _ident |> s ->
     Parse.TypeSpec.TRef(Parse.ScopedName.Name(Symbol[], Symbol(s), true))
 
 # Element type — primitive, string-with-bound, or reference. Ordered so that
-# bounded forms win over unbounded, and absolute over relative.
+# bounded forms win over unbounded, absolute over relative, and the legacy
+# `time`/`duration` builtins are tried before the generic relative_ref
+# (which would otherwise swallow them as plain identifier refs).
 @rule _element_type = (
     _prim_scalar,
     _string_bounded, _wstring_bounded,
     _string_unbounded, _wstring_unbounded,
-    _absolute_ref, _relative_ref)
+    _absolute_ref,
+    _builtin_time, _builtin_duration, _builtin_header,
+    _relative_ref)
 
 # Array suffixes attached to the type token: `[N]`, `[]`, `[<=N]`.
 # Each evaluates to a tagged tuple consumed by `_apply_array`. Use regex

@@ -371,5 +371,122 @@ end
     end
 end
 
+@testset "RIHS01" begin
+    import IDLParser.ROS2: rihs01_hash, calculate_rihs01_hash, type_description_from_struct,
+        TypeDescriptionMsg, TypeDescription, FieldDescription, FieldTypeDescription,
+        TYPE_ID_STRING, TYPE_ID_INT32, TYPE_ID_UINT32, TYPE_ID_NESTED_TYPE,
+        TYPE_ID_BOUNDED_STRING, ARRAY_OFFSET, BOUNDED_SEQUENCE_OFFSET,
+        UNBOUNDED_SEQUENCE_OFFSET
+    import IDLParser.ROS2: to_ros2_json
+
+    # std_msgs/msg/String — single STRING field. Published hash from ROS2.
+    @testset "std_msgs/msg/String" begin
+        decls = parse_msg("string data"; name="String")
+        h = rihs01_hash(decls[1], "std_msgs/msg/String")
+        @test h == "RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18"
+    end
+
+    # builtin_interfaces/msg/Time — INT32 sec + UINT32 nanosec.
+    @testset "builtin_interfaces/msg/Time" begin
+        decls = parse_msg("int32 sec\nuint32 nanosec"; name="Time")
+        h = rihs01_hash(decls[1], "builtin_interfaces/msg/Time")
+        @test h == "RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197"
+    end
+
+    # `package=` builds the fully-qualified name with the rosidl `/msg/` segment.
+    @testset "package-qualified name" begin
+        decls = parse_msg("string data"; name="String")
+        h = rihs01_hash(decls[1], "String"; package="std_msgs")
+        @test h == "RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18"
+    end
+
+    @testset "JSON shape" begin
+        td = type_description_from_struct(
+            parse_msg("string data"; name="String")[1],
+            "std_msgs/msg/String")
+        msg = TypeDescriptionMsg(td, TypeDescription[])
+        json = to_ros2_json(msg)
+        @test json == """{"type_description": {"type_name": "std_msgs/msg/String", "fields": [{"name": "data", "type": {"type_id": 17, "capacity": 0, "string_capacity": 0, "nested_type_name": ""}}]}, "referenced_type_descriptions": []}"""
+    end
+
+    # Defaults must be excluded from the hash per the spec — two messages
+    # differing only in a `@default(...)` annotation should hash equal.
+    @testset "defaults excluded from hash" begin
+        h_no_default = rihs01_hash(parse_msg("int32 value"; name="Test")[1], "test/msg/Test")
+        h_with_default = rihs01_hash(parse_msg("int32 value 42"; name="Test")[1], "test/msg/Test")
+        @test h_no_default == h_with_default
+    end
+
+    # Empty message — no fields. Just needs to produce a well-formed hash.
+    @testset "empty message" begin
+        # parse_msg with an empty body — the parser should produce a struct with zero members.
+        decls = parse_msg(""; name="Empty")
+        h = rihs01_hash(decls[1], "test_msgs/msg/Empty")
+        @test startswith(h, "RIHS01_")
+        @test length(h) == 7 + 64
+    end
+
+    # Type-id offsets for arrays / bounded sequences / unbounded sequences.
+    @testset "type_id offsets" begin
+        # int32[3] → INT32 + ARRAY_OFFSET = 6 + 48 = 54, capacity=3
+        td = type_description_from_struct(parse_msg("int32[3] xs"; name="A")[1], "a/msg/A")
+        ft = td.fields[1].field_type
+        @test ft.type_id == TYPE_ID_INT32 + ARRAY_OFFSET
+        @test ft.capacity == 3
+        @test ft.string_capacity == 0
+
+        # int32[]  → INT32 + UNBOUNDED_SEQUENCE_OFFSET, capacity=0
+        td = type_description_from_struct(parse_msg("int32[] xs"; name="A")[1], "a/msg/A")
+        ft = td.fields[1].field_type
+        @test ft.type_id == TYPE_ID_INT32 + UNBOUNDED_SEQUENCE_OFFSET
+        @test ft.capacity == 0
+
+        # int32[<=5] → INT32 + BOUNDED_SEQUENCE_OFFSET, capacity=5
+        td = type_description_from_struct(parse_msg("int32[<=5] xs"; name="A")[1], "a/msg/A")
+        ft = td.fields[1].field_type
+        @test ft.type_id == TYPE_ID_INT32 + BOUNDED_SEQUENCE_OFFSET
+        @test ft.capacity == 5
+
+        # string<=64 → BOUNDED_STRING (21), string_capacity=64
+        td = type_description_from_struct(parse_msg("string<=64 s"; name="A")[1], "a/msg/A")
+        ft = td.fields[1].field_type
+        @test ft.type_id == TYPE_ID_BOUNDED_STRING
+        @test ft.string_capacity == 64
+
+        # string<=64[] → BOUNDED_STRING + UNBOUNDED_SEQUENCE_OFFSET, string_capacity=64
+        td = type_description_from_struct(parse_msg("string<=64[] s"; name="A")[1], "a/msg/A")
+        ft = td.fields[1].field_type
+        @test ft.type_id == TYPE_ID_BOUNDED_STRING + UNBOUNDED_SEQUENCE_OFFSET
+        @test ft.string_capacity == 64
+        @test ft.capacity == 0
+
+        # geometry_msgs/Pose → NESTED_TYPE, nested_type_name expanded via /msg/
+        td = type_description_from_struct(parse_msg("geometry_msgs/Pose p"; name="A")[1], "a/msg/A")
+        ft = td.fields[1].field_type
+        @test ft.type_id == TYPE_ID_NESTED_TYPE
+        @test ft.nested_type_name == "geometry_msgs/msg/Pose"
+    end
+
+    # Nested types: the referenced TypeDescription must be passed in by the caller
+    # (and pre-sorted alphabetically if the caller wants cross-impl-stable hashes).
+    @testset "nested references" begin
+        time_td = type_description_from_struct(
+            parse_msg("int32 sec\nuint32 nanosec"; name="Time")[1],
+            "builtin_interfaces/msg/Time")
+        header_struct = parse_msg(
+            "builtin_interfaces/Time stamp\nstring frame_id"; name="Header")[1]
+        h = rihs01_hash(header_struct, "std_msgs/msg/Header"; references=[time_td])
+        @test startswith(h, "RIHS01_")
+        # Caller-order sensitivity: same data, different reference order → different hash.
+        # Single ref here can't test ordering — but two refs in opposite order should differ.
+        type_a = TypeDescription("pkg/msg/A", [FieldDescription("v", FieldTypeDescription(TYPE_ID_INT32))])
+        type_b = TypeDescription("pkg/msg/B", [FieldDescription("v", FieldTypeDescription(0x0B))])
+        main_struct = parse_msg("pkg/A a\npkg/B b"; name="Main")[1]
+        h_ab = rihs01_hash(main_struct, "pkg/msg/Main"; references=[type_a, type_b])
+        h_ba = rihs01_hash(main_struct, "pkg/msg/Main"; references=[type_b, type_a])
+        @test h_ab != h_ba
+    end
+end
+
 end # @testset ROS2
 end # module
