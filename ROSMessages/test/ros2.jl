@@ -1,11 +1,12 @@
 module ROS2Tests
 using IDLParser
+using ROSMessages
 using Test, PEG
 using Moshi.Match: @match
 import IDLParser.Parse: specification, preprocessor, parse_whole, unparse, open_idl
 import IDLParser.Parse: Literal, ScopedName, ConstExpr, Annotated, Declarator,
     TypeSpec, TypeDecl, ConstDecl, ModuleDecl
-import IDLParser.ROS2: parse_msg, parse_srv, parse_action, parse_file
+import ROSMessages: parse_msg, parse_srv, parse_action, parse_file
 
 # Variant discrimination helpers — Moshi @data variants need pattern matching
 # (or `isa T.Variant.Type` from inside @match) rather than plain `isa`.
@@ -372,12 +373,12 @@ end
 end
 
 @testset "RIHS01" begin
-    import IDLParser.ROS2: rihs01_hash, calculate_rihs01_hash, type_description_from_struct,
+    import ROSMessages: rihs01_hash, calculate_rihs01_hash, type_description_from_struct,
         TypeDescriptionMsg, TypeDescription, FieldDescription, FieldTypeDescription,
         TYPE_ID_STRING, TYPE_ID_INT32, TYPE_ID_UINT32, TYPE_ID_NESTED_TYPE,
         TYPE_ID_BOUNDED_STRING, ARRAY_OFFSET, BOUNDED_SEQUENCE_OFFSET,
         UNBOUNDED_SEQUENCE_OFFSET
-    import IDLParser.ROS2: to_ros2_json
+    import ROSMessages: to_ros2_json
 
     # std_msgs/msg/String — single STRING field. Published hash from ROS2.
     @testset "std_msgs/msg/String" begin

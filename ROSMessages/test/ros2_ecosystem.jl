@@ -1,5 +1,6 @@
 module ROS2EcosystemTests
 using IDLParser
+using ROSMessages
 using CDRSerialization: CDRReader, CDRWriter
 using Test
 
@@ -56,11 +57,11 @@ if HAVE_VENDORED
             push!(seen, key)
             src = read(path, String)
             if kind == "msg"
-                append!(combined, IDLParser.ROS2.parse_msg(src; name=name, package=pkg))
+                append!(combined, ROSMessages.parse_msg(src; name=name, package=pkg))
             elseif kind == "srv"
-                append!(combined, IDLParser.ROS2.parse_srv(src; name=name, package=pkg))
+                append!(combined, ROSMessages.parse_srv(src; name=name, package=pkg))
             else
-                append!(combined, IDLParser.ROS2.parse_action(src; name=name, package=pkg))
+                append!(combined, ROSMessages.parse_action(src; name=name, package=pkg))
             end
         end
         resolved = IDLParser.ConstResolution.resolve_constants(combined)
@@ -101,7 +102,7 @@ end
     for (pkg, kind, _, path) in INTERFACES
         rel = relpath(path, dirname(STD_ROOT))
         parsed = try
-            IDLParser.ROS2.parse_file(path; package=pkg)
+            ROSMessages.parse_file(path; package=pkg)
         catch e
             push!(parse_fail, (rel, sprint(showerror, e)))
             continue

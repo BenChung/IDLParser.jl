@@ -1,5 +1,6 @@
 module TypeDescriptionInterfacesTests
 using IDLParser
+using ROSMessages
 using CDRSerialization: CDRReader, CDRWriter
 using Test
 
@@ -16,7 +17,7 @@ end
 let combined = IDLParser.Parse.Decl[]
     for name in MSG_NAMES
         src = read(joinpath(FILES_DIR, name * ".msg"), String)
-        decls = IDLParser.ROS2.parse_msg(src; name=name,
+        decls = ROSMessages.parse_msg(src; name=name,
             package="type_description_interfaces")
         append!(combined, decls)
     end

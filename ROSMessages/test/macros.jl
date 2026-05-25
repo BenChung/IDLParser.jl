@@ -1,5 +1,6 @@
 module MacroTests
 using IDLParser
+using ROSMessages
 using CDRSerialization: CDRReader, CDRWriter
 using Test
 
@@ -12,18 +13,18 @@ end
 # Single-file macro: pull in `std_msgs/String` and confirm the type plus
 # its CDR codec are spliced into this module.
 module SingleFile
-    using IDLParser
+    using ROSMessages
     if isfile(joinpath(@__DIR__, "files/ros2_standard/std_msgs/msg/String.msg"))
-        IDLParser.@ros_msg "files/ros2_standard/std_msgs/msg/String.msg"
+        ROSMessages.@ros_msg "files/ros2_standard/std_msgs/msg/String.msg"
     end
 end
 
 # Multi-directory macro: pull in the geometry_msgs cluster (which needs
 # std_msgs and builtin_interfaces too) and round-trip a Pose.
 module MultiDir
-    using IDLParser
+    using ROSMessages
     if isdir(joinpath(@__DIR__, "files/ros2_standard/geometry_msgs"))
-        IDLParser.@ros_msgs(
+        ROSMessages.@ros_msgs(
             "files/ros2_standard/builtin_interfaces",
             "files/ros2_standard/std_msgs",
             "files/ros2_standard/geometry_msgs",
@@ -74,7 +75,7 @@ end
 
 @testset "macros register include_dependency for precompile invalidation" begin
     # Verify the expansion includes `Base.include_dependency(<path>)` calls.
-    ex = @macroexpand IDLParser.@ros_msg "files/ros2_standard/std_msgs/msg/String.msg"
+    ex = @macroexpand ROSMessages.@ros_msg "files/ros2_standard/std_msgs/msg/String.msg"
     inner = ex.head === :escape ? ex.args[1] : ex
     @test inner.head === :toplevel
     # The expansion uses `Base.include_dependency(path)` which serializes as
