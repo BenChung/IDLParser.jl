@@ -1,0 +1,23 @@
+name = "ROSZenoh"
+uuid = "02c87683-9d8e-4267-bbb6-13e61ef8b9a5"
+version = "0.1.0"
+authors = ["Benjamin Chung <ckfinite@gmail.com> and contributors"]
+
+[deps]
+IDLParser = "817e8c30-d1ad-4896-85b5-1c4c82b7999b"
+ROSMessages = "745bd5ac-df70-4edb-8655-498bbbb894cf"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Zenoh = "b742139f-8771-480b-a9b2-33222b45d29b"
+
+[compat]
+IDLParser = "1"
+ROSMessages = "0.1"
+SHA = "0.7.0"
+Zenoh = "0.1"
+julia = "1.11"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

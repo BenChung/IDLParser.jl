@@ -489,5 +489,72 @@ end
     end
 end
 
+# Lifting a `TypeDescription` back into the IL — the inverse of the
+# type-id encoding. Compares on `RBase`/`ArraySpec` (which derive `Eq`) rather
+# than the plain `RType`/`RMessage` structs.
+@testset "TypeDescription → IL" begin
+    import ROSMessages: type_description_from_struct, TypeDescription,
+        TypeDescriptionMsg, FieldDescription, FieldTypeDescription, lift, IL
+
+    # The single field's RType, round-tripped through a TypeDescription.
+    rtype(src) = lift(type_description_from_struct(
+        parse_msg(src; name="A")[1], "a/msg/A")).fields[1].type
+
+    @testset "scalar bases" begin
+        @test rtype("int8 x").base    == IL.RBase.RInt(8)
+        @test rtype("uint64 x").base  == IL.RBase.RUInt(64)
+        @test rtype("float32 x").base == IL.RBase.RFloat(32)
+        @test rtype("float64 x").base == IL.RBase.RFloat(64)
+        @test rtype("bool x").base    == IL.RBase.RBool()
+        # char/byte collapse to uint8/octet at parse time, so they come back
+        # as uint8/byte — the IDL spellings, not the original ROS ones.
+        @test rtype("byte x").base    == IL.RBase.RByte()
+        @test rtype("uint8 x").base   == IL.RBase.RUInt(8)
+        @test rtype("string x").base    == IL.RBase.RStr(nothing)
+        @test rtype("string<=8 x").base == IL.RBase.RStr(8)
+        @test rtype("wstring x").base   == IL.RBase.RWStr(nothing)
+        @test rtype("wstring<=4 x").base == IL.RBase.RWStr(4)
+    end
+
+    @testset "array modifiers" begin
+        @test rtype("int32 x").array      == IL.ArraySpec.AScalar()
+        @test rtype("int32[3] x").array   == IL.ArraySpec.AStatic(3)
+        @test rtype("int32[<=5] x").array == IL.ArraySpec.ABounded(5)
+        @test rtype("int32[] x").array    == IL.ArraySpec.AUnbounded()
+        # a bounded string in an unbounded sequence keeps both bounds
+        t = rtype("string<=8[] x")
+        @test t.base == IL.RBase.RStr(8)
+        @test t.array == IL.ArraySpec.AUnbounded()
+    end
+
+    @testset "nested refs" begin
+        # fully-qualified `.../msg/Name` keeps the owning package
+        @test rtype("geometry_msgs/Pose p").base == IL.RBase.RRef("geometry_msgs", "Pose")
+        # a bare relative ref comes back relative
+        @test rtype("Pose p").base == IL.RBase.RRef(nothing, "Pose")
+    end
+
+    @testset "message shape" begin
+        msg = lift(type_description_from_struct(
+            parse_msg("int32 a\nstring b"; name="Point")[1], "geometry_msgs/msg/Point"))
+        # name is the bare final segment of the fully-qualified type_name
+        @test msg.name === :Point
+        # RIHS01 carries neither constants nor field defaults
+        @test isempty(msg.constants)
+        @test [f.name for f in msg.fields] == [:a, :b]
+        @test all(f.default === nothing for f in msg.fields)
+    end
+
+    # The references in a TypeDescriptionMsg only matter for hashing; the IL
+    # already keeps nested types as refs, so a lift uses just the main type.
+    @testset "TypeDescriptionMsg uses the main type" begin
+        td = type_description_from_struct(parse_msg("int32 x"; name="A")[1], "a/msg/A")
+        m1 = lift(TypeDescriptionMsg(td, TypeDescription[]))
+        m2 = lift(td)
+        @test m1.name === m2.name
+        @test length(m1.fields) == length(m2.fields)
+    end
+end
+
 end # @testset ROS2
 end # module

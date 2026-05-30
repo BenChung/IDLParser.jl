@@ -349,3 +349,105 @@ function rihs01_hash(struct_ast::Parse.TypeDecl.Type,
     td = type_description_from_struct(struct_ast, name; package=package, qualifier=qualifier)
     return calculate_rihs01_hash(TypeDescriptionMsg(td, collect(references)))
 end
+
+# ---- TypeDescription → IL (inverse of the AST→TypeDescription encoding) -----
+#
+# Lifts the type-id-encoded `TypeDescription` back into the interface IL. The
+# round trip is lossy in the ways the encoding itself is: constants and field
+# defaults are dropped by RIHS01, `wchar` collapses to `char` (the IL has no
+# wide-char base), and the package qualifier survives only inside nested-type
+# refs — the lifted `RMessage` carries the bare struct name like the rest of
+# the IL. The `fixed`-string ids never arise from a ROS2 interface and error.
+
+# Parse a fully-qualified nested type name (`geometry_msgs/msg/Point`, or a
+# bare `Point` relative ref) into an `RRef`, mirroring `_ref_to_base` in
+# `ros2.jl`: a trailing `.../msg/Name` keeps the owning package, anything else
+# keeps the leading segment.
+function _nested_name_to_ref(qualified::AbstractString)
+    parts = split(qualified, '/')
+    name = String(parts[end])
+    path = parts[1:end-1]
+    if isempty(path)
+        return IL.RBase.RRef(nothing, name)
+    elseif length(path) >= 2 && path[end] == "msg"
+        return IL.RBase.RRef(String(path[end-1]), name)
+    else
+        return IL.RBase.RRef(String(path[1]), name)
+    end
+end
+
+# Split a field's `type_id` into its primitive id and array modifier. The
+# offsets don't overlap (primitives are 1..22), so a single descending cascade
+# recovers which wrapper, if any, was applied; `capacity` is the element count
+# for static arrays and bounded sequences and is ignored otherwise.
+function _decode_array(type_id::UInt8, capacity::UInt64)
+    if type_id > UNBOUNDED_SEQUENCE_OFFSET
+        return (type_id - UNBOUNDED_SEQUENCE_OFFSET, IL.ArraySpec.AUnbounded())
+    elseif type_id > BOUNDED_SEQUENCE_OFFSET
+        return (type_id - BOUNDED_SEQUENCE_OFFSET, IL.ArraySpec.ABounded(Int(capacity)))
+    elseif type_id > ARRAY_OFFSET
+        return (type_id - ARRAY_OFFSET, IL.ArraySpec.AStatic(Int(capacity)))
+    else
+        return (type_id, IL.ArraySpec.AScalar())
+    end
+end
+
+# Map a primitive type id (the array/sequence offset already stripped) back to
+# an IL base type. `string_capacity` supplies the bound for bounded strings;
+# `nested_type_name` the ref target for a nested type.
+function _base_from_type_id(prim_id::UInt8, string_capacity::UInt64,
+                            nested_type_name::AbstractString)
+    if prim_id == TYPE_ID_NESTED_TYPE
+        return _nested_name_to_ref(nested_type_name)
+    elseif prim_id == TYPE_ID_INT8;   return IL.RBase.RInt(8)
+    elseif prim_id == TYPE_ID_INT16;  return IL.RBase.RInt(16)
+    elseif prim_id == TYPE_ID_INT32;  return IL.RBase.RInt(32)
+    elseif prim_id == TYPE_ID_INT64;  return IL.RBase.RInt(64)
+    elseif prim_id == TYPE_ID_UINT8;  return IL.RBase.RUInt(8)
+    elseif prim_id == TYPE_ID_UINT16; return IL.RBase.RUInt(16)
+    elseif prim_id == TYPE_ID_UINT32; return IL.RBase.RUInt(32)
+    elseif prim_id == TYPE_ID_UINT64; return IL.RBase.RUInt(64)
+    elseif prim_id == TYPE_ID_FLOAT;       return IL.RBase.RFloat(32)
+    elseif prim_id == TYPE_ID_DOUBLE;      return IL.RBase.RFloat(64)
+    elseif prim_id == TYPE_ID_LONG_DOUBLE; return IL.RBase.RFloat(128)
+    elseif prim_id == TYPE_ID_CHAR;  return IL.RBase.RChar()
+    # The IL has no wide-char base; `wchar` collapses to `char` as it does in
+    # `ros2.jl`'s `_ts_to_base`.
+    elseif prim_id == TYPE_ID_WCHAR;   return IL.RBase.RChar()
+    elseif prim_id == TYPE_ID_BOOLEAN; return IL.RBase.RBool()
+    elseif prim_id == TYPE_ID_BYTE;    return IL.RBase.RByte()
+    elseif prim_id == TYPE_ID_STRING;          return IL.RBase.RStr(nothing)
+    elseif prim_id == TYPE_ID_WSTRING;         return IL.RBase.RWStr(nothing)
+    elseif prim_id == TYPE_ID_BOUNDED_STRING;  return IL.RBase.RStr(Int(string_capacity))
+    elseif prim_id == TYPE_ID_BOUNDED_WSTRING; return IL.RBase.RWStr(Int(string_capacity))
+    else
+        error("unsupported RIHS01 type_id for IL lift: $(Int(prim_id))")
+    end
+end
+
+function _lift_field_description(fd::FieldDescription)
+    ft = fd.field_type
+    prim_id, array = _decode_array(ft.type_id, ft.capacity)
+    base = _base_from_type_id(prim_id, ft.string_capacity, ft.nested_type_name)
+    return IL.RField(IL.RType(base, array), Symbol(fd.name), nothing)
+end
+
+"""
+    lift(td::TypeDescription) -> IL.RMessage
+    lift(msg::TypeDescriptionMsg) -> IL.RMessage
+
+Reconstruct the interface IL from a RIHS01 `TypeDescription` — the inverse of
+[`type_description_from_struct`](@ref). The `RMessage` name is the final
+segment of the fully-qualified `type_name` (`std_msgs/msg/String` → `String`).
+Constants and field defaults are not present (RIHS01 excludes them), so the
+result carries no constants and no field defaults. For a `TypeDescriptionMsg`
+the referenced descriptions are ignored: nested types already survive as refs
+inside the main type's fields.
+"""
+function lift(td::TypeDescription)
+    name = Symbol(split(td.type_name, '/')[end])
+    fields = IL.RField[_lift_field_description(f) for f in td.fields]
+    return IL.RMessage(name, IL.RConstant[], fields)
+end
+
+lift(msg::TypeDescriptionMsg) = lift(msg.type_description)

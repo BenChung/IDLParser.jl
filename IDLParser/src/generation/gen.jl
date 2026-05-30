@@ -11,18 +11,18 @@ struct ModEntry
     refs::Vector{Pair{Vector{Symbol}, Symbol}}
 end
 
-generate_code(definition::CR.Annotated.Type, genmod) = @match definition begin
-    CR.Annotated.Annotation(name, params, defn) => generate_code(defn, genmod)
+generate_code(definition::CR.Annotated.Type, genmod, registry) = @match definition begin
+    CR.Annotated.Annotation(name, params, defn) => generate_code(defn, genmod, registry)
 end
-generate_code(definition::CR.ModuleDecl.Type, genmod) = @match definition begin
+generate_code(definition::CR.ModuleDecl.Type, genmod, registry) = @match definition begin
     CR.ModuleDecl.MDecl(name, decls) => begin
         mod = get!(genmod, name, LittleDict{Symbol, Any}())
         for decl in decls
-            generate_code(decl, mod)
+            generate_code(decl, mod, registry)
         end
     end
 end
-generate_code(definition::CR.ConstDecl.Type, genmod) = @match definition begin
+generate_code(definition::CR.ConstDecl.Type, genmod, registry) = @match definition begin
     CR.ConstDecl.CDecl(typ, name, val) => begin
         genmod[name] = ModEntry(_ -> :(const $name = $val), Pair{Vector{Symbol}, Symbol}[])
     end
@@ -113,77 +113,230 @@ function _classify_refs(refs::Vector{Pair{Vector{Symbol}, Symbol}},
     end
     return (unique!(sort!(same_mod)), unique!(sort!(cross_pkg)))
 end
-function generate_struct_field(ts::CR.TypeSpec.Type, decls::CR.Declarator.Type, f, s, des;
-                                enclosing::Union{Symbol, Nothing}=nothing)
-    # CDRSerialization's generic `read(::Vector{T})` only covers primitive
-    # `T`; emit an explicit length-prefix + loop for every sequence so
-    # struct and string elements work too.
-    seq_elt = @match ts begin
-        CR.TypeSpec.TSeq(elt, _) => elt
-        _ => nothing
-    end
-    if seq_elt !== nothing
-        name = @match decls begin
-            CR.Declarator.DIdent(n) => n
-            _ => error("static array of sequence not supported")
+# --- Compact-eligibility classification -----------------------------------
+#
+# A struct can be emitted via `@cdr1_compat` (a single plain concrete CDR1
+# struct) only when every field is flat: a primitive, an SArray of primitives,
+# a typedef resolving to those, or a nested struct that is
+# itself all-fixed (`@cdr1_compat` validates nesting recursively). A string,
+# sequence, or non-flat nested struct disqualifies it, so it falls back to a
+# plain `@kwdef` struct decoded field-by-field by CDRSerialization's generic
+# `read` (owned) / `read_view` (zero-copy `CDRString`/`CDRArray`). The registry
+# lets the classifier resolve a `TRef` (typedef vs struct vs enum) and recurse
+# into nested struct definitions without re-walking the AST for every field.
+struct TypeRegistry
+    structs::Set{Symbol}
+    enums::Set{Symbol}
+    typedefs::Dict{Symbol, Tuple{CR.TypeSpec.Type, CR.Declarator.Type}}
+    struct_decls::Dict{Symbol, Any}
+end
+
+_collect_registry!(reg::TypeRegistry, def::CR.Annotated.Type) = @match def begin
+    CR.Annotated.Annotation(_, _, inner) => _collect_registry!(reg, inner)
+end
+_collect_registry!(reg::TypeRegistry, def::CR.ModuleDecl.Type) = @match def begin
+    CR.ModuleDecl.MDecl(_, decls) => for d in decls; _collect_registry!(reg, d); end
+end
+_collect_registry!(::TypeRegistry, ::CR.ConstDecl.Type) = nothing
+_collect_registry!(reg::TypeRegistry, def::CR.TypeDecl.Type) = @match def begin
+    CR.TypeDecl.StructDecl(name, _, decls) => (push!(reg.structs, name); reg.struct_decls[name] = decls)
+    CR.TypeDecl.StructFwdDecl(name)    => push!(reg.structs, name)
+    CR.TypeDecl.EnumDecl(name, _)      => push!(reg.enums, name)
+    CR.TypeDecl.TypedefDecl(target, declarators) => begin
+        # Only `target isa TypeSpec` typedefs (the alias forms) are tracked;
+        # anonymous nested-type typedefs aren't compact-eligible references.
+        if target isa CR.TypeSpec.Type
+            for decl in declarators
+                reg.typedefs[_declarator_name(decl)] = (target, decl)
+            end
         end
-        elt_jltype = resolve_type(seq_elt; enclosing=enclosing)
-        push!(f, :($name::Vector{$elt_jltype}))
-        push!(s, :(CDRSerialization.sequenceLength(dst, length(o.$name))))
-        push!(s, :(for elem in o.$name; write(dst, elem); end))
-        push!(des, Expr(:kw, name, :(
-            let n = CDRSerialization.sequenceLength(rdr)
-                $elt_jltype[read(rdr, $elt_jltype) for _ in 1:n]
-            end)))
-        return
     end
-    jltype = resolve_type(ts; enclosing=enclosing)
-    (name, jltype) = resolve_declarator(decls, jltype)
-    push!(f, :($name::$jltype))
-    push!(s, :(write(dst, o.$name)))
-    push!(des, Expr(:kw, name, :(read(rdr, $jltype))))
+    _ => nothing
 end
-function generate_struct_field((ts, decls)::Pair{CR.TypeSpec.Type, Vector{CR.Declarator.Type}}, f, s, des;
-                                enclosing::Union{Symbol, Nothing}=nothing)
-    for decl in decls
-        generate_struct_field(ts, decl, f, s, des; enclosing=enclosing)
+
+function _build_registry(definitions)
+    reg = TypeRegistry(Set{Symbol}(), Set{Symbol}(),
+                       Dict{Symbol, Tuple{CR.TypeSpec.Type, CR.Declarator.Type}}(),
+                       Dict{Symbol, Any}())
+    for def in definitions
+        _collect_registry!(reg, def)
+    end
+    return reg
+end
+
+_is_primitive_spec(ts::CR.TypeSpec.Type) = @match ts begin
+    CR.TypeSpec.TFloat(_) => true
+    CR.TypeSpec.TInt(_)   => true
+    CR.TypeSpec.TUInt(_)  => true
+    CR.TypeSpec.TChar()   => true
+    CR.TypeSpec.TWChar()  => true
+    CR.TypeSpec.TBool()   => true
+    CR.TypeSpec.TOctet()  => true
+    _ => false
+end
+
+# Classify a typedef alias chain as :primitive_scalar, :primitive_array,
+# :other, or :none (name not a tracked typedef).
+function _typedef_kind(name::Symbol, registry::TypeRegistry)
+    info = get(registry.typedefs, name, nothing)
+    info === nothing && return :none
+    (tts, tdecl) = info
+    isarray = @match tdecl begin
+        CR.Declarator.DArray(_, _) => true
+        CR.Declarator.DIdent(_)    => false
+    end
+    isarray && return _spec_resolves_to_primitive(tts, registry) ? :primitive_array : :other
+    _is_primitive_spec(tts) && return :primitive_scalar
+    return @match tts begin
+        CR.TypeSpec.TRef(CR.ScopedName.Name(_, n2, _)) => _typedef_kind(n2, registry)
+        _ => :other
     end
 end
-generate_struct_field(d::CR.Annotated.Type, f, s, des;
-                       enclosing::Union{Symbol, Nothing}=nothing) = @match d begin
-    CR.Annotated.Annotation(name, params, defn) =>
-        generate_struct_field(defn, f, s, des; enclosing=enclosing)
-end
-function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing})
-    fields = []
-    serializer_body = []
-    deserializer_body = []
-    for decl in decls
-        generate_struct_field(decl, fields, serializer_body, deserializer_body;
-                              enclosing=enclosing)
+
+# Does `ts`, used as a scalar field, resolve to a primitive (directly or via a
+# scalar typedef alias)?
+function _spec_resolves_to_primitive(ts::CR.TypeSpec.Type, registry::TypeRegistry)
+    _is_primitive_spec(ts) && return true
+    @match ts begin
+        CR.TypeSpec.TRef(CR.ScopedName.Name(_, name, _)) =>
+            _typedef_kind(name, registry) === :primitive_scalar
+        _ => false
     end
-    # Julia's default `==` only field-compares when every field is a bits
-    # type; with `String` or `Vector` fields it falls back to `===`.
-    # Generated messages are pure data, so force value equality.
-    field_names = [f.args[1] for f in fields]
+end
+
+# Is a single field (its TypeSpec + declarator) flat — i.e. a primitive, an
+# SArray of primitives, or a nested struct that is itself all-fixed — so the
+# whole struct can be a single `@cdr1_compat` value? `seen` guards against a
+# (degenerate) cyclic struct reference.
+function _field_is_fixed(ts::CR.TypeSpec.Type, decl::CR.Declarator.Type,
+                         registry::TypeRegistry, seen::Set{Symbol})
+    @match decl begin
+        # `T name[N]` → SArray; eligible iff the element is a primitive
+        # (`@cdr1_compat` rejects SArrays of structs).
+        CR.Declarator.DArray(_, _) => _spec_resolves_to_primitive(ts, registry)
+        # `T name` → primitive, a typedef to a primitive/primitive-array
+        # (e.g. `float[3]`), or a nested all-fixed struct.
+        CR.Declarator.DIdent(_) => begin
+            _is_primitive_spec(ts) && return true
+            @match ts begin
+                CR.TypeSpec.TRef(CR.ScopedName.Name(_, name, _)) => begin
+                    _typedef_kind(name, registry) in (:primitive_scalar, :primitive_array) && return true
+                    name in registry.structs && return _struct_all_fixed(name, registry, seen)
+                    false
+                end
+                _ => false
+            end
+        end
+    end
+end
+
+# Is every field of struct `name` flat (recursively)? Unknown / forward-declared
+# structs (no stored decls) and cycles are treated as not-fixed.
+function _struct_all_fixed(name::Symbol, registry::TypeRegistry, seen::Set{Symbol})
+    name in seen && return false
+    decls = get(registry.struct_decls, name, nothing)
+    decls === nothing && return false
+    seen2 = push!(copy(seen), name)
+    for d in decls
+        member = _unwrap_member(d)
+        member isa Pair || return false
+        ts, declarators = member
+        for decl in declarators
+            _field_is_fixed(ts, decl, registry, seen2) || return false
+        end
+    end
+    return true
+end
+
+# Strip any `@annotation` layers down to the underlying member `Pair`.
+function _unwrap_member(d)
+    while d isa CR.Annotated.Type
+        d = @match d begin
+            CR.Annotated.Annotation(_, _, inner) => inner
+        end
+    end
+    return d
+end
+
+# (name, julia_type_expr, is_fixed) for every declared field, in order. `seen`
+# seeds the cycle guard with the struct being rendered.
+function _struct_fields(decls, enclosing::Union{Symbol, Nothing}, registry::TypeRegistry,
+                        seen::Set{Symbol})
+    fields = Tuple{Symbol, Any, Bool}[]
+    for d in decls
+        member = _unwrap_member(d)
+        member isa Pair || error("unexpected struct member: $member")
+        ts, declarators = member
+        for decl in declarators
+            jltype = resolve_type(ts; enclosing=enclosing)
+            (fname, ftype) = resolve_declarator(decl, jltype)
+            push!(fields, (fname, ftype, _field_is_fixed(ts, decl, registry, seen)))
+        end
+    end
+    return fields
+end
+
+# An all-fixed struct (every field a primitive or an SArray of primitives) is
+# emitted via `@cdr1_compat`: a single plain concrete struct whose wire format
+# is standard CDR1 — exactly what a ROS2 publisher emits, trailing pad omitted.
+# Unlike `@cdr_compact` it produces no `Name{V}` CDR1/CDR2 variant wrapper
+# (ROS2 only needs CDR1), so `fieldnames`/`fieldtype` reflect the real fields
+# and the value nests cleanly. `@cdr1_compat` supplies `propertynames`, `==`,
+# and `show`; serialization flows through the library's generic `write`/`read`.
+#
+# A struct with a string/sequence/non-flat-nested field is a plain `@kwdef`
+# struct. Serialization is entirely the library's: generic `read` (owned),
+# `read_view` (zero-copy `CDRView{T}` with `CDRString`/`CDRArray` fields), and
+# generic `write` (a field-by-field inverse of `read`). The generator emits no
+# read/write — only the struct, a value `==`, and `@kwdef`'s keyword ctor.
+function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
+                        registry::TypeRegistry)
+    fields = _struct_fields(decls, enclosing, registry, Set{Symbol}((name,)))
+    field_decls = [Expr(:(::), n, t) for (n, t, _) in fields]
+    field_names = Symbol[n for (n, _, _) in fields]
+    all_fixed = !isempty(fields) && all(f -> f[3], fields)
+
+    if all_fixed
+        structdef = Expr(:struct, false, name, Expr(:block, field_decls...))
+        cdr1_compat = Expr(:macrocall,
+            Expr(:., :CDRSerialization, QuoteNode(Symbol("@cdr1_compat"))),
+            LineNumberNode(@__LINE__, Symbol(@__FILE__)),
+            structdef)
+        # Keyword constructor preserving the old `@kwdef` ergonomics: convert
+        # each field so callers can pass plain `Int`/`Float64` literals, then
+        # forward to the positional constructor the plain struct provides.
+        conv_args = [:(convert($t, $n)) for (n, t, _) in fields]
+        kw_ctor = Expr(:(=),
+            Expr(:call, name, Expr(:parameters, field_names...)),
+            Expr(:call, name, conv_args...))
+        # `@cdr1_compat` emits `propertynames`/`==`/`show`; the library's
+        # generic `write`/`read` handle serialization. We only add the keyword
+        # constructor (the macro's own constructor is positional).
+        return quote
+            $cdr1_compat
+            $kw_ctor
+        end
+    end
+
+    # Julia's default `==` only field-compares bits types; with `String`/
+    # `Vector` fields it falls back to `===`. Generated messages are pure data,
+    # so force value equality.
     eq_body = isempty(field_names) ? true :
         foldl((acc, n) -> :($acc && a.$n == b.$n),
               field_names[2:end];
               init = :(a.$(field_names[1]) == b.$(field_names[1])))
     return quote
         @kwdef struct $name
-            $(fields...)
+            $(field_decls...)
         end
         Base.:(==)(a::$name, b::$name) = $eq_body
-        Base.read(rdr::CDRSerialization.CDRReader, ::Type{$name}) = $name(; $(deserializer_body...))
-        Base.write(dst::CDRSerialization.CDRWriter, o::$name) = begin $(serializer_body...) end
     end
 end
 
-generate_struct(definition::CR.TypeDecl.Type, genmod) = @match definition begin
+generate_struct(definition::CR.TypeDecl.Type, genmod, registry::TypeRegistry) = @match definition begin
     CR.TypeDecl.StructDecl(name, nothing, decls) => begin
         refs = _collect_refs_members(decls)
-        genmod[name] = ModEntry(enc -> _render_struct(name, decls, enc), refs)
+        genmod[name] = ModEntry(enc -> _render_struct(name, decls, enc, registry), refs)
     end
 end
 _declarator_name(decl::CR.Declarator.Type) = @match decl begin
@@ -191,7 +344,7 @@ _declarator_name(decl::CR.Declarator.Type) = @match decl begin
     CR.Declarator.DIdent(n)    => n
 end
 
-generate_typedef(definition::CR.TypeDecl.Type, genmod) = @match definition begin
+generate_typedef(definition::CR.TypeDecl.Type, genmod, registry) = @match definition begin
     CR.TypeDecl.TypedefDecl(ts::CR.TypeSpec.Type, declarators) => begin
         refs = Pair{Vector{Symbol}, Symbol}[]
         _collect_refs_ts!(refs, ts)
@@ -212,14 +365,14 @@ generate_typedef(definition::CR.TypeDecl.Type, genmod) = @match definition begin
     _ => error("Anonymous typedefs not supported")
 end
 
-generate_code(definition::CR.TypeDecl.Type, genmod) = @match definition begin
-    CR.TypeDecl.StructDecl(name, nothing, decls) => generate_struct(definition, genmod)
+generate_code(definition::CR.TypeDecl.Type, genmod, registry) = @match definition begin
+    CR.TypeDecl.StructDecl(name, nothing, decls) => generate_struct(definition, genmod, registry)
     CR.TypeDecl.StructDecl(name, super, decls) => error("struct inheritance not supported")
     CR.TypeDecl.StructFwdDecl(name) => error("forward declarations not supported")
     CR.TypeDecl.UnionDecl(name, disc, cases) => error("unions not supported")
     CR.TypeDecl.UnionFwdDecl(name) => error("forward declarations not supported")
     CR.TypeDecl.EnumDecl(name, cases) => error("enums not supported")
-    CR.TypeDecl.TypedefDecl(def, decls) => generate_typedef(definition, genmod)
+    CR.TypeDecl.TypedefDecl(def, decls) => generate_typedef(definition, genmod, registry)
     CR.TypeDecl.BitsetDecl(name, super, bfs) => error("bitsets not supported")
     CR.TypeDecl.BitmaskDecl(name, cases) => error("bitmasks not supported")
 end
@@ -371,9 +524,10 @@ function build_modules(name, mod_dict; depth::Int=1,
 end
 
 function generate_code(definitions::Vector{<:CR.CanAnnotate{CR.Decl}})
+    registry = _build_registry(definitions)
     generated_modules = LittleDict{Symbol, Any}()
     for def in definitions
-        generate_code(def, generated_modules)
+        generate_code(def, generated_modules, registry)
     end
 
     top_modules = Tuple{Symbol, AbstractDict}[]

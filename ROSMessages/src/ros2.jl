@@ -1,6 +1,17 @@
-# ROS2 .msg / .srv / .action → `Parse.Decl` AST. Constants are hoisted into
-# a sibling `<Name>_Constants` module because IDL forbids `const` inside
-# `struct`. Cross-package refs (`pkg/Name`) project to `pkg::msg::Name`.
+# ROS2 `.msg` / `.srv` / `.action` interfaces, in three independent steps:
+#
+#   text  ──parse──▶  IL  ──lower──▶  Parse.Decl   (forward; `parse_msg` etc.)
+#   text  ◀─unparse─  IL  ◀──lift───  Parse.Decl   (backward; `to_ros`)
+#
+# The IL (`il.jl`) models ROS concepts directly; the two ends of the pipe only
+# ever speak to it, never to each other. Forward and backward are exact
+# inverses except where ROS and IDL genuinely disagree (the `char`/`uint8` and
+# `byte`/`octet` spellings collapse, and the `time`/`duration`/`Header` aliases
+# come back as their fully-qualified references — all semantically identical).
+#
+# IDL lowering: constants are hoisted into a sibling `<Name>_Constants` module
+# because IDL forbids `const` inside `struct`; cross-package refs (`pkg/Name`)
+# project to `pkg::msg::Name`.
 
 using PEG
 using Moshi.Match: @match
@@ -10,20 +21,19 @@ using Moshi.Match: @match
 @rule _ident = r"[a-zA-Z_][a-zA-Z0-9_]*"p
 @rule _uint_dec = r"[0-9]+"p |> s -> parse(Int, s)
 
-@rule _prim_bool    = r"bool\b"p     |> _ -> Parse.TypeSpec.TBool()
-@rule _prim_byte    = r"byte\b"p     |> _ -> Parse.TypeSpec.TOctet()
-# `char` per ROS2 spec is an unsigned 8-bit integer.
-@rule _prim_char    = r"char\b"p     |> _ -> Parse.TypeSpec.TUInt(8)
-@rule _prim_int8    = r"int8\b"p     |> _ -> Parse.TypeSpec.TInt(8)
-@rule _prim_uint8   = r"uint8\b"p    |> _ -> Parse.TypeSpec.TUInt(8)
-@rule _prim_int16   = r"int16\b"p    |> _ -> Parse.TypeSpec.TInt(16)
-@rule _prim_uint16  = r"uint16\b"p   |> _ -> Parse.TypeSpec.TUInt(16)
-@rule _prim_int32   = r"int32\b"p    |> _ -> Parse.TypeSpec.TInt(32)
-@rule _prim_uint32  = r"uint32\b"p   |> _ -> Parse.TypeSpec.TUInt(32)
-@rule _prim_int64   = r"int64\b"p    |> _ -> Parse.TypeSpec.TInt(64)
-@rule _prim_uint64  = r"uint64\b"p   |> _ -> Parse.TypeSpec.TUInt(64)
-@rule _prim_f32     = r"float32\b"p  |> _ -> Parse.TypeSpec.TFloat(32)
-@rule _prim_f64     = r"float64\b"p  |> _ -> Parse.TypeSpec.TFloat(64)
+@rule _prim_bool    = r"bool\b"p     |> _ -> IL.RBase.RBool()
+@rule _prim_byte    = r"byte\b"p     |> _ -> IL.RBase.RByte()
+@rule _prim_char    = r"char\b"p     |> _ -> IL.RBase.RChar()
+@rule _prim_int8    = r"int8\b"p     |> _ -> IL.RBase.RInt(8)
+@rule _prim_uint8   = r"uint8\b"p    |> _ -> IL.RBase.RUInt(8)
+@rule _prim_int16   = r"int16\b"p    |> _ -> IL.RBase.RInt(16)
+@rule _prim_uint16  = r"uint16\b"p   |> _ -> IL.RBase.RUInt(16)
+@rule _prim_int32   = r"int32\b"p    |> _ -> IL.RBase.RInt(32)
+@rule _prim_uint32  = r"uint32\b"p   |> _ -> IL.RBase.RUInt(32)
+@rule _prim_int64   = r"int64\b"p    |> _ -> IL.RBase.RInt(64)
+@rule _prim_uint64  = r"uint64\b"p   |> _ -> IL.RBase.RUInt(64)
+@rule _prim_f32     = r"float32\b"p  |> _ -> IL.RBase.RFloat(32)
+@rule _prim_f64     = r"float64\b"p  |> _ -> IL.RBase.RFloat(64)
 
 @rule _prim_scalar = (
     _prim_bool, _prim_byte, _prim_char,
@@ -31,29 +41,22 @@ using Moshi.Match: @match
     _prim_int32, _prim_uint32, _prim_int64, _prim_uint64,
     _prim_f32, _prim_f64)
 
-@rule _string_bounded  = r"string<="p   & _uint_dec  > (_, n) ->
-    Parse.TypeSpec.TString(Parse.ConstExpr.Lit(Parse.Literal.Intg(n)))
-@rule _wstring_bounded = r"wstring<="p  & _uint_dec  > (_, n) ->
-    Parse.TypeSpec.TWString(Parse.ConstExpr.Lit(Parse.Literal.Intg(n)))
-@rule _string_unbounded  = r"string\b"p   |> _ -> Parse.TypeSpec.TString(nothing)
-@rule _wstring_unbounded = r"wstring\b"p  |> _ -> Parse.TypeSpec.TWString(nothing)
+@rule _string_bounded  = r"string<="p   & _uint_dec  > (_, n) -> IL.RBase.RStr(n)
+@rule _wstring_bounded = r"wstring<="p  & _uint_dec  > (_, n) -> IL.RBase.RWStr(n)
+@rule _string_unbounded  = r"string\b"p   |> _ -> IL.RBase.RStr(nothing)
+@rule _wstring_unbounded = r"wstring\b"p  |> _ -> IL.RBase.RWStr(nothing)
 
 @rule _absolute_ref = _ident & r"/"p & _ident > (pkg, _, name) ->
-    Parse.TypeSpec.TRef(Parse.ScopedName.Name(
-        [Symbol(pkg), :msg], Symbol(name), true))
+    IL.RBase.RRef(String(pkg), String(name))
 
 # Legacy ROS1 aliases. `rosidl_adapter` rewrites these unconditionally even
 # in the presence of a same-package type with the same name, so we do too;
 # a user wanting their own `Header` must spell it `<pkg>/Header`.
-@rule _builtin_time     = r"time\b"p     |> _ ->
-    Parse.TypeSpec.TRef(Parse.ScopedName.Name([:builtin_interfaces, :msg], :Time, true))
-@rule _builtin_duration = r"duration\b"p |> _ ->
-    Parse.TypeSpec.TRef(Parse.ScopedName.Name([:builtin_interfaces, :msg], :Duration, true))
-@rule _builtin_header   = r"Header\b"p   |> _ ->
-    Parse.TypeSpec.TRef(Parse.ScopedName.Name([:std_msgs, :msg], :Header, true))
+@rule _builtin_time     = r"time\b"p     |> _ -> IL.RBase.RRef("builtin_interfaces", "Time")
+@rule _builtin_duration = r"duration\b"p |> _ -> IL.RBase.RRef("builtin_interfaces", "Duration")
+@rule _builtin_header   = r"Header\b"p   |> _ -> IL.RBase.RRef("std_msgs", "Header")
 
-@rule _relative_ref = _ident |> s ->
-    Parse.TypeSpec.TRef(Parse.ScopedName.Name(Symbol[], Symbol(s), true))
+@rule _relative_ref = _ident |> s -> IL.RBase.RRef(nothing, String(s))
 
 # Order matters: PEG alternation is first-match. Bounded forms must precede
 # unbounded, absolute_ref must precede relative_ref, and the legacy builtin
@@ -67,45 +70,28 @@ using Moshi.Match: @match
     _builtin_time, _builtin_duration, _builtin_header,
     _relative_ref)
 
-@rule _suffix_static    = r"\["p & _uint_dec & r"\]"p   > (_, n, _) -> (:static, n)
-@rule _suffix_bounded   = r"\[<="p & _uint_dec & r"\]"p > (_, n, _) -> (:bounded, n)
-@rule _suffix_unbounded = r"\[\]"p                      |> _ -> :unbounded
+@rule _suffix_static    = r"\["p & _uint_dec & r"\]"p   > (_, n, _) -> IL.ArraySpec.AStatic(n)
+@rule _suffix_bounded   = r"\[<="p & _uint_dec & r"\]"p > (_, n, _) -> IL.ArraySpec.ABounded(n)
+@rule _suffix_unbounded = r"\[\]"p                      |> _ -> IL.ArraySpec.AUnbounded()
 @rule _array_suffix = (_suffix_bounded, _suffix_static, _suffix_unbounded)
 
 @rule _field_type = _element_type & _array_suffix[:?] > (base, suf) ->
-    (base, isempty(suf) ? nothing : suf[1])
+    IL.RType(base, isempty(suf) ? IL.ArraySpec.AScalar() : suf[1])
 
 # Constants never carry an array suffix in valid ROS2; accept and ignore one
 # so a malformed line errors at the value-side rules instead of the type-side.
 @rule _const_type = _element_type & _array_suffix[:?] > (base, _) -> base
 
-function _apply_array(base_ts, suffix, field_name::Symbol)
-    if suffix === nothing
-        return (base_ts, Parse.Declarator.DIdent(field_name))
-    elseif suffix === :unbounded
-        return (Parse.TypeSpec.TSeq(base_ts, nothing),
-                Parse.Declarator.DIdent(field_name))
-    elseif suffix isa Tuple && suffix[1] === :bounded
-        n = Parse.ConstExpr.Lit(Parse.Literal.Intg(suffix[2]))
-        return (Parse.TypeSpec.TSeq(base_ts, n),
-                Parse.Declarator.DIdent(field_name))
-    elseif suffix isa Tuple && suffix[1] === :static
-        n = Parse.ConstExpr.Lit(Parse.Literal.Intg(suffix[2]))
-        return (base_ts, Parse.Declarator.DArray(field_name, [n]))
-    else
-        error("unknown array suffix: $suffix")
-    end
-end
-
 # ---- Value literals (constants and default values) -------------------------
-# The IDL parser has rich expression rules but ROS2 only allows literals (or
-# array literals — see _wrap_default). These rules cover scalar cases.
+# The IL only carries literals (or, for array defaults, opaque source text);
+# these rules cover the scalar cases. Float width is *not* resolved here — the
+# IL keeps the natural literal and IDL lowering narrows it to the field type.
 
 @rule _bool_lit = (
-    r"true\b"i  |> _ -> Parse.Literal.Bl(true),
-    r"True\b"   |> _ -> Parse.Literal.Bl(true),
-    r"false\b"i |> _ -> Parse.Literal.Bl(false),
-    r"False\b"  |> _ -> Parse.Literal.Bl(false))
+    r"true\b"i  |> _ -> IL.RValue.VBool(true),
+    r"True\b"   |> _ -> IL.RValue.VBool(true),
+    r"false\b"i |> _ -> IL.RValue.VBool(false),
+    r"False\b"  |> _ -> IL.RValue.VBool(false))
 
 @rule _int_hex = r"[+-]?0[xX][0-9a-fA-F]+"p |> s -> begin
     m = match(r"^([+-]?)0[xX]([0-9a-fA-F]+)$", strip(s))
@@ -121,16 +107,14 @@ end
 end
 @rule _int_dec = r"[+-]?[0-9]+(?![0-9eE.])"p |> s -> parse(Int, strip(s))
 
-@rule _int_lit = (_int_hex, _int_bin, _int_oct, _int_dec) |> n -> Parse.Literal.Intg(n)
+@rule _int_lit = (_int_hex, _int_bin, _int_oct, _int_dec) |> n -> IL.RValue.VInt(n)
 
 # Float syntax requires either a decimal point or an exponent to distinguish
-# from an integer; otherwise `42` would parse as a float too. Parse as F64 so
-# precision survives when the declared field type is float64 — the coercion in
-# `_parse_scalar_value` narrows to F32 (which is exact) when the field is
-# float32.
+# from an integer; otherwise `42` would parse as a float too. The IL stores it
+# as a Float64; lowering picks F32 vs F64 from the declared field type.
 @rule _float_raw = r"[+-]?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)"p
 @rule _float_dot = r"[+-]?(?:[0-9]+\.[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"p
-@rule _float_lit = (_float_raw, _float_dot) |> s -> Parse.Literal.F64(parse(Float64, s))
+@rule _float_lit = (_float_raw, _float_dot) |> s -> IL.RValue.VFloat(parse(Float64, s))
 
 # String literals: single- or double-quoted, with the usual escape sequences.
 # PEG.jl wraps each regex with `^(...)\s*`, so a user pattern ending in `\`
@@ -146,16 +130,11 @@ end
 @rule _squoted_body = ((-r"'"p  & (_esc_pair, r"."s)) |> x -> x[2])[*] |> xs -> join(xs)
 @rule _string_lit = (r"\""p & _dquoted_body & r"\""p > (_, b, _) -> b,
                      r"'"p  & _squoted_body & r"'"p  > (_, b, _) -> b) |>
-                     s -> Parse.Literal.St(s)
+                     s -> IL.RValue.VString(s)
 
 # Generic scalar literal — order matters: try float first (with dot/exponent)
 # before integer, since `3.14` should not be matched as `3` followed by `.14`.
 @rule _scalar_lit = (_bool_lit, _string_lit, _float_lit, _int_lit)
-
-# Wrap a raw `Literal` in `ConstExpr.Lit`. For float values we may need to
-# coerce F32 → F64 if the declared type is `float64`; that fixup happens in
-# the caller (after the value has been parsed).
-_lit_to_expr(lit) = Parse.ConstExpr.Lit(lit)
 
 # Strip an unquoted `#` line comment off a source line. The `#` inside a string
 # literal is literal text, not a comment.
@@ -183,80 +162,49 @@ function _strip_comment(line::AbstractString)
     return line
 end
 
-# Parse a scalar value with the declared ROS2 type known. Picks the right
-# Literal variant (F32 vs F64 for floats; Intg for any int base; Bl for bools;
-# St for quoted strings). For unquoted bare strings (allowed by the spec for
-# simple string defaults) and for anything not matching the grammar, falls
-# back to a Literal.St of the raw token.
-function _parse_scalar_value(raw::AbstractString, decl_type::Parse.TypeSpec.Type)
+# Parse a scalar value into an IL value, given the declared base type. Bools
+# accept `0`/`1`; anything that doesn't match the literal grammar falls back to
+# a bare string (per the ROS2 spec for simple string defaults).
+function _parse_scalar_value(raw::AbstractString, base::IL.RBase.Type)
     s = strip(raw)
-    # bool special-case: ROS2 accepts 0/1 as bool defaults too
-    is_bool = @match decl_type begin
-        Parse.TypeSpec.TBool() => true
+    is_bool = @match base begin
+        IL.RBase.RBool() => true
         _ => false
     end
     if is_bool && s in ("0", "1")
-        return Parse.ConstExpr.Lit(Parse.Literal.Bl(s == "1"))
+        return IL.RValue.VBool(s == "1")
     end
     parsed = try
         parse_whole(_scalar_lit, s)
     catch
         nothing
     end
-    if parsed === nothing
-        # Unquoted bare string fallback (per spec for simple string defaults).
-        return Parse.ConstExpr.Lit(Parse.Literal.St(s))
-    end
-    # Coerce float width to match the declared field type — the literal parser
-    # produces F32 by default, but a `float64` field needs F64. Also accept
-    # an integer literal (`1`) as a default for a float-typed field.
-    float_width = @match decl_type begin
-        Parse.TypeSpec.TFloat(w) => w
-        _ => 0
-    end
-    if float_width != 0
-        parsed = @match parsed begin
-            Parse.Literal.F32(v) => float_width == 64 ? Parse.Literal.F64(Float64(v)) : parsed
-            Parse.Literal.F64(v) => float_width == 32 ? Parse.Literal.F32(Float32(v)) : parsed
-            Parse.Literal.Intg(v) => float_width == 64 ?
-                Parse.Literal.F64(Float64(v)) :
-                Parse.Literal.F32(Float32(v))
-            _ => parsed
-        end
-    end
-    return Parse.ConstExpr.Lit(parsed)
+    parsed === nothing && return IL.RValue.VString(s)
+    return parsed
 end
 
 # ---- Line-level parsing ----------------------------------------------------
 
 # A line is either a constant (`<type> NAME=value`), a field with default
-# (`<type> name value`), or a bare field (`<type> name`). We parse each
-# variant separately and try them in order.
+# (`<type> name value`), or a bare field (`<type> name`).
 
-# Helper: parse the type portion of a line. PEG.jl's `p` suffix on the inner
-# regex rules already consumes trailing whitespace, so no extra `_ws` is needed.
 @rule _type_token = _field_type
 @rule _const_type_token = _const_type
 
 # Capture-all rules: the value half of constants and defaults can hold
 # arbitrary text (with embedded spaces — e.g. `"hello world"` or `[1, 2, 3]`),
-# so consume the rest of the line as an opaque string and parse it separately
-# with `_parse_scalar_value`.
+# so consume the rest of the line as an opaque string and parse it separately.
 @rule _rest_of_line = r"[^\n\r]*"p
 # Like `_rest_of_line` but requires at least one non-space character so the
 # parser commits to "this is a default" only when there's actually a value.
 @rule _rest_of_line_nonempty = r"[^\s][^\n\r]*"p
 
-# Constant: `<type> NAME = <value>`. The `=` may or may not have surrounding
-# whitespace; the `p` suffix on `_ident` already eats trailing spaces.
 @rule _const_line = _const_type_token & _ident & r"="p & _rest_of_line >
-    (ts, name, _, val) -> (:const, ts, Symbol(name), strip(val))
+    (base, name, _, val) -> (:const, base, Symbol(name), strip(val))
 
-# Field with default: `<type> name <value>` — the value is non-empty.
 @rule _field_with_default_line = _type_token & _ident & _rest_of_line_nonempty >
     (ft, name, val) -> (:field_default, ft, Symbol(name), strip(val))
 
-# Field without default: `<type> name`
 @rule _field_bare_line = _type_token & _ident > (ft, name) -> (:field, ft, Symbol(name))
 
 # Try const first (the `=` disambiguates), then field-with-default, then bare.
@@ -274,89 +222,52 @@ function _parse_line(line::AbstractString)
     end
 end
 
-# Build the `@default(value=...)` annotation wrapping a field member. Array
-# defaults — e.g. `int32[3] foo [1, 2, 3]` — don't have a corresponding IDL
-# expression form (no array-literal `ConstExpr` variant), so as a tactical
-# workaround we emit the raw source text as a string literal. Documented as
-# such inline.
-function _wrap_default(member, default_raw::AbstractString, base_ts, suffix)
-    expr = if suffix === nothing
-        _parse_scalar_value(default_raw, base_ts)
-    else
-        # Array default: pass through raw source as a string. See note above.
-        Parse.ConstExpr.Lit(Parse.Literal.St(strip(default_raw)))
-    end
-    ann_name = Parse.ScopedName.Name(Symbol[], :default, true)
-    return Parse.Annotated.Annotation(ann_name,
-        [:value => expr],
-        member)
-end
+_is_scalar(a::IL.ArraySpec.Type) = (@match a begin
+    IL.ArraySpec.AScalar() => true
+    _ => false
+end)
 
-# Parse a section's source text into `(constants, members)`.
+# Parse a section's source text into an `(constants, fields)` IL pair.
 function _parse_section(src::AbstractString)
-    constants = Parse.ConstDecl.Type[]
-    members = Any[]
+    constants = IL.RConstant[]
+    fields = IL.RField[]
     for line in split(src, '\n')
         parsed = _parse_line(line)
         parsed === nothing && continue
         tag = parsed[1]
         if tag === :const
-            _, ts, name, val = parsed
-            push!(constants,
-                Parse.ConstDecl.CDecl(ts, name, _parse_scalar_value(val, ts)))
+            _, base, name, val = parsed
+            push!(constants, IL.RConstant(base, name, _parse_scalar_value(val, base)))
         elseif tag === :field
-            _, (base_ts, suffix), name = parsed
-            ts, decl = _apply_array(base_ts, suffix, name)
-            push!(members, ts => Parse.Declarator.Type[decl])
+            _, rtype, name = parsed
+            push!(fields, IL.RField(rtype, name, nothing))
         elseif tag === :field_default
-            _, (base_ts, suffix), name, default = parsed
-            ts, decl = _apply_array(base_ts, suffix, name)
-            member = ts => Parse.Declarator.Type[decl]
-            push!(members, _wrap_default(member, default, base_ts, suffix))
+            _, rtype, name, raw = parsed
+            # Array defaults — e.g. `int32[3] foo [1, 2, 3]` — have no
+            # structured literal form, so carry the source text verbatim.
+            default = _is_scalar(rtype.array) ?
+                _parse_scalar_value(raw, rtype.base) : IL.RValue.VRaw(raw)
+            push!(fields, IL.RField(rtype, name, default))
         else
             error("unexpected line tag: $tag")
         end
     end
-    return (constants, members)
+    return (constants, fields)
 end
 
-# Assemble the IDL decls for a single message: a `<Name>_Constants` module if
-# there are any constants, then the struct.
-function _build_message_decls(name::AbstractString, constants, members)
-    decls = Any[]
-    if !isempty(constants)
-        constants_name = Symbol(string(name, "_Constants"))
-        push!(decls, Parse.ModuleDecl.MDecl(constants_name,
-            Vector{Parse.CanAnnotate{Parse.Decl}}(constants)))
-    end
-    sname = Symbol(name)
-    members_typed = Vector{Parse.CanAnnotate{
-        Pair{Parse.TypeSpec.Type, Vector{Parse.Declarator.Type}}}}(members)
-    push!(decls, Parse.TypeDecl.StructDecl(sname, nothing, members_typed))
-    return decls
-end
+# ---- Building IL interfaces from source ------------------------------------
 
-# Wrap inner decls in `module <package> { module <submodule> { ... } }` if
-# `package` is non-empty. `submodule` is `:msg` / `:srv` / `:action`.
-function _wrap_package(inner_decls, package::AbstractString, submodule::Symbol)
-    isempty(package) && return inner_decls
-    inner_typed = Vector{Parse.CanAnnotate{Parse.Decl}}(inner_decls)
-    sub = Parse.ModuleDecl.MDecl(submodule, inner_typed)
-    outer = Parse.ModuleDecl.MDecl(Symbol(package),
-        Vector{Parse.CanAnnotate{Parse.Decl}}([sub]))
-    return Any[outer]
-end
+build_message(name, constants, fields) =
+    IL.RMessage(Symbol(name), constants, fields)
 
 """
-    parse_msg(source; name, package="")
+    message_il(source; name) -> IL.RMessage
 
-Parse the contents of a ROS2 `.msg` file into a vector of IDL declarations.
+Parse a ROS2 `.msg` source into the interface IL.
 """
-function parse_msg(source::AbstractString; name::AbstractString,
-                   package::AbstractString="")
-    constants, members = _parse_section(source)
-    inner = _build_message_decls(name, constants, members)
-    return _wrap_package(inner, package, :msg)
+function message_il(source::AbstractString; name::AbstractString)
+    constants, fields = _parse_section(source)
+    return build_message(name, constants, fields)
 end
 
 # Split a `.srv` / `.action` source on lines that are exactly `---` (after
@@ -377,41 +288,183 @@ function _split_on_marker(source::AbstractString)
 end
 
 """
+    service_il(source; name) -> IL.RService
+
+Parse a ROS2 `.srv` source into the interface IL.
+"""
+function service_il(source::AbstractString; name::AbstractString)
+    sections = _split_on_marker(source)
+    length(sections) == 2 || error(".srv source must have exactly one `---` separator")
+    req_consts, req_fields = _parse_section(sections[1])
+    res_consts, res_fields = _parse_section(sections[2])
+    return IL.RService(Symbol(name),
+        build_message(string(name, "_Request"), req_consts, req_fields),
+        build_message(string(name, "_Response"), res_consts, res_fields))
+end
+
+"""
+    action_il(source; name) -> IL.RAction
+
+Parse a ROS2 `.action` source into the interface IL.
+"""
+function action_il(source::AbstractString; name::AbstractString)
+    sections = _split_on_marker(source)
+    length(sections) == 3 || error(".action source must have exactly two `---` separators")
+    cf = [_parse_section(s) for s in sections]
+    return IL.RAction(Symbol(name),
+        build_message(string(name, "_Goal"), cf[1]...),
+        build_message(string(name, "_Result"), cf[2]...),
+        build_message(string(name, "_Feedback"), cf[3]...))
+end
+
+# ---- Lowering: IL → Parse.Decl ---------------------------------------------
+
+_base_to_ts(base::IL.RBase.Type) = @match base begin
+    IL.RBase.RBool() => Parse.TypeSpec.TBool()
+    IL.RBase.RByte() => Parse.TypeSpec.TOctet()
+    # `char` per ROS2 spec is an unsigned 8-bit integer.
+    IL.RBase.RChar() => Parse.TypeSpec.TUInt(8)
+    IL.RBase.RInt(w) => Parse.TypeSpec.TInt(w)
+    IL.RBase.RUInt(w) => Parse.TypeSpec.TUInt(w)
+    IL.RBase.RFloat(w) => Parse.TypeSpec.TFloat(w)
+    IL.RBase.RStr(b) => Parse.TypeSpec.TString(
+        b === nothing ? nothing : Parse.ConstExpr.Lit(Parse.Literal.Intg(b)))
+    IL.RBase.RWStr(b) => Parse.TypeSpec.TWString(
+        b === nothing ? nothing : Parse.ConstExpr.Lit(Parse.Literal.Intg(b)))
+    IL.RBase.RRef(pkg, name) => Parse.TypeSpec.TRef(
+        pkg === nothing ?
+            Parse.ScopedName.Name(Symbol[], Symbol(name), true) :
+            Parse.ScopedName.Name([Symbol(pkg), :msg], Symbol(name), true))
+end
+
+# Lower an IL value to a `ConstExpr`. Float-typed targets narrow the value's
+# width (and accept an integer literal as a float default), matching the spec.
+function _value_to_expr(v::IL.RValue.Type, base::IL.RBase.Type)
+    fw = @match base begin
+        IL.RBase.RFloat(w) => w
+        _ => 0
+    end
+    @match v begin
+        IL.RValue.VBool(b) => Parse.ConstExpr.Lit(Parse.Literal.Bl(b))
+        IL.RValue.VString(s) => Parse.ConstExpr.Lit(Parse.Literal.St(s))
+        IL.RValue.VRaw(s) => Parse.ConstExpr.Lit(Parse.Literal.St(s))
+        IL.RValue.VInt(n) =>
+            fw == 64 ? Parse.ConstExpr.Lit(Parse.Literal.F64(Float64(n))) :
+            fw == 32 ? Parse.ConstExpr.Lit(Parse.Literal.F32(Float32(n))) :
+                       Parse.ConstExpr.Lit(Parse.Literal.Intg(n))
+        IL.RValue.VFloat(x) =>
+            fw == 32 ? Parse.ConstExpr.Lit(Parse.Literal.F32(Float32(x))) :
+                       Parse.ConstExpr.Lit(Parse.Literal.F64(x))
+    end
+end
+
+function _apply_array(base_ts, arr::IL.ArraySpec.Type, name::Symbol)
+    @match arr begin
+        IL.ArraySpec.AScalar() => (base_ts, Parse.Declarator.DIdent(name))
+        IL.ArraySpec.AUnbounded() =>
+            (Parse.TypeSpec.TSeq(base_ts, nothing), Parse.Declarator.DIdent(name))
+        IL.ArraySpec.ABounded(n) =>
+            (Parse.TypeSpec.TSeq(base_ts, Parse.ConstExpr.Lit(Parse.Literal.Intg(n))),
+             Parse.Declarator.DIdent(name))
+        IL.ArraySpec.AStatic(n) =>
+            (base_ts, Parse.Declarator.DArray(name,
+                [Parse.ConstExpr.Lit(Parse.Literal.Intg(n))]))
+    end
+end
+
+# Wrap a member in a `@default(value=...)` annotation.
+function _wrap_default(member, expr)
+    ann_name = Parse.ScopedName.Name(Symbol[], :default, true)
+    return Parse.Annotated.Annotation(ann_name, [:value => expr], member)
+end
+
+function _lower_field(f::IL.RField)
+    base_ts = _base_to_ts(f.type.base)
+    ts, decl = _apply_array(base_ts, f.type.array, f.name)
+    member = ts => Parse.Declarator.Type[decl]
+    f.default === nothing && return member
+    return _wrap_default(member, _value_to_expr(f.default, f.type.base))
+end
+
+_lower_constant(c::IL.RConstant) =
+    Parse.ConstDecl.CDecl(_base_to_ts(c.type), c.name, _value_to_expr(c.value, c.type))
+
+# A `<Name>_Constants` module (if there are any constants) then the struct.
+function _lower_message_decls(msg::IL.RMessage)
+    decls = Any[]
+    if !isempty(msg.constants)
+        constants_name = Symbol(string(msg.name, "_Constants"))
+        consts = Parse.ConstDecl.Type[_lower_constant(c) for c in msg.constants]
+        push!(decls, Parse.ModuleDecl.MDecl(constants_name,
+            Vector{Parse.CanAnnotate{Parse.Decl}}(consts)))
+    end
+    members = Any[_lower_field(f) for f in msg.fields]
+    members_typed = Vector{Parse.CanAnnotate{
+        Pair{Parse.TypeSpec.Type, Vector{Parse.Declarator.Type}}}}(members)
+    push!(decls, Parse.TypeDecl.StructDecl(msg.name, nothing, members_typed))
+    return decls
+end
+
+# Wrap inner decls in `module <package> { module <submodule> { ... } }` if
+# `package` is non-empty. `submodule` is `:msg` / `:srv` / `:action`.
+function _wrap_package(inner_decls, package::AbstractString, submodule::Symbol)
+    isempty(package) && return inner_decls
+    inner_typed = Vector{Parse.CanAnnotate{Parse.Decl}}(inner_decls)
+    sub = Parse.ModuleDecl.MDecl(submodule, inner_typed)
+    outer = Parse.ModuleDecl.MDecl(Symbol(package),
+        Vector{Parse.CanAnnotate{Parse.Decl}}([sub]))
+    return Any[outer]
+end
+
+"""
+    lower(interface; package="") -> Vector
+
+Lower an IL interface (`RMessage`/`RService`/`RAction`) into the IDL
+`Parse.Decl` vector, optionally wrapped in a `<package>` module.
+"""
+lower(msg::IL.RMessage; package::AbstractString="") =
+    _wrap_package(_lower_message_decls(msg), package, :msg)
+
+function lower(srv::IL.RService; package::AbstractString="")
+    inner = Any[]
+    append!(inner, _lower_message_decls(srv.request))
+    append!(inner, _lower_message_decls(srv.response))
+    return _wrap_package(inner, package, :srv)
+end
+
+function lower(act::IL.RAction; package::AbstractString="")
+    inner = Any[]
+    append!(inner, _lower_message_decls(act.goal))
+    append!(inner, _lower_message_decls(act.result))
+    append!(inner, _lower_message_decls(act.feedback))
+    return _wrap_package(inner, package, :action)
+end
+
+# ---- Public forward API ----------------------------------------------------
+
+"""
+    parse_msg(source; name, package="")
+
+Parse the contents of a ROS2 `.msg` file into a vector of IDL declarations.
+"""
+parse_msg(source::AbstractString; name::AbstractString, package::AbstractString="") =
+    lower(message_il(source; name=name); package=package)
+
+"""
     parse_srv(source; name, package="")
 
 Parse a ROS2 `.srv` source into request and response struct decls.
 """
-function parse_srv(source::AbstractString; name::AbstractString,
-                   package::AbstractString="")
-    sections = _split_on_marker(source)
-    length(sections) == 2 || error(".srv source must have exactly one `---` separator")
-    req_consts, req_members = _parse_section(sections[1])
-    res_consts, res_members = _parse_section(sections[2])
-    inner = Any[]
-    append!(inner, _build_message_decls(string(name, "_Request"),
-        req_consts, req_members))
-    append!(inner, _build_message_decls(string(name, "_Response"),
-        res_consts, res_members))
-    return _wrap_package(inner, package, :srv)
-end
+parse_srv(source::AbstractString; name::AbstractString, package::AbstractString="") =
+    lower(service_il(source; name=name); package=package)
 
 """
     parse_action(source; name, package="")
 
 Parse a ROS2 `.action` source into goal, result, and feedback struct decls.
 """
-function parse_action(source::AbstractString; name::AbstractString,
-                      package::AbstractString="")
-    sections = _split_on_marker(source)
-    length(sections) == 3 || error(".action source must have exactly two `---` separators")
-    parts = [_parse_section(s) for s in sections]
-    inner = Any[]
-    for (suffix, (consts, members)) in zip(("Goal", "Result", "Feedback"), parts)
-        append!(inner, _build_message_decls(string(name, "_", suffix),
-            consts, members))
-    end
-    return _wrap_package(inner, package, :action)
-end
+parse_action(source::AbstractString; name::AbstractString, package::AbstractString="") =
+    lower(action_il(source; name=name); package=package)
 
 """
     parse_file(path; package="")
@@ -433,3 +486,231 @@ function parse_file(path::AbstractString; package::AbstractString="")
         error("unknown ROS2 interface extension: $ext")
     end
 end
+
+# ---- Lifting: Parse.Decl → IL ----------------------------------------------
+
+# `(name, decls)` if `d` is a module, else `nothing`.
+function _as_module(d)
+    d isa Parse.ModuleDecl.Type || return nothing
+    @match d begin
+        Parse.ModuleDecl.MDecl(n, ds) => (n, ds)
+    end
+end
+
+# `(name, members)` if `d` is a struct decl, else `nothing`.
+function _as_struct(d)
+    d isa Parse.TypeDecl.Type || return nothing
+    @match d begin
+        Parse.TypeDecl.StructDecl(n, _, ms) => (n, ms)
+        _ => nothing
+    end
+end
+
+_struct_names(decls) = Symbol[s[1] for s in (_as_struct(d) for d in decls) if s !== nothing]
+
+# Decide whether a bare (un-package-wrapped) decl list is a msg/srv/action,
+# from the suffixes of its struct names.
+function _infer_kind(decls)
+    names = Set(string.(_struct_names(decls)))
+    has(suf) = any(endswith(n, suf) for n in names)
+    if has("_Goal") && has("_Result") && has("_Feedback")
+        return :action
+    elseif has("_Request") && has("_Response")
+        return :srv
+    else
+        return :msg
+    end
+end
+
+# Peel an optional `module <pkg> { module <msg|srv|action> { ... } }` wrapper,
+# returning `(package, kind, inner_decls)`.
+function _unwrap_package(decls)
+    if length(decls) == 1
+        m = _as_module(decls[1])
+        if m !== nothing && length(m[2]) == 1
+            sm = _as_module(m[2][1])
+            if sm !== nothing && sm[1] in (:msg, :srv, :action)
+                return (string(m[1]), sm[1], sm[2])
+            end
+        end
+    end
+    return (nothing, _infer_kind(decls), decls)
+end
+
+_scoped_name(name) = (@match name begin
+    Parse.ScopedName.Name(path, n, _) => (path, n)
+end)
+
+# Walk `Annotated` wrappers, returning `(inner, default_expr)` where
+# `default_expr` is the `@default(value=...)` argument if present.
+function _peel_annotated(x)
+    default = nothing
+    while x isa Parse.Annotated.Type
+        x = @match x begin
+            Parse.Annotated.Annotation(name, params, inner) => begin
+                if _scoped_name(name)[2] === :default
+                    for (k, v) in params
+                        k === :value && (default = v)
+                    end
+                end
+                inner
+            end
+        end
+    end
+    return (x, default)
+end
+
+_expr_int(expr) = (@match expr begin
+    Parse.ConstExpr.Lit(Parse.Literal.Intg(n)) => Int(n)
+    _ => error("expected integer literal, got $(expr)")
+end)
+
+function _ref_to_base(scoped)
+    path, n = _scoped_name(scoped)
+    if isempty(path)
+        return IL.RBase.RRef(nothing, string(n))
+    elseif length(path) >= 2 && path[end] === :msg
+        return IL.RBase.RRef(string(path[end-1]), string(n))
+    else
+        return IL.RBase.RRef(string(path[1]), string(n))
+    end
+end
+
+_ts_to_base(ts) = @match ts begin
+    Parse.TypeSpec.TBool() => IL.RBase.RBool()
+    Parse.TypeSpec.TOctet() => IL.RBase.RByte()
+    Parse.TypeSpec.TChar() => IL.RBase.RChar()
+    Parse.TypeSpec.TWChar() => IL.RBase.RChar()
+    Parse.TypeSpec.TInt(w) => IL.RBase.RInt(w)
+    Parse.TypeSpec.TUInt(w) => IL.RBase.RUInt(w)
+    Parse.TypeSpec.TFloat(w) => IL.RBase.RFloat(w)
+    Parse.TypeSpec.TString(b) => IL.RBase.RStr(b === nothing ? nothing : _expr_int(b))
+    Parse.TypeSpec.TWString(b) => IL.RBase.RWStr(b === nothing ? nothing : _expr_int(b))
+    Parse.TypeSpec.TRef(name) => _ref_to_base(name)
+    _ => error("unsupported ROS type spec: $(ts)")
+end
+
+function _expr_to_value(expr, is_array::Bool)
+    @match expr begin
+        Parse.ConstExpr.Lit(lit) => (@match lit begin
+            Parse.Literal.Bl(b) => IL.RValue.VBool(b)
+            Parse.Literal.Intg(n) => IL.RValue.VInt(n)
+            Parse.Literal.F32(v) => IL.RValue.VFloat(Float64(v))
+            Parse.Literal.F64(v) => IL.RValue.VFloat(v)
+            Parse.Literal.Ch(c) => IL.RValue.VString(string(c))
+            Parse.Literal.St(s) => is_array ? IL.RValue.VRaw(s) : IL.RValue.VString(s)
+        end)
+        # ROS only emits literals; anything richer round-trips as opaque text.
+        _ => IL.RValue.VRaw(Parse.unparse(expr))
+    end
+end
+
+function _lift_field(member)
+    pair, default_expr = _peel_annotated(member)
+    ts = pair.first
+    decl = pair.second[1]
+    base, array, name = @match decl begin
+        Parse.Declarator.DArray(nm, dims) =>
+            (_ts_to_base(ts), IL.ArraySpec.AStatic(_expr_int(dims[1])), nm)
+        Parse.Declarator.DIdent(nm) => (@match ts begin
+            Parse.TypeSpec.TSeq(elt, bound) => (_ts_to_base(elt),
+                bound === nothing ? IL.ArraySpec.AUnbounded() :
+                    IL.ArraySpec.ABounded(_expr_int(bound)), nm)
+            _ => (_ts_to_base(ts), IL.ArraySpec.AScalar(), nm)
+        end)
+    end
+    default = default_expr === nothing ? nothing :
+        _expr_to_value(default_expr, !_is_scalar(array))
+    return IL.RField(IL.RType(base, array), name, default)
+end
+
+function _lift_constant(d)
+    d, _ = _peel_annotated(d)
+    @match d begin
+        Parse.ConstDecl.CDecl(ts, name, val) =>
+            IL.RConstant(_ts_to_base(ts), name, _expr_to_value(val, false))
+    end
+end
+
+# Reconstruct one `RMessage` (the named struct plus its `<Name>_Constants`
+# module, if any) out of a flat decl list.
+function _lift_message(decls, name::Symbol)
+    members = nothing
+    for d in decls
+        s = _as_struct(d)
+        s !== nothing && s[1] == name && (members = s[2])
+    end
+    members === nothing && error("struct $name not found")
+    consts_name = Symbol(string(name, "_Constants"))
+    constants = IL.RConstant[]
+    for d in decls
+        m = _as_module(d)
+        if m !== nothing && m[1] == consts_name
+            append!(constants, (_lift_constant(c) for c in m[2]))
+        end
+    end
+    fields = IL.RField[_lift_field(m) for m in members]
+    return IL.RMessage(name, constants, fields)
+end
+
+function _first_with_suffix(names, suf)
+    for n in names
+        endswith(string(n), suf) && return n
+    end
+    error("no struct ending in `$suf` found")
+end
+
+_strip_suffix(s, suf) = endswith(s, suf) ? s[1:end-length(suf)] : s
+
+function _lift_service(decls)
+    names = _struct_names(decls)
+    req = _first_with_suffix(names, "_Request")
+    res = _first_with_suffix(names, "_Response")
+    base = Symbol(_strip_suffix(string(req), "_Request"))
+    return IL.RService(base, _lift_message(decls, req), _lift_message(decls, res))
+end
+
+function _lift_action(decls)
+    names = _struct_names(decls)
+    goal = _first_with_suffix(names, "_Goal")
+    result = _first_with_suffix(names, "_Result")
+    feedback = _first_with_suffix(names, "_Feedback")
+    base = Symbol(_strip_suffix(string(goal), "_Goal"))
+    return IL.RAction(base, _lift_message(decls, goal),
+        _lift_message(decls, result), _lift_message(decls, feedback))
+end
+
+"""
+    lift(decls) -> IL interface
+
+Reconstruct the ROS interface IL (`RMessage`/`RService`/`RAction`) from a
+`Parse.Decl` vector — the inverse of [`lower`](@ref). The kind is taken from a
+`module msg|srv|action` wrapper if present, else inferred from struct-name
+suffixes (`_Request`/`_Response`, `_Goal`/`_Result`/`_Feedback`).
+"""
+function lift(decls)
+    _, kind, inner = _unwrap_package(decls)
+    if kind === :srv
+        return _lift_service(inner)
+    elseif kind === :action
+        return _lift_action(inner)
+    else
+        names = _struct_names(inner)
+        isempty(names) && error("no message struct found in decls")
+        return _lift_message(inner, names[1])
+    end
+end
+
+# ---- Public backward API ---------------------------------------------------
+
+"""
+    to_ros(decls) -> String
+    to_ros(io, decls)
+
+Render a `Parse.Decl` vector back to ROS2 interface text (`.msg`/`.srv`/
+`.action`), going `Parse.Decl → IL → text`. The inverse of [`parse_msg`](@ref)
+and friends, up to spellings that ROS and IDL share (`char`↔`uint8`,
+`byte`↔`octet`, and the `time`/`duration`/`Header` aliases).
+"""
+to_ros(decls) = IL.unparse(lift(decls))
+to_ros(io::IO, decls) = IL.unparse(io, lift(decls))
