@@ -1,6 +1,6 @@
 module Gencode
 using IDLParser
-using CDRSerialization: CDRReader, CDRWriter
+using CDRSerialization: CDRReader, CDRWriter, iscompact
 using StaticArrays
 using Test, PEG
 import IDLParser.Parse: open_idl
@@ -51,5 +51,41 @@ end
     end
     @test TypedefMulti.a == SVector{3, Float32}
     @test TypedefMulti.b == SVector{5, Float32}
+end
+
+module LayoutGood end
+module LayoutPadded end
+module LayoutOverride end
+@testset "layout requirements (@compact annotation + require option)" begin
+    import IDLParser.Parse: specification
+    p(src) = resolve_constants(convert(Vector{IDLParser.Parse.Decl}, parse_whole(specification, src)))
+
+    # `@compact` on a genuinely-compact struct builds; the layout holds.
+    for c in generate_code(p("module m { @compact struct Good { double a; double b; }; };"))
+        LayoutGood.eval(c)
+    end
+    @test iscompact(LayoutGood.m.Good)
+
+    # `require => :compact` on a padded struct (sizeof 16 ≠ wire 12) fails when the
+    # generated code loads — the precompile-time `@assert iscompact` fires.
+    padded = generate_code(p("module m { struct Padded { double a; unsigned long b; }; };");
+                           require = Dict("m/Padded" => :compact))
+    @test_throws Exception begin
+        for c in padded
+            LayoutPadded.eval(c)
+        end
+    end
+
+    # `:compact` on a variable-length struct is impossible → errors during generation.
+    @test_throws ErrorException generate_code(
+        p("module m { struct Dyn { string name; double v; }; };");
+        require = Dict("m/Dyn" => :compact))
+
+    # The `require` option overrides the IDL annotation (:any lets a padded struct build).
+    for c in generate_code(p("module m { @compact struct P2 { double a; unsigned long b; }; };");
+                           require = Dict("m/P2" => :any))
+        LayoutOverride.eval(c)
+    end
+    @test isdefined(LayoutOverride.m, :P2)
 end
 end

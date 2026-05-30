@@ -39,6 +39,40 @@
         @test q2 == q
     end
 
+    @testset "QoS deadline / lifespan" begin
+        q = QosProfile(deadline=Duration(1, 500), lifespan=Duration(0, 250))
+        s = encode_qos(f, q)
+        # deadline 1,500 ; lifespan sec=0 omitted → ",250" ; liveliness default ",,"
+        @test s == "::,10:1,500:,250:,,"
+        _, q2 = decode_qos(f, s)
+        @test q2 == q
+        @test q2.deadline == Duration(1, 500)
+        @test q2.lifespan == Duration(0, 250)
+    end
+
+    @testset "QoS liveliness manual_by_topic + lease" begin
+        q = QosProfile(liveliness=:manual_by_topic, liveliness_lease=Duration(2, 0))
+        s = encode_qos(f, q)
+        # liveliness kind "3", lease sec=2, nsec=0 omitted → "3,2,"
+        @test s == "::,10:,:,:3,2,"
+        _, q2 = decode_qos(f, s)
+        @test q2 == q
+        @test q2.liveliness == :manual_by_topic
+        @test q2.liveliness_lease == Duration(2, 0)
+    end
+
+    @testset "QoS — tolerates rmw_zenoh omit-on-default forms" begin
+        # rmw_zenoh omits the depth at the default (10); we accept it as 10.
+        _, q = decode_qos(f, "::,:,:,:,,")
+        @test q == default_qos()
+        # liveliness kind "1" is Automatic (the RMW default enum value).
+        _, q2 = decode_qos(f, "::,10:,:,:1,,")
+        @test q2.liveliness == :automatic
+        # Older peers that omit the trailing fields entirely.
+        _, q3 = decode_qos(f, "::,10")
+        @test q3 == default_qos()
+    end
+
     @testset "topic_keyexpr — simple" begin
         node = NodeEntity(0, zid, 0, "test_node", "/", "")
         e = EndpointEntity(id=1, node=node, kind=Publisher,

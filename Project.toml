@@ -1,5 +1,10 @@
 [workspace]
-projects = ["IDLParser", "ROSMessages", "ROSZenoh"]
+projects = ["IDLParser", "ROSMessages", "ROSZenoh", "ROSNode"]
 
 [deps]
 CDRSerialization = "cbcadc0d-0faf-4c71-82b5-fceb8cc36223"
+Zenoh = "b742139f-8771-480b-a9b2-33222b45d29b"
+
+[sources]
+CDRSerialization = {path = "/home/benchung/juliahub/drone/CDRSerialization.jl"}
+Zenoh = {path = "/home/benchung/juliahub/dyad-bot2/Zenoh.jl"}

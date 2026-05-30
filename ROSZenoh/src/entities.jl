@@ -115,37 +115,73 @@ kind_code(k::EndpointKind) = _KIND_CODE[k]
 parse_kind_code(s::AbstractString) = get(_CODE_KIND, String(s), nothing)
 
 """
+    Duration(sec, nsec)
+
+A non-negative time duration (`rmw_time_t`: unsigned `sec` + `nsec`). Used for
+the deadline / lifespan / liveliness-lease QoS policies. `nothing` is used
+elsewhere to mean the ROS2 default (infinite / unset), so a `Duration` always
+denotes a finite value.
+"""
+struct Duration
+    sec::UInt64
+    nsec::UInt64
+end
+
+function Duration(sec::Integer, nsec::Integer)
+    (sec >= 0 && nsec >= 0) ||
+        throw(ArgumentError("Duration components must be non-negative, got ($sec, $nsec)"))
+    Duration(UInt64(sec), UInt64(nsec))
+end
+
+"""
     QosProfile(; reliability=:reliable, durability=:volatile,
-                 history=:keep_last, depth=10)
+                 history=:keep_last, depth=10,
+                 deadline=nothing, lifespan=nothing,
+                 liveliness=:automatic, liveliness_lease=nothing)
 
 DDS-style QoS profile attached to publishers and subscriptions. The fields
 mirror ROS2 RMW values; `keyless` is **not** a QoS attribute here — it's a
 runtime flag passed alongside the profile to `encode_qos`/`decode_qos`
 because rmw_zenoh ignores it but ros2dds prepends it to the encoding.
 
-`history == :keep_all` ignores `depth`.
+`history == :keep_all` ignores `depth`. `deadline`, `lifespan`, and
+`liveliness_lease` are `Union{Nothing, Duration}` where `nothing` is the ROS2
+default (infinite / unset). `liveliness` is `:automatic` (default) or
+`:manual_by_topic`.
 """
 struct QosProfile
     reliability::Symbol   # :reliable | :best_effort
     durability::Symbol    # :volatile | :transient_local
     history::Symbol       # :keep_last | :keep_all
     depth::Int
+    deadline::Union{Nothing, Duration}
+    lifespan::Union{Nothing, Duration}
+    liveliness::Symbol    # :automatic | :manual_by_topic
+    liveliness_lease::Union{Nothing, Duration}
 end
 
 function QosProfile(; reliability::Symbol=:reliable,
                       durability::Symbol=:volatile,
                       history::Symbol=:keep_last,
-                      depth::Integer=10)
+                      depth::Integer=10,
+                      deadline::Union{Nothing, Duration}=nothing,
+                      lifespan::Union{Nothing, Duration}=nothing,
+                      liveliness::Symbol=:automatic,
+                      liveliness_lease::Union{Nothing, Duration}=nothing)
     reliability in (:reliable, :best_effort) ||
         throw(ArgumentError("reliability must be :reliable or :best_effort, got :$reliability"))
     durability in (:volatile, :transient_local) ||
         throw(ArgumentError("durability must be :volatile or :transient_local, got :$durability"))
     history in (:keep_last, :keep_all) ||
         throw(ArgumentError("history must be :keep_last or :keep_all, got :$history"))
-    QosProfile(reliability, durability, history, Int(depth))
+    liveliness in (:automatic, :manual_by_topic) ||
+        throw(ArgumentError("liveliness must be :automatic or :manual_by_topic, got :$liveliness"))
+    QosProfile(reliability, durability, history, Int(depth),
+               deadline, lifespan, liveliness, liveliness_lease)
 end
 
-# rmw_zenoh and ros2dds both default to Reliable + Volatile + KeepLast(10).
+# rmw_zenoh and ros2dds both default to Reliable + Volatile + KeepLast(10),
+# infinite deadline/lifespan, and Automatic liveliness.
 default_qos() = QosProfile()
 
 """

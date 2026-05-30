@@ -11,18 +11,77 @@ struct ModEntry
     refs::Vector{Pair{Vector{Symbol}, Symbol}}
 end
 
-generate_code(definition::CR.Annotated.Type, genmod, registry) = @match definition begin
-    CR.Annotated.Annotation(name, params, defn) => generate_code(defn, genmod, registry)
+# --- Per-type layout requirement plumbing ----------------------------------
+#
+# A struct can be pinned to a CDR layout tier — `:compact` (in-memory bytes ==
+# wire, single load / zero-copy alias), `:fixed` (no variable-length fields), or
+# `:any` (default) — either with an `@compact` / `@fixed` annotation in the IDL
+# or via the `require` option to `generate_code` (which wins on conflict). The
+# generator asserts the tier at build time: an impossible request (`:compact` on
+# a struct with a string/sequence field) errors during generation with the
+# offending field named, and a request that depends on field layout (padding)
+# emits a precompile `@assert` against the library's `iscompact` — so a layout
+# regression fails the build instead of silently dropping to a slower tier.
+struct LayoutCtx
+    require::Dict{Vector{Symbol}, Symbol}   # full scoped path => tier
+    scope::Vector{Symbol}                   # enclosing module path
+    anno_tier::Union{Symbol, Nothing}       # tier from an enclosing annotation
 end
-generate_code(definition::CR.ModuleDecl.Type, genmod, registry) = @match definition begin
+LayoutCtx() = LayoutCtx(Dict{Vector{Symbol}, Symbol}(), Symbol[], nothing)
+
+# Descend into a sub-module: extend the scope, drop any pending annotation tier
+# (an annotation binds only to the single decl it precedes).
+_descend(lc::LayoutCtx, name::Symbol) = LayoutCtx(lc.require, [lc.scope; name], nothing)
+# Apply an annotation in a chain: a recognised layout annotation sets the tier;
+# any other annotation keeps whatever an outer one set.
+_anno(lc::LayoutCtx, tier) = LayoutCtx(lc.require, lc.scope,
+                                       tier === nothing ? lc.anno_tier : tier)
+
+# `@compact` / `@fixed` (bare, no params) are the recognised layout annotations;
+# everything else (`@verbatim`, …) returns nothing and is ignored for layout.
+function _layout_tier_from_anno(annotation_name::CR.ScopedName.Type)
+    nm = @match annotation_name begin
+        CR.ScopedName.Name(_, n, _) => n
+    end
+    nm === :compact && return :compact
+    nm === :fixed   && return :fixed
+    return nothing
+end
+
+# Effective tier for a struct: the `require` option (by full scoped path) wins,
+# else the annotation tier, else `:any`.
+function _effective_tier(lc::LayoutCtx, name::Symbol)
+    fullpath = [lc.scope; name]
+    haskey(lc.require, fullpath) && return lc.require[fullpath]
+    return lc.anno_tier === nothing ? :any : lc.anno_tier
+end
+
+# Normalise `require` keys ("pkg/sub/Name") to scoped-symbol paths; validate tiers.
+function _normalize_require(require)
+    out = Dict{Vector{Symbol}, Symbol}()
+    for (k, v) in require
+        tier = Symbol(v)
+        tier in (:compact, :fixed, :any) ||
+            error("generate_code: unknown layout tier `:$tier` for `$k` (use :compact, :fixed, or :any)")
+        out[Symbol.(split(String(k), '/'))] = tier
+    end
+    return out
+end
+
+generate_code(definition::CR.Annotated.Type, genmod, registry, lc::LayoutCtx) = @match definition begin
+    CR.Annotated.Annotation(name, params, defn) =>
+        generate_code(defn, genmod, registry, _anno(lc, _layout_tier_from_anno(name)))
+end
+generate_code(definition::CR.ModuleDecl.Type, genmod, registry, lc::LayoutCtx) = @match definition begin
     CR.ModuleDecl.MDecl(name, decls) => begin
         mod = get!(genmod, name, LittleDict{Symbol, Any}())
+        child = _descend(lc, name)
         for decl in decls
-            generate_code(decl, mod, registry)
+            generate_code(decl, mod, registry, child)
         end
     end
 end
-generate_code(definition::CR.ConstDecl.Type, genmod, registry) = @match definition begin
+generate_code(definition::CR.ConstDecl.Type, genmod, registry, lc::LayoutCtx) = @match definition begin
     CR.ConstDecl.CDecl(typ, name, val) => begin
         genmod[name] = ModEntry(_ -> :(const $name = $val), Pair{Vector{Symbol}, Symbol}[])
     end
@@ -290,11 +349,22 @@ end
 # generic `write` (a field-by-field inverse of `read`). The generator emits no
 # read/write — only the struct, a value `==`, and `@kwdef`'s keyword ctor.
 function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
-                        registry::TypeRegistry)
+                        registry::TypeRegistry, tier::Symbol=:any)
     fields = _struct_fields(decls, enclosing, registry, Set{Symbol}((name,)))
     field_decls = [Expr(:(::), n, t) for (n, t, _) in fields]
     field_names = Symbol[n for (n, _, _) in fields]
     all_fixed = !isempty(fields) && all(f -> f[3], fields)
+
+    # A requested compact/fixed layout that's structurally impossible (a
+    # variable-length field) is an error now, with the offending field named —
+    # no homogeneous representation exists, and deferring to precompile would
+    # only obscure the cause.
+    if (tier === :compact || tier === :fixed) && !all_fixed
+        bad = first(f[1] for f in fields if !f[3])
+        error("layout: message `$name` is required to be `:$tier`, but field `$bad` " *
+              "is variable-length (string/sequence/non-flat-nested); a homogeneous " *
+              "in-memory representation is impossible. Drop the requirement or change the schema.")
+    end
 
     if all_fixed
         structdef = Expr(:struct, false, name, Expr(:block, field_decls...))
@@ -312,10 +382,22 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
         # `@cdr1_compat` emits `propertynames`/`==`/`show`; the library's
         # generic `write`/`read` handle serialization. We only add the keyword
         # constructor (the macro's own constructor is positional).
-        return quote
-            $cdr1_compat
-            $kw_ctor
+        body = Any[cdr1_compat, kw_ctor]
+        # `:fixed` is already guaranteed by `@cdr1_compat` (it rejects any
+        # non-flat field at macro-expansion). `:compact` additionally requires a
+        # padding-free layout, which depends on the Julia field layout — assert
+        # it at precompile so a regression fails the build with the library's
+        # explanation rather than silently losing the zero-copy path.
+        if tier === :compact
+            push!(body, quote
+                @assert CDRSerialization.iscompact($name) string(
+                    "layout: message `", $(string(name)),
+                    "` is required to be compact (in-memory layout identical to the CDR1 ",
+                    "wire — single load / zero-copy) but is not — ",
+                    CDRSerialization.cdr_layout($name).why)
+            end)
         end
+        return Expr(:block, body...)
     end
 
     # Julia's default `==` only field-compares bits types; with `String`/
@@ -333,10 +415,11 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
     end
 end
 
-generate_struct(definition::CR.TypeDecl.Type, genmod, registry::TypeRegistry) = @match definition begin
+generate_struct(definition::CR.TypeDecl.Type, genmod, registry::TypeRegistry, lc::LayoutCtx) = @match definition begin
     CR.TypeDecl.StructDecl(name, nothing, decls) => begin
+        tier = _effective_tier(lc, name)
         refs = _collect_refs_members(decls)
-        genmod[name] = ModEntry(enc -> _render_struct(name, decls, enc, registry), refs)
+        genmod[name] = ModEntry(enc -> _render_struct(name, decls, enc, registry, tier), refs)
     end
 end
 _declarator_name(decl::CR.Declarator.Type) = @match decl begin
@@ -365,8 +448,8 @@ generate_typedef(definition::CR.TypeDecl.Type, genmod, registry) = @match defini
     _ => error("Anonymous typedefs not supported")
 end
 
-generate_code(definition::CR.TypeDecl.Type, genmod, registry) = @match definition begin
-    CR.TypeDecl.StructDecl(name, nothing, decls) => generate_struct(definition, genmod, registry)
+generate_code(definition::CR.TypeDecl.Type, genmod, registry, lc::LayoutCtx) = @match definition begin
+    CR.TypeDecl.StructDecl(name, nothing, decls) => generate_struct(definition, genmod, registry, lc)
     CR.TypeDecl.StructDecl(name, super, decls) => error("struct inheritance not supported")
     CR.TypeDecl.StructFwdDecl(name) => error("forward declarations not supported")
     CR.TypeDecl.UnionDecl(name, disc, cases) => error("unions not supported")
@@ -523,11 +606,13 @@ function build_modules(name, mod_dict; depth::Int=1,
     return :(module $name $(body...) end)
 end
 
-function generate_code(definitions::Vector{<:CR.CanAnnotate{CR.Decl}})
+function generate_code(definitions::Vector{<:CR.CanAnnotate{CR.Decl}};
+                       require::AbstractDict = Dict{String, Symbol}())
     registry = _build_registry(definitions)
+    lc = LayoutCtx(_normalize_require(require), Symbol[], nothing)
     generated_modules = LittleDict{Symbol, Any}()
     for def in definitions
-        generate_code(def, generated_modules, registry)
+        generate_code(def, generated_modules, registry, lc)
     end
 
     top_modules = Tuple{Symbol, AbstractDict}[]

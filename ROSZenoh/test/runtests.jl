@@ -3,6 +3,7 @@ using ROSZenoh
 
 @testset "ROSZenoh" begin
     include("entities.jl")
+    include("qos.jl")
     include("rmw_zenoh.jl")
     include("ros2dds.jl")
     include("roundtrip.jl")

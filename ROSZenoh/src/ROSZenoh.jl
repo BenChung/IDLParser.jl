@@ -15,12 +15,13 @@ using SHA: sha256
 
 include("entities.jl")
 include("keyexpr.jl")
+include("qos.jl")
 include("rmw_zenoh.jl")
 include("ros2dds.jl")
 include("bridge.jl")
 include("attachment.jl")
 
-export ZenohId, TypeHash, TypeInfo, QosProfile,
+export ZenohId, TypeHash, TypeInfo, QosProfile, Duration,
        NodeEntity, EndpointEntity, EndpointKind,
        Publisher, Subscription, Service, Client,
        KeyExprFormat, RmwZenoh, Ros2DDS,
@@ -28,6 +29,7 @@ export ZenohId, TypeHash, TypeInfo, QosProfile,
        encode_qos, decode_qos, mangle, demangle,
        to_rihs_string, type_hash_from_rihs_string, default_qos,
        type_info_from_struct,
-       entity_gid, encode_attachment, decode_attachment
+       entity_gid, encode_attachment, decode_attachment,
+       qos_compatible, QosIncompatibility
 
 end # module ROSZenoh

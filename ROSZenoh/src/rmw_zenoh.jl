@@ -11,12 +11,27 @@
 
 # ---- QoS ------------------------------------------------------------------
 #
-# Format: <reliability>:<durability>:<history>:,:,:,,
-# - reliability/durability emit empty string when at default (Reliable /
-#   Volatile), otherwise "1" or "2".
-# - history is ",<depth>" when default (KeepLast(10)), "1,<depth>" when
-#   non-default keep-last, "2," for KeepAll.
-# - deadline/lifespan/liveliness are always ",", ",", ",,".
+# Six colon-separated fields, each component omitted (empty) when it matches the
+# ROS2 default — exactly mirroring rmw_zenoh_cpp's `qos_to_keyexpr`:
+#
+#   <reliability>:<durability>:<hist>,<depth>:<dl_s>,<dl_ns>:<ls_s>,<ls_ns>:<liv>,<lease_s>,<lease_ns>
+#
+# - reliability: "" (Reliable, default) / "2" (BestEffort). [RMW: 1/2]
+# - durability:  "" (Volatile, default) / "1" (TransientLocal). [RMW: 1/2]
+# - history:     hist "" (KeepLast, default) / "1" (KeepLast) / "2" (KeepAll);
+#                depth always emitted (",<depth>") — matches hiroz, which keeps
+#                the depth even at the default 10 rather than omitting it.
+# - deadline / lifespan: "<sec>,<nsec>", each component empty when 0 (∞ default).
+# - liveliness:  "<kind>,<lease_sec>,<lease_nsec>"; kind "" (Automatic, default)
+#                / "3" (ManualByTopic) [RMW: 1/3]; lease components empty when 0.
+#
+# The all-default profile therefore encodes the trailing fields as `,:,:,,`,
+# identical to the previous placeholder form.
+
+# A Duration component renders as its integer, or "" when 0 (the ∞/default).
+_dur_sec_nsec(::Nothing) = ("", "")
+_dur_sec_nsec(d::Duration) = (d.sec == 0 ? "" : string(d.sec),
+                              d.nsec == 0 ? "" : string(d.nsec))
 
 function encode_qos(::RmwZenoh, qos::QosProfile; keyless::Bool=false)
     rel = qos.reliability == :reliable     ? "" :
@@ -36,7 +51,28 @@ function encode_qos(::RmwZenoh, qos::QosProfile; keyless::Bool=false)
     else
         "1,$(qos.depth)"
     end
-    return string(rel, ':', dur, ':', hist, ":,:,:,,")
+
+    dl_s, dl_ns = _dur_sec_nsec(qos.deadline)
+    ls_s, ls_ns = _dur_sec_nsec(qos.lifespan)
+    liv = qos.liveliness == :automatic       ? "" :
+          qos.liveliness == :manual_by_topic ? "3" :
+          error("invalid liveliness $(qos.liveliness)")
+    lease_s, lease_ns = _dur_sec_nsec(qos.liveliness_lease)
+
+    return string(rel, ':', dur, ':', hist, ':',
+                  dl_s, ',', dl_ns, ':',
+                  ls_s, ',', ls_ns, ':',
+                  liv, ',', lease_s, ',', lease_ns)
+end
+
+# Parse a "<sec>,<nsec>" duration field into `Union{Nothing, Duration}`. Empty
+# components default to 0; an all-default (0,0) field is the ∞/unset `nothing`.
+function _parse_duration(comps, what)
+    sec  = isempty(comps[1]) ? 0 : tryparse(UInt64, String(comps[1]))
+    nsec = length(comps) >= 2 && !isempty(comps[2]) ? tryparse(UInt64, String(comps[2])) : 0
+    (sec === nothing || nsec === nothing) &&
+        throw(ArgumentError("invalid QoS $what $(repr(join(comps, ',')))"))
+    (sec == 0 && nsec == 0) ? nothing : Duration(sec, nsec)
 end
 
 function decode_qos(::RmwZenoh, s::AbstractString)
@@ -55,17 +91,38 @@ function decode_qos(::RmwZenoh, s::AbstractString)
 
     history_parts = split(parts[3], ',')
     length(history_parts) >= 2 || throw(ArgumentError("invalid QoS history $(repr(parts[3]))"))
-    if history_parts[1] == "" || history_parts[1] == "1"
-        depth = tryparse(Int, String(history_parts[2]))
-        depth === nothing && throw(ArgumentError("invalid QoS depth $(repr(history_parts[2]))"))
-        return (false, QosProfile(reliability=reliability, durability=durability,
-                                  history=:keep_last, depth=depth))
+    history, depth = if history_parts[1] == "" || history_parts[1] == "1"
+        # Empty depth → default (10), tolerating rmw_zenoh's omit-on-default form.
+        d = isempty(history_parts[2]) ? 10 : tryparse(Int, String(history_parts[2]))
+        d === nothing && throw(ArgumentError("invalid QoS depth $(repr(history_parts[2]))"))
+        (:keep_last, d)
     elseif history_parts[1] == "2"
-        return (false, QosProfile(reliability=reliability, durability=durability,
-                                  history=:keep_all, depth=0))
+        (:keep_all, 0)
     else
         throw(ArgumentError("invalid QoS history kind $(repr(history_parts[1]))"))
     end
+
+    # Trailing fields are tolerated when omitted (older peers, default-only tokens).
+    deadline = _parse_duration(length(parts) >= 4 ? split(parts[4], ',') : [""], "deadline")
+    lifespan = _parse_duration(length(parts) >= 5 ? split(parts[5], ',') : [""], "lifespan")
+
+    liveliness = :automatic
+    liveliness_lease = nothing
+    if length(parts) >= 6
+        liv_parts = split(parts[6], ',')
+        liveliness = liv_parts[1] == ""  ? :automatic :
+                     liv_parts[1] == "1" ? :automatic :
+                     liv_parts[1] == "3" ? :manual_by_topic :
+                     throw(ArgumentError("invalid liveliness kind $(repr(liv_parts[1]))"))
+        liveliness_lease = _parse_duration(length(liv_parts) >= 3 ? liv_parts[2:3] :
+                                           length(liv_parts) >= 2 ? liv_parts[2:2] : [""],
+                                           "liveliness lease")
+    end
+
+    return (false, QosProfile(reliability=reliability, durability=durability,
+                              history=history, depth=depth,
+                              deadline=deadline, lifespan=lifespan,
+                              liveliness=liveliness, liveliness_lease=liveliness_lease))
 end
 
 # ---- Topic KE -------------------------------------------------------------
