@@ -64,6 +64,8 @@ try
         _section("dynamic_types", "dynamic_types.jl")     # §11/D5 dynamic type support (conversions, cache, macros)
         # Live D5 round-trips against the private router (§11/§13/D5 S2/S3/S5/S7).
         _section("dynamic_live", "dynamic_live.jl")
+        # Live D4: transient_local latched delivery + durability-aware lifecycle re-latch.
+        _section("transient_local", "transient_local.jl")
     end
 finally
     _kill_router!()

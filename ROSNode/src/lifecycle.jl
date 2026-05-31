@@ -314,9 +314,29 @@ configure!(ln::LifecycleNode) =
 automatic, so activation is just the state flip that un-silences the node's
 entities.
 """
-activate!(ln::LifecycleNode) =
-    _drive!(ln, Inactive(), Active(), ln.on_activate,
-            TRANSITION_ACTIVATE, "activate")
+function activate!(ln::LifecycleNode)
+    r = _drive!(ln, Inactive(), Active(), ln.on_activate,
+                TRANSITION_ACTIVATE, "activate")
+    # D4: now that the gate is open (state latched Active inside `_drive!`), re-run
+    # each transient_local subscription's latched-history query so the node picks up
+    # state it dropped while inactive. Novelty-gated, so an already-seen latched
+    # sample isn't replayed across deactivate/reactivate cycles. A no-op for every
+    # other entity. Best-effort: a re-latch failure must not unwind the transition.
+    if r === :success
+        for e in _node_entities_snapshot(ln.node)
+            try
+                _relatch!(e)
+            catch err
+                @error "activate: re-latch failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
+            end
+        end
+    end
+    return r
+end
+
+# A snapshot of the node's entities under its lock (the re-latch iterates outside the
+# lock, since `_relatch!` reopens routes + joins consumer tasks).
+_node_entities_snapshot(node::Node) = @lock node.lock copy(node.entities)
 
 """
     deactivate!(ln) -> TransitionResult
@@ -533,15 +553,18 @@ closes the wrapped [`Node`] — which undeclares every entity (control surface +
 application) and the node token. Idempotent.
 """
 function Base.close(ln::LifecycleNode)
-    (@atomicswap ln.open = false) || return nothing
-    # Run the shutdown transition so `on_shutdown` fires and observers see the
-    # Finalized event before the entities vanish. Guard it — a throwing transition
-    # must not abort teardown.
+    isopen(ln) || return nothing
+    # Run the shutdown transition *before* latching closed, so `shutdown!`'s own
+    # open-check passes and `on_shutdown` fires + observers see the Finalized event
+    # before the entities vanish. Guard it — a throwing transition must not abort
+    # teardown. (`shutdown!` is idempotent: a concurrent close finds Finalized and
+    # no-ops, and the `@atomicswap` below is the single-winner latch.)
     try
         state(ln) === Finalized() || shutdown!(ln)
     catch err
         @error "close(LifecycleNode): shutdown! failed" node=ln.node.fqn exception=(err, catch_backtrace())
     end
+    (@atomicswap ln.open = false) || return nothing
     _unregister_gate!(ln)
     close(ln.node)            # reaps every entity (control + application) + token
     nothing

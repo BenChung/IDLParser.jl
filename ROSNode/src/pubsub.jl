@@ -31,8 +31,9 @@ sequence counter (§3.4). `close`-able; dies with its node.
 
 Constructed via the `Publisher(node, topic, T)` spelling — see [`Publisher`](@ref).
 """
-mutable struct PublisherHandle{T}
+mutable struct PublisherHandle{T, R}
     const entity::Entity
+    const route::R               # concrete Zenoh route (plain Publisher or AdvancedPublisher)
     @atomic seq::Int64           # per-endpoint attachment sequence_number (§3.4)
 end
 
@@ -47,27 +48,15 @@ Declare a publisher for ROS message type `T` on `topic` (§6). Materializes the
 `Publisher` here is the `EndpointKind` enum instance given a call-method; the kind
 is fixed by the spelling. Publish with [`publish`](@ref).
 """
-# `transient_local` is *advertised* correctly in the liveliness QoS token, but the
-# latched cache/history behavior needs Zenoh advanced pub/sub, which Zenoh.jl does
-# not yet expose (see ROSNode/HANDOFF-zenoh-advanced-pubsub.md, D4). Until that
-# lands, a `transient_local` endpoint behaves as `volatile` (no latched delivery).
-# Warn once so it's not a silent surprise.
-function _warn_transient_local(qos::QosProfile, kind::AbstractString)
-    qos.durability === :transient_local && @warn(
-        "transient_local $kind: QoS advertised, but latched delivery is pending the \
-         Zenoh advanced-pubsub handoff — behaves as volatile for now \
-         (ROSNode/HANDOFF-zenoh-advanced-pubsub.md)", maxlog=1)
-    nothing
-end
-
 function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          qos::QosProfile=default_qos(),
                          congestion_control=nothing, priority=nothing) where {T}
-    _warn_transient_local(qos, "publisher")
     name = resolve_name(node, topic)
     ent = make_entity(node, Publisher, name, type_info_of(T); qos=qos)
-    declare_publisher!(ent; congestion_control=congestion_control, priority=priority)
-    return PublisherHandle{T}(ent, 0)
+    # `transient_local` routes to an AdvancedPublisher (sample cache, D4); the
+    # concrete route type flows into `PublisherHandle{T,R}` so `put` stays monomorphic.
+    route = declare_publisher!(ent; congestion_control=congestion_control, priority=priority)
+    return PublisherHandle{T, typeof(route)}(ent, route, 0)
 end
 
 """
@@ -79,20 +68,19 @@ carries the per-message attachment `(sequence_number, source_timestamp,
 source_gid)` (§3.4): the sequence increments per publisher, the timestamp is
 publish-time wall ns (distinct from `header.stamp`, §7), the gid is the entity's.
 
-A publish on a closed publisher (or closed node) is a no-op — gated like every
-other entity at dispatch (§14.2 will route lifecycle gating through here too).
+A publish on a closed publisher (or closed node) is a no-op, as is a publish while
+the node is gated inactive (§14.2 lifecycle gate) — a managed publisher drops.
 """
 function publish(pub::PublisherHandle{T}, msg::T) where {T}
     e = pub.entity
     isopen(e) || return nothing
-    route = e._route
-    route === nothing && return nothing
+    isactive(e) || return nothing                   # §14.2: gated (inactive) node ⇒ drop
 
     payload = encode(msg)
     seq = (@atomic pub.seq += 1)
     ts = nanoseconds(Dates.now(e.node, System()))   # publish-time wall ns (§3.4)
     attach = encode_attachment(seq, ts, gid(e))
-    put(route::ZPublisher, payload; attachment=attach)
+    put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced)
     return nothing
 end
 
@@ -150,11 +138,16 @@ is fixed by the spelling.
 """
 function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T};
                             qos::QosProfile=default_qos(), view::Bool=false,
-                            concurrency::Concurrency=Serial()) where {T}
-    _warn_transient_local(qos, "subscription")
+                            concurrency::Concurrency=Serial(),
+                            force_relatch::Bool=false) where {T}
     name = resolve_name(node, topic)
     ent = make_entity(node, Subscription, name, type_info_of(T); qos=qos)
-    declare_subscription!(ent, T, handler; view=view, concurrency=concurrency)
+    # `transient_local` ⇒ an AdvancedSubscriber with latched history (D4).
+    # `force_relatch` is the D4 escape hatch: re-deliver on every activation
+    # regardless of sequence (for idempotent handlers that rebuild from latched
+    # inputs); the default dedups replays by novelty.
+    declare_subscription!(ent, T, handler; view=view, concurrency=concurrency,
+                          force_relatch=force_relatch)
     return SubscriptionHandle{T}(ent)
 end
 
@@ -205,7 +198,6 @@ you what to write).
 function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     qos::QosProfile=default_qos(),
                                     concurrency::Concurrency=Serial())
-    _warn_transient_local(qos, "subscription")
     # NB: no codegen on this (the caller's) task. Per-sample `realize!` runs on the
     # dispatch *worker* (node.jl), off the recv thread and while the receiver drains
     # the FIFO GC-safe, so the codegen's GC always completes. Running `Core.eval`
