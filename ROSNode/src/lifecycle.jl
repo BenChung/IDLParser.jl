@@ -51,8 +51,8 @@ Base.show(io::IO, ::Active)       = print(io, "Active")
 Base.show(io::IO, ::Finalized)    = print(io, "Finalized")
 
 # The `lifecycle_msgs/msg/State` id for each primary state (wire-facing, used by the
-# `get_state` reply + `transition_event` start/goal states once the generated types
-# land). Kept here so the wire layer has the single source of truth.
+# `get_state` reply + `transition_event` start/goal states). Kept here so the wire
+# layer has the single source of truth.
 _state_id(::Unconfigured) = 0x01
 _state_id(::Inactive)     = 0x02
 _state_id(::Active)       = 0x03
@@ -104,11 +104,10 @@ gated **at dispatch** ([`isactive`](@ref)): publishers drop, subscriptions/timer
 don't fire, services error-reply. The control surface is exempt (always live).
 
 `autostart=true` runs `configure!` then `activate!` on construction (the simple
-single-owner case). `msgs` supplies the generated `lifecycle_msgs` module so the
-wire control services + `transition_event` topic are declared; until those types
-are available in-package it may be `nothing`, leaving the *in-process* state
-machine, gating, and `configure!`/… fully live with the wire surface staged
-(TODO below).
+single-owner case). The wire control surface (the five `lifecycle_msgs` services +
+the `~/transition_event` topic) is always declared from the vendored
+`lifecycle_msgs` types; `msgs` is accepted for source-compat but no longer gates
+generation.
 
 Entities and the node die with `close` / the Context drain (§14), which runs
 `shutdown!` → `Finalized` first.
@@ -129,8 +128,9 @@ mutable struct LifecycleNode
     # in-process `configure!` racing a wire request) must not interleave callbacks.
     const lock::ReentrantLock
     # The control surface — always-live entities exempt from the gate. The
-    # `transition_event` publisher (or `nothing` until `msgs` lands) and the set of
-    # control `Entity` handles the gate must *not* gate (identity membership).
+    # `transition_event` publisher (`nothing` until `_wire_control_surface!` runs)
+    # and the set of control `Entity` handles the gate must *not* gate (identity
+    # membership).
     _event_pub::Any
     const _control::Base.IdSet{Entity}
     @atomic open::Bool
@@ -451,60 +451,147 @@ end
 # the wrapped node so they ride the normal §6/§8 machinery (liveliness, graph,
 # close-on-node-close) — but registered in `ln._control` so the gate exempts them:
 # an external manager must reach `change_state`/`get_state` *while the node is
-# inactive*, which is the whole point.
-#
-# These need the generated `lifecycle_msgs` request/response + msg types, which are
-# not in this package yet (same staging as the parameter services, §10). When
-# `msgs` is supplied the services + topic are declared; otherwise the wire surface
-# is a no-op and the full in-process state machine + gating still run.
+# inactive*, which is the whole point. The handlers are thin marshals over the
+# already-written transition drivers + `state(ln)`.
 
-const _CONTROL_SERVICES = ("change_state", "get_state", "get_available_states",
-                           "get_available_transitions", "get_transition_graph")
+# The vendored `lifecycle_msgs` types — always in-package. Aliased here so the wire
+# layer reads cleanly.
+const _LC_msg = Interfaces.lifecycle_msgs.msg
+const _LC_srv = Interfaces.lifecycle_msgs.srv
+const LCState                = _LC_msg.State
+const LCTransition           = _LC_msg.Transition
+const LCTransitionEvent      = _LC_msg.TransitionEvent
+const LCTransitionDescription = _LC_msg.TransitionDescription
+const ChangeState_Request    = _LC_srv.ChangeState_Request
+const ChangeState_Response   = _LC_srv.ChangeState_Response
+const GetState_Request       = _LC_srv.GetState_Request
+const GetState_Response      = _LC_srv.GetState_Response
+const GetAvailableStates_Request  = _LC_srv.GetAvailableStates_Request
+const GetAvailableStates_Response = _LC_srv.GetAvailableStates_Response
+const GetAvailableTransitions_Request  = _LC_srv.GetAvailableTransitions_Request
+const GetAvailableTransitions_Response = _LC_srv.GetAvailableTransitions_Response
+const GetTransitionGraph_Request  = _LC_srv.GetTransitionGraph_Request
+const GetTransitionGraph_Response = _LC_srv.GetTransitionGraph_Response
 
-# Declare an entity as part of the control surface: build it via `make_entity` on
-# the wrapped node and record it so the gate exempts it. Returns the Entity. The
-# kind/type/route wiring is the caller's (a Service queryable or a Publisher route).
-function _control_entity!(ln::LifecycleNode, kind, topic::AbstractString,
-                          type_info; qos::QosProfile=default_qos())
-    e = make_entity(ln.node, kind, resolve_name(ln.node, topic), type_info; qos=qos)
-    push!(ln._control, e)
-    return e
+# Register a control-surface handle's entity so the dispatch gate exempts it (the
+# manager must reach it while the node is inactive). Returns the handle.
+function _exempt!(ln::LifecycleNode, handle)
+    push!(ln._control, entity(handle))
+    return handle
 end
+
+# The wire `State` for one of our primary states (id + label, the single source of
+# truth above). Used by `get_state` / `get_available_states` / transition events.
+_wire_state(s::LifecycleState) = LCState(; id = _state_id(s), label = _state_label(s))
+
+# The four primary states, in id order — the `get_available_states` reply and the
+# row set the transition graph is built from.
+_primary_states() = (Unconfigured(), Inactive(), Active(), Finalized())
+
+# The static transition graph: every (transition_id → goal) edge keyed by origin
+# state. `get_transition_graph` is the full set; `get_available_transitions` is the
+# subset whose origin is the live state. Edges mirror `_apply_transition!`.
+function _transitions_from(s::LifecycleState)
+    s === Unconfigured() && return ((TRANSITION_CONFIGURE, Inactive()),
+                                    (TRANSITION_UNCONFIGURED_SHUTDOWN, Finalized()))
+    s === Inactive()     && return ((TRANSITION_ACTIVATE, Active()),
+                                    (TRANSITION_CLEANUP, Unconfigured()),
+                                    (TRANSITION_INACTIVE_SHUTDOWN, Finalized()))
+    s === Active()       && return ((TRANSITION_DEACTIVATE, Inactive()),
+                                    (TRANSITION_ACTIVE_SHUTDOWN, Finalized()))
+    return ()   # Finalized is terminal
+end
+
+# Human-readable transition labels (the `lifecycle_msgs/Transition.label` field).
+function _transition_label(id::UInt8)
+    id == TRANSITION_CONFIGURE             && return "configure"
+    id == TRANSITION_CLEANUP               && return "cleanup"
+    id == TRANSITION_ACTIVATE              && return "activate"
+    id == TRANSITION_DEACTIVATE            && return "deactivate"
+    id == TRANSITION_UNCONFIGURED_SHUTDOWN && return "unconfigured_shutdown"
+    id == TRANSITION_INACTIVE_SHUTDOWN     && return "inactive_shutdown"
+    id == TRANSITION_ACTIVE_SHUTDOWN       && return "active_shutdown"
+    return "transition_$(id)"
+end
+
+# A wire `TransitionDescription` (transition + start/goal states) for one edge.
+_wire_transition_desc(origin::LifecycleState, id::UInt8, goal::LifecycleState) =
+    LCTransitionDescription(;
+        transition  = LCTransition(; id = id, label = _transition_label(id)),
+        start_state = _wire_state(origin),
+        goal_state  = _wire_state(goal))
+
+# The `TransitionDescription`s available from a given origin state.
+_available_descs(s::LifecycleState) =
+    LCTransitionDescription[_wire_transition_desc(s, id, goal)
+                            for (id, goal) in _transitions_from(s)]
+
+# The full static graph (every edge, every origin).
+_graph_descs() =
+    LCTransitionDescription[_wire_transition_desc(s, id, goal)
+                            for s in _primary_states()
+                            for (id, goal) in _transitions_from(s)]
 
 """
     _wire_control_surface!(ln, msgs)
 
 Declare the always-live control surface (§14.2): the `~/transition_event` topic and
-the five `lifecycle_msgs` services. `msgs` is the generated `lifecycle_msgs`
-module (so we can name `ChangeState`/`GetState`/… + `TransitionEvent`); when it's
-`nothing` the wire surface is staged and only the in-process machine runs.
-
-TODO(layer §msgs): wire the services + topic once the `lifecycle_msgs` generated
-types are available in-package. The handlers are thin marshals over the already-
-written transition drivers + `state(ln)`:
-  - `~/change_state(ChangeState)`  → map `req.transition.id` via `_apply_transition!`,
-                                     reply `success = (result === :success)`
-  - `~/get_state(GetState)`        → reply `State(id=_state_id(state(ln)), label=…)`
-  - `~/get_available_states`       → the four primary `State`s
-  - `~/get_available_transitions` / `~/get_transition_graph` → the static graph
-  - `~/transition_event` (TransitionEvent) → published by `_publish_transition_event`
-The control entities must be created via `_control_entity!` so the gate exempts them.
+the five `lifecycle_msgs` services, each registered in `ln._control` so the
+dispatch gate exempts it (an external manager reaches `change_state`/`get_state`
+*while the node is inactive* — the whole point). The vendored `lifecycle_msgs`
+types are always in-package, so this always wires; `msgs` is accepted for
+source-compat but unused. Handlers are thin marshals over the transition drivers +
+`state(ln)`:
+  - `~/change_state`             → `_apply_transition!(req.transition.id)`, `success`
+  - `~/get_state`                → the live primary `State`
+  - `~/get_available_states`     → the four primary `State`s
+  - `~/get_available_transitions`→ edges out of the live state
+  - `~/get_transition_graph`     → the full static graph
 """
 function _wire_control_surface!(ln::LifecycleNode, msgs)
-    if msgs === nothing
-        # TODO(layer §msgs): generated `lifecycle_msgs` types not in-package yet.
-        # In-process `configure!`/…/`state`/gating are fully live; the wire control
-        # services + transition_event topic attach here once the types land. See the
-        # docstring for the per-service marshal. Mirrors the parameter-service
-        # staging (parameters.jl `wire_parameter_services!`).
-        return ln
-    end
-    # TODO(layer §msgs): with `msgs` in hand, declare via `_control_entity!`:
-    #   ln._event_pub = Publisher(...) on "~/transition_event" (TransitionEvent)
-    #   Service(...) on each of `_CONTROL_SERVICES` bound to the marshals above.
-    # Left explicit (not silently partial) so a caller passing `msgs` early gets a
-    # clear "not wired yet" rather than a half-built surface.
-    @warn "LifecycleNode: `msgs`-driven control surface not wired yet (TODO §msgs); in-process lifecycle is live" node=ln.node.fqn
+    node = ln.node
+
+    # change_state: drive the requested transition; reply success on landing. A
+    # transition that isn't valid from the live state throws `ArgumentError` in
+    # `_drive!` — for the wire contract that's a clean `success=false`, not a service
+    # error (which would raise on the caller).
+    _exempt!(ln, Service(node, "~/change_state", ChangeState_Request) do req
+        result = try
+            _apply_transition!(ln, req.transition.id)
+        catch err
+            err isa ArgumentError || rethrow()
+            :failure
+        end
+        return ChangeState_Response(; success = (result === :success))
+    end)
+
+    _exempt!(ln, Service(node, "~/get_state", GetState_Request) do _req
+        return GetState_Response(; current_state = _wire_state(state(ln)))
+    end)
+
+    _exempt!(ln, Service(node, "~/get_available_states", GetAvailableStates_Request) do _req
+        return GetAvailableStates_Response(;
+            available_states = LCState[_wire_state(s) for s in _primary_states()])
+    end)
+
+    _exempt!(ln, Service(node, "~/get_available_transitions",
+                         GetAvailableTransitions_Request) do _req
+        return GetAvailableTransitions_Response(;
+            available_transitions = _available_descs(state(ln)))
+    end)
+
+    _exempt!(ln, Service(node, "~/get_transition_graph",
+                         GetTransitionGraph_Request) do _req
+        return GetTransitionGraph_Response(; available_transitions = _graph_descs())
+    end)
+
+    # transition_event: the async observation channel. Transient-local + reliable so
+    # a late-joining manager sees the latest transition (rclcpp's latched event topic).
+    pub = Publisher(node, "~/transition_event", LCTransitionEvent;
+                    qos = QosProfile(durability = :transient_local,
+                                     reliability = :reliable, depth = 1))
+    _exempt!(ln, pub)
+    ln._event_pub = pub
     return ln
 end
 
@@ -526,19 +613,21 @@ function _apply_transition!(ln::LifecycleNode, transition_id::Integer)
 end
 
 # Publish a `TransitionEvent` on `~/transition_event` (the async observation
-# channel, §14.2). No-op until the topic is wired (`_event_pub === nothing`).
-# Stamped with the node's ROS clock; the start/goal `State`s come from the
-# `_state_id`/`_state_label` of origin/target.
+# channel, §14.2). No-op before the surface is wired (`_event_pub === nothing`).
+# `TransitionEvent.timestamp` is a bare `uint64` of nanoseconds (NOT a
+# builtin_interfaces/Time), so stamp it with the node's ROS-clock ns directly; the
+# start/goal `State`s come from the `_state_id`/`_state_label` of origin/target.
 function _publish_transition_event(ln::LifecycleNode, transition_id::UInt8,
                                    origin::LifecycleState, target::LifecycleState)
     pub = ln._event_pub
     pub === nothing && return nothing
-    # TODO(layer §msgs): assemble + publish the `TransitionEvent`:
-    #   stamp       = now(ln.node)            (→ builtin_interfaces/Time at the boundary)
-    #   transition  = Transition(id=transition_id, label=…)
-    #   start_state = State(id=_state_id(origin), label=_state_label(origin))
-    #   goal_state  = State(id=_state_id(target), label=_state_label(target))
-    #   publish(pub, event)
+    event = LCTransitionEvent(;
+        timestamp   = UInt64(nanoseconds(Dates.now(ln.node))),
+        transition  = LCTransition(; id = transition_id,
+                                   label = _transition_label(transition_id)),
+        start_state = _wire_state(origin),
+        goal_state  = _wire_state(target))
+    publish(pub, event)
     return nothing
 end
 

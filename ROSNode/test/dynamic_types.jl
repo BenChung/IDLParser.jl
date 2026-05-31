@@ -50,6 +50,21 @@ module _StrayTime
     @ros_msgs "../vendor/builtin_interfaces"
 end
 
+# `@ros_import … as Alias` on a (provided) vendored type binds straight to the
+# canonical struct under the chosen name.
+module _AsImport
+    using ROSNode
+    @ros_import "builtin_interfaces/msg/Time" as Stamp
+end
+
+# Hybrid binding: a fully-qualified type binds its bare leaf; a bare package binds
+# only the module (no leaf flood).
+module _LeafImport
+    using ROSNode
+    @ros_import "builtin_interfaces/msg/Time"    # → leaf `Time` (+ nested path)
+    @ros_import "rcl_interfaces"                  # → module `rcl_interfaces` only
+end
+
 @testset "D5 dynamic type support" begin
 
     @testset "wire ⇄ internal TypeDescription preserves RIHS01" begin
@@ -196,6 +211,24 @@ end
         msg = sprint(showerror, err)
         @test occursin("builtin_interfaces/msg/Time", msg)
         @test occursin("as <Alias>", msg)
+    end
+
+    @testset "@ros_import ... as binds the canonical copy under the alias" begin
+        _dt("@ros_import as")
+        @test _AsImport.Stamp === ROSNode.Interfaces.builtin_interfaces.msg.Time
+        @test !isdefined(_AsImport, :builtin_interfaces)    # `as` doesn't leak the bare path
+    end
+
+    @testset "@ros_import binds leaf for a type, module for a package" begin
+        _dt("@ros_import hybrid binding")
+        # fully-qualified type → bare leaf, same identity as the nested path + canonical
+        @test isdefined(_LeafImport, :Time)
+        @test _LeafImport.Time === ROSNode.Interfaces.builtin_interfaces.msg.Time
+        @test _LeafImport.builtin_interfaces.msg.Time === _LeafImport.Time
+        # bare package → module bound, but no leaf flood
+        @test isdefined(_LeafImport, :rcl_interfaces)
+        @test !isdefined(_LeafImport, :Log)
+        @test isdefined(_LeafImport.rcl_interfaces.msg, :Log)
     end
 
     @testset "flush_type_cache exports the cache" begin

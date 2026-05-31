@@ -502,6 +502,10 @@ or `nothing` when types agree or the key carries no type (ros2dds, EMPTY).
 The subscription dispatch path may call this before decoding; a hash mismatch
 means the bytes are decode-unsafe against the local struct.
 """
+# TODO(§12.2): defined but unwired — the subscription consumer loop (node.jl) has no
+# caller, so the wildcard-sub type backstop is dormant (the graph detector still fires
+# on a graph match; this only adds the on-the-wire case). Wire into the per-sample
+# dispatch alongside the message-lost hook below.
 function check_sample_type(sub, sample)
     e = _client_entity(sub)
     want = e.endpoint.type_info
@@ -609,6 +613,11 @@ from that `gid`, fire the `on_message_lost` listeners and return the `MessageLos
 Returns `nothing` when in-order (or the very first message from a gid, or the
 attachment is absent). The subscription dispatch path calls this per sample.
 """
+# TODO(§12.3): unwired — no caller in the subscription consumer loop (node.jl), so
+# `on_message_lost` is dormant despite the docstring. Tracked as a standalone follow-up
+# (DESIGN-ADDENDA: "message-lost wiring stays a separate follow-up"; dropped from
+# PLAN-D4 §1). Wiring = call `note_sequence!(e, sample)` per received sample and
+# `_forget_lost_tracker!(e)` from `close(::Entity)`.
 function note_sequence!(sub, sample)
     e = _client_entity(sub)
     seq, _, srcgid = try
@@ -637,8 +646,11 @@ function note_sequence!(sub, sample)
     lost
 end
 
-# Drop a subscription's detector state when it closes (called from the entity
-# teardown path; safe to call for entities that never registered one).
+# Drop a subscription's detector state when it closes; safe to call for entities that
+# never registered one.
+# TODO(§12.3): not yet called from `close(::Entity)` (node.jl), so a sub that registered
+# an `on_message_lost` listener leaks its `_LOST` entry. Wire alongside `note_sequence!`
+# (see above) — same message-lost follow-up.
 function _forget_lost_tracker!(e::Entity)
     @lock _LOST_LOCK delete!(_LOST, objectid(e))
     nothing

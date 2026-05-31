@@ -24,23 +24,9 @@
 
 using ROSMessages: message_il, service_il
 
-# ── the canonical generated interface types (static) ──────────────────────────
-# Generated once at ROSNode precompile time: `@ros_msgs` over the *whole* vendored
-# tree emits the nested `<pkg>.{msg,srv,action}.<Name>` modules and
-# `Base.include_dependency`s each source, so editing any vendored interface
-# invalidates ROSNode's precompile. The generated `import StaticArrays,
-# CDRSerialization` resolve against ROSNode's deps (both are direct).
-#
-# `Interfaces` is the *canonical home* for every vendored ROS type: `@ros_import`
-# aliases to `Interfaces.<pkg>.<qual>.<Name>` instead of re-generating a duplicate,
-# so one wire type (name + RIHS01) maps to exactly one Julia struct (see
-# [`canonical_type`](@ref)). The `type_description_interfaces` subtree additionally
-# backs the §11/§13 bootstrap — the wire⇄internal bridge below.
-module Interfaces
-    using ROSMessages: @ros_msgs
-    @ros_msgs "../vendor"
-end
-
+# `Interfaces` (the generated vendored types) is defined in interfaces.jl, included
+# first so every component file can reference it; this file adds the wire⇄internal
+# bridge and the registry/canonical entries that need typesupport.jl.
 const _TDI = Interfaces.type_description_interfaces
 
 # The wire structs (distinct from ROSMessages' internal hashing structs of the
@@ -293,6 +279,25 @@ function canonical_type(name::AbstractString, hash::TypeHash)
     _canonical_entries()                        # ensure built
     return get(_CANONICAL_INDEX[]::Dict{Tuple{String, TypeHash}, Type},
                (String(name), hash), nothing)
+end
+
+"""
+    provided_type(name, hash) -> Union{Type, Nothing}
+
+A compiled struct for `(name, RIHS01)` already provided by a loaded module: the
+vendored [`canonical_type`](@ref) first, else one a *dependency* generated via
+`@ros_import`/`@ros_cache` (the `_STATIC_TYPES` singleton, populated as dependencies
+load). `@ros_import` aliases to this instead of minting a second copy — so a type a
+package C imports is shared by downstream A and B (not re-generated), as long as C is
+loaded when they expand `@ros_import`. `nothing` if no loaded module provides it.
+"""
+function provided_type(name::AbstractString, hash::TypeHash)
+    T = canonical_type(name, hash)
+    T === nothing || return T
+    @lock _STATIC_TYPES.lock for e in _STATIC_TYPES.entries
+        (e.info.name == name && e.info.hash == hash && e.type isa Type) && return e.type
+    end
+    return nothing
 end
 
 """

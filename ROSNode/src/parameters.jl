@@ -10,9 +10,9 @@
 # The six standard parameter services + `/parameter_events` are generic over `P`
 # via reflection (`fieldnames`/`fieldtypes` + `descriptors()`); they reflect over
 # the union of declared fields and the dynamic dict so a ROS client sees one flat
-# namespace. The Service/Client pattern layer (§8) and the `rcl_interfaces`
-# generated types aren't in this package yet, so the wire-facing service handlers
-# are staged behind a `TODO(layer §8)` that does not break precompilation.
+# namespace. The reflection handlers return plain Julia values; the wire binding
+# (`wire_parameter_services!`) marshals them to/from the `rcl_interfaces` generated
+# request/response types over the §8 Service layer.
 
 import Dates
 
@@ -380,13 +380,14 @@ mutable struct ParameterServer{P}
     const lock::ReentrantLock                        # the single parameter-mutation lock
     const listeners::Vector{Any}                     # on_parameter_event callbacks
     _events_pub::Any                                 # /parameter_events publisher (§8 wire)
+    const services::Vector{Any}                      # the six wired parameter-service handles
 end
 
 function ParameterServer(node, initial::P; allow_undeclared::Bool=false) where {P}
     ds = descriptors(P)
     by = Dict{Symbol, ParameterDescriptor}(d.name => d for d in ds)
     return ParameterServer{P}(node, initial, ds, by, Dict{Symbol, Any}(),
-                              allow_undeclared, ReentrantLock(), Any[], nothing)
+                              allow_undeclared, ReentrantLock(), Any[], nothing, Any[])
 end
 
 # Convenience: build the server straight from a schema type, overlaying startup
@@ -835,36 +836,160 @@ function set_parameters(s::ParameterServer{P}, pairs) where {P}
     end
 end
 
+# ── wire types (§10) ──────────────────────────────────────────────────────────
+# The `rcl_interfaces` generated structs the parameter services marshal over.
+# Vendored under `Interfaces`; aliased here for readability. Keyword constructors
+# require *every* field (the generator emits no defaults), so each build below is
+# exhaustive.
+
+const _RCL_MSG = Interfaces.rcl_interfaces.msg
+const _RCL_SRV = Interfaces.rcl_interfaces.srv
+const _ParameterValue       = _RCL_MSG.ParameterValue
+const _Parameter            = _RCL_MSG.Parameter
+const _ParameterEvent       = _RCL_MSG.ParameterEvent
+const _SetParametersResult  = _RCL_MSG.SetParametersResult
+const _ListParametersResult = _RCL_MSG.ListParametersResult
+const _WireDescriptor       = _RCL_MSG.ParameterDescriptor
+const _Time                 = Interfaces.builtin_interfaces.msg.Time
+
+# ── value marshalling (§10) ─────────────────────────────────────────────────────
+# A Julia parameter value ⇄ the `ParameterValue` tagged union. The `type` byte
+# selects the live arm; the other ten fields carry zeroed placeholders (the union
+# is flat on the wire, so every field is present — the kw ctor needs all of them).
+
+# A `ParameterValue` with `type=tag` and one arm filled; the rest are zero/empty.
+_param_value(tag::UInt8; bool=false, int=Int64(0), dbl=0.0, str="",
+             bytes=UInt8[], bools=Bool[], ints=Int64[], dbls=Float64[], strs=String[]) =
+    _ParameterValue(; type = tag, bool_value = bool, integer_value = int,
+        double_value = dbl, string_value = str, byte_array_value = bytes,
+        bool_array_value = bools, integer_array_value = ints,
+        double_array_value = dbls, string_array_value = strs)
+
+# A Julia value → its `ParameterValue`. `Symbol` is string-with-choices sugar, so
+# it marshals as STRING. `nothing` (an unset/unknown param) is NOT_SET. `Bool` is
+# matched before `Integer` (it `<: Integer`).
+function _to_param_value(x)
+    x === nothing                      && return _param_value(PARAMETER_NOT_SET)
+    x isa Bool                         && return _param_value(PARAMETER_BOOL;          bool = x)
+    x isa Integer                      && return _param_value(PARAMETER_INTEGER;       int  = Int64(x))
+    x isa AbstractFloat                && return _param_value(PARAMETER_DOUBLE;         dbl  = Float64(x))
+    x isa Symbol                       && return _param_value(PARAMETER_STRING;         str  = String(x))
+    x isa AbstractString               && return _param_value(PARAMETER_STRING;         str  = String(x))
+    x isa AbstractVector{UInt8}        && return _param_value(PARAMETER_BYTE_ARRAY;     bytes = collect(UInt8, x))
+    x isa AbstractVector{Bool}         && return _param_value(PARAMETER_BOOL_ARRAY;     bools = collect(Bool, x))
+    x isa AbstractVector{<:Integer}    && return _param_value(PARAMETER_INTEGER_ARRAY;  ints  = collect(Int64, x))
+    x isa AbstractVector{<:AbstractFloat}  && return _param_value(PARAMETER_DOUBLE_ARRAY; dbls = collect(Float64, x))
+    x isa AbstractVector{<:AbstractString} && return _param_value(PARAMETER_STRING_ARRAY; strs = collect(String, x))
+    throw(ArgumentError("not a legal parameter value: $(typeof(x))"))
+end
+
+# A `ParameterValue` → its Julia value, dispatched on the `type` tag. NOT_SET (and
+# any unknown tag) reads back as `nothing` — the unset-parameter sentinel `set`
+# rejects upstream.
+function _from_param_value(pv)
+    t = pv.type
+    t == PARAMETER_BOOL          && return pv.bool_value
+    t == PARAMETER_INTEGER       && return pv.integer_value
+    t == PARAMETER_DOUBLE        && return pv.double_value
+    t == PARAMETER_STRING        && return pv.string_value
+    t == PARAMETER_BYTE_ARRAY    && return pv.byte_array_value
+    t == PARAMETER_BOOL_ARRAY    && return pv.bool_array_value
+    t == PARAMETER_INTEGER_ARRAY && return pv.integer_array_value
+    t == PARAMETER_DOUBLE_ARRAY  && return pv.double_array_value
+    t == PARAMETER_STRING_ARRAY  && return pv.string_array_value
+    return nothing
+end
+
+# An internal `ParameterDescriptor` → the wire `rcl_interfaces/msg/ParameterDescriptor`.
+# The constraint forms (numeric range / choice set) don't map onto ROS2's
+# `FloatingPointRange`/`IntegerRange` arms cleanly (those carry a step and a single
+# value type), so we leave the range sequences empty and surface the human form via
+# `additional_constraints`. `dynamic_typing` is true only for a synthesized dynamic
+# descriptor (no fixed declared type).
+function _to_descriptor(d::ParameterDescriptor)
+    constraints = d.constraint === nothing ? "" : string("∈ ", d.constraint)
+    return _WireDescriptor(; name = String(d.name), type = d.ptype,
+        description = d.description, additional_constraints = constraints,
+        read_only = d.read_only, dynamic_typing = (d.type === Nothing),
+        floating_point_range = _RCL_MSG.FloatingPointRange[],
+        integer_range = _RCL_MSG.IntegerRange[])
+end
+
+# One handler `(successful, reason)` tuple → its wire `SetParametersResult`.
+_to_set_result((ok, reason)) = _SetParametersResult(; successful = ok, reason = reason)
+
 """
-    wire_parameter_services!(server)
+    wire_parameter_services!(server) -> server
 
 Declare the six standard parameter services + the `/parameter_events` publisher on
 the server's node (§10/§13), each bound to the reflection handlers above. Generic
-over `P` — one implementation serves every schema.
-
-TODO(layer §8): needs the Service/Client pattern layer and the `rcl_interfaces`
-generated request/response types (`DescribeParameters`, `GetParameters`,
-`SetParameters`, …, and `msg/ParameterEvent`), which aren't in this package yet.
-Until they land this is a no-op so a node with declared parameters precompiles and
-runs with the full *in-process* surface (`transaction`/sugar/reads/events); the
-wire-facing services attach here once §8 exists. The handler bodies
-(`describe_parameters`, `get_parameters`, `set_parameters`, …) are already written
-and tested against `P` by reflection, so wiring is a thin request/response
-marshal over them.
+over `P` — one implementation serves every schema. The services are node-private
+(`~/…`); `/parameter_events` is absolute (every node publishes the same topic).
+Service handles are tracked on the node (closed with it) and held on the server.
 """
 function wire_parameter_services!(s::ParameterServer)
-    # TODO(layer §8): for each name in PARAMETER_SERVICE_NAMES, declare a
-    #   Service(node, "~/<name>", <ReqType>) do req … marshal → handler → resp end
-    # and a Publisher(node, "/parameter_events", ParameterEvent); store the latter
-    # in `s._events_pub` so `_emit_parameter_event!` publishes the batch.
+    node = s.node
+
+    push!(s.services, Service(node, "~/describe_parameters", _RCL_SRV.DescribeParameters_Request) do req
+        descs = describe_parameters(s, req.names)
+        return _RCL_SRV.DescribeParameters_Response(;
+            descriptors = _WireDescriptor[_to_descriptor(d) for d in descs])
+    end)
+
+    push!(s.services, Service(node, "~/get_parameter_types", _RCL_SRV.GetParameterTypes_Request) do req
+        return _RCL_SRV.GetParameterTypes_Response(;
+            types = collect(UInt8, get_parameter_types(s, req.names)))
+    end)
+
+    push!(s.services, Service(node, "~/get_parameters", _RCL_SRV.GetParameters_Request) do req
+        return _RCL_SRV.GetParameters_Response(;
+            values = _ParameterValue[_to_param_value(v) for v in get_parameters(s, req.names)])
+    end)
+
+    push!(s.services, Service(node, "~/list_parameters", _RCL_SRV.ListParameters_Request) do req
+        names = list_parameters(s; prefixes = req.prefixes)
+        return _RCL_SRV.ListParameters_Response(;
+            result = _ListParametersResult(;
+                names = String[String(n) for n in names], prefixes = String[]))
+    end)
+
+    push!(s.services, Service(node, "~/set_parameters", _RCL_SRV.SetParameters_Request) do req
+        pairs = [(Symbol(p.name), _from_param_value(p.value)) for p in req.parameters]
+        results = set_parameters(s, pairs)
+        return _RCL_SRV.SetParameters_Response(;
+            results = _SetParametersResult[_to_set_result(r) for r in results])
+    end)
+
+    push!(s.services, Service(node, "~/set_parameters_atomically", _RCL_SRV.SetParametersAtomically_Request) do req
+        pairs = [(Symbol(p.name), _from_param_value(p.value)) for p in req.parameters]
+        ok, reason = set_parameters_atomically(s, pairs)
+        return _RCL_SRV.SetParametersAtomically_Response(;
+            result = _SetParametersResult(; successful = ok, reason = reason))
+    end)
+
+    s._events_pub = Publisher(node, "/parameter_events", _ParameterEvent)
     return s
 end
 
-# Placeholder for the wire publish; real body lands with the generated
-# `rcl_interfaces/msg/ParameterEvent` + §8 publisher (above).
+# Assemble `rcl_interfaces/msg/ParameterEvent` from the post-commit batch and
+# publish it on `/parameter_events`. A declared field that *moved* is a change; a
+# name absent from `previous` (a fresh dynamic param) is new. Deletions aren't
+# modeled by the transaction path yet, so `deleted_parameters` stays empty.
 function _publish_parameter_event(s::ParameterServer, batch::ParameterEventBatch)
-    # TODO(layer §8): assemble `rcl_interfaces/msg/ParameterEvent` from `batch`
-    # (node FQN, new_parameters/changed_parameters/deleted_parameters) and
-    # `publish(s._events_pub, evt)`.
+    s._events_pub === nothing && return nothing
+    node = s.node
+
+    new_params     = _Parameter[]
+    changed_params = _Parameter[]
+    for (name, value) in batch.changed
+        p = _Parameter(; name = String(name), value = _to_param_value(value))
+        push!(haskey(batch.previous, name) ? changed_params : new_params, p)
+    end
+
+    ev = _ParameterEvent(; stamp = to_msg(_Time, Dates.now(node)),
+        node = node === nothing ? "" : String(node.fqn),
+        new_parameters = new_params, changed_parameters = changed_params,
+        deleted_parameters = _Parameter[])
+    publish(s._events_pub, ev)
     return nothing
 end

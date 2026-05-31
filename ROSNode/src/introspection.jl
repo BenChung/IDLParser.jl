@@ -9,21 +9,19 @@
 #     logger *and* to a node-owned `rcl_interfaces/msg/Log` publisher, so a Julia
 #     `@info`/`@warn` on a node surfaces on the ROS `/rosout` topic.
 #
-# Both have a transport-facing half that needs lower-layer work not yet in this
-# package: the generated `type_description_interfaces` / `rcl_interfaces` message
-# types and the typesupport layer (§11) that stamps real `TypeDescription`s into
-# registry entries. As with `wire_parameter_services!` (§10), the in-process core
-# (registry lookup + canonicalization; the logger + level mapping + tee) is
-# implemented against what exists, and the wire binding (the `Service`/`Publisher`
-# declaration + message marshal) is staged behind a `TODO(layer §11)` /
-# `TODO(messages)` stub that does not break precompilation.
+# Both are wired against the vendored `type_description_interfaces` / `rcl_interfaces`
+# wire types (the `Interfaces` subtree, wellknown.jl): `~/get_type_description`
+# serves real `TypeDescription`s from the §11 registry, and the `/rosout` bridge
+# publishes `rcl_interfaces/msg/Log`. The type-source side (`include_type_sources`)
+# is the only piece still staged (`describe_type` returns the description; sources
+# need IL.unparse).
 
 import Logging
 using Logging: AbstractLogger, LogLevel
 # `TypeInfo` is in scope (core.jl re-exports it); the RIHS-string parser is not.
 using ROSZenoh: TypeInfo, type_hash_from_rihs_string
 
-export RosoutLogger, with_rosout, get_type_description, fetch_type_description,
+export RosoutLogger, with_rosout, Fatal, get_type_description, fetch_type_description,
        resolve_or_discover, wire_get_type_description!, describe_type
 
 # ── ~/get_type_description: the registry-served type description (§11/§13) ─────
@@ -313,8 +311,15 @@ end
 #
 # The level mapping follows ROS2's `rcl_interfaces/msg/Log` constants (DEBUG=10,
 # INFO=20, WARN=30, ERROR=40, FATAL=50), which mirror Python's logging levels.
-# Julia has no FATAL distinct from ERROR, so `Error` maps to ERROR (a `fatal`
-# convenience can map explicitly when needed).
+# Julia has no FATAL, so we add one (`Fatal`, above `Error`) and map `@logmsg
+# Fatal …` to ROS2 FATAL.
+
+const LogMsg  = Interfaces.rcl_interfaces.msg.Log
+const TimeMsg = Interfaces.builtin_interfaces.msg.Time
+
+# A FATAL level above Julia's `Error` (2000) so a Julia program can request ROS2's
+# FATAL severity explicitly (`@logmsg Fatal …`); plain `@error` stays at ERROR.
+const Fatal = Logging.LogLevel(3000)
 
 # ROS2 severity constants (rcl_interfaces/msg/Log). Named here so the bridge is
 # self-contained; identical to the generated `Log_Constants.*`.
@@ -328,6 +333,7 @@ const _ROSOUT_FATAL = 0x32
 # `Int32` scale (Debug=-1000, Info=0, Warn=1000, Error=2000); we bucket on the
 # standard thresholds so a custom level between two standards rounds to the lower.
 function _rosout_level(level::LogLevel)
+    level >= Fatal        && return _ROSOUT_FATAL
     level < Logging.Info  && return _ROSOUT_DEBUG
     level < Logging.Warn  && return _ROSOUT_INFO
     level < Logging.Error && return _ROSOUT_WARN
@@ -343,17 +349,16 @@ An `AbstractLogger` that tees Julia log records to `parent` *and* to `node`'s
 both sinks; `shouldlog`/`catch_exceptions` defer to `parent` so per-module log
 settings still apply.
 
-The `/rosout` publisher and the `Log` message construction need the generated
-`rcl_interfaces/msg/Log` type, which isn't in this package yet; until it lands the
-ROS-side emit is a precompile-safe no-op and the logger behaves as a pass-through
-tee to `parent` (so installing it is always safe). See [`with_rosout`](@ref).
+If `node` has no live session/context the `/rosout` publisher can't be declared;
+the logger then degrades to a pure tee to `parent` (so installing it is always
+safe). See [`with_rosout`](@ref).
 """
 mutable struct RosoutLogger <: AbstractLogger
     const node::Any                  # the Node whose /rosout we publish to
     const parent::AbstractLogger     # forwarded-to logger (console/file)
     const min_level::LogLevel
-    # The `/rosout` publisher (a `PublisherHandle{Log}`); `nothing` until the
-    # generated `Log` type exists and `_rosout_publisher!` declares it (§13).
+    # The `/rosout` publisher (a `PublisherHandle{LogMsg}`); `nothing` for a
+    # sessionless node — then the logger is a pure tee (§13).
     _pub::Any
 end
 
@@ -365,15 +370,20 @@ function RosoutLogger(node; parent::AbstractLogger=Logging.current_logger(),
 end
 
 # Declare the node-owned `/rosout` publisher. rmw_zenoh publishes `/rosout` as a
-# `rcl_interfaces/msg/Log` topic (transient-local, so late subscribers get the
-# backlog). Needs the generated `Log` type; staged precompile-safe until then —
-# a `nothing` publisher makes the bridge a pure tee (parent only).
-# TODO(messages): when `rcl_interfaces.msg.Log` is generated/registered, declare
-#   Publisher(node, "/rosout", rcl_interfaces.msg.Log;
-#             qos=QosProfile(durability=:transient_local, depth=1000))
-# and return the handle; `_emit_rosout` then publishes onto it.
+# `rcl_interfaces/msg/Log` topic, transient-local with a deep history so late
+# subscribers (e.g. `ros2 topic echo /rosout`) get the backlog. A sessionless or
+# closed node can't carry a publisher — return `nothing` so the bridge degrades to
+# a pure tee (parent only) instead of throwing during logger construction.
 function _rosout_publisher!(node)
-    return nothing
+    (node isa Node && isopen(node)) || return nothing
+    try
+        return Publisher(node, "/rosout", LogMsg;
+                         qos = QosProfile(durability = :transient_local,
+                                          reliability = :reliable, depth = 1000))
+    catch err
+        @debug "rosout bridge: /rosout publisher declaration failed" exception=(err, catch_backtrace())
+        return nothing
+    end
 end
 
 # Tee one record: forward to the parent logger, then (if a `/rosout` publisher is
@@ -387,7 +397,7 @@ function Logging.handle_message(lg::RosoutLogger, level, message, _module, group
                            line; kwargs...)
     if lg._pub !== nothing
         try
-            _emit_rosout(lg, level, message, _module, file, line)
+            _emit_rosout(lg, level, message, file, line; kwargs...)
         catch err
             @debug "rosout bridge: publish failed" exception=(err, catch_backtrace())
         end
@@ -395,19 +405,58 @@ function Logging.handle_message(lg::RosoutLogger, level, message, _module, group
     nothing
 end
 
+# The node FQN is the ROS logger name (`/ns/node`), matching what rmw_zenoh stamps
+# on `Log.name` — not the Julia `_module`, which carries no ROS identity.
+_logger_name(lg::RosoutLogger) = lg.node isa Node ? lg.node.fqn : string(lg.node)
+
+# Internal keys `@info`/`@warn` add to a record that are not user payload: `:maxlog`
+# (rate-limit count) and `:_id` (the call-site id). Skip them when folding kwargs
+# into the message text.
+const _ROSOUT_SKIP_KWARGS = (:maxlog, :_id)
+
+# Render a log record's `message` + structured `kwargs` into one `Log.msg` string.
+# `@warn "x" a=1 b=2` carries the extras as kwargs; we append them as `(a=1, b=2)`
+# so the structure survives onto a flat ROS string. An `:exception` value renders
+# as its message (the backtrace would bloat the line). Must never throw — a bad
+# `show`/`string` on a user value can't be allowed to break logging.
+function _render_message(message, kwargs)
+    base = try
+        string(message)
+    catch
+        "<unprintable message>"
+    end
+    parts = String[]
+    for (k, v) in pairs(kwargs)
+        k in _ROSOUT_SKIP_KWARGS && continue
+        rendered = try
+            if k === :exception
+                ex = v isa Tuple ? first(v) : v        # (exception, backtrace) or bare
+                ex isa Exception ? sprint(showerror, ex) : string(ex)
+            else
+                string(v)
+            end
+        catch
+            "<unprintable>"
+        end
+        push!(parts, string(k, "=", rendered))
+    end
+    isempty(parts) ? base : string(base, " (", join(parts, ", "), ")")
+end
+
 # Build and publish the `rcl_interfaces/msg/Log` for one record. The stamp is the
-# node's ROS clock (§7), the level the bucketed severity, `name` the logger/module,
-# and `function` is unavailable from `handle_message`'s arguments (Julia carries no
+# node's ROS clock (§7), the level the bucketed severity, `name` the node FQN, and
+# `function` is unavailable from `handle_message`'s arguments (Julia carries no
 # enclosing-function name there) so it's left empty — matching what rmw_zenoh emits
 # when the producing function is unknown.
-# TODO(messages): construct `rcl_interfaces.msg.Log(stamp=to_msg(Time, now(node)),
-#   level=_rosout_level(level), name=string(_module), msg=string(message),
-#   file=string(file), function="", line=UInt32(line === nothing ? 0 : line))`
-#   and `publish(lg._pub, log)`. The field assembly is ready; only the generated
-#   `Log` (and `builtin_interfaces/Time`) types are missing.
-function _emit_rosout(lg::RosoutLogger, level, message, _module, file, line)
-    # Staged: the publisher is `nothing` until the generated `Log` type lands, so
-    # `handle_message` never reaches here. Kept as the marked seam for the marshal.
+function _emit_rosout(lg::RosoutLogger, level, message, file, line; kwargs...)
+    log = LogMsg(; stamp = to_msg(TimeMsg, Dates.now(lg.node)),
+                 level = _rosout_level(level),
+                 name = _logger_name(lg),
+                 msg = _render_message(message, kwargs),
+                 file = string(file),
+                 var"function" = "",
+                 line = UInt32(line === nothing ? 0 : line))
+    publish(lg._pub, log)
     return nothing
 end
 

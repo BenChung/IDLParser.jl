@@ -43,11 +43,12 @@ export ActionServer, ActionClient, GoalHandle,
 # bare sub-types (`<A>_Goal`/`_Result`/`_Feedback`, §ROSMessages); the protocol
 # wrappers + `action_msgs`/`unique_identifier_msgs` types are a typesupport gap.
 #
-# `ActionTypeSupport` is the seam: it carries the three sub-types so the server/
-# client speak in them, and centralizes the topic-suffix naming. The wrapper
-# encode/decode (prepending the 16-byte goal_id, the status enum) is marked
-# TODO(messages §11) where it bites — the registry will supply generated wrapper
-# structs and this seam will hold those instead of reflecting the bare sub-types.
+# `ActionTypeSupport` carries the three sub-types so the server/client speak in
+# them and centralizes the topic-suffix naming. The protocol wrappers
+# (`<A>_SendGoal_Request/_Response`, `<A>_GetResult_Request/_Response`,
+# `<A>_FeedbackMessage`) are generated as siblings of `A` (§ROSMessages
+# `action_protocol_decls`) and resolved reflectively off `A` (`_action_wrapper`),
+# so the wire framing is built through real ctors rather than byte seams.
 
 """
     ActionTypeSupport{A, G, R, F}
@@ -55,14 +56,9 @@ export ActionServer, ActionClient, GoalHandle,
 Resolves the sub-message types of an action type `A` into its `Goal` (`G`),
 `Result` (`R`), and `Feedback` (`F`) structs (§9). Built from the action type
 argument to `ActionServer`/`ActionClient`; the three types drive the data-route
-key expressions and the handler signatures.
-
-TODO(messages §11): today the sub-types are found reflectively from the generated
-`<A>_Goal`/`_Result`/`_Feedback` triple under the action's module; the type
-registry will instead hand over the full set of generated protocol wrapper
-structs (`SendGoal`/`GetResult` request/response, `FeedbackMessage`,
-`GoalStatusArray`) so the wire framing is constructed through real ctors rather
-than the byte-level seams below.
+key expressions and the handler signatures. The protocol wrappers
+(`SendGoal`/`GetResult` request/response, `FeedbackMessage`) are resolved off `A`
+on demand via [`_action_wrapper`](@ref) — they're generated siblings of `A`.
 """
 struct ActionTypeSupport{A, G, R, F} end
 
@@ -70,6 +66,28 @@ goal_type(::ActionTypeSupport{A, G, R, F})     where {A, G, R, F} = G
 result_type(::ActionTypeSupport{A, G, R, F})   where {A, G, R, F} = R
 feedback_type(::ActionTypeSupport{A, G, R, F}) where {A, G, R, F} = F
 action_type(::ActionTypeSupport{A})            where {A}          = A
+
+# The five protocol-wrapper structs rosidl derives from a `.action` are emitted
+# as siblings of `A` in its `.action` module (`<A>_SendGoal_Request`, etc. —
+# §ROSMessages `action_protocol_decls`). Resolve them by suffix off `A`'s name,
+# the same reflection `ActionTypeSupport` does for the `_Goal`/`_Result`/`_Feedback`
+# triple; a missing wrapper means the action was generated without the protocol
+# set (an `@ros_msg` on the bare `.action` text, not `@ros_msgs`).
+function _action_wrapper(::Type{A}, suffix::AbstractString) where {A}
+    m = parentmodule(A)
+    s = Symbol(nameof(A), suffix)
+    isdefined(m, s) ||
+        throw(ArgumentError("$(A): missing protocol wrapper `$(s)` in $(m) — \
+                             generate the action with `@ros_msgs` so the \
+                             SendGoal/GetResult/FeedbackMessage wrappers exist"))
+    return getfield(m, s)::Type
+end
+
+_send_goal_request_type(::Type{A})  where {A} = _action_wrapper(A, "_SendGoal_Request")
+_send_goal_response_type(::Type{A}) where {A} = _action_wrapper(A, "_SendGoal_Response")
+_get_result_request_type(::Type{A}) where {A} = _action_wrapper(A, "_GetResult_Request")
+_get_result_response_type(::Type{A})where {A} = _action_wrapper(A, "_GetResult_Response")
+_feedback_message_type(::Type{A})   where {A} = _action_wrapper(A, "_FeedbackMessage")
 
 # Reflectively resolve `<A>_Goal`/`_Result`/`_Feedback` from `A`'s defining
 # module (the `<pkg>.action` submodule, §ROSMessages codegen). `A` is named by
@@ -107,6 +125,19 @@ _status_topic(name)      = string(name, "/_action/status")
 const GoalId = NTuple{16, UInt8}
 
 _new_goal_id()::GoalId = ntuple(_ -> rand(UInt8), 16)
+
+# The wire `unique_identifier_msgs/UUID` is a `@cdr_fixed` struct with a single
+# `uuid::SVector{16,UInt8}` field; its kw-ctor accepts a plain NTuple (it
+# `convert`s). Reading back, `.uuid` indexes 1-based. These are the only two
+# crossings between the internal `GoalId` tuple and the wire UUID.
+const _UUID = Interfaces.unique_identifier_msgs.msg.UUID
+const _Time = Interfaces.builtin_interfaces.msg.Time
+
+_to_uuid(id::GoalId) = _UUID(; uuid = id)
+_from_uuid(u)::GoalId = ntuple(i -> u.uuid[i], 16)
+
+# A zeroed UUID (16 NUL bytes) is the action_msgs "cancel-all" sentinel.
+_is_zero_uuid(id::GoalId) = all(==(0x00), id)
 
 # ── goal state machine (§9) ───────────────────────────────────────────────────
 # rclcpp's status enum (action_msgs/GoalStatus): the values are wire-stable —
@@ -205,6 +236,12 @@ mutable struct GoalHandle{A, G, R, F}
     const accepted_at::Int64             # acceptance stamp (wall ns, §3.4/§7)
     const lock::ReentrantLock
     @atomic status::GoalState
+    # The settled result, cached for `get_result` replay (a late or repeated
+    # fetch is answered without re-running the goal). The cell delivers the
+    # payload through `deliver` and does *not* retain it, so we capture it here on
+    # the first terminal fill. `nothing` until settled; written under the cell
+    # lock (single-writer, in `_deliver_result!`).
+    result::Union{R, Nothing}
     # The execution task (set when scheduled); tracked so `close(server)` joins
     # outstanding goals incl. detached post-cancel cleanup (§14 / DESIGN §drain).
     _task::Union{Task, Nothing}
@@ -571,17 +608,22 @@ function _register_goal!(server::ActionServer{A, G, R, F}, id::GoalId, req::G) w
     cell = ResultCell{Nothing, R}(nothing, deliver)
     g = GoalHandle{A, G, R, F}(server, id, req, cell,
                                _now_ns(server.node), ReentrantLock(),
-                               GOAL_ACCEPTED, nothing)
+                               GOAL_ACCEPTED, nothing, nothing)
     @lock server.lock server.goals[id] = g
     _publish_status(server)          # ACCEPTED appears on the status topic
     return g
 end
 
 # The result-cache + status delivery, invoked once by the cell's first terminal
-# fill (settlement.jl, under the cell lock). Transition the goal status, then
-# publish status. The cached result is read out of the cell by `get_result`
-# (`outcome` + the stored payload) — TODO(messages §11) frames the actual reply.
-function _deliver_result!(server::ActionServer, g::GoalHandle, status::SettlementStatus, payload)
+# fill (settlement.jl, under the cell lock). Cache the result payload (the cell
+# doesn't retain it), transition the goal status, then publish status. A waiting
+# `get_result` replays the cached result; a late fetch finds it in `g.result`.
+function _deliver_result!(server::ActionServer{A, G, R, F}, g::GoalHandle{A, G, R, F},
+                          status::SettlementStatus, payload) where {A, G, R, F}
+    # The settled payload is the goal's `Result` on a success/cancel/abort with a
+    # real value; a force-aborted goal delivers `nothing` (no defaultable result)
+    # — leave `g.result` nothing and let `_reply_result` fall back to a default.
+    g.result = payload isa R ? payload : nothing
     @atomic g.status = _terminal_state(status)
     _publish_status(server)
     nothing
@@ -734,114 +776,121 @@ end
 _default_result(::Type{R}) where {R} = R()
 
 # ── feedback / status publication (§9) ──────────────────────────────────────────
-# Feedback rides the `_action/feedback` topic as a `FeedbackMessage` (goal_id +
-# feedback); status rides `_action/status` as a `GoalStatusArray`. Both `put`
-# through the topic Entity's Zenoh publisher with the per-message attachment
-# (§3.4). The wrapper framing (goal_id prefix / status array) is the typesupport
-# gap — see TODO(messages §11) on `ActionTypeSupport`.
+# Feedback rides the `_action/feedback` topic as a `<A>_FeedbackMessage` (goal_id
+# + feedback); status rides `_action/status` as an `action_msgs/GoalStatusArray`.
+# Both `put` through the topic Entity's Zenoh publisher with the per-message
+# attachment (§3.4).
+
+const _GoalInfo        = Interfaces.action_msgs.msg.GoalInfo
+const _GoalStatus      = Interfaces.action_msgs.msg.GoalStatus
+const _GoalStatusArray = Interfaces.action_msgs.msg.GoalStatusArray
+
+# GoalState's Int8 values are the action_msgs/GoalStatus STATUS_* codes verbatim
+# (UNKNOWN=0 … ABORTED=6), so the enum reinterprets straight to the wire byte.
+_goal_status_byte(s::GoalState) = Int8(s)
 
 function _publish_feedback(server::ActionServer{A, G, R, F}, id::GoalId, fb::F) where {A, G, R, F}
     e = server.feedback_ent
     isopen(e) || return nothing
     route = e._route
     route === nothing && return nothing
-    # TODO(messages §11): the wire message is `<A>_FeedbackMessage{goal_id, feedback}`,
-    # not the bare `fb`. Until that wrapper struct is generated, encode the bare
-    # feedback; the goal_id correlation rides the attachment gid + (later) the
-    # wrapper. Byte-compat with rmw_zenoh feedback requires the wrapper — tracked.
-    payload_bytes = encode(fb)
+    msg = _feedback_message_type(A)(; goal_id = _to_uuid(id), feedback = fb)
     attach = encode_attachment(0, _now_ns(server.node), gid(e))
-    put(route::ZPublisher, payload_bytes; attachment=attach)
+    put(route::ZPublisher, encode(msg); attachment=attach)
     nothing
 end
 
-# Publish the current goal-status snapshot. TODO(messages §11): the wire type is
-# `action_msgs/GoalStatusArray` (a vector of {goal_info, status}); until it's
-# generated we emit nothing rather than a wrong-shaped payload — status is also
-# observable via the graph + get_result, so this is a safe stub, not a hang.
+# Publish the current goal-status snapshot as an `action_msgs/GoalStatusArray`
+# (one `GoalStatus{goal_info{goal_id, stamp}, status}` per tracked goal). Status
+# also reaches clients via get_result, so a closed/un-routed publisher is a quiet
+# no-op rather than an error.
 function _publish_status(server::ActionServer)
-    # TODO(messages §11): build + publish the GoalStatusArray once the wrapper
-    # type is available. No-op today (status still reaches clients via get_result).
+    e = server.status_ent
+    isopen(e) || return nothing
+    route = e._route
+    route === nothing && return nothing
+    stamp = to_msg(_Time, Dates.now(server.node))
+    statuses = @lock server.lock _GoalStatus[
+        _GoalStatus(; goal_info = _GoalInfo(; goal_id = _to_uuid(g.id), stamp = stamp),
+                    status = _goal_status_byte(@atomic g.status))
+        for g in values(server.goals)]
+    msg = _GoalStatusArray(; status_list = statuses)
+    attach = encode_attachment(0, _now_ns(server.node), gid(e))
+    put(route::ZPublisher, encode(msg); attachment=attach)
     nothing
 end
 
-# ── send_goal / cancel / get_result wire framing (TODO seams, §11) ──────────────
-# These bridge the Zenoh `Query`/`reply` to the action protocol wrapper messages.
-# The wrapper structs (`SendGoal_Request/_Response`, the cancel request/response,
-# `GetResult_Request/_Response`) are not generated yet (§ROSMessages handles only
-# the bare `_Goal`/`_Result`/`_Feedback` triple) — so each is a clearly-marked
-# seam that does the structurally-correct thing against what exists and notes the
-# byte-exact wrapper it must become.
+# ── send_goal / cancel / get_result wire framing (§9) ───────────────────────────
+# Bridge the Zenoh `Query`/`reply` to the action protocol wrapper messages: the
+# per-action `<A>_SendGoal_Request/_Response` + `<A>_GetResult_Request/_Response`
+# (generated siblings of `A`) and `action_msgs/CancelGoal_Request/_Response`. Each
+# decodes the request payload (mirroring service.jl) and replies the encoded
+# wrapper, so the framing is byte-exact with rmw_zenoh / cross-vendor peers.
 
-# Decode `SendGoal_Request{goal_id::UUID, goal::G}` from the query payload. The
-# wrapper isn't generated; the goal_id is a fixed 16-byte CDR field ahead of the
-# goal. Until the wrapper lands we mint a server-side id and decode the goal body.
-function _decode_send_goal(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
-    # TODO(messages §11): decode the real `SendGoal_Request` (16-byte goal_id CDR
-    # field + goal). For now: the client supplies the id, but without the wrapper
-    # struct we can't split it from the goal bytes byte-exactly — mint one and
-    # decode the goal from the payload, which round-trips for the Julia client
-    # below (which sends the bare goal). Cross-vendor needs the wrapper.
+const _CancelGoal_Request  = Interfaces.action_msgs.srv.CancelGoal_Request
+const _CancelGoal_Response = Interfaces.action_msgs.srv.CancelGoal_Response
+
+# Decode the request payload as `T` (owned copy; the query buffer is borrowed).
+# A request always carries a CDR body, even an empty one — a missing payload is a
+# protocol error from the peer.
+function _decode_query(q::Query, ::Type{T}) where {T}
     pay = payload(q)
-    goal_req = pay === nothing ? G() : decode(Zenoh.as_memory(pay, UInt8), G)
-    id = _new_goal_id()
-    return (id, goal_req)
+    pay === nothing && throw(ArgumentError("action request carried no payload"))
+    return decode(Zenoh.as_memory(pay, UInt8), T)
 end
 
-# Decode the cancel request → a target GoalId (or `nothing` for cancel-all). The
-# wire type is `action_msgs/CancelGoal_Request{goal_info{goal_id, stamp}}`; a
-# zeroed goal_id means cancel-all.
+# Decode `<A>_SendGoal_Request{goal_id::UUID, goal::G}` → (GoalId, G). The client
+# mints the goal_id, so we adopt it (the correlation token across the three
+# services + feedback topic).
+function _decode_send_goal(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
+    req = _decode_query(q, _send_goal_request_type(A))
+    return (_from_uuid(req.goal_id), req.goal)
+end
+
+# Decode `action_msgs/CancelGoal_Request{goal_info{goal_id, stamp}}` → a target
+# GoalId, or `nothing` for cancel-all (the all-zero UUID sentinel).
 function _decode_cancel(server::ActionServer, q::Query)
-    # TODO(messages §11): decode `CancelGoal_Request.goal_info.goal_id` (16-byte
-    # CDR field). Without the wrapper we cannot extract it byte-exactly; treat an
-    # empty/absent payload as cancel-all so a Julia-client `cancel` (which targets
-    # by handle and re-keys, below) still drives the state machine.
-    return nothing
+    req = _decode_query(q, _CancelGoal_Request)
+    id = _from_uuid(req.goal_info.goal_id)
+    return _is_zero_uuid(id) ? nothing : id
 end
 
-# Decode the get_result request → the GoalId to wait on. Wire type
-# `GetResult_Request{goal_id::UUID}` (a bare 16-byte CDR field).
-function _decode_get_result(server::ActionServer, q::Query)
-    # TODO(messages §11): decode the 16-byte goal_id. Until the wrapper lands the
-    # Julia client passes the id in the query `parameters` string (hex) so result
-    # correlation works within this stack; cross-vendor needs the CDR field.
-    p = Zenoh.parameters(q)
-    if !isempty(p)
-        try
-            return _goal_id_from_hex(p)
-        catch
-        end
-    end
-    # Fallback: a single live goal is unambiguous.
-    @lock server.lock begin
-        length(server.goals) == 1 && return first(keys(server.goals))
-    end
-    return _new_goal_id()             # unknown ⇒ guaranteed cache miss → reply_err
+# Decode `<A>_GetResult_Request{goal_id::UUID}` → the GoalId to wait on.
+function _decode_get_result(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
+    req = _decode_query(q, _get_result_request_type(A))
+    return _from_uuid(req.goal_id)
 end
 
-# Reply framing. SendGoal_Response{accepted::Bool, stamp}. GetResult_Response
-# {status::Int8, result::R}. CancelGoal_Response{return_code, goals_canceling}.
-function _reply_send_goal(server::ActionServer, q::Query, accepted::Bool)
-    # TODO(messages §11): reply the real `SendGoal_Response`. Until generated, the
-    # accepted flag rides a 1-byte payload; the Julia client reads it back.
-    reply(q, UInt8[accepted ? 0x01 : 0x00])
+# Reply `<A>_SendGoal_Response{accepted::Bool, stamp}` — the accept decision +
+# the acceptance wall-clock stamp.
+function _reply_send_goal(server::ActionServer{A, G, R, F}, q::Query, accepted::Bool) where {A, G, R, F}
+    resp = _send_goal_response_type(A)(; accepted = accepted,
+                                       stamp = to_msg(_Time, Dates.now(server.node)))
+    reply(q, encode(resp))
     nothing
 end
 
+# Reply `action_msgs/CancelGoal_Response{return_code::Int8, goals_canceling}`.
+# `return_code` 0 (`ERROR_NONE`) when at least one goal moved to CANCELING, else 1
+# (`ERROR_REJECTED`); `goals_canceling` lists the accepted goals' GoalInfo.
 function _reply_cancel(server::ActionServer, q::Query, accepted::AbstractVector)
-    # TODO(messages §11): reply `CancelGoal_Response{return_code, goals_canceling}`.
-    reply(q, UInt8[isempty(accepted) ? 0x01 : 0x00])   # 0 == ERROR_NONE
+    stamp = to_msg(_Time, Dates.now(server.node))
+    canceling = _GoalInfo[_GoalInfo(; goal_id = _to_uuid(g.id), stamp = stamp) for g in accepted]
+    resp = _CancelGoal_Response(; return_code = Int8(isempty(accepted) ? 1 : 0),
+                                goals_canceling = canceling)
+    reply(q, encode(resp))
     nothing
 end
 
-function _reply_result(server::ActionServer{A, G, R, F}, q::Query, g::GoalHandle) where {A, G, R, F}
+# Reply `<A>_GetResult_Response{status::Int8, result::R}` — the terminal status
+# byte and the cached result (`g.result`, captured by `_deliver_result!`). A
+# force-aborted goal has no cached result; fall back to a default-constructed `R`
+# so the reply is well-formed and the client's `fetch` unblocks with the status.
+function _reply_result(server::ActionServer{A, G, R, F}, q::Query, g::GoalHandle{A, G, R, F}) where {A, G, R, F}
     st = _terminal_state(outcome(g.cell)::SettlementStatus)
-    # TODO(messages §11): reply `GetResult_Response{status::Int8, result::R}` — the
-    # status byte then the CDR-encoded result. The cell doesn't retain the result
-    # payload (settlement.jl delivers it through `deliver`); the result must be
-    # captured there for replay. Until the wrapper + capture land, reply the status
-    # byte so the client unblocks with the terminal state. Tracked.
-    reply(q, UInt8[Int8(st) % UInt8])
+    result = g.result === nothing ? _default_result(R) : g.result
+    resp = _get_result_response_type(A)(; status = _goal_status_byte(st), result = result)
+    reply(q, encode(resp))
     nothing
 end
 
@@ -851,13 +900,6 @@ _result_unknown_payload(::ActionServer) = "unknown goal id"
 # ── small helpers ──────────────────────────────────────────────────────────────
 
 _now_ns(node) = nanoseconds(Dates.now(node, System()))
-
-_goal_id_hex(id::GoalId) = bytes2hex(collect(id))
-function _goal_id_from_hex(s::AbstractString)::GoalId
-    b = hex2bytes(s)
-    length(b) == 16 || throw(ArgumentError("goal id hex must be 16 bytes"))
-    ntuple(i -> b[i], 16)
-end
 
 # ── ActionClient (§9) ──────────────────────────────────────────────────────────
 # `send` issues a send_goal request and returns a client-side goal handle that is
@@ -938,15 +980,15 @@ function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     ctx = client.node.context
     tk = _service_key(client, _send_goal_topic(client.name))
 
-    # TODO(messages §11): the request is `SendGoal_Request{goal_id, goal}`; send
-    # the bare goal until the wrapper struct is generated (the server mints the id
-    # too — see `_decode_send_goal`). Result correlation uses our minted `id` via
-    # the get_result `parameters` channel (`_decode_get_result`).
+    # The request is `<A>_SendGoal_Request{goal_id, goal}`; we mint the id (the
+    # correlation token reused on feedback / get_result / cancel). The reply is the
+    # `<A>_SendGoal_Response{accepted, stamp}`.
+    req = _send_goal_request_type(A)(; goal_id = _to_uuid(id), goal = goal)
     accepted = false
-    for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(goal), timeout_ms=5000)
+    for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req), timeout_ms=5000)
         if Zenoh.is_ok(r)
-            bytes = Vector{UInt8}(payload(Zenoh.sample(r)))
-            accepted = !isempty(bytes) && bytes[1] != 0x00
+            resp = decode(Zenoh.sample(r), _send_goal_response_type(A))
+            accepted = resp.accepted
         end
         break                       # a service has a single reply
     end
@@ -959,19 +1001,19 @@ end
 
 Stream the goal's feedback messages (§9), each a `Feedback` struct. Lazily opens
 a subscription on the action's feedback topic on first iteration; the stream ends
-when the goal reaches a terminal state. (Goal-id filtering needs the
-`FeedbackMessage` wrapper — TODO(messages §11); today the stream carries all
-feedback on the topic.)
+when the goal reaches a terminal state. The topic carries `<A>_FeedbackMessage`
+(goal_id + feedback), so the stream is filtered to *this* goal's id.
 """
 function feedback(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     # A bounded Channel fed by a Subscription on the feedback topic. The
-    # subscription decodes the bare feedback (TODO(messages §11): the wrapper +
-    # goal-id filter); the channel closes when the goal settles.
+    # subscription decodes `<A>_FeedbackMessage`, drops messages for other goals,
+    # and forwards the unwrapped `Feedback`; the channel closes when the goal settles.
     ch = Channel{F}(32)
     client = g.client
-    sub = _make_subscription((fb) -> (isopen(ch) && put!(ch, fb)),
-                             client.node, _feedback_topic(client.name), F;
-                             qos=client.qos)
+    sub = _make_subscription(client.node, _feedback_topic(client.name),
+                             _feedback_message_type(A); qos=client.qos) do msg
+        _from_uuid(msg.goal_id) == g.id && isopen(ch) && put!(ch, msg.feedback)
+    end
     g._feedback_sub = sub
     # Close the stream when the goal terminates (polled; the result fetch flips
     # `_state`). Kept simple — a dedicated terminal-state notify is a later hook.
@@ -1006,28 +1048,25 @@ function Base.fetch(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     ctx = client.node.context
     tk = _service_key(client, _get_result_topic(client.name))
 
-    # TODO(messages §11): request `GetResult_Request{goal_id}` as a CDR field; the
-    # id rides the query `parameters` (hex) until the wrapper is generated
-    # (`_decode_get_result` reads it). The reply today is the status byte; the
-    # result payload capture is the settlement seam — see `_reply_result`.
+    # Request `<A>_GetResult_Request{goal_id}`; the server holds the reply open
+    # until the goal settles, then answers `<A>_GetResult_Response{status, result}`.
+    req = _get_result_request_type(A)(; goal_id = _to_uuid(g.id))
     local result_state::Symbol = :aborted
-    for r in Base.get(ctx.session, Keyexpr(tk), _goal_id_hex(g.id); timeout_ms=0)
+    local result::R = _default_result(R)
+    for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req), timeout_ms=0)
         if Zenoh.is_ok(r)
-            bytes = Vector{UInt8}(payload(Zenoh.sample(r)))
-            result_state = isempty(bytes) ? :aborted : _client_state_from_status(bytes[1])
+            resp = decode(Zenoh.sample(r), _get_result_response_type(A))
+            result_state = _client_state_from_status(resp.status)
+            result = resp.result
         end
         break
     end
     @atomic g._state = result_state
-    # TODO(messages §11): decode + return the real result `R` once the
-    # GetResult_Response wrapper carries it. Until then a default-constructed `R`
-    # stands in so `fetch` returns the right *type*; the terminal `state(goal)` is
-    # authoritative for success/cancel/abort.
-    return _default_result(R)
+    return result
 end
 
-_client_state_from_status(b::UInt8) =
-    _state_symbol(GoalState(b % Int8))
+_client_state_from_status(b::Integer) =
+    _state_symbol(GoalState(Int8(b)))
 
 """
     cancel(goal)
@@ -1042,10 +1081,11 @@ function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     client = g.client
     ctx = client.node.context
     tk = _service_key(client, _cancel_goal_topic(client.name))
-    # TODO(messages §11): request `CancelGoal_Request{goal_info{goal_id}}`; the
-    # server treats an empty payload as cancel-all (`_decode_cancel`). The id rides
-    # `parameters` for the single-server case.
-    for r in Base.get(ctx.session, Keyexpr(tk), _goal_id_hex(g.id); timeout_ms=5000)
+    # Request `action_msgs/CancelGoal_Request{goal_info{goal_id, stamp}}` targeting
+    # this goal (a zeroed goal_id would be the server's cancel-all sentinel).
+    req = _CancelGoal_Request(; goal_info = _GoalInfo(; goal_id = _to_uuid(g.id),
+                                                      stamp = to_msg(_Time, Dates.now(client.node))))
+    for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req), timeout_ms=5000)
         break
     end
     @atomic g._state = :canceling
