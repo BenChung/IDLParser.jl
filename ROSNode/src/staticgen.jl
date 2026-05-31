@@ -193,33 +193,27 @@ end
 
 # ── @ros_import ─────────────────────────────────────────────────────────────────
 
-# Emit, per canonical hit, `module <pkg> module <qual> const <Name> =
-# ROSNode.Interfaces.<pkg>.<qual>.<Name> end end` so the caller's
-# `<pkg>.<qual>.<Name>` path *aliases* the single compiled `Interfaces` struct
-# (one wire type ⇒ one Julia struct, §11/D5) instead of minting a duplicate.
-# Grouped so each (pkg, qual) is one module pair carrying all its aliased names.
-# The alias target is the `Interfaces` module *object* spliced in literally, so it
-# resolves in the caller regardless of how it imported ROSNode.
-function _alias_block(hits::Vector{Tuple{String, String, String}})
-    bypkg = Dict{String, Dict{String, Vector{String}}}()
+# Emit, per provided hit, `module <pkg> module <qual> const <Name> = <T> end end`
+# so the caller's `<pkg>.<qual>.<Name>` path *aliases* an already-compiled struct `T`
+# (one wire type ⇒ one Julia struct, §11/D5) instead of minting a duplicate. `T` is
+# the resolved type spliced in literally — ROSNode's vendored canonical copy, or a
+# type a dependency already `@ros_import`ed — so it's an external reference (single
+# copy, even across a precompile boundary). One module pair per (pkg, qual).
+function _alias_block(hits::Vector{Tuple{String, String, String, Any}})
+    bypkg = Dict{String, Dict{String, Vector{Tuple{String, Any}}}}()
     pkg_order = String[]
-    for (pkg, qual, bare) in hits
-        haskey(bypkg, pkg) || (push!(pkg_order, pkg); bypkg[pkg] = Dict{String, Vector{String}}())
-        bares = get!(bypkg[pkg], qual, String[])
-        bare in bares || push!(bares, bare)
+    seen = Set{Tuple{String, String, String}}()
+    for (pkg, qual, bare, T) in hits
+        (pkg, qual, bare) in seen && continue
+        push!(seen, (pkg, qual, bare))
+        haskey(bypkg, pkg) || (push!(pkg_order, pkg); bypkg[pkg] = Dict{String, Vector{Tuple{String, Any}}}())
+        push!(get!(bypkg[pkg], qual, Tuple{String, Any}[]), (bare, T))
     end
     out = Any[]
     for pkg in pkg_order
         qualmods = Any[]
         for (qual, bares) in bypkg[pkg]
-            consts = Any[]
-            for bare in bares
-                target = Interfaces
-                for seg in (pkg, qual, bare)
-                    target = Expr(:., target, QuoteNode(Symbol(seg)))
-                end
-                push!(consts, Expr(:const, Expr(:(=), Symbol(bare), target)))
-            end
+            consts = [Expr(:const, Expr(:(=), Symbol(bare), T)) for (bare, T) in bares]
             push!(qualmods, Expr(:module, true, Symbol(qual), Expr(:block, consts...)))
         end
         push!(out, Expr(:module, true, Symbol(pkg), Expr(:block, qualmods...)))
@@ -227,8 +221,62 @@ function _alias_block(hits::Vector{Tuple{String, String, String}})
     return out
 end
 
+# Resolve `names` to an import plan `(alias_hits, gen_paths, gen_jsons)`: provided
+# sections to alias (`[(pkg, qual, bare, Type)]`) vs. files to generate locally and
+# their registration JSON. Shared by the bare and `as` forms.
+function _import_plan(names::Vector{String})
+    specs = _resolve_import_closure(names)
+    isempty(specs) &&
+        error("@ros_import: no sources resolved for $(names) — vendored, or source a ROS2 env")
+    tds = _static_type_descriptions([(s.package, s.il) for s in specs])
+    hashof = Dict{String, Any}()
+    jsonof = Dict{String, String}()
+    for (pkg, qual, bare, tdmsg) in tds
+        qn = "$pkg/$qual/$bare"
+        h = type_hash_from_rihs_string(calculate_rihs01_hash(tdmsg))
+        h === nothing && continue
+        hashof[qn] = h
+        jsonof[qn] = to_ros2_json(tdmsg)
+    end
+    prov(qn) = (h = get(hashof, qn, nothing); h === nothing ? nothing : provided_type(qn, h))
+    secs(s) = [(s.package, qual, bare) for (qual, bare, _) in _il_sections(s.il)]
+    # A msg/srv whose every section is already provided aliases; everything else
+    # (incl. actions — their implicit protocol types aren't provided) generates.
+    aliasable(s) = s.qualifier in ("msg", "srv") &&
+                   all(((p, q, b),) -> prov("$p/$q/$b") !== nothing, secs(s))
+    alias_hits = Tuple{String, String, String, Any}[]
+    gen_paths  = String[]
+    gen_qns    = Set{String}()
+    for s in specs
+        if aliasable(s)
+            for (p, q, b) in secs(s)
+                push!(alias_hits, (p, q, b, prov("$p/$q/$b")))
+            end
+        else
+            push!(gen_paths, s.path)
+            for (p, q, b) in secs(s); push!(gen_qns, "$p/$q/$b"); end
+        end
+    end
+    gen_jsons = [(p, q, b, jsonof["$p/$q/$b"]) for (p, q, b, _) in tds if "$p/$q/$b" in gen_qns]
+    return (alias_hits, unique(gen_paths), gen_jsons)
+end
+
+# Append a plan's code to `block`: provided-type aliases first (so generated structs
+# resolve their refs), then the generated structs + their registration.
+function _plan_block!(block, plan)
+    (alias_hits, gen_paths, gen_jsons) = plan
+    append!(block.args, _alias_block(alias_hits))
+    if !isempty(gen_paths)
+        gen = ROSMessages._expand_msg_files(gen_paths)       # structs + include_dependency
+        append!(block.args, gen.args)
+        append!(block.args, _static_register_stmts(gen_jsons, nothing))
+    end
+    return block
+end
+
 """
     @ros_import "pkg" | "pkg/qual/Name" ...
+    @ros_import "pkg/qual/Name" as Alias
 
 Statically generate ament/vendored ROS interface types *resolved by name* into the
 calling module (the static counterpart to dynamic discovery). Each name is a package
@@ -244,70 +292,92 @@ Generation reuses the same pipeline as [`@ros_msg`](@ref) (structs +
 §13 server can serve their descriptions. No JSON caching — ament/vendored is the
 durable source.
 
-**Single-copy:** any type whose `(name, RIHS01)` matches a vendored canonical type
-(see [`canonical_type`](@ref)) is *aliased* to the one compiled `Interfaces` struct
-rather than re-generated — so transitively-pulled commons (`builtin_interfaces/Time`,
-`unique_identifier_msgs/UUID`, …) are shared, and a second import of the same type
-re-aliases rather than redefines.
+**Binding (Julia-`import`-like).** A fully-qualified *message* type binds its bare
+leaf, like `import Mod: Name` — `@ros_import "sensor_msgs/msg/Image"` gives `Image`
+directly (and `sensor_msgs.msg.Image` too, since `sensor_msgs` is in scope). A bare
+package binds the module, like `import Mod` — `@ros_import "sensor_msgs"` gives
+`sensor_msgs` (use `sensor_msgs.msg.X`). Transitively-pulled deps are *not* leaf-bound
+(no namespace flood). Two imports binding the same leaf error, pointing at `as`.
+
+**Single-copy:** any type whose `(name, RIHS01)` is already provided by a loaded
+module — the vendored canonical copy, or one a dependency `@ros_import`ed (see
+[`provided_type`](@ref)) — is *aliased* to that one struct rather than re-generated.
+So transitively-pulled commons are shared, a second import re-aliases instead of
+redefining, and a type package C imports is reused by downstream A and B (provided C
+is loaded when they expand the macro).
+
+`… as Alias` binds the imported type to `Alias` instead of its `pkg.qual.Name` path —
+for a short handle, or to disambiguate a name collision (two same-named but
+different-RIHS01 versions). A *generated* `as` type is isolated in a hidden submodule
+so its path can't clash with another import; a *provided* one binds straight through.
 """
 macro ros_import(names...)
-    all(n -> n isa AbstractString, names) ||
-        error("@ros_import takes string literals (package or fully-qualified type names)")
-    specs = _resolve_import_closure(String[String(n) for n in names])
-    isempty(specs) &&
-        error("@ros_import: no sources resolved for $(names) — vendored, or source a ROS2 env")
-
-    # Per generated section: its real RIHS01 and registration JSON.
-    tds = _static_type_descriptions([(s.package, s.il) for s in specs])
-    hashof = Dict{String, Any}()
-    jsonof = Dict{String, String}()
-    for (pkg, qual, bare, tdmsg) in tds
-        qn = "$pkg/$qual/$bare"
-        h = type_hash_from_rihs_string(calculate_rihs01_hash(tdmsg))
-        h === nothing && continue
-        hashof[qn] = h
-        jsonof[qn] = to_ros2_json(tdmsg)
-    end
-
-    # A spec aliases to canonical iff it's a msg/srv whose every section is a
-    # canonical (name + RIHS01) hit. Actions always generate locally — their
-    # implicit protocol types aren't canonical — but their UUID/Time deps (separate
-    # msg specs) do alias.
-    sections(s) = [(s.package, qual, bare) for (qual, bare, _) in _il_sections(s.il)]
-    function aliasable(s)
-        s.qualifier in ("msg", "srv") || return false
-        for (pkg, qual, bare) in sections(s)
-            qn = "$pkg/$qual/$bare"
-            h = get(hashof, qn, nothing)
-            (h !== nothing && canonical_type(qn, h) !== nothing) || return false
-        end
-        return true
-    end
-
-    alias_hits = Tuple{String, String, String}[]
-    gen_paths  = String[]
-    gen_qns    = Set{String}()
-    for s in specs
-        if aliasable(s)
-            append!(alias_hits, sections(s))
+    # Split into bare imports and `"pkg/qual/Name" as Alias` triples.
+    bare = String[]
+    aliased = Tuple{String, Symbol}[]
+    i = 1
+    while i <= length(names)
+        n = names[i]
+        if i + 2 <= length(names) && names[i + 1] === :as
+            (n isa AbstractString && names[i + 2] isa Symbol) ||
+                error("@ros_import: the `as` form is `@ros_import \"pkg/qual/Name\" as Alias`")
+            push!(aliased, (String(n), names[i + 2])); i += 3
+        elseif n isa AbstractString
+            push!(bare, String(n)); i += 1
         else
-            push!(gen_paths, s.path)
-            for (pkg, qual, bare) in sections(s)
-                push!(gen_qns, "$pkg/$qual/$bare")
-            end
+            error("@ros_import takes string literals (optionally `\"pkg/qual/Name\" as Alias`)")
         end
     end
+    (isempty(bare) && isempty(aliased)) && error("@ros_import: nothing to import")
 
     block = Expr(:toplevel)
-    append!(block.args, _alias_block(alias_hits))            # canonical aliases first
-    if !isempty(gen_paths)
-        gen = ROSMessages._expand_msg_files(unique(gen_paths))   # structs + include_dependency
-        append!(block.args, gen.args)
-        # Register only the locally-generated types; canonical ones are registered by
-        # ROSNode's own `_register_canonical_types!` at Context creation.
-        jsons = [(pkg, qual, bare, jsonof["$pkg/$qual/$bare"])
-                 for (pkg, qual, bare, _) in tds if "$pkg/$qual/$bare" in gen_qns]
-        append!(block.args, _static_register_stmts(jsons, nothing))
+    isempty(bare) || _plan_block!(block, _import_plan(bare))
+
+    # Hybrid binding: an explicitly-listed fully-qualified *message* type also binds
+    # its bare leaf name (like `import Mod: Name`) — so `@ros_import "pkg/msg/Image"`
+    # gives both `Image` and `pkg.msg.Image`. A bare package binds only the module
+    # (`import Mod`), and transitively-pulled deps are never leaf-bound (no namespace
+    # flood). The leaf points at the already-emitted `pkg.msg.Name` path (an alias for
+    # a provided type, the struct for a generated one), so identity is unchanged.
+    leaves = Dict{Symbol, String}()
+    for n in bare
+        parts = split(n, '/')
+        (length(parts) == 3 && parts[2] == "msg") || continue
+        pkg, _, name = parts
+        sym = Symbol(name)
+        if haskey(leaves, sym)
+            error("@ros_import: `$name` is imported from both `$(leaves[sym])` and " *
+                  "`$pkg/msg/$name`; use `@ros_import \"$pkg/msg/$name\" as <Alias>` to disambiguate")
+        end
+        leaves[sym] = "$pkg/msg/$name"
+        target = Expr(:., Expr(:., Symbol(pkg), QuoteNode(:msg)), QuoteNode(sym))
+        push!(block.args, Expr(:const, Expr(:(=), sym, target)))
+    end
+
+    for (tname, asym) in aliased
+        count(==('/'), tname) == 2 ||
+            error("@ros_import … as $(asym): need a fully-qualified \"pkg/qual/Name\", got \"$tname\"")
+        pkg, qual, bare_name = split_ros_name(tname)
+        qual == "msg" ||
+            error("@ros_import … as $(asym): `as` aliasing is only for message types " *
+                  "(\"pkg/msg/Name\"); a srv/action has no single struct to bind, got \"$tname\"")
+        (alias_hits, gen_paths, _) = plan = _import_plan([tname])
+        if isempty(gen_paths)
+            # Fully provided: bind `Alias` straight to the provided type (no submodule).
+            j = findfirst(h -> (h[1], h[2], h[3]) == (pkg, qual, bare_name), alias_hits)
+            j === nothing && error("@ros_import … as $(asym): could not resolve \"$tname\"")
+            push!(block.args, Expr(:const, Expr(:(=), asym, alias_hits[j][4])))
+        else
+            # Generated: isolate the type (+ its closure) in a hidden submodule so its
+            # `pkg.qual.Name` path can't clash with another import, then expose `Alias`.
+            modname = Symbol("__ros_alias_", asym)
+            inner = _plan_block!(Expr(:toplevel), plan)
+            pushfirst!(inner.args, :(using ROSNode))   # the register stmts call ROSNode.…
+            push!(block.args, Expr(:module, true, modname, Expr(:block, inner.args...)))
+            target = Expr(:., Expr(:., Expr(:., modname, QuoteNode(Symbol(pkg))),
+                                   QuoteNode(Symbol(qual))), QuoteNode(Symbol(bare_name)))
+            push!(block.args, Expr(:const, Expr(:(=), asym, target)))
+        end
     end
     return esc(block)
 end
