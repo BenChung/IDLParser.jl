@@ -193,6 +193,40 @@ end
 
 # ── @ros_import ─────────────────────────────────────────────────────────────────
 
+# Emit, per canonical hit, `module <pkg> module <qual> const <Name> =
+# ROSNode.Interfaces.<pkg>.<qual>.<Name> end end` so the caller's
+# `<pkg>.<qual>.<Name>` path *aliases* the single compiled `Interfaces` struct
+# (one wire type ⇒ one Julia struct, §11/D5) instead of minting a duplicate.
+# Grouped so each (pkg, qual) is one module pair carrying all its aliased names.
+# The alias target is the `Interfaces` module *object* spliced in literally, so it
+# resolves in the caller regardless of how it imported ROSNode.
+function _alias_block(hits::Vector{Tuple{String, String, String}})
+    bypkg = Dict{String, Dict{String, Vector{String}}}()
+    pkg_order = String[]
+    for (pkg, qual, bare) in hits
+        haskey(bypkg, pkg) || (push!(pkg_order, pkg); bypkg[pkg] = Dict{String, Vector{String}}())
+        bares = get!(bypkg[pkg], qual, String[])
+        bare in bares || push!(bares, bare)
+    end
+    out = Any[]
+    for pkg in pkg_order
+        qualmods = Any[]
+        for (qual, bares) in bypkg[pkg]
+            consts = Any[]
+            for bare in bares
+                target = Interfaces
+                for seg in (pkg, qual, bare)
+                    target = Expr(:., target, QuoteNode(Symbol(seg)))
+                end
+                push!(consts, Expr(:const, Expr(:(=), Symbol(bare), target)))
+            end
+            push!(qualmods, Expr(:module, true, Symbol(qual), Expr(:block, consts...)))
+        end
+        push!(out, Expr(:module, true, Symbol(pkg), Expr(:block, qualmods...)))
+    end
+    return out
+end
+
 """
     @ros_import "pkg" | "pkg/qual/Name" ...
 
@@ -209,6 +243,12 @@ Generation reuses the same pipeline as [`@ros_msg`](@ref) (structs +
 `Subscription(node, "/t")` uses the precompiled type with no runtime codegen, and the
 §13 server can serve their descriptions. No JSON caching — ament/vendored is the
 durable source.
+
+**Single-copy:** any type whose `(name, RIHS01)` matches a vendored canonical type
+(see [`canonical_type`](@ref)) is *aliased* to the one compiled `Interfaces` struct
+rather than re-generated — so transitively-pulled commons (`builtin_interfaces/Time`,
+`unique_identifier_msgs/UUID`, …) are shared, and a second import of the same type
+re-aliases rather than redefines.
 """
 macro ros_import(names...)
     all(n -> n isa AbstractString, names) ||
@@ -216,11 +256,59 @@ macro ros_import(names...)
     specs = _resolve_import_closure(String[String(n) for n in names])
     isempty(specs) &&
         error("@ros_import: no sources resolved for $(names) — vendored, or source a ROS2 env")
-    files = unique(String[s.path for s in specs])
-    block = ROSMessages._expand_msg_files(files)             # structs + include_dependency
+
+    # Per generated section: its real RIHS01 and registration JSON.
     tds = _static_type_descriptions([(s.package, s.il) for s in specs])
-    jsons = [(pkg, qual, bare, to_ros2_json(tdmsg)) for (pkg, qual, bare, tdmsg) in tds]
-    append!(block.args, _static_register_stmts(jsons, nothing))
+    hashof = Dict{String, Any}()
+    jsonof = Dict{String, String}()
+    for (pkg, qual, bare, tdmsg) in tds
+        qn = "$pkg/$qual/$bare"
+        h = type_hash_from_rihs_string(calculate_rihs01_hash(tdmsg))
+        h === nothing && continue
+        hashof[qn] = h
+        jsonof[qn] = to_ros2_json(tdmsg)
+    end
+
+    # A spec aliases to canonical iff it's a msg/srv whose every section is a
+    # canonical (name + RIHS01) hit. Actions always generate locally — their
+    # implicit protocol types aren't canonical — but their UUID/Time deps (separate
+    # msg specs) do alias.
+    sections(s) = [(s.package, qual, bare) for (qual, bare, _) in _il_sections(s.il)]
+    function aliasable(s)
+        s.qualifier in ("msg", "srv") || return false
+        for (pkg, qual, bare) in sections(s)
+            qn = "$pkg/$qual/$bare"
+            h = get(hashof, qn, nothing)
+            (h !== nothing && canonical_type(qn, h) !== nothing) || return false
+        end
+        return true
+    end
+
+    alias_hits = Tuple{String, String, String}[]
+    gen_paths  = String[]
+    gen_qns    = Set{String}()
+    for s in specs
+        if aliasable(s)
+            append!(alias_hits, sections(s))
+        else
+            push!(gen_paths, s.path)
+            for (pkg, qual, bare) in sections(s)
+                push!(gen_qns, "$pkg/$qual/$bare")
+            end
+        end
+    end
+
+    block = Expr(:toplevel)
+    append!(block.args, _alias_block(alias_hits))            # canonical aliases first
+    if !isempty(gen_paths)
+        gen = ROSMessages._expand_msg_files(unique(gen_paths))   # structs + include_dependency
+        append!(block.args, gen.args)
+        # Register only the locally-generated types; canonical ones are registered by
+        # ROSNode's own `_register_canonical_types!` at Context creation.
+        jsons = [(pkg, qual, bare, jsonof["$pkg/$qual/$bare"])
+                 for (pkg, qual, bare, _) in tds if "$pkg/$qual/$bare" in gen_qns]
+        append!(block.args, _static_register_stmts(jsons, nothing))
+    end
     return esc(block)
 end
 

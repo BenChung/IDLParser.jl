@@ -1,0 +1,5 @@
+# The requested transition.
+Transition transition
+---
+# The result of the call. True if the transition was successfully triggered.
+bool success

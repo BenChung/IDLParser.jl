@@ -32,6 +32,20 @@ module MultiDir
     end
 end
 
+# Action codegen: a `.action` expands to its three sections plus the implicit
+# SendGoal / GetResult / FeedbackMessage protocol types, which reference
+# unique_identifier_msgs/UUID and builtin_interfaces/Time (supplied alongside).
+module ActionProto
+    using ROSMessages
+    if isdir(joinpath(@__DIR__, "files/ros2_standard/unique_identifier_msgs"))
+        ROSMessages.@ros_msgs(
+            "files/ros2_standard/builtin_interfaces",
+            "files/ros2_standard/unique_identifier_msgs",
+            "files/action_protocol/example_msgs",
+        )
+    end
+end
+
 HAVE_VENDORED && @testset "@ros_msg / @ros_msgs macros" begin
 
 @testset "@ros_msg single file" begin
@@ -71,6 +85,40 @@ end
     buf = IOBuffer(); write(CDRWriter(buf), ps); seekstart(buf)
     back_ps = read(CDRReader(buf), G.PoseStamped)
     @test back_ps == ps
+end
+
+@testset "@ros_msgs .action expands to full protocol" begin
+    A = ActionProto.example_msgs.action
+
+    # The three user sections.
+    @test fieldnames(A.Fibonacci_Goal) == (:order,)
+    @test fieldnames(A.Fibonacci_Result) == (:sequence,)
+    @test fieldnames(A.Fibonacci_Feedback) == (:partial_sequence,)
+
+    # The implicit protocol types rosidl derives.
+    @test fieldnames(A.Fibonacci_SendGoal_Request) == (:goal_id, :goal)
+    @test fieldnames(A.Fibonacci_SendGoal_Response) == (:accepted, :stamp)
+    @test fieldnames(A.Fibonacci_GetResult_Request) == (:goal_id,)
+    @test fieldnames(A.Fibonacci_GetResult_Response) == (:status, :result)
+    @test fieldnames(A.Fibonacci_FeedbackMessage) == (:goal_id, :feedback)
+
+    # Field types: cross-package refs and section refs resolve.
+    UUID = ActionProto.unique_identifier_msgs.msg.UUID
+    Time = ActionProto.builtin_interfaces.msg.Time
+    @test fieldtype(A.Fibonacci_SendGoal_Request, :goal_id) === UUID
+    @test fieldtype(A.Fibonacci_SendGoal_Request, :goal) === A.Fibonacci_Goal
+    @test fieldtype(A.Fibonacci_SendGoal_Response, :accepted) === Bool
+    @test fieldtype(A.Fibonacci_SendGoal_Response, :stamp) === Time
+    @test fieldtype(A.Fibonacci_GetResult_Response, :status) === Int8
+    @test fieldtype(A.Fibonacci_GetResult_Response, :result) === A.Fibonacci_Result
+    @test fieldtype(A.Fibonacci_FeedbackMessage, :feedback) === A.Fibonacci_Feedback
+
+    # The generated protocol structs are CDR-codable end-to-end.
+    req = A.Fibonacci_SendGoal_Request(
+        goal_id = UUID(uuid = ntuple(i -> UInt8(i), 16)),
+        goal = A.Fibonacci_Goal(order = Int32(7)))
+    buf = IOBuffer(); write(CDRWriter(buf), req); seekstart(buf)
+    @test read(CDRReader(buf), A.Fibonacci_SendGoal_Request) == req
 end
 
 @testset "macros register include_dependency for precompile invalidation" begin

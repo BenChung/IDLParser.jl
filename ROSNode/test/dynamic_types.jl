@@ -43,6 +43,13 @@ module _D5Import
 end
 _dt("@ros_import module ready")
 
+# A *stray* copy of a vendored type — what `@ros_msgs` on the vendored sources
+# produces (no aliasing). Used to exercise the single-copy convert guard.
+module _StrayTime
+    using ROSMessages: @ros_msgs
+    @ros_msgs "../vendor/builtin_interfaces"
+end
+
 @testset "D5 dynamic type support" begin
 
     @testset "wire ⇄ internal TypeDescription preserves RIHS01" begin
@@ -136,18 +143,59 @@ _dt("@ros_import module ready")
         end
     end
 
-    @testset "@ros_import: static generation + auto-registration" begin
-        _dt("@ros_import static generation")
+    @testset "@ros_import: canonical types alias to the single Interfaces copy" begin
+        _dt("@ros_import aliasing")
         @test isdefined(_D5Import.type_description_interfaces.msg, :Field)
         @test isdefined(_D5Import.type_description_interfaces.msg, :FieldType)   # transitive
-        # flushed into the ROSNode singleton (no scanning), bound to the compiled type
-        types = [e.type for e in _STATIC_TYPES.entries]
-        @test _D5Import.type_description_interfaces.msg.Field in types
-        # real RIHS01 (identical to the vendored well-known Field / real ROS2)
+        # A vendored (canonical) type is aliased to the one compiled `Interfaces`
+        # struct, not re-generated — one wire type (name + RIHS01) ⇒ one Julia type.
+        @test _D5Import.type_description_interfaces.msg.Field ===
+              ROSNode.Interfaces.type_description_interfaces.msg.Field
+        @test _D5Import.type_description_interfaces.msg.FieldType ===
+              ROSNode.Interfaces.type_description_interfaces.msg.FieldType
+        # carries the real RIHS01 (identical to real ROS2), recorded for the canonical
+        # type (so `type_info_of` recovers it through the alias)
         ti = type_info_of(_D5Import.type_description_interfaces.msg.Field)
         @test ti.name == "type_description_interfaces/msg/Field"
         @test to_rihs_string(ti.hash) ==
               "RIHS01_c0b01379cd4226281285ccaf6be46653968f855f7c5e41614ff5d7a854efef7c"
+    end
+
+    @testset "@ros_import action closure pulls vendored UUID + Time" begin
+        _dt("@ros_import action closure")
+        # An action's generated protocol types (SendGoal/GetResult/FeedbackMessage)
+        # reference unique_identifier_msgs/UUID and builtin_interfaces/Time, so the
+        # import closure must pull them — resolved here from ROSNode's vendored dir
+        # (the action itself comes from a throwaway ament prefix).
+        amroot = mktempdir()
+        actdir = joinpath(amroot, "share", "example_msgs", "action")
+        mkpath(actdir)
+        write(joinpath(actdir, "Fibonacci.action"),
+              "int32 order\n---\nint32[] sequence\n---\nint32[] partial_sequence\n")
+        withenv("AMENT_PREFIX_PATH" => amroot) do
+            specs = ROSNode._resolve_import_closure(["example_msgs/action/Fibonacci"])
+            names = Set("$(s.package)/$(s.qualifier)/$(s.bare)" for s in specs)
+            @test "example_msgs/action/Fibonacci" in names
+            @test "unique_identifier_msgs/msg/UUID" in names
+            @test "builtin_interfaces/msg/Time" in names
+            # the pulled deps resolve to the shipped vendor copies, not ament
+            uuid = only(filter(s -> s.bare == "UUID", specs))
+            @test startswith(uuid.path, ROSNode._VENDOR_DIR)
+        end
+    end
+
+    @testset "single-copy convert guard rejects a stray duplicate" begin
+        _dt("single-copy convert guard")
+        T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+        canon = T(sec = Int32(1), nanosec = UInt32(2))
+        @test convert(T, canon) === canon                       # identity unaffected
+        stray = _StrayTime.builtin_interfaces.msg.Time(sec = Int32(1), nanosec = UInt32(2))
+        @test typeof(stray) !== T                                # genuinely distinct
+        err = try; convert(T, stray); nothing; catch e; e; end
+        @test err isa ArgumentError
+        msg = sprint(showerror, err)
+        @test occursin("builtin_interfaces/msg/Time", msg)
+        @test occursin("as <Alias>", msg)
     end
 
     @testset "flush_type_cache exports the cache" begin

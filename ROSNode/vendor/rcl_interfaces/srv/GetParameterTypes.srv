@@ -1,0 +1,7 @@
+# A list of parameter names to get the types.
+string[] names
+---
+# List of types which is the same length and order as the provided names. The
+# types are defined in ParameterType.msg. If a parameter is not set, the type
+# will be PARAMETER_NOT_SET.
+uint8[] types

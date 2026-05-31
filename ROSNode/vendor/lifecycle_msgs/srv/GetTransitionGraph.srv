@@ -1,0 +1,4 @@
+---
+# A list of all transitions known to the node's state machine, regardless of the
+# current state.
+TransitionDescription[] available_transitions

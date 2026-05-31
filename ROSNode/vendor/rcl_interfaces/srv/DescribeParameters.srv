@@ -1,0 +1,6 @@
+# A list of parameter names to get the descriptors.
+string[] names
+---
+# List of descriptors which is the same length and order as the provided names.
+# If a parameter was not yet set, the descriptor type will have PARAMETER_NOT_SET.
+ParameterDescriptor[] descriptors

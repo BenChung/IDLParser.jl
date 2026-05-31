@@ -1,0 +1,3 @@
+---
+# A list of all states that the node's state machine knows about.
+State[] available_states

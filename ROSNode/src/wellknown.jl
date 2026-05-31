@@ -24,18 +24,24 @@
 
 using ROSMessages: message_il, service_il
 
-# ── the generated wire types (static) ─────────────────────────────────────────
-# Generated at ROSNode precompile time. `@ros_msgs` over the vendored directory
-# emits the nested `type_description_interfaces.{msg,srv}.<Name>` modules and
-# `Base.include_dependency`s each source, so editing a vendored `.msg` invalidates
-# ROSNode's precompile. The generated `import StaticArrays, CDRSerialization`
-# resolve against ROSNode's deps (both are direct).
-module WellKnown
+# ── the canonical generated interface types (static) ──────────────────────────
+# Generated once at ROSNode precompile time: `@ros_msgs` over the *whole* vendored
+# tree emits the nested `<pkg>.{msg,srv,action}.<Name>` modules and
+# `Base.include_dependency`s each source, so editing any vendored interface
+# invalidates ROSNode's precompile. The generated `import StaticArrays,
+# CDRSerialization` resolve against ROSNode's deps (both are direct).
+#
+# `Interfaces` is the *canonical home* for every vendored ROS type: `@ros_import`
+# aliases to `Interfaces.<pkg>.<qual>.<Name>` instead of re-generating a duplicate,
+# so one wire type (name + RIHS01) maps to exactly one Julia struct (see
+# [`canonical_type`](@ref)). The `type_description_interfaces` subtree additionally
+# backs the §11/§13 bootstrap — the wire⇄internal bridge below.
+module Interfaces
     using ROSMessages: @ros_msgs
-    @ros_msgs "../vendor/type_description_interfaces"
+    @ros_msgs "../vendor"
 end
 
-const _TDI = WellKnown.type_description_interfaces
+const _TDI = Interfaces.type_description_interfaces
 
 # The wire structs (distinct from ROSMessages' internal hashing structs of the
 # same conceptual shape — see the module banner).
@@ -216,6 +222,8 @@ const _WELLKNOWN_ENTRIES = Ref{Union{Nothing, Vector{RegistryEntry}}}(nothing)
 const _WELLKNOWN_LOCK = ReentrantLock()
 
 # The memoized well-known entries (computed once per process). Shared, read-only.
+# A view of the §13 bootstrap subset (`type_description_interfaces`); the broader
+# canonical set below is a superset.
 function _wellknown_entries()
     @lock _WELLKNOWN_LOCK begin
         _WELLKNOWN_ENTRIES[] === nothing && (_WELLKNOWN_ENTRIES[] = _build_wellknown_entries())
@@ -223,22 +231,143 @@ function _wellknown_entries()
     end
 end
 
-"""
-    _register_wellknown_types!(ctx) -> ctx
+# ── canonical type index: every vendored type, bound to its compiled `Interfaces`
+# struct — the single-copy home (§11/D5) ──────────────────────────────────────
+# `@ros_import`/`@ros_cache` consult [`canonical_type`](@ref) and *alias* a hit
+# (`const Name = Interfaces.<pkg>.<qual>.<Name>`) instead of re-generating, so a
+# given wire type (name + RIHS01) has exactly one Julia struct process-wide. Built
+# once from the vendored sources: parse → TypeDescription (with the cross-package
+# closure, so referencing types hash exactly) → real RIHS01 → bind to the compiled
+# `Interfaces` struct. Reuses the static-gen machinery (`_static_type_descriptions`,
+# `_package_iface_files`, `_parse_interface`) — defined in staticgen.jl, resolved at
+# call time (this runs at first Context creation, not at include).
+const _CANONICAL_ENTRIES = Ref{Union{Nothing, Vector{RegistryEntry}}}(nothing)
+const _CANONICAL_INDEX   = Ref{Union{Nothing, Dict{Tuple{String, TypeHash}, Type}}}(nothing)
+const _CANONICAL_LOCK    = ReentrantLock()
 
-Register the bootstrap `type_description_interfaces` types into `ctx`'s registry
-(§11 S1) so the §13 `~/get_type_description` server can answer for them and the
-client can resolve them. Best-effort: a failure is logged, never fatal (the
-generated types are already compiled and usable directly).
+function _build_canonical_entries()
+    specs = Tuple{String, Any}[]
+    for pkg in sort!(readdir(_VENDOR_DIR))
+        isdir(joinpath(_VENDOR_DIR, pkg)) || continue
+        for (qual, bare, path) in _package_iface_files(pkg)
+            specs = push!(specs, (pkg, _parse_interface(path, qual, bare)))
+        end
+    end
+    entries = RegistryEntry[]
+    for (pkg, qual, bare, tdmsg) in _static_type_descriptions(specs)
+        qn = "$pkg/$qual/$bare"
+        hash = type_hash_from_rihs_string(calculate_rihs01_hash(tdmsg))
+        hash === nothing && continue
+        T = _fetch_generated_type(Interfaces, qn)
+        T isa Type || continue
+        e = RegistryEntry(TypeInfo(qn, hash), lift(tdmsg); td = tdmsg, provenance = :static)
+        e.mod = parentmodule(T)
+        e.type = T
+        _record_type_entry!(e)                  # type_info_of(T) → the real hash
+        push!(entries, e)
+    end
+    return entries
+end
+
+# Memoized canonical entries + the (name, hash) → compiled type index. Shared.
+function _canonical_entries()
+    @lock _CANONICAL_LOCK begin
+        if _CANONICAL_ENTRIES[] === nothing
+            es = _build_canonical_entries()
+            _CANONICAL_ENTRIES[] = es
+            _CANONICAL_INDEX[] = Dict{Tuple{String, TypeHash}, Type}(
+                (e.info.name, e.info.hash) => e.type::Type for e in es)
+        end
+        return _CANONICAL_ENTRIES[]::Vector{RegistryEntry}
+    end
+end
+
 """
-function _register_wellknown_types!(ctx)
+    canonical_type(name, hash) -> Union{Type, Nothing}
+
+The single compiled `Interfaces` struct for a vendored wire type `(name, RIHS01)`,
+or `nothing` if that exact `(name, hash)` isn't vendored. `@ros_import`/`@ros_cache`
+alias to it instead of generating a duplicate, so one wire type ⇒ one Julia struct.
+"""
+function canonical_type(name::AbstractString, hash::TypeHash)
+    _canonical_entries()                        # ensure built
+    return get(_CANONICAL_INDEX[]::Dict{Tuple{String, TypeHash}, Type},
+               (String(name), hash), nothing)
+end
+
+"""
+    _register_canonical_types!(ctx) -> ctx
+
+Register every canonical vendored type (the §11/§13 `type_description_interfaces`
+bootstrap among them) into `ctx`'s registry, binding each to its compiled
+`Interfaces` struct + real RIHS01 — so the §13 `~/get_type_description` server can
+answer for them and keyexpr-only resolution uses them directly. Best-effort: a
+failure is logged, never fatal (the generated types are compiled and usable).
+"""
+function _register_canonical_types!(ctx)
     try
         reg = registry(ctx)
-        for e in _wellknown_entries()
+        for e in _canonical_entries()
             register_type!(reg, e.info, e)
         end
     catch err
-        @error "typesupport: registering well-known bootstrap types failed" exception=(err, catch_backtrace())
+        @error "typesupport: registering canonical vendored types failed" exception=(err, catch_backtrace())
     end
     return ctx
+end
+
+# ── single-copy guard: a nice error for the residual duplicate case (§11/D5) ──
+# Aliasing (`@ros_import`) collapses vendored types to one `Interfaces` copy, but a
+# *stray* copy can still arise — e.g. `@ros_msgs` run directly on the vendored
+# sources, which doesn't alias. Passing such a stray where a canonical type is
+# expected would otherwise fail with a cryptic `convert` MethodError. We install a
+# `Base.convert` method on each canonical `Interfaces` struct (we own them — not
+# piracy) that fires only for a non-matching value (Base's identity
+# `convert(::Type{T}, ::T)` is more specific) and explains the fix. Installed at
+# ROSNode precompile so the methods belong to ROSNode, never a downstream package.
+function _canonical_convert_guard(::Type{T}, @nospecialize(x)) where {T}
+    name  = type_info_of(T).name
+    sx    = typeof(x)
+    sname = try; type_info_of(sx).name; catch; ""; end
+    if sname == name
+        throw(ArgumentError(
+            "two distinct Julia structs for ROS type `$name`: expected `$T` (from " *
+            "$(parentmodule(T))), got `$sx` (from $(parentmodule(sx))). They share the ROS " *
+            "name but are not the same Julia type — `@ros_import` aliases vendored types to " *
+            "the single `ROSNode.Interfaces` copy, so import both through it (don't `@ros_msgs` " *
+            "the vendored sources directly), or `@ros_import \"$name\" as <Alias>` if these are " *
+            "genuinely different versions."))
+    end
+    throw(ArgumentError("cannot convert a value of type `$sx` to ROS type `$name` (`$T`)"))
+end
+
+# Every concrete struct generated under `Interfaces` (skips the `*_Constants` and
+# qualifier submodules; structs only).
+function _interface_struct_types()
+    out = Type[]
+    for pn in names(Interfaces; all = true)
+        (pn === :Interfaces || !isdefined(Interfaces, pn)) && continue
+        pkg = getfield(Interfaces, pn)
+        pkg isa Module || continue
+        for qn in names(pkg; all = true)
+            (!isdefined(pkg, qn)) && continue
+            qual = getfield(pkg, qn)
+            qual isa Module || continue
+            for tn in names(qual; all = true)
+                isdefined(qual, tn) || continue
+                T = getfield(qual, tn)
+                (T isa Type && isstructtype(T)) && push!(out, T)
+            end
+        end
+    end
+    return out
+end
+
+# Install the guards at include (precompile) time. The explicit identity method is
+# fully concrete on both arguments, so it unambiguously beats both our `::Any` guard
+# and Base's parametric `convert(::Type{T}, x::T)` for a same-type value; the guard
+# then only sees a mismatched value.
+for _T in _interface_struct_types()
+    @eval Base.convert(::Type{$_T}, x::$_T) = x
+    @eval Base.convert(::Type{$_T}, x) = _canonical_convert_guard($_T, x)
 end

@@ -16,7 +16,12 @@ function _parse_one(path::AbstractString)
     elseif kind == "srv"
         parse_srv(src; name=name, package=pkg)
     else
-        parse_action(src; name=name, package=pkg)
+        # An action generates its three sections plus the implicit SendGoal /
+        # GetResult / FeedbackMessage protocol types rosidl derives — both land
+        # in the same `<pkg>::action` module (the generator merges them).
+        decls = parse_action(src; name=name, package=pkg)
+        append!(decls, action_protocol_decls(name; package=pkg))
+        decls
     end
 end
 

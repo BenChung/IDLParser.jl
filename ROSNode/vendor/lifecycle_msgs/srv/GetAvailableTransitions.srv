@@ -1,0 +1,3 @@
+---
+# A list of the transitions that are available given the current state.
+TransitionDescription[] available_transitions

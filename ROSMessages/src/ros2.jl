@@ -466,6 +466,51 @@ Parse a ROS2 `.action` source into goal, result, and feedback struct decls.
 parse_action(source::AbstractString; name::AbstractString, package::AbstractString="") =
     lower(action_il(source; name=name); package=package)
 
+# The implicit interface types rosidl derives from every `.action` — the wire
+# types an action client and server actually exchange, on top of the user's
+# Goal/Result/Feedback. Each goal carries a `unique_identifier_msgs/UUID`; the
+# accept reply stamps a `builtin_interfaces/Time`. Field names match
+# rosidl_adapter so the generated structs (and their RIHS01) are wire-compatible.
+function _action_protocol_messages(name::AbstractString)
+    uuid    = IL.RType(IL.RBase.RRef("unique_identifier_msgs", "UUID"), IL.ArraySpec.AScalar())
+    time    = IL.RType(IL.RBase.RRef("builtin_interfaces", "Time"), IL.ArraySpec.AScalar())
+    boolean = IL.RType(IL.RBase.RBool(), IL.ArraySpec.AScalar())
+    int8    = IL.RType(IL.RBase.RInt(8), IL.ArraySpec.AScalar())
+    # A same-package (relative) ref to one of the three sections.
+    section(sec) = IL.RType(IL.RBase.RRef(nothing, string(name, sec)), IL.ArraySpec.AScalar())
+    fld(t, n) = IL.RField(t, n, nothing)
+    msg(suffix, fields) = IL.RMessage(Symbol(name, suffix), IL.RConstant[], fields)
+    return IL.RMessage[
+        msg("_SendGoal_Request",   [fld(uuid, :goal_id), fld(section("_Goal"), :goal)]),
+        msg("_SendGoal_Response",  [fld(boolean, :accepted), fld(time, :stamp)]),
+        msg("_GetResult_Request",  [fld(uuid, :goal_id)]),
+        msg("_GetResult_Response", [fld(int8, :status), fld(section("_Result"), :result)]),
+        msg("_FeedbackMessage",    [fld(uuid, :goal_id), fld(section("_Feedback"), :feedback)]),
+    ]
+end
+
+"""
+    action_protocol_decls(name; package="") -> Vector
+
+The IDL decls for the implicit action-protocol types rosidl derives from a
+`<name>.action`: `<name>_SendGoal_{Request,Response}`,
+`<name>_GetResult_{Request,Response}`, and `<name>_FeedbackMessage`. These are
+emitted alongside the goal/result/feedback sections (e.g. by `@ros_msgs`) so a
+generated action is usable end-to-end. They reference `unique_identifier_msgs/
+UUID` and `builtin_interfaces/Time`, which must be in the same generation set.
+
+Kept separate from [`parse_action`](@ref) — which is the faithful text↔IDL
+projection of the three `.action` sections — because these are codegen
+artifacts, not part of the source text.
+"""
+function action_protocol_decls(name::AbstractString; package::AbstractString="")
+    inner = Any[]
+    for m in _action_protocol_messages(name)
+        append!(inner, _lower_message_decls(m))
+    end
+    return _wrap_package(inner, package, :action)
+end
+
 """
     parse_file(path; package="")
 

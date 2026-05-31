@@ -118,8 +118,16 @@ function referenced_refs(fields::Vector{RField})
 end
 referenced_refs(m::RMessage) = referenced_refs(m.fields)
 referenced_refs(s::RService) = vcat(referenced_refs(s.request), referenced_refs(s.response))
+# Beyond the three sections' own field refs, an action's implicit protocol types
+# (SendGoal/GetResult/FeedbackMessage — see `action_protocol_decls`) reference
+# `unique_identifier_msgs/UUID` (every goal id) and `builtin_interfaces/Time` (the
+# accept stamp). Reporting them keeps a consumer's generation closure (e.g.
+# `@ros_import`) closed when it emits those protocol types. The protocol types'
+# refs to the same-package sections are intrinsic to the action, not external.
 referenced_refs(a::RAction)  =
-    vcat(referenced_refs(a.goal), referenced_refs(a.result), referenced_refs(a.feedback))
+    vcat(referenced_refs(a.goal), referenced_refs(a.result), referenced_refs(a.feedback),
+         Tuple{Union{Nothing, String}, String}[
+             ("unique_identifier_msgs", "UUID"), ("builtin_interfaces", "Time")])
 
 # ---- Unparsing IL → ROS interface text -------------------------------------
 

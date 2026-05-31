@@ -254,7 +254,7 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
     # @ros_import/@ros_cache statically-generated types (so keyexpr-only resolution
     # uses the precompiled type directly). Forward references into typesupport/
     # wellknown (included after this file).
-    _register_wellknown_types!(ctx)
+    _register_canonical_types!(ctx)
     _register_static_types!(ctx)
 
     _start_discovery!(ctx)

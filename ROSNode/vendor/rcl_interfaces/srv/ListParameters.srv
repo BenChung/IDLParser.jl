@@ -1,0 +1,12 @@
+# Used to set the depth parameter to list all parameters recursively.
+uint64 DEPTH_RECURSIVE=0
+
+# The list of parameter prefixes to query.
+string[] prefixes
+
+# The depth at which to stop listing parameters. Use DEPTH_RECURSIVE (0) to
+# list parameters at any depth.
+uint64 depth
+---
+# Lists the parameter names and their prefixes.
+ListParametersResult result
