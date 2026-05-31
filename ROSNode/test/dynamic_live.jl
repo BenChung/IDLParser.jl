@@ -37,37 +37,54 @@ function _recv(ch::Channel, secs::Real)
     end === :ok ? ref[] : nothing
 end
 
+# Flushed progress marker: the live tests can wedge on a blocking native call, so
+# each step announces itself (and flushes) before it might block — a hung run then
+# names the exact step it stuck on instead of going dark.
+_step(msg::AbstractString) = (@info "  · $msg"; flush(stdout); flush(stderr))
+
 @testset "D5 live (Zenoh session)" begin
 
     # S2/S3 — the GetTypeDescription wire round-trip (this IS the wire-discovery
     # mechanism: a client builds the request, the §13 server answers from the
     # registry, hashes round-trip).
     @testset "S2/S3 — GetTypeDescription round-trip" begin
+        _step("S2/S3: opening context")
         _rctx() do ctx
+            _step("S2/S3: creating talker node (serves ~/get_type_description)")
             node = Node(ctx, "talker")               # auto-serves ~/get_type_description
+            _step("S2/S3: creating service client")
             client = ServiceClient(node, "/talker/get_type_description", GetTypeDescription_Request)
             sleep(0.3)
+            _step("S2/S3: call #1 (TypeDescription, ≤4s)")
             resp = get_type_description(client,
                        "type_description_interfaces/msg/TypeDescription"; timeout_ms=4000)
+            _step("S2/S3: call #1 returned")
             @test resp.successful
             @test resp.type_description.type_description.type_name ==
                   "type_description_interfaces/msg/TypeDescription"
             @test length(resp.type_description.referenced_type_descriptions) == 3
+            _step("S2/S3: call #2 (not-found, ≤4s)")
             @test !get_type_description(client, "nope/msg/Nope"; timeout_ms=4000).successful
+            _step("S2/S3: closing client")
             close(client)
+            _step("S2/S3: client closed — do-block returning, context drain next")
         end
+        _step("S2/S3: context drained, testset done")
     end
 
     # S5 — the keyexpr-only subscription receives a real typed message (registry-hit
     # resolution; the published well-known type is already registered).
     @testset "S5 — keyexpr-only subscription" begin
+        _step("S5: open context + node + dynamic subscription")
         _rctx() do ctx
             node = Node(ctx, "n")
             got = Channel{Any}(8)
             sub = Subscription(node, "/kv") do msg; put!(got, msg); end
             @test sub isa DynamicSubscriptionHandle
+            _step("S5: dynamic subscription created; opening publisher")
             pub = Publisher(node, "/kv", WireKeyValue)
             sleep(0.4)
+            _step("S5: publish + await dynamic dispatch")
             publish(pub, WireKeyValue(key="hello", value="d5"))
             msg = _recv(got, 5.0)
             @test msg isa WireKeyValue && msg !== nothing && msg.key == "hello"
@@ -108,9 +125,11 @@ end
             println("READY"); flush(stdout)
             while true; sleep(1); end
         """
+        _step("xctx: launching server subprocess")
         proc = run(pipeline(`$(Base.julia_cmd()) --startup-file=no --project=$proj -e $server`,
                             stdout = srclog, stderr = srclog), wait = false)
         try
+            _step("xctx: waiting for server READY (≤60s)")
             ready = timedwait(60.0; pollint = 0.25) do
                 process_exited(proc) || (isfile(srclog) && occursin("READY", read(srclog, String)))
             end
@@ -121,6 +140,7 @@ end
                 _rctx() do ctx
                     nodeB = Node(ctx, "client")
                     sleep(0.5)
+                    _step("xctx: fetch_type_description from /server (≤5s)")
                     entry = fetch_type_description(nodeB, "/server", "d5_demo/msg/Ping", hash; timeout_ms = 5000)
                     if entry === nothing
                         @info "skipping cross-context: query did not round-trip in this env"
@@ -133,7 +153,12 @@ end
                 end
             end
         finally
-            kill(proc); (try; wait(proc); catch; end)
+            # SIGKILL + reap: the server may be wedged in a libzenohc call that
+            # ignores SIGTERM, and an unreaped child lingers as a zombie. Force-kill
+            # then `wait` so no defunct process is left. (This is a test-spawned
+            # subprocess, not a user session — killing it is correct.)
+            try; process_running(proc) && kill(proc, Base.SIGKILL); catch; end
+            try; wait(proc); catch; end
         end
     end
 end

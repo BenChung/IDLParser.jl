@@ -33,8 +33,7 @@ using ROSZenoh: ROSZenoh, TypeInfo, TypeHash, to_rihs_string,
 export TypeRegistry, RegistryEntry, register_type!, lookup_type,
        resolve_type, export_typesupport,
        ament_prefix_paths, discover_ament_packages, load_ament_type,
-       enable_project_cache!, disable_project_cache!, absorb_static_types!,
-       warm_codegen!
+       enable_project_cache!, disable_project_cache!, absorb_static_types!
 
 # ── registry entry shape (§11) ────────────────────────────────────────────
 # The value stored in the Context's `(name, hash)`-keyed table. Holds the IL (the
@@ -205,39 +204,6 @@ function realize!(entry::RegistryEntry)
         @error "typesupport: codegen/eval failed for $(entry.info.name)" exception=(err, catch_backtrace())
     end
     return entry
-end
-
-# ── codegen warm-up (D8-aligned; guards the dynamic-discovery GC stall) ───────
-# The first runtime codegen in a process (`lower → generate_code → eval`) JITs the
-# whole generation pipeline and allocates heavily. If that first codegen runs
-# *concurrently with heavy Zenoh I/O* (a busy libzenohc thread that has entered
-# Julia), its allocation can stall on GC waiting for that thread to reach a
-# safepoint — a hang. So we warm the pipeline ONCE while idle (at keyexpr-only
-# subscription creation, before data flows): the JIT is paid up front, and each
-# per-sample `realize!` during live traffic is then fast and light, opening no GC
-# window to stall on. Idempotent + best-effort.
-const _CODEGEN_WARMED = Ref(false)
-const _WARM_LOCK = ReentrantLock()
-
-"""
-    warm_codegen!() -> nothing
-
-Pre-JIT the runtime type-generation pipeline (once per process) while idle, so a
-later [`realize!`](@ref) during live Zenoh traffic is fast and can't stall on GC
-against a busy transport thread. Called automatically when a keyexpr-only
-`Subscription` is created; safe to call eagerly. Idempotent.
-"""
-function warm_codegen!()
-    @lock _WARM_LOCK begin
-        _CODEGEN_WARMED[] && return nothing
-        _CODEGEN_WARMED[] = true
-    end
-    try
-        _eval_module(message_il("uint8 _b\nstring _s\n"; name="_Warm"), "_ros_warmup")
-    catch err
-        @debug "typesupport: codegen warm-up failed" exception=(err, catch_backtrace())
-    end
-    return nothing
 end
 
 # ── dynamic acquisition: TypeDescription → registry entry (§11) ─────────────

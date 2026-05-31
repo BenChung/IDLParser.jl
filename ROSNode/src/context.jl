@@ -11,7 +11,8 @@
 # injection into the graph (§6/§12) — the index ingests liveliness today and
 # exposes the injection seam for the entity layer to call.
 
-using Zenoh: Zenoh, Config, Session, Keyexpr, zid, to_le_bytes, LivelinessSubscriber
+using Zenoh: Zenoh, Config, Session, Keyexpr, zid, to_le_bytes, LivelinessSubscriber,
+             LivelinessSubscriberHandler
 import Zenoh
 using ROSZenoh: ROSZenoh, ZenohId, RmwZenoh, KeyExprFormat, NodeEntity,
                 EndpointEntity, EndpointKind, parse_liveliness
@@ -166,9 +167,10 @@ mutable struct Context
     @atomic _next_id::Int                # atomic entity-id allocator (§5)
     const registry::TypeRegistry
     const graph::GraphIndex
-    # The `@ros2_lv/**` liveliness subscriber (callback form) feeding `graph`.
-    # `Any` because Zenoh's `LivelinessSubscriber` isn't in scope as a field type
-    # constraint here and `close` is duck-typed.
+    # The `@ros2_lv/**` liveliness subscriber (channel form) feeding `graph`, drained
+    # by a Julia consumer task (so no foreign thread runs Julia — see `_start_discovery!`).
+    # `Any` because Zenoh's handler type isn't in scope as a field constraint here and
+    # `close` is duck-typed.
     _lv_sub::Any
     # Clock handles by source — `clock(ctx, C())` returns/creates one. The §7
     # `Clock` is duck-typed against `node.clocks`; the Context fills that role.
@@ -394,9 +396,17 @@ function _apply_remap(node, resolved::AbstractString, ::Symbol)
 end
 
 # ── discovery: the @ros2_lv/** liveliness subscriber (§12) ─────────────────
-# One callback-form subscriber per Context. Each token PUT/DELETE updates the
-# index and fans a `GraphChange` to listeners. Parse failures are logged and
-# skipped — a malformed/foreign token must not kill the discovery task.
+# One channel-form subscriber per Context, drained by a Julia consumer task. Each
+# token PUT/DELETE updates the index and fans a `GraphChange` to listeners. Parse
+# failures are logged and skipped — a malformed/foreign token must not kill the task.
+#
+# Channel (FIFO) form, NOT callback — this is load-bearing for deadlock-freedom. The
+# callback form runs `_ingest_liveliness!` on a foreign libzenohc thread; a stop-the-
+# world GC anywhere else in the process (e.g. the first service round-trip's first-
+# call JIT — acute when a process queries *itself*, both serving and calling) must
+# then halt that foreign thread, but it can be mid-Julia-callback and unable to reach
+# a safepoint → deadlock. Draining a FIFO on a Julia-managed (GC-safe) consumer task
+# keeps ALL Julia execution off foreign threads, so a GC can always complete (§12/D8).
 
 # The wildcard liveliness keyexpr. rmw_zenoh tokens live under `@ros2_lv/**`;
 # ros2dds under `@/<zid>/@ros2_lv/**`, so `**/@ros2_lv/**` covers both.
@@ -405,16 +415,30 @@ _lv_wildcard(::KeyExprFormat) = "**/@ros2_lv/**"
 
 function _start_discovery!(ctx::Context)
     ke = Keyexpr(_lv_wildcard(ctx.format))
-    # Liveliness (not data-plane) subscriber, callback form: latest-wins is fine —
-    # each token PUT/DELETE is a discrete event we apply immediately, no backlog
-    # buffer needed. `history=true` replays the live token set so a late-joining
-    # Context sees the existing graph (§12 eventual consistency).
-    ctx._lv_sub = LivelinessSubscriber(ctx.session, ke; history=true) do sample
+    # `history=true` replays the live token set so a late-joining Context sees the
+    # existing graph (§12 eventual consistency). Capacity is generous: a discovery
+    # burst (many tokens at once) buffers rather than drops, and the consumer drains
+    # it fast (a locked index update per token, no user handler).
+    sub = LivelinessSubscriberHandler(ctx.session, ke; channel=:fifo,
+                                      capacity=1024, history=true)
+    ctx._lv_sub = sub
+    # Plain `@spawn` (migratable): the index update is lock-guarded, needs no thread
+    # affinity, and runs on any thread under `-t>=2`. Closing the handler (drain/§14)
+    # disconnects the channel → the `for` loop ends → the task exits.
+    Threads.@spawn begin
         try
-            _ingest_liveliness!(ctx, sample)
+            for sample in sub
+                try
+                    _ingest_liveliness!(ctx, sample)
+                catch err
+                    err isa ShutdownException && return
+                    @error "discovery: liveliness sample handling failed" exception=(err, catch_backtrace())
+                end
+            end
         catch err
             err isa ShutdownException && return
-            @error "discovery: liveliness sample handling failed" exception=(err, catch_backtrace())
+            isopen(ctx) &&
+                @error "discovery: liveliness consumer task failed" exception=(err, catch_backtrace())
         end
     end
     return ctx

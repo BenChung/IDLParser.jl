@@ -86,8 +86,10 @@ make_cell(rec::Recorder) =
     @testset "settle_handler!: arbitrary throw ⇒ aborted (fail-safe)" begin
         rec = Recorder()
         cell = make_cell(rec)
-        out = settle_handler!(cell, () -> error("boom");
-                              success_status=succeeded, default_result=() -> -2)
+        # The fail-safe path logs the swallowed handler error (with a backtrace) by
+        # design; capture it so the expected error isn't leaked to stderr.
+        out = @test_logs (:error, r"handler failed") match_mode=:any settle_handler!(
+            cell, () -> error("boom"); success_status=succeeded, default_result=() -> -2)
         @test out === aborted
         @test rec.calls == [(aborted, -2)]
     end
@@ -105,9 +107,11 @@ make_cell(rec::Recorder) =
         rec = Recorder()
         cell = make_cell(rec)
         # default_result itself throws → catch-path fill fails → finally force_abort!
-        out = settle_handler!(cell, () -> error("boom");
-                              success_status=succeeded,
-                              default_result=() -> error("no default"))
+        # Both the handler error and the failed default are logged by design; capture
+        # them (match_mode=:any) so the expected errors don't leak to stderr.
+        out = @test_logs (:error, r"handler failed") match_mode=:any settle_handler!(
+            cell, () -> error("boom"); success_status=succeeded,
+            default_result=() -> error("no default"))
         @test out === aborted
         @test isfilled(cell)
         @test rec.calls == [(aborted, nothing)]      # nothing payload ⇒ zero-filled bytes

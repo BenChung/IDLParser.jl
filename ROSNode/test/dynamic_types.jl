@@ -30,15 +30,23 @@ function _cdr_roundtrip(msg, ::Type{T}) where {T}
     return decode(mem, T; view = false)
 end
 
+# Flushed progress marker — these tests run runtime codegen (`@ros_import`, eval'd
+# type generation), which is slow on first JIT; the banner shows which step is live.
+_dt(msg::AbstractString) = (@info "  · dynamic_types: $msg"; flush(stdout); flush(stderr))
+
 # A module exercising @ros_import (vendored, name-resolved, with transitive closure).
+# This generates code at module-definition time (first-JIT heavy) — announce it.
+_dt("expanding @ros_import module (codegen)")
 module _D5Import
     using ROSNode
     @ros_import "type_description_interfaces/msg/Field"   # → pulls FieldType transitively
 end
+_dt("@ros_import module ready")
 
 @testset "D5 dynamic type support" begin
 
     @testset "wire ⇄ internal TypeDescription preserves RIHS01" begin
+        _dt("wire ⇄ internal RIHS01")
         # leaf (no refs)
         kv = _internal_td("string key\nstring value\n", "KeyValue", "type_description_interfaces")
         @test calculate_rihs01_hash(from_wire_td(to_wire_td(kv))) == calculate_rihs01_hash(kv)
@@ -57,6 +65,7 @@ end
     end
 
     @testset "well-known bootstrap entries (hashes match real ROS2)" begin
+        _dt("well-known bootstrap entries")
         es = Dict(e.info.name => e for e in _wellknown_entries())
         @test length(es) == 8
         # closures are the canonical sorted referenced sets
@@ -73,6 +82,7 @@ end
     end
 
     @testset "GetTypeDescription request/response CDR marshal" begin
+        _dt("GetTypeDescription CDR marshal")
         req = GetTypeDescription_Request(type_name = "std_msgs/msg/String",
                                          type_hash = "RIHS01_" * repeat("ab", 32),
                                          include_type_sources = false)
@@ -98,6 +108,7 @@ end
     end
 
     @testset "content-addressed cache is opt-in + self-validating" begin
+        _dt("content-addressed cache opt-in")
         td = _internal_td("string data\n", "String", "std_msgs")
         hash = type_hash_from_rihs_string(calculate_rihs01_hash(td))
         info = TypeInfo("std_msgs/msg/String", hash)
@@ -126,6 +137,7 @@ end
     end
 
     @testset "@ros_import: static generation + auto-registration" begin
+        _dt("@ros_import static generation")
         @test isdefined(_D5Import.type_description_interfaces.msg, :Field)
         @test isdefined(_D5Import.type_description_interfaces.msg, :FieldType)   # transitive
         # flushed into the ROSNode singleton (no scanning), bound to the compiled type
@@ -139,6 +151,7 @@ end
     end
 
     @testset "flush_type_cache exports the cache" begin
+        _dt("flush_type_cache export")
         tmp = mktempdir()
         td = _internal_td("string data\n", "String", "std_msgs")
         hash = type_hash_from_rihs_string(calculate_rihs01_hash(td))

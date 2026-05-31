@@ -206,11 +206,12 @@ function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     qos::QosProfile=default_qos(),
                                     concurrency::Concurrency=Serial())
     _warn_transient_local(qos, "subscription")
-    # Warm the runtime-codegen JIT now, while idle — so the per-sample `realize!`
-    # of a discovered type later (during live traffic) is fast and can't stall on GC
-    # against a busy transport thread (§11/D8). Idempotent; one-time on the first
-    # keyexpr-only subscription.
-    warm_codegen!()
+    # NB: no codegen on this (the caller's) task. Per-sample `realize!` runs on the
+    # dispatch *worker* (node.jl), off the recv thread and while the receiver drains
+    # the FIFO GC-safe, so the codegen's GC always completes. Running `Core.eval`
+    # codegen here instead — while the node already has live Zenoh sessions (its own
+    # `get_type_description` queryable, liveliness traffic) — is the JIT-racing-Zenoh
+    # GC stall the worker design exists to avoid (§11/D8).
     name = resolve_name(node, topic)
     # No type identity: liveliness advertises the empty-type placeholder and the
     # data route wildcards type+hash (the type rides each sample's keyexpr, §11).
