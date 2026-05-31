@@ -1,6 +1,7 @@
 import IDLParser.ConstResolution as CR
 import IDLParser.Parse as Parse
 import StaticArrays
+import CDRSerialization
 using OrderedCollections
 using Moshi.Match: @match
 
@@ -372,8 +373,12 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
 
     if all_fixed
         structdef = Expr(:struct, false, name, Expr(:block, field_decls...))
+        # Splice the `CDRSerialization` module object directly (rather than the
+        # bare symbol) so the macrocall resolves at any eval site without the
+        # caller importing it — same approach as `GlobalRef(StaticArrays, …)`
+        # for `SArray`. The generated code carries no external `import`.
         cdr_fixed = Expr(:macrocall,
-            Expr(:., :CDRSerialization, QuoteNode(Symbol("@cdr_fixed"))),
+            Expr(:., CDRSerialization, QuoteNode(Symbol("@cdr_fixed"))),
             LineNumberNode(@__LINE__, Symbol(@__FILE__)),
             structdef)
         # Keyword constructor preserving the old `@kwdef` ergonomics: convert
@@ -394,11 +399,11 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
         # explanation rather than silently losing the zero-copy path.
         if tier === :compact
             push!(body, quote
-                @assert CDRSerialization.iscompact($name) string(
+                @assert $(GlobalRef(CDRSerialization, :iscompact))($name) string(
                     "layout: message `", $(string(name)),
                     "` is required to be compact (in-memory layout identical to the CDR1 ",
                     "wire — single load / zero-copy) but is not — ",
-                    CDRSerialization.cdr_layout($name).why)
+                    $(GlobalRef(CDRSerialization, :cdr_layout))($name).why)
             end)
         end
         return Expr(:block, body...)
@@ -541,7 +546,8 @@ end
 # from `msg`.
 function build_modules(name, mod_dict; depth::Int=1,
                        enclosing::Union{Symbol, Nothing}=nothing,
-                       siblings::Dict{Symbol, Vector{Symbol}}=Dict{Symbol, Vector{Symbol}}())
+                       siblings::Dict{Symbol, Vector{Symbol}}=Dict{Symbol, Vector{Symbol}}(),
+                       emit_imports::Bool=false)
     # First call's `name` is the package; carry it as the enclosing context
     # for every recursive call so refs resolve consistently.
     enclosing_pkg = enclosing === nothing ? name : enclosing
@@ -565,7 +571,14 @@ function build_modules(name, mod_dict; depth::Int=1,
     end
 
     body = Any[]
-    push!(body, :(import StaticArrays, CDRSerialization))
+    # By default no `import StaticArrays, CDRSerialization`: every reference to
+    # those modules is spliced in as a module object / `GlobalRef` at generation
+    # time (see `resolve_declarator` and `_render_struct`), so eval'd code resolves
+    # them regardless of the eval site's imports — a consumer of the generated
+    # types needs neither as a direct dependency. `emit_imports=true` restores the
+    # per-module import for the *textual* export (`:julia`), where pretty-printing
+    # degrades the spliced module objects back to bare names that must be in scope.
+    emit_imports && push!(body, :(import StaticArrays, CDRSerialization))
     for pkg in sort!(collect(cross_pkgs))
         push!(body, _dotted_import(depth + 1, pkg))
     end
@@ -599,7 +612,7 @@ function build_modules(name, mod_dict; depth::Int=1,
             Dict{Symbol, Vector{Symbol}}()
         push!(body, build_modules(sub_name, sub_dict;
                                   depth=depth+1, enclosing=enclosing_pkg,
-                                  siblings=child_siblings))
+                                  siblings=child_siblings, emit_imports=emit_imports))
         push!(seen_subs, sub_name)
     end
 
@@ -611,7 +624,8 @@ function build_modules(name, mod_dict; depth::Int=1,
 end
 
 function generate_code(definitions::Vector{<:CR.CanAnnotate{CR.Decl}};
-                       require::AbstractDict = Dict{String, Symbol}())
+                       require::AbstractDict = Dict{String, Symbol}(),
+                       emit_imports::Bool=false)
     registry = _build_registry(definitions)
     lc = LayoutCtx(_normalize_require(require), Symbol[], nothing)
     generated_modules = LittleDict{Symbol, Any}()
@@ -647,7 +661,7 @@ function generate_code(definitions::Vector{<:CR.CanAnnotate{CR.Decl}};
     out = Any[]
     by_name = Dict(name => d for (name, d) in top_modules)
     for name in sorted_order
-        push!(out, build_modules(name, by_name[name]; depth=1))
+        push!(out, build_modules(name, by_name[name]; depth=1, emit_imports=emit_imports))
     end
     flat_same_mod = Dict{Symbol, Vector{Symbol}}(
         name => first(_classify_refs(entry.refs, nothing))
