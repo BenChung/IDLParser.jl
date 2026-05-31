@@ -21,7 +21,8 @@ using Logging: AbstractLogger, LogLevel
 # `TypeInfo` is in scope (core.jl re-exports it); the RIHS-string parser is not.
 using ROSZenoh: TypeInfo, type_hash_from_rihs_string
 
-export RosoutLogger, with_rosout, Fatal, get_type_description, fetch_type_description,
+export RosoutLogger, with_rosout, Fatal, logger, set_logger_level!,
+       bridge_zenoh_logs!, get_type_description, fetch_type_description,
        resolve_or_discover, wire_get_type_description!, describe_type
 
 # ── ~/get_type_description: the registry-served type description (§11/§13) ─────
@@ -309,18 +310,24 @@ function wire_get_type_description!(node)
     end
 end
 
-# ── /rosout: the Julia-logging → rcl_interfaces/msg/Log bridge (§13) ──────────
-# rmw_zenoh mirrors a node's log output onto the `/rosout` topic as
-# `rcl_interfaces/msg/Log`. We bridge Julia's logging stack: `RosoutLogger` is an
-# `AbstractLogger` that *tees* — it forwards every record to a parent logger (so
-# the console/file output a Julia program expects is unchanged) and *also* emits a
-# `Log` message on a node-owned `/rosout` publisher. `with_rosout(node) do … end`
-# installs it for a scope via `Logging.with_logger`.
+# ── /rosout: the Julia-logging → rcl_interfaces/msg/Log bridge (§13, D7) ──────
+# D7: Julia's `@info`/`@warn`/`@error`/`@logmsg` *are* the ROS logging API — no
+# `RCLCPP_INFO`-style macros. `RosoutLogger <: AbstractLogger` is node-scoped and,
+# per record, (a) writes the ROS console line `[LEVEL] [stamp] [name]: msg` to
+# stderr, (b) publishes an `rcl_interfaces/msg/Log` on the node's shared `/rosout`
+# publisher, and (c) optionally forwards to a `parent` logger (a file/Julia console
+# sink), if one was supplied. The dispatcher wraps every handler in the node logger
+# (`_with_node_logger`, called from node.jl/service.jl/action.jl), so a plain `@info`
+# inside any handler routes to that node's `/rosout` with no user effort.
+#
+# Logger name = node FQN; `logger(node, "child")` gives a `.`-separated child. Per-
+# logger min levels live in a node-local table (`set_logger_level!`); `--ros-args
+# --log-level` will populate it once ros-args parsing lands (§5 TODO). `maxlog` is
+# enforced here (it's the logger's responsibility, not the frontend's).
 #
 # The level mapping follows ROS2's `rcl_interfaces/msg/Log` constants (DEBUG=10,
-# INFO=20, WARN=30, ERROR=40, FATAL=50), which mirror Python's logging levels.
-# Julia has no FATAL, so we add one (`Fatal`, above `Error`) and map `@logmsg
-# Fatal …` to ROS2 FATAL.
+# INFO=20, WARN=30, ERROR=40, FATAL=50). Julia has no FATAL, so we add one (`Fatal`,
+# above `Error`) and map `@logmsg Fatal …` to ROS2 FATAL.
 
 const LogMsg  = Interfaces.rcl_interfaces.msg.Log
 const TimeMsg = Interfaces.builtin_interfaces.msg.Time
@@ -348,74 +355,179 @@ function _rosout_level(level::LogLevel)
     return _ROSOUT_ERROR
 end
 
-"""
-    RosoutLogger(node; parent=current_logger(), min_level=Logging.Debug)
-
-An `AbstractLogger` that tees Julia log records to `parent` *and* to `node`'s
-`/rosout` publisher as `rcl_interfaces/msg/Log` (§13). Install it for a scope with
-[`with_rosout`](@ref) (or `Logging.with_logger`). `min_level` gates what reaches
-both sinks; `shouldlog`/`catch_exceptions` defer to `parent` so per-module log
-settings still apply.
-
-If `node` has no live session/context the `/rosout` publisher can't be declared;
-the logger then degrades to a pure tee to `parent` (so installing it is always
-safe). See [`with_rosout`](@ref).
-"""
-mutable struct RosoutLogger <: AbstractLogger
-    const node::Any                  # the Node whose /rosout we publish to
-    const parent::AbstractLogger     # forwarded-to logger (console/file)
-    const min_level::LogLevel
-    # The `/rosout` publisher (a `PublisherHandle{LogMsg}`); `nothing` for a
-    # sessionless node — then the logger is a pure tee (§13).
-    _pub::Any
+# Same bucketing as `_rosout_level`, but the ROS console label (`[INFO]` etc.).
+function _console_level_label(level::LogLevel)
+    level >= Fatal        && return "FATAL"
+    level < Logging.Info  && return "DEBUG"
+    level < Logging.Warn  && return "INFO"
+    level < Logging.Error && return "WARN"
+    return "ERROR"
 end
 
-function RosoutLogger(node; parent::AbstractLogger=Logging.current_logger(),
-                      min_level::LogLevel=Logging.Debug)
-    lg = RosoutLogger(node, parent, min_level, nothing)
+"""
+    RosoutLogger(node; name=node.fqn, parent=nothing, console=true,
+                 min_level=Logging.BelowMinLevel)
+
+An `AbstractLogger` that, per record (§13, D7): writes the ROS console line
+`[LEVEL] [stamp] [name]: msg` to stderr (when `console`), publishes an
+`rcl_interfaces/msg/Log` on `node`'s shared `/rosout` publisher, and — if a `parent`
+logger is supplied — forwards the raw record to it too (an extra file/Julia-console
+sink). `name` is the ROS logger name (node FQN by default; `logger(node,"child")`
+makes a `.`-separated child). `min_level` is the logger's own floor; per-name
+overrides come from the node's level table ([`set_logger_level!`](@ref)).
+
+Default ([`logger`](@ref)) is `console=true, parent=nothing` — a bare node logs in
+ROS format. Pass a `parent` (e.g. a `ConsoleLogger`) to *also* get Julia's native
+output. If `node` has no live session the `/rosout` publisher can't be declared and
+that sink is skipped (console/parent still work), so installing the logger is always
+safe.
+"""
+mutable struct RosoutLogger <: AbstractLogger
+    const node::Any                              # the Node whose /rosout we publish to
+    const name::String                           # ROS logger name (FQN or "<fqn>.child")
+    const parent::Union{AbstractLogger, Nothing} # optional extra sink (file/Julia console)
+    const console::Bool                          # write the ROS-format line to stderr
+    const min_level::LogLevel
+    # The shared `/rosout` publisher (a `PublisherHandle{LogMsg}`); `nothing` for a
+    # sessionless node — then the bridge skips the /rosout sink (§13).
+    _pub::Any
+    # `maxlog` is the logger's responsibility (the frontend doesn't enforce it):
+    # per-call-site-id emit counts, mirroring `ConsoleLogger`'s `message_limits`.
+    const _maxlog_counts::Dict{Any, Int}
+end
+
+_default_logger_name(node) = node isa Node ? node.fqn : string(node)
+
+function RosoutLogger(node; name::AbstractString=_default_logger_name(node),
+                      parent::Union{AbstractLogger, Nothing}=nothing,
+                      console::Bool=true,
+                      min_level::LogLevel=Logging.BelowMinLevel)
+    lg = RosoutLogger(node, String(name), parent, console, min_level, nothing,
+                      Dict{Any, Int}())
     lg._pub = _rosout_publisher!(node)
     return lg
 end
 
-# Declare the node-owned `/rosout` publisher. rmw_zenoh publishes `/rosout` as a
-# `rcl_interfaces/msg/Log` topic, transient-local with a deep history so late
-# subscribers (e.g. `ros2 topic echo /rosout`) get the backlog. A sessionless or
-# closed node can't carry a publisher — return `nothing` so the bridge degrades to
-# a pure tee (parent only) instead of throwing during logger construction.
+# The node-owned `/rosout` publisher, declared once and **shared** by the node logger
+# and every `logger(node,"child")` (so children don't each declare a duplicate).
+# rmw_zenoh publishes `/rosout` as a transient-local `rcl_interfaces/msg/Log` topic
+# with a deep history, so late subscribers (`ros2 topic echo /rosout`) get the
+# backlog. A sessionless/closed node can't carry one — return `nothing` and the
+# bridge skips the /rosout sink rather than throwing during logger construction.
 function _rosout_publisher!(node)
     (node isa Node && isopen(node)) || return nothing
-    try
-        return Publisher(node, "/rosout", LogMsg;
-                         qos = QosProfile(durability = :transient_local,
-                                          reliability = :reliable, depth = 1000))
-    catch err
-        @debug "rosout bridge: /rosout publisher declaration failed" exception=(err, catch_backtrace())
-        return nothing
+    @lock node.lock begin
+        node._rosout_pub === nothing || return node._rosout_pub
+        node._rosout_pub = try
+            Publisher(node, "/rosout", LogMsg;
+                      qos = QosProfile(durability = :transient_local,
+                                       reliability = :reliable, depth = 1000))
+        catch err
+            @debug "rosout bridge: /rosout publisher declaration failed" exception=(err, catch_backtrace())
+            nothing
+        end
+        return node._rosout_pub
     end
 end
 
-# Tee one record: forward to the parent logger, then (if a `/rosout` publisher is
-# live) emit the `Log` message. A failure on the ROS side must never break the
-# program's own logging, so the emit is best-effort and logged-through-parent only
-# on error — it never escapes `handle_message`.
+"""
+    logger(node) -> RosoutLogger
+    logger(node, child::AbstractString) -> RosoutLogger
+
+The node's default ROS logger (cached on the node; name = FQN), or a `.`-separated
+child logger (`"<fqn>.child"`) sharing the node's `/rosout` publisher and console.
+The dispatcher installs `logger(node)` around every handler (D7), so handlers rarely
+need this directly; use it for hierarchy or outside a handler via
+`with_logger(node) do … end`.
+"""
+function logger(node::Node)
+    # Unlocked fast path: `_logger` is set once. The dispatcher calls this per
+    # message (§4), so we must not take the node lock every time — a stale `nothing`
+    # read just falls to the locked re-check below (double-checked locking).
+    node._logger === nothing || return node._logger
+    @lock node.lock begin
+        node._logger === nothing || return node._logger
+        node._logger = RosoutLogger(node)
+        return node._logger
+    end
+end
+logger(node::Node, child::AbstractString) =
+    RosoutLogger(node; name = string(node.fqn, ".", child))
+
+# §4 (D7): run a user handler `f` under the node's `RosoutLogger`, so a plain `@info`
+# inside it routes to that node's `/rosout` + ROS console. Forward-referenced from
+# the dispatch sites in node.jl/service.jl/action.jl (included before this file); a
+# non-`Node` owner (shouldn't happen on those paths) just runs `f` unwrapped.
+_with_node_logger(f, node::Node) = Logging.with_logger(f, logger(node))
+_with_node_logger(f, ::Any)      = f()
+
+# Emit one record to up to three sinks: ROS console (stderr), an optional `parent`
+# logger, and the `/rosout` publisher. `maxlog` is gated first (the logger's job).
+# Every sink is best-effort and isolated — a failure in one (a bad `show`, a dead
+# `/rosout` route) must never break the others or escape `handle_message`. Errors go
+# straight to stderr (NOT through logging) to avoid recursion under the active logger.
 function Logging.handle_message(lg::RosoutLogger, level, message, _module, group,
                                 id, file, line; kwargs...)
-    # Parent first: the program's expected output is never lost to a ROS hiccup.
-    Logging.handle_message(lg.parent, level, message, _module, group, id, file,
-                           line; kwargs...)
+    _maxlog_exceeded!(lg, id, kwargs) && return nothing
+    if lg.console
+        try
+            _print_ros_console(lg, level, message; kwargs...)
+        catch err
+            Base.println(stderr, "rosout: console format failed: ", err)
+        end
+    end
+    if lg.parent !== nothing
+        try
+            Logging.handle_message(lg.parent, level, message, _module, group, id,
+                                   file, line; kwargs...)
+        catch err
+            Base.println(stderr, "rosout: parent logger failed: ", err)
+        end
+    end
     if lg._pub !== nothing
         try
             _emit_rosout(lg, level, message, file, line; kwargs...)
         catch err
-            @debug "rosout bridge: publish failed" exception=(err, catch_backtrace())
+            Base.println(stderr, "rosout: /rosout publish failed: ", err)
         end
     end
     nothing
 end
 
-# The node FQN is the ROS logger name (`/ns/node`), matching what rmw_zenoh stamps
-# on `Log.name` — not the Julia `_module`, which carries no ROS identity.
-_logger_name(lg::RosoutLogger) = lg.node isa Node ? lg.node.fqn : string(lg.node)
+# `maxlog`: emit at most `maxlog` records per call-site `id`. Counts live on the
+# logger (`ConsoleLogger` does the same). The frontend does NOT enforce `maxlog`,
+# so without this `@info … maxlog=1` would log every time. (Counts race under
+# `Parallel(n)` concurrent handlers — benign, like `ConsoleLogger`'s own limits.)
+function _maxlog_exceeded!(lg::RosoutLogger, id, kwargs)
+    maxlog = get(kwargs, :maxlog, nothing)
+    maxlog === nothing && return false
+    n = get(lg._maxlog_counts, id, 0)
+    n >= maxlog && return true
+    lg._maxlog_counts[id] = n + 1
+    return false
+end
+
+# The node's ROS clock instant as `(sec, nanosec)` for a stamp; `(0,0)` if the clock
+# can't be read (a non-`Node` owner / closed node) so the console line never throws.
+function _stamp_sec_nanosec(node)
+    try
+        return _sec_nanosec(Dates.now(node).ns)   # `now(node)` is `Dates.now` extended (time.jl)
+    catch
+        return (Int32(0), UInt32(0))
+    end
+end
+
+# Write the ROS-format console line: `[LEVEL] [secs.nanosec] [logger_name]: msg`.
+# Built as one string and printed in a single `print` so concurrent records don't
+# interleave mid-line. Uses the logger's *own* `name`, so a child logger's records
+# show the child name even sharing the parent's stderr.
+function _print_ros_console(lg::RosoutLogger, level, message; kwargs...)
+    sec, nanosec = _stamp_sec_nanosec(lg.node)
+    Base.print(stderr, "[", _console_level_label(level), "] [", sec, ".",
+               lpad(string(nanosec), 9, '0'), "] [", lg.name, "]: ",
+               _render_message(message, kwargs), "\n")
+    return nothing
+end
 
 # Internal keys `@info`/`@warn` add to a record that are not user payload: `:maxlog`
 # (rate-limit count) and `:_id` (the call-site id). Skip them when folding kwargs
@@ -459,7 +571,7 @@ end
 function _emit_rosout(lg::RosoutLogger, level, message, file, line; kwargs...)
     log = LogMsg(; stamp = to_msg(TimeMsg, Dates.now(lg.node)),
                  level = _rosout_level(level),
-                 name = _logger_name(lg),
+                 name = lg.name,
                  msg = _render_message(message, kwargs),
                  file = string(file),
                  var"function" = "",
@@ -468,35 +580,123 @@ function _emit_rosout(lg::RosoutLogger, level, message, file, line; kwargs...)
     return nothing
 end
 
-# `AbstractLogger` interface: gate on `min_level` and defer the rest to `parent`,
-# so a `RosoutLogger` is a transparent tee — per-module `shouldlog` settings and
-# exception handling behave exactly as the wrapped logger.
-Logging.shouldlog(lg::RosoutLogger, level, _module, group, id) =
-    level >= lg.min_level && Logging.shouldlog(lg.parent, level, _module, group, id)
+# The effective min level for this logger: the longest-prefix match in the node's
+# level table (§7, set by `set_logger_level!` / future `--ros-args --log-level`),
+# else the logger's own `min_level`. Hierarchy: `/ns/n.child` inherits `/ns/n`'s
+# level unless it has its own entry.
+function _effective_level(lg::RosoutLogger)
+    lg.node isa Node || return lg.min_level
+    lvls = lg.node._log_levels
+    isempty(lvls) && return lg.min_level
+    best = nothing; bestlen = -1
+    for (nm, lv) in lvls
+        (lg.name == nm || startswith(lg.name, nm * ".")) || continue
+        length(nm) > bestlen && (best = lv; bestlen = length(nm))
+    end
+    return best === nothing ? lg.min_level : LogLevel(best)
+end
+
+# `AbstractLogger` interface. Gate on the effective level; when a `parent` sink is
+# present also defer to its `shouldlog`/`min_enabled_level` so its per-module
+# settings still apply (a `nothing` parent → console+/rosout only, gate on level).
+function Logging.shouldlog(lg::RosoutLogger, level, _module, group, id)
+    level >= _effective_level(lg) || return false
+    lg.parent === nothing && return true
+    return Logging.shouldlog(lg.parent, level, _module, group, id)
+end
 
 Logging.min_enabled_level(lg::RosoutLogger) =
-    min(lg.min_level, Logging.min_enabled_level(lg.parent))
+    lg.parent === nothing ? _effective_level(lg) :
+        min(_effective_level(lg), Logging.min_enabled_level(lg.parent))
 
-Logging.catch_exceptions(lg::RosoutLogger) = Logging.catch_exceptions(lg.parent)
+Logging.catch_exceptions(lg::RosoutLogger) =
+    lg.parent === nothing ? false : Logging.catch_exceptions(lg.parent)
 
 """
-    with_rosout(f, node; parent=current_logger(), min_level=Logging.Debug)
+    set_logger_level!(node, level)            # sets the node's own logger (FQN)
+    set_logger_level!(node, name, level)      # sets a specific logger name
 
-Run `f()` with a [`RosoutLogger`](@ref) installed as the active logger (§13): every
-`@info`/`@warn`/… inside the scope is forwarded to `parent` *and* mirrored to
-`node`'s `/rosout` topic. Restores the previous logger on exit (it's
-`Logging.with_logger` under the hood). Use it to wrap a node's main loop so its
-logging surfaces on ROS tooling.
+Set the per-logger minimum level (§7, D7). `name` matches the logger and any
+`.`-separated descendant lacking its own entry (`set_logger_level!(node, "/n", Warn)`
+also gates `"/n.child"`). The programmatic form of `--ros-args --log-level name:=…`,
+which will populate the same table once ros-args parsing lands (§5).
+"""
+set_logger_level!(node::Node, name::AbstractString, level::LogLevel) =
+    (node._log_levels[String(name)] = level.level; nothing)
+set_logger_level!(node::Node, level::LogLevel) =
+    set_logger_level!(node, node.fqn, level)
+
+# Node forms of the standard scope/global installers (D7): `with_logger(node) do … end`
+# and `global_logger(node)` use the node's default `RosoutLogger`.
+Logging.with_logger(f::Function, node::Node) = Logging.with_logger(f, logger(node))
+Logging.global_logger(node::Node) = Logging.global_logger(logger(node))
+
+"""
+    with_rosout(f, node; kwargs...)
+
+Run `f()` with a fresh [`RosoutLogger`](@ref) (built with `kwargs`) installed as the
+active logger (§13). `with_logger(node) do … end` is the usual form (it reuses the
+node's cached logger); `with_rosout` is kept for explicitly overriding logger
+options (`parent=`, `console=`, `min_level=`) for a scope.
 
 ```julia
-with_rosout(node) do
-    @info "armed"          # → console AND /rosout
+with_rosout(node; parent = ConsoleLogger()) do
+    @info "armed"          # → ROS console, /rosout, AND Julia console
 end
 ```
 """
-function with_rosout(f, node; parent::AbstractLogger=Logging.current_logger(),
-                     min_level::LogLevel=Logging.Debug)
-    Logging.with_logger(f, RosoutLogger(node; parent=parent, min_level=min_level))
+with_rosout(f, node; kwargs...) =
+    Logging.with_logger(f, RosoutLogger(node; kwargs...))
+
+# ── Zenoh transport logs → /rosout (§8 / D7, opt-in) ──────────────────────────
+# Zenoh's Rust core emits its own logs (session, transport, liveliness). Zenoh.jl
+# can capture them into a bounded, pull-based `LogStream` (`open_log_stream`); we
+# drain it and re-emit each record through Julia logging under a `<fqn>.zenoh` child
+# logger, so it rides the same path to `/rosout` + ROS console + the level table.
+#
+# Opt-in, off by default: nothing claims Zenoh's process-global (one-shot) logger
+# unless this is called. Feedback-loop discipline (Zenoh docs/logging.md): the
+# `WARN` floor is enforced *inside* Zenoh, so a `/rosout` publish's own data-plane
+# DEBUG/TRACE logs never enter the stream and steady-state forwarding can't feed
+# itself; the bounded drop-oldest ring is the backstop. Keep the floor at WARN.
+
+_julia_log_level(s) =
+    s == Zenoh.LogSeverities.ERROR ? Logging.Error :
+    s == Zenoh.LogSeverities.WARN  ? Logging.Warn  :
+    s == Zenoh.LogSeverities.INFO  ? Logging.Info  : Logging.Debug
+
+"""
+    bridge_zenoh_logs!(node; min_severity=Zenoh.LogSeverities.WARN, capacity=256)
+
+Capture Zenoh's transport logs (at `min_severity`+) and re-emit them on `node`'s
+`/rosout` under a `<fqn>.zenoh` child logger (§8, D7). Opt-in; spawns a drain task
+that the node's Context drain closes (§14.1). Returns the `Zenoh.LogStream`.
+
+Zenoh's logger is **process-global and one-shot** — call this at most once per
+process, and not together with `Zenoh.setup_logging`. Keep `min_severity` at `WARN`
+(the default): it's the primary defense against a log→publish→log feedback loop.
+"""
+function bridge_zenoh_logs!(node::Node;
+                            min_severity = Zenoh.LogSeverities.WARN,
+                            capacity::Integer = 256)
+    stream = Zenoh.open_log_stream(; min_severity = min_severity, capacity = capacity)
+    zlog = logger(node, "zenoh")
+    task = Threads.@spawn Logging.with_logger(zlog) do
+        try
+            for rec in stream
+                Logging.@logmsg _julia_log_level(rec.severity) rec.message
+            end
+        catch err
+            err isa ShutdownException && return
+            Base.println(stderr, "rosout: zenoh log bridge drain failed: ", err)
+        end
+    end
+    # Close the stream on Context drain so the drain task exits and doesn't outlive
+    # the session (the iterator ends when the stream closes).
+    on_shutdown(_ctx(node)) do
+        try; close(stream); catch; end
+    end
+    return stream
 end
 
 # `_ctx` (a Context from a Node-or-Context) is context.jl's, duck-typed on

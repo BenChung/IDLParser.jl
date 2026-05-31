@@ -68,6 +68,10 @@ mutable struct Node
     const lock::ReentrantLock
     # Static remap table (§5): empty until `--ros-args` parsing lands.
     const remaps::Vector{Pair{String, String}}
+    # /rosout + logging (§13, D7), lazily populated on first use (introspection.jl):
+    _rosout_pub::Any                     # node-owned /rosout publisher, shared by every node logger
+    _logger::Any                         # the default node `RosoutLogger`
+    const _log_levels::Dict{String, Int32}  # §7 per-logger-name min levels (LogLevel.level)
     @atomic open::Bool
 end
 
@@ -87,7 +91,8 @@ function Node(ctx::Context, name::AbstractString;
 
     node = Node(ctx, nm, ns, fqn, ent, lv_key, nothing,
                 Any[], Dict{DataType, Any}(), ReentrantLock(),
-                Pair{String, String}[], true)
+                Pair{String, String}[], nothing, nothing,
+                Dict{String, Int32}(), true)
 
     # Declare the node's liveliness token (peers discover the node), then inject
     # it into our own index so self-queries see it immediately (§12 authoritative).
@@ -598,7 +603,10 @@ end
 # fatal (one bad message must not kill the subscription).
 function _invoke_owned(e::Entity, msg, handler)
     try
-        handler(msg)
+        # D7: a plain `@info` inside the handler routes to this node's /rosout.
+        _with_node_logger(e.node) do
+            handler(msg)
+        end
     catch err
         err isa ShutdownException && return
         @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
@@ -611,8 +619,10 @@ end
 # use-after-free (§3.2). Decode is at the dispatch so the borrow scopes here (D1).
 function _invoke_view(e::Entity, sample::Sample, msgtype::Type, handler)
     try
-        with_memory(sample, UInt8) do b
-            handler(decode(unsafe_memory(b), msgtype; view=true))
+        _with_node_logger(e.node) do          # D7: handler logs → node's /rosout
+            with_memory(sample, UInt8) do b
+                handler(decode(unsafe_memory(b), msgtype; view=true))
+            end
         end
     catch err
         err isa ShutdownException && return
@@ -798,7 +808,9 @@ function _run_typed_dynamic(::Type{T}, e::Entity, bytes::Vector{UInt8},
                             handler, sched) where {T}
     sched() do
         try
-            handler(decode(bytes, T; view=false))
+            _with_node_logger(e.node) do      # D7: handler logs → node's /rosout
+                handler(decode(bytes, T; view=false))
+            end
         catch err
             err isa ShutdownException && return
             @error "dynamic subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())

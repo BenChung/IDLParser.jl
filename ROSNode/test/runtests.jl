@@ -66,6 +66,8 @@ try
         _section("dynamic_live", "dynamic_live.jl")
         # Live D4: transient_local latched delivery + durability-aware lifecycle re-latch.
         _section("transient_local", "transient_local.jl")
+        # D7: unified logging — pure level/format/maxlog + live /rosout dispatcher wrap.
+        _section("rosout", "rosout.jl")
     end
 finally
     _kill_router!()

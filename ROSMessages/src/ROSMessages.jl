@@ -11,12 +11,15 @@ include("macros.jl")
 export @ros_msg, @ros_msgs
 export to_ros, lift, lower, IL
 
-# Bake the ROS2 `.msg`/`.srv`/`.action` pipeline into the pkgimage: the ros2.jl
-# PEG grammar (`message_il`/`service_il`/`action_il`), `lower`, the RIHS01 hashing
-# (`type_description_from_struct` → `calculate_rihs01_hash`), and `lift` — exactly
-# the path `@ros_msgs` drives at a consumer's precompile (e.g. ROSNode's vendored
-# `Interfaces`). Without this each consumer re-JITs that grammar (~several seconds).
-# The IDL parse/resolve/generate layer is baked by IDLParser's own workload.
+# Bake the entire `@ros_msgs` pipeline into the pkgimage so consumers (e.g. ROSNode's
+# vendored `Interfaces`) don't re-JIT it at *their* precompile (~6s saved there):
+#   • ros2.jl PEG grammar — `parse_msg`/`parse_srv`/`parse_action` (→ `message_il`/
+#     `service_il`/`action_il` + `lower`) and `action_protocol_decls`;
+#   • IDLParser's `resolve_constants` + `generate_code` — the resolve/codegen half of
+#     the chain. Exercising them here caches those *external* CodeInstances into this
+#     pkgimage (so IDLParser needs no workload of its own, and we never compile its
+#     unused IDL-text parser);
+#   • the RIHS01 path — `type_description_from_struct` → `calculate_rihs01_hash` + `lift`.
 using PrecompileTools: @setup_workload, @compile_workload
 @setup_workload begin
     msg = """
@@ -32,16 +35,17 @@ using PrecompileTools: @setup_workload, @compile_workload
     srv = msg * "---\n" * msg
     act = msg * "---\n" * msg * "---\n" * msg
     @compile_workload begin
-        m = message_il(msg; name="M")
-        s = service_il(srv; name="S")
-        a = action_il(act; name="A")
-        lower(m; package="p")
-        lower(s; package="p")
-        lower(a; package="p")
+        # Full parse → resolve → generate chain, mirroring `_expand_msg_files`.
+        decls = Parse.Decl[]
+        append!(decls, parse_msg(msg; name="M", package="p"))
+        append!(decls, parse_srv(srv; name="S", package="p"))
+        append!(decls, parse_action(act; name="A", package="p"))
+        append!(decls, action_protocol_decls("A"; package="p"))
+        resolved = ConstResolution.resolve_constants(decls)
+        Generation.generate_code(resolved)
         # RIHS01 path: lower → struct AST → TypeDescription → hash → lift.
-        decls = lower(m; package="")
-        ast = decls[end]                       # the StructDecl (after any _Constants)
-        td = type_description_from_struct(ast, "p/msg/M"; package="p", qualifier="msg")
+        d = lower(message_il(msg; name="M"); package="")
+        td = type_description_from_struct(d[end], "p/msg/M"; package="p", qualifier="msg")
         tdmsg = TypeDescriptionMsg(td, TypeDescription[])
         calculate_rihs01_hash(tdmsg)
         lift(tdmsg)

@@ -582,7 +582,7 @@ function _handle_send_goal(server::ActionServer{A, G, R, F}, q::Query) where {A,
     isopen(server) || return _reply_inactive(q)
     gid_bytes, goal_req = _decode_send_goal(server, q)
 
-    decision = server.on_goal(goal_req)
+    decision = _with_node_logger(() -> server.on_goal(goal_req), server.node)  # D7
     accepted = !(decision isa Reject)
 
     if accepted
@@ -651,7 +651,7 @@ function _handle_cancel_goal(server::ActionServer{A, G, R, F}, q::Query) where {
     for g in canceling
         # Only a live (accepted/executing) goal can be canceled.
         (@atomic g.status) in (GOAL_ACCEPTED, GOAL_EXECUTING) || continue
-        server.on_cancel(g) isa Reject && continue
+        _with_node_logger(() -> server.on_cancel(g), server.node) isa Reject && continue  # D7
         if _transition!(g, GOAL_CANCELING)
             push!(accepted, g)
         end
@@ -724,7 +724,9 @@ function _run_goal_body(g::GoalHandle{A, G, R, F}, body::Function, concurrency::
     _transition!(g, GOAL_EXECUTING)
     server = g.server
     _publish_status(server)
-    runner = () -> settle_handler!(g.cell, () -> body(g);
+    # D7: run the goal body under the node logger so a plain `@info` inside it
+    # routes to the server node's /rosout.
+    runner = () -> settle_handler!(g.cell, () -> _with_node_logger(() -> body(g), server.node);
                                    success_status = succeeded,
                                    default_result = () -> _default_result(R),
                                    log_id = g.id)

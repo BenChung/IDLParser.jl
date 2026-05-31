@@ -220,7 +220,9 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
     try
         req = _decode_request(query, Req, view)
         cell = ResultCell{Query, Resp}(query, _service_deliver(e, query, Resp))
-        settle_handler!(cell, () -> handler(req);
+        # D7: run the handler under the node logger so a plain `@info` inside it
+        # routes to the node's /rosout (wherever `settle_handler!` runs the thunk).
+        settle_handler!(cell, () -> _with_node_logger(() -> handler(req), e.node);
                         success_status = success,
                         default_result = () -> _zero_response(Resp),
                         log_id = e.endpoint.topic)

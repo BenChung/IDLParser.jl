@@ -15,39 +15,13 @@ module Generation
     include("generation/gen.jl")
 end
 
-# Bake the parse → resolve → generate pipeline into the pkgimage. The PEG parser
-# combinators and the Moshi-`@match` walkers cost several seconds to JIT on first
-# use; without this every downstream consumer (ROSMessages' `@ros_msgs`, …) pays
-# that at *its* precompile. The snippet covers the constructs that drive the
-# expensive specializations: modules, a const expr, a struct with scalars, a
-# bounded string, fixed array, bounded/unbounded sequences, a typedef, a ref.
-using PrecompileTools: @setup_workload, @compile_workload
-using PEG: parse_whole
-@setup_workload begin
-    idl = """
-    module pkg {
-      module msg {
-        const long FOO = 1 + 2 * 3;
-        typedef double Vec3[3];
-        struct Sample {
-          long a;
-          double b;
-          boolean flag;
-          string<16> label;
-          double arr[4];
-          Vec3 v;
-          sequence<long> seq;
-          sequence<double, 8> bseq;
-        };
-      };
-    };
-    """
-    @compile_workload begin
-        parsed = parse_whole(Parse.specification, idl)
-        resolved = ConstResolution.resolve_constants(
-            convert(Vector{Parse.Decl}, parsed))
-        Generation.generate_code(resolved)
-    end
-end
+# NB: no precompile workload here on purpose. ROSNode's `@ros_msgs` path uses only
+# `ConstResolution.resolve_constants` + `Generation.generate_code` — never the IDL
+# *text* parser (`Parse.specification`). Baking the full IDL grammar here cost ~14s
+# of cold-build time compiling combinators no ROSNode consumer calls. Coverage for
+# the resolve+generate methods ROSNode *does* hit is baked by ROSMessages' workload
+# (it runs the real parse_msg → resolve → generate chain, caching those external
+# CodeInstances into ROSMessages' pkgimage). A standalone `.idl` consumer that wants
+# the parser baked should add its own workload exercising `open_idl`/`parse_whole`.
 
 end
