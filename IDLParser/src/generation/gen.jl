@@ -1,5 +1,6 @@
 import IDLParser.ConstResolution as CR
 import IDLParser.Parse as Parse
+import StaticArrays
 using OrderedCollections
 using Moshi.Match: @match
 
@@ -125,7 +126,10 @@ function resolve_type(typ::CR.TypeSpec.Type; enclosing::Union{Symbol, Nothing}=n
 end
 
 resolve_declarator(decl::CR.Declarator.Type, jltype) = @match decl begin
-    CR.Declarator.DArray(name, dims) => (name, :(StaticArrays.SArray{Tuple{$(dims...),}, $jltype, $(length(dims)), $(prod(dims))}))
+    # `GlobalRef` binds the `StaticArrays` module object directly, so the
+    # emitted `SArray` type resolves at any eval site regardless of its imports
+    # (matching how `@cdr_fixed`/`@cdr_view` reference `SVector`).
+    CR.Declarator.DArray(name, dims) => (name, :($(GlobalRef(StaticArrays, :SArray)){Tuple{$(dims...),}, $jltype, $(length(dims)), $(prod(dims))}))
     CR.Declarator.DIdent(name) => (name, jltype)
 end
 
@@ -174,10 +178,10 @@ function _classify_refs(refs::Vector{Pair{Vector{Symbol}, Symbol}},
 end
 # --- Compact-eligibility classification -----------------------------------
 #
-# A struct can be emitted via `@cdr1_compat` (a single plain concrete CDR1
+# A struct can be emitted via `@cdr_fixed` (a single plain concrete CDR1
 # struct) only when every field is flat: a primitive, an SArray of primitives,
 # a typedef resolving to those, or a nested struct that is
-# itself all-fixed (`@cdr1_compat` validates nesting recursively). A string,
+# itself all-fixed (`@cdr_fixed` validates nesting recursively). A string,
 # sequence, or non-flat nested struct disqualifies it, so it falls back to a
 # plain `@kwdef` struct decoded field-by-field by CDRSerialization's generic
 # `read` (owned) / `read_view` (zero-copy `CDRString`/`CDRArray`). The registry
@@ -265,13 +269,13 @@ end
 
 # Is a single field (its TypeSpec + declarator) flat — i.e. a primitive, an
 # SArray of primitives, or a nested struct that is itself all-fixed — so the
-# whole struct can be a single `@cdr1_compat` value? `seen` guards against a
+# whole struct can be a single `@cdr_fixed` value? `seen` guards against a
 # (degenerate) cyclic struct reference.
 function _field_is_fixed(ts::CR.TypeSpec.Type, decl::CR.Declarator.Type,
                          registry::TypeRegistry, seen::Set{Symbol})
     @match decl begin
         # `T name[N]` → SArray; eligible iff the element is a primitive
-        # (`@cdr1_compat` rejects SArrays of structs).
+        # (`@cdr_fixed` rejects SArrays of structs).
         CR.Declarator.DArray(_, _) => _spec_resolves_to_primitive(ts, registry)
         # `T name` → primitive, a typedef to a primitive/primitive-array
         # (e.g. `float[3]`), or a nested all-fixed struct.
@@ -336,12 +340,12 @@ function _struct_fields(decls, enclosing::Union{Symbol, Nothing}, registry::Type
 end
 
 # An all-fixed struct (every field a primitive or an SArray of primitives) is
-# emitted via `@cdr1_compat`: a single plain concrete struct whose wire format
-# is standard CDR1 — exactly what a ROS2 publisher emits, trailing pad omitted.
-# Unlike `@cdr_compact` it produces no `Name{V}` CDR1/CDR2 variant wrapper
-# (ROS2 only needs CDR1), so `fieldnames`/`fieldtype` reflect the real fields
-# and the value nests cleanly. `@cdr1_compat` supplies `propertynames`, `==`,
-# and `show`; serialization flows through the library's generic `write`/`read`.
+# emitted via `@cdr_fixed`: a single plain concrete struct whose wire format is
+# standard CDR1 — exactly what a ROS2 publisher emits, trailing pad omitted. It
+# is one concrete type (no variant wrapper), so `fieldnames`/`fieldtype` reflect
+# the real fields and the value nests cleanly. `@cdr_fixed` supplies
+# `propertynames`, `==`, and `show`; serialization flows through the library's
+# generic `write`/`read`.
 #
 # A struct with a string/sequence/non-flat-nested field is a plain `@kwdef`
 # struct. Serialization is entirely the library's: generic `read` (owned),
@@ -368,8 +372,8 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
 
     if all_fixed
         structdef = Expr(:struct, false, name, Expr(:block, field_decls...))
-        cdr1_compat = Expr(:macrocall,
-            Expr(:., :CDRSerialization, QuoteNode(Symbol("@cdr1_compat"))),
+        cdr_fixed = Expr(:macrocall,
+            Expr(:., :CDRSerialization, QuoteNode(Symbol("@cdr_fixed"))),
             LineNumberNode(@__LINE__, Symbol(@__FILE__)),
             structdef)
         # Keyword constructor preserving the old `@kwdef` ergonomics: convert
@@ -379,11 +383,11 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
         kw_ctor = Expr(:(=),
             Expr(:call, name, Expr(:parameters, field_names...)),
             Expr(:call, name, conv_args...))
-        # `@cdr1_compat` emits `propertynames`/`==`/`show`; the library's
-        # generic `write`/`read` handle serialization. We only add the keyword
+        # `@cdr_fixed` emits `propertynames`/`==`/`show`; the library's generic
+        # `write`/`read` handle serialization. We only add the keyword
         # constructor (the macro's own constructor is positional).
-        body = Any[cdr1_compat, kw_ctor]
-        # `:fixed` is already guaranteed by `@cdr1_compat` (it rejects any
+        body = Any[cdr_fixed, kw_ctor]
+        # `:fixed` is already guaranteed by `@cdr_fixed` (it rejects any
         # non-flat field at macro-expansion). `:compact` additionally requires a
         # padding-free layout, which depends on the Julia field layout — assert
         # it at precompile so a regression fails the build with the library's

@@ -4,3 +4,5 @@ Manifest*.toml
 # Only NOTICE.md (provenance) and vendor_ros2.sh (the script) stay tracked.
 /ROSMessages/test/files/ros2_standard/*/
 /ROSMessages/test/files/ros2_ecosystem/*/
+
+infra/hiroz-participant/target

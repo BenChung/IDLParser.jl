@@ -10,13 +10,16 @@ IDLParser = "817e8c30-d1ad-4896-85b5-1c4c82b7999b"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 ROSMessages = "745bd5ac-df70-4edb-8655-498bbbb894cf"
 ROSZenoh = "02c87683-9d8e-4267-bbb6-13e61ef8b9a5"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Zenoh = "b742139f-8771-480b-a9b2-33222b45d29b"
 
 [compat]
+StaticArrays = "1.9.18"
 julia = "1.11"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Zenohd_jll = "60fe4315-4d9d-51d2-90b3-f4c2062225d6"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Zenohd_jll"]

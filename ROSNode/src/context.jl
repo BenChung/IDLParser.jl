@@ -1,0 +1,764 @@
+# §5 Contexts — the process-level container. One Context = one Zenoh session;
+# N nodes share it (hiroz's `ZContext`). It owns: the session (+ shared `z_id`),
+# an atomic entity-id counter, the domain id, default namespace/enclave, the
+# keyexpr formatter, the type registry (§11), the discovery index (§12) fed by a
+# single `@ros2_lv/**` liveliness subscriber, a clock (§7), the `on_shutdown`
+# hooks, and the shutdown state machine + drain (§14).
+#
+# Lower layers not yet landed are stubbed against what exists with `# TODO(layer):`
+# markers: the Node type (§6) — name resolution is duck-typed against a node's
+# `namespace`/`name`/`fqn`; the per-Context `/clock` sim source (§7); local-entity
+# injection into the graph (§6/§12) — the index ingests liveliness today and
+# exposes the injection seam for the entity layer to call.
+
+using Zenoh: Zenoh, Config, Session, Keyexpr, zid, to_le_bytes, LivelinessSubscriber
+import Zenoh
+using ROSZenoh: ROSZenoh, ZenohId, RmwZenoh, KeyExprFormat, NodeEntity,
+                EndpointEntity, EndpointKind, parse_liveliness
+
+export Context, Node, # `Node` forward-declared here; the §6 layer specializes it
+       resolve_name, on_shutdown, request_shutdown, is_shutdown,
+       spin, session, next_entity_id!, registry, graph,
+       EndpointInfo, NodeInfo, GraphIndex
+
+# ── discovery index (§12) ────────────────────────────────────────────────
+# One record per endpoint, parsed from a liveliness token (or injected for our
+# own, §6). Carries the RIHS01 hash and gid (not just a type-name string) so a
+# caller can run its own type/QoS compatibility check (§12.2) with the same data
+# the auto-detectors use.
+
+"""
+    EndpointInfo
+
+A single discovered (or locally-injected) endpoint, the atom of the graph (§12).
+`type === nothing` for an `EMPTY_TOPIC_TYPE` token; `is_local` distinguishes our
+own injected entities (authoritative) from liveliness-discovered remotes
+(eventually consistent).
+"""
+struct EndpointInfo
+    node_name::String
+    namespace::String
+    kind::EndpointKind
+    topic::String                        # resolved FQN
+    type::Union{TypeInfo, Nothing}       # name + RIHS01 hash
+    qos::QosProfile
+    gid::NTuple{16, UInt8}
+    is_local::Bool
+end
+
+"""
+    NodeInfo(name, namespace, enclave)
+
+Identity of a discovered node — what `node_names` returns (§12.1).
+"""
+struct NodeInfo
+    name::String
+    namespace::String
+    enclave::String
+end
+
+# Build an `EndpointInfo` from a parsed `EndpointEntity`. The node fields come
+# from the entity's node when present (rmw_zenoh carries it; ros2dds yields
+# `node === nothing`, leaving them blank — the bridge-compat gap).
+function _endpoint_info(e::EndpointEntity; is_local::Bool)
+    nn = e.node === nothing ? "" : e.node.name
+    ns = e.node === nothing ? "" : e.node.namespace
+    # gid needs the node identity; without it we can't derive it, so zero-fill.
+    gid = e.node === nothing ? ntuple(_ -> 0x00, 16) : ROSZenoh.entity_gid(e)
+    EndpointInfo(nn, ns, e.kind, e.topic, e.type_info, e.qos, gid, is_local)
+end
+
+"""
+    GraphIndex
+
+The Context's discovery index: the observed `EndpointInfo` set keyed by
+liveliness keyexpr (the token uniquely identifies an endpoint), guarded by a
+lock, plus a `Condition` the graph waits (`wait_for_service`, `on_graph_change`,
+§12) park on. The single `@ros2_lv/**` liveliness subscriber drives it; our own
+entities are injected directly (§6).
+
+This is the one change stream every §12 detector/wait is a view over.
+"""
+mutable struct GraphIndex
+    lock::ReentrantLock
+    # keyexpr → EndpointInfo. The liveliness token string is the natural key:
+    # PUT inserts/updates, DELETE removes by the same key.
+    endpoints::Dict{String, EndpointInfo}
+    # Bumped on every change; waiters re-check the graph predicate when notified.
+    changed::Threads.Condition
+    # User `on_graph_change` listeners (added/removed EndpointInfo) — fired
+    # outside the index lock. Stored as plain functions of one `NamedTuple`.
+    listeners::Vector{Any}
+end
+
+GraphIndex() = GraphIndex(ReentrantLock(), Dict{String, EndpointInfo}(),
+                          Threads.Condition(), Any[])
+
+# ── type registry (§11) ──────────────────────────────────────────────────
+# Keyed by (name, RIHS01-hash) so evolved versions of a type coexist. The value
+# is left `Any` (the §11 registry entry: IL + generated module + TypeDescription)
+# — that layer owns the entry shape; the Context only owns the table + lock so
+# all nodes share discovered types.
+
+"""
+    TypeRegistry
+
+Per-Context type table keyed by `(type_name, RIHS01-hash)` so versions coexist
+(§11). The Context owns the storage + lock; the typesupport layer populates and
+reads entries. Lookups normalize the key to `(String, TypeHash)`.
+"""
+mutable struct TypeRegistry
+    lock::ReentrantLock
+    entries::Dict{Tuple{String, ROSZenoh.TypeHash}, Any}
+end
+
+TypeRegistry() = TypeRegistry(ReentrantLock(), Dict{Tuple{String, ROSZenoh.TypeHash}, Any}())
+
+"""
+    register_type!(reg, info::TypeInfo, entry)
+
+Store `entry` (the §11 IL/codegen/TypeDescription record — opaque here) under
+`(info.name, info.hash)`. Returns `entry`.
+"""
+function register_type!(reg::TypeRegistry, info::TypeInfo, entry)
+    @lock reg.lock reg.entries[(info.name, info.hash)] = entry
+    entry
+end
+
+"""
+    lookup_type(reg, info::TypeInfo) -> Union{Any, Nothing}
+
+Fetch the registry entry for `(info.name, info.hash)`, or `nothing` if the exact
+name+version isn't registered (the §11 dynamic-discovery trigger).
+"""
+lookup_type(reg::TypeRegistry, info::TypeInfo) =
+    @lock reg.lock get(reg.entries, (info.name, info.hash), nothing)
+
+# ── shutdown state (§14) ──────────────────────────────────────────────────
+# `:running → :shutting_down → :shutdown`. The transition is the one drain path
+# every trigger funnels through (close / request_shutdown / signal).
+
+@enum ShutdownState running shutting_down shutdown_done
+
+# ── the Context ───────────────────────────────────────────────────────────
+
+"""
+    Context(; domain_id, namespace, enclave, config, format, drain_timeout, …)
+    Context(f; kwargs...)  do ctx … end
+
+The process-level container (§5). Opens one Zenoh `Session` and holds everything
+nodes share: the session and its `z_id`, the atomic entity-id counter, the
+`domain_id`, default `namespace`/`enclave`, the keyexpr formatter, the type
+registry (§11), the discovery index + its `@ros2_lv/**` liveliness subscriber
+(§12), a clock (§7), the `on_shutdown` hooks, and the shutdown state machine
+(§14). `Context` is the RAII/shutdown root: `close(ctx)` runs the drain.
+
+The do-block form opens, runs `f(ctx)`, and `close`s on exit (the
+`rclcpp::init`/`shutdown` bracket).
+"""
+mutable struct Context
+    const session::Session
+    const z_id::ZenohId                  # the session id in ROSZenoh's hex form
+    const domain_id::Int
+    const namespace::String              # default node namespace
+    const enclave::String
+    const format::KeyExprFormat
+    @atomic _next_id::Int                # atomic entity-id allocator (§5)
+    const registry::TypeRegistry
+    const graph::GraphIndex
+    # The `@ros2_lv/**` liveliness subscriber (callback form) feeding `graph`.
+    # `Any` because Zenoh's `LivelinessSubscriber` isn't in scope as a field type
+    # constraint here and `close` is duck-typed.
+    _lv_sub::Any
+    # Clock handles by source — `clock(ctx, C())` returns/creates one. The §7
+    # `Clock` is duck-typed against `node.clocks`; the Context fills that role.
+    const clocks::Dict{DataType, Any}
+    # Sim-time source (§7): the Context-hosted `/clock` value, atomically held.
+    # `nothing` until any node sets `use_sim_time` and the sub lands.
+    @atomic sim_time_ns::Union{Int64, Nothing}
+    # Shutdown state + drain machinery (§14).
+    const _state_lock::ReentrantLock
+    @atomic _state::ShutdownState
+    const _on_shutdown::Vector{Any}      # user cleanup hooks, run during the drain
+    const _shutdown_done::Threads.Condition  # `spin`/`wait` park here until drained
+    const drain_timeout::Float64         # seconds to await in-flight work
+    # Registered close-able handles (nodes, entities, timers) undeclared on drain
+    # (step 4). The entity layer pushes here; `close(ctx)` walks it in reverse.
+    const _resources::Vector{Any}
+end
+
+# Render the session's `z_id_t` into ROSZenoh's canonical lowercase-hex form.
+# zenoh's own `z_id_to_string` reverses the LE bytes (MSB first) and elides
+# leading zero bytes; we reproduce that so the hex matches what rmw_zenoh writes
+# into liveliness tokens (and what `parse_liveliness` reads back).
+function _zid_hex(s::Session)
+    le = to_le_bytes(zid(s))                       # NTuple{16,UInt8}, little-endian
+    be = reverse(collect(le))
+    i = findfirst(!=(0x00), be)                    # strip leading zero bytes
+    i === nothing && return "0"                    # all-zero ⇒ invalid session
+    bytes2hex(@view be[i:end])
+end
+
+# ROS env → values, with explicit kwargs winning. Kept tiny: domain/namespace/
+# enclave here; the localhost/peers→Zenoh-config translation is below.
+_env_domain_id() = (v = get(ENV, "ROS_DOMAIN_ID", nothing); v === nothing ? 0 : parse(Int, v))
+_env_namespace() = get(ENV, "ROS_NAMESPACE", "")
+_env_enclave()   = get(ENV, "ROS_ENCLAVE", "")
+
+# Translate the ROS transport-shaping env vars into the Zenoh `Config` via its
+# `c[key]=value` JSON5 setter (§5). Only the unambiguous mappings: localhost-only
+# → scouting off + loopback connect; static peers → connect/endpoints. `domain_id`
+# deliberately does *not* go here — it lives in the keyexprs, not the transport.
+# TODO(layer): `ROS_AUTOMATIC_DISCOVERY_RANGE` → gossip/multicast scope once the
+# exact rmw_zenoh scouting mapping is pinned down.
+function _apply_ros_transport_config!(c::Config; localhost_only::Bool, peers::Vector{String})
+    if localhost_only
+        c["scouting/multicast/enabled"] = false
+        isempty(peers) && (peers = ["tcp/localhost:7447"])
+    end
+    isempty(peers) || (c["connect/endpoints"] = peers)
+    c
+end
+
+function Context(; domain_id::Union{Integer, Nothing}=nothing,
+                   namespace::Union{AbstractString, Nothing}=nothing,
+                   enclave::Union{AbstractString, Nothing}=nothing,
+                   config::Union{Config, Nothing}=nothing,
+                   format::KeyExprFormat=RmwZenoh(),
+                   localhost_only::Bool=false,
+                   peers::AbstractVector{<:AbstractString}=String[],
+                   drain_timeout::Real=5.0,
+                   shm_clients=nothing)
+    dom = domain_id === nothing ? _env_domain_id() : Int(domain_id)
+    ns  = _normalize_namespace(namespace === nothing ? _env_namespace() : String(namespace))
+    enc = enclave === nothing ? _env_enclave() : String(enclave)
+
+    # Zenoh session config: reuse the caller's `Config` wholesale, else a default
+    # (peer mode → local router). ROS transport env is layered in either way.
+    cfg = config === nothing ? Config() : config
+    _apply_ros_transport_config!(cfg; localhost_only=localhost_only,
+                                       peers=collect(String, peers))
+
+    sess = shm_clients === nothing ? Base.open(cfg) : Base.open(cfg; shm_clients=shm_clients)
+
+    ctx = Context(sess, ZenohId(_zid_hex(sess)), dom, ns, enc, format,
+                  0, TypeRegistry(), GraphIndex(), nothing,
+                  Dict{DataType, Any}(), nothing,
+                  ReentrantLock(), running, Any[], Threads.Condition(),
+                  Float64(drain_timeout), Any[])
+
+    # Register the statically-compiled bootstrap types (type_description_interfaces,
+    # §11 S1) so the §13 server can serve them and discovery can use them, plus any
+    # @ros_import/@ros_cache statically-generated types (so keyexpr-only resolution
+    # uses the precompiled type directly). Forward references into typesupport/
+    # wellknown (included after this file).
+    _register_wellknown_types!(ctx)
+    _register_static_types!(ctx)
+
+    _start_discovery!(ctx)
+    return ctx
+end
+
+function Context(f::Function; kwargs...)
+    ctx = Context(; kwargs...)
+    try
+        f(ctx)
+    finally
+        close(ctx)
+    end
+end
+
+Base.show(io::IO, ctx::Context) =
+    print(io, "Context(domain=", ctx.domain_id, ", z_id=", ctx.z_id,
+              ", state=", (@atomic ctx._state), ")")
+
+# ── accessors others need (§5) ─────────────────────────────────────────────
+
+"The Context's Zenoh `Session` (shared by all its nodes)."
+session(ctx::Context) = ctx.session
+
+"The Context's type registry (§11)."
+registry(ctx::Context) = ctx.registry
+
+"The Context's discovery index (§12)."
+graph(ctx::Context) = ctx.graph
+
+"""
+    next_entity_id!(ctx) -> Int
+
+Allocate the next node/endpoint id from the Context's atomic counter (§5). Nodes
+*and* endpoints draw from one counter — they populate `ROSZenoh` entity `id`
+fields, which must be unique within the session.
+"""
+next_entity_id!(ctx::Context) = (@atomic ctx._next_id += 1)
+
+# The Context fills the §7 clock's `node`-role for context-level reads; the time
+# layer reads `node.clocks` duck-typed, so a Context works wherever a node would.
+function clock(ctx::Context, src::ClockSource)
+    C = typeof(src)
+    @lock ctx._state_lock get!(ctx.clocks, C) do
+        Clock(ctx, src)
+    end::Clock{C}
+end
+clock(ctx::Context) = clock(ctx, ROS())
+
+# ── name resolution (§5) ────────────────────────────────────────────────────
+# Turn a user name into a fully-qualified name *before* it reaches ROSZenoh:
+# absolute `/foo` as-is; relative `foo` → prepend namespace; private `~/foo` →
+# prepend the node FQN; then validate. Remap is a per-context rule table (the
+# `from:=to` / `__ns:=` / `__node:=` forms) — applied last; today the table is
+# empty until `--ros-args` parsing lands (TODO below). ROSZenoh stays
+# naming-agnostic — it takes the final topic string.
+
+# Normalize a namespace to a leading-slash, no-trailing-slash form. Empty ⇒ "/".
+function _normalize_namespace(ns::AbstractString)
+    isempty(ns) && return "/"
+    s = startswith(ns, "/") ? String(ns) : "/" * String(ns)
+    (length(s) > 1 && endswith(s, "/")) ? rstrip(s, '/') : s
+end
+
+# Join a namespace and a relative name without doubling the slash.
+_ns_join(ns::AbstractString, name::AbstractString) =
+    ns == "/" ? "/" * name : ns * "/" * name
+
+# A node's FQN = namespace + "/" + name. Duck-typed: the §6 Node has
+# `namespace`/`name`; a bare Context resolves relative names against its default
+# namespace with no private (`~`) support.
+_resolver_namespace(node) = hasproperty(node, :namespace) ? node.namespace : "/"
+function _resolver_fqn(node)
+    hasproperty(node, :fqn) && return node.fqn
+    if hasproperty(node, :namespace) && hasproperty(node, :name)
+        return _ns_join(_normalize_namespace(node.namespace), node.name)
+    end
+    return ""    # Context-level: no node FQN, so `~` is unresolvable
+end
+
+# Charset/structure validation of a resolved FQN: leading slash, no `//`, no
+# trailing slash (except the bare root), tokens are `[A-Za-z_][A-Za-z0-9_]*`.
+function _validate_fqn(name::AbstractString)
+    startswith(name, "/") || throw(ArgumentError("resolved name must be absolute: $(repr(name))"))
+    name == "/" && return name
+    occursin("//", name) && throw(ArgumentError("name contains empty token (//): $(repr(name))"))
+    endswith(name, "/") && throw(ArgumentError("name has trailing slash: $(repr(name))"))
+    for tok in split(name[2:end], "/")
+        (!isempty(tok) && (isletter(tok[1]) || tok[1] == '_') &&
+         all(c -> isletter(c) || isdigit(c) || c == '_', tok)) ||
+            throw(ArgumentError("invalid name token $(repr(tok)) in $(repr(name))"))
+    end
+    name
+end
+
+"""
+    resolve_name(node_or_ctx, name; kind=:topic) -> String
+
+Resolve a user-supplied `name` to a fully-qualified name (§5), the form ROSZenoh
+keyexpr builders expect:
+
+- **absolute** `"/foo"` — used as-is (after remap).
+- **relative** `"foo"` — prepended with the node's namespace.
+- **private** `"~/foo"` — prepended with the node's FQN (`namespace`/`name`).
+
+Then remap rules apply and the result is charset/structure-validated. `kind`
+(`:topic`/`:service`/`:node`) is carried for kind-scoped remap rules; it does not
+change the algorithm today. Resolving a private name against a bare `Context`
+(no node FQN) is an error.
+"""
+function resolve_name(node, name::AbstractString; kind::Symbol=:topic)
+    isempty(name) && throw(ArgumentError("name may not be empty"))
+    resolved = if startswith(name, "~")
+        # private: `~/foo` (or bare `~`) → node FQN + remainder
+        fqn = _resolver_fqn(node)
+        isempty(fqn) && throw(ArgumentError("private name $(repr(name)) needs a node FQN"))
+        rest = startswith(name, "~/") ? name[3:end] : name[2:end]
+        isempty(rest) ? fqn : _ns_join(fqn, rest)
+    elseif startswith(name, "/")
+        String(name)                                   # absolute
+    else
+        _ns_join(_normalize_namespace(_resolver_namespace(node)), name)  # relative
+    end
+    resolved = _apply_remap(node, resolved, kind)
+    return _validate_fqn(resolved)
+end
+
+# Remap rule application. The rule table lives on the node/context as `remaps`
+# (an ordered `Vector{Pair{String,String}}`), empty until `--ros-args` parsing
+# lands. Exact-match `from => to` on the resolved FQN (rclcpp's static remap).
+# TODO(layer): `__ns:=`/`__node:=` and node-scoped `nodename:from:=to` parsing
+# from `--ros-args`; today only an explicit `remaps` table is honored.
+function _apply_remap(node, resolved::AbstractString, ::Symbol)
+    hasproperty(node, :remaps) || return resolved
+    for (from, to) in node.remaps
+        from == resolved && return to
+    end
+    resolved
+end
+
+# ── discovery: the @ros2_lv/** liveliness subscriber (§12) ─────────────────
+# One callback-form subscriber per Context. Each token PUT/DELETE updates the
+# index and fans a `GraphChange` to listeners. Parse failures are logged and
+# skipped — a malformed/foreign token must not kill the discovery task.
+
+# The wildcard liveliness keyexpr. rmw_zenoh tokens live under `@ros2_lv/**`;
+# ros2dds under `@/<zid>/@ros2_lv/**`, so `**/@ros2_lv/**` covers both.
+_lv_wildcard(::RmwZenoh) = "@ros2_lv/**"
+_lv_wildcard(::KeyExprFormat) = "**/@ros2_lv/**"
+
+function _start_discovery!(ctx::Context)
+    ke = Keyexpr(_lv_wildcard(ctx.format))
+    # Liveliness (not data-plane) subscriber, callback form: latest-wins is fine —
+    # each token PUT/DELETE is a discrete event we apply immediately, no backlog
+    # buffer needed. `history=true` replays the live token set so a late-joining
+    # Context sees the existing graph (§12 eventual consistency).
+    ctx._lv_sub = LivelinessSubscriber(ctx.session, ke; history=true) do sample
+        try
+            _ingest_liveliness!(ctx, sample)
+        catch err
+            err isa ShutdownException && return
+            @error "discovery: liveliness sample handling failed" exception=(err, catch_backtrace())
+        end
+    end
+    return ctx
+end
+
+# Apply one liveliness sample to the index. PUT = appeared (parse + insert),
+# DELETE = withdrew (remove by the token key). Node tokens (`parse_liveliness`
+# returns a `NodeEntity`) carry no endpoint, so they only register the node's
+# presence — we track endpoints here and recover node identity from them.
+function _ingest_liveliness!(ctx::Context, sample)
+    key = Zenoh.keyexpr(sample)                       # the token string is the index key
+    appeared = Zenoh.kind(sample) === Zenoh.SampleKinds.PUT
+
+    if !appeared
+        removed = nothing
+        @lock ctx.graph.lock begin
+            removed = pop!(ctx.graph.endpoints, key, nothing)
+        end
+        removed === nothing || _notify_graph_change!(ctx, EndpointInfo[], EndpointInfo[removed])
+        return nothing
+    end
+
+    entity = parse_liveliness(ctx.format, key)
+    # A node token (`NN` kind) parses to a `NodeEntity` — no endpoint to index.
+    entity isa EndpointEntity || return nothing
+
+    info = _endpoint_info(entity; is_local=false)
+    @lock ctx.graph.lock ctx.graph.endpoints[key] = info
+    _notify_graph_change!(ctx, EndpointInfo[info], EndpointInfo[])
+    return nothing
+end
+
+# Wake graph waiters and fan a `GraphChange` to user listeners. Listeners run
+# outside the index lock (their handlers may query the graph). The condition is
+# how `wait_for_service`/`wait_for_matched` (§12) re-check on each change.
+function _notify_graph_change!(ctx::Context, added::Vector{EndpointInfo},
+                               removed::Vector{EndpointInfo})
+    @lock ctx.graph.changed notify(ctx.graph.changed)
+    isempty(ctx.graph.listeners) && return nothing
+    change = (; added=added, removed=removed)
+    for f in ctx.graph.listeners
+        try
+            f(change)
+        catch err
+            @error "on_graph_change listener threw" exception=(err, catch_backtrace())
+        end
+    end
+    nothing
+end
+
+"""
+    inject_endpoint!(ctx, key::AbstractString, e::EndpointEntity)
+
+Register one of *our own* entities in the discovery index immediately (§6/§12),
+authoritative ahead of the liveliness round-trip. `key` is the entity's
+liveliness keyexpr (its unique index key). The entity layer calls this when it
+declares an endpoint; `remove_endpoint!` is the close-side inverse.
+"""
+function inject_endpoint!(ctx::Context, key::AbstractString, e::EndpointEntity)
+    info = _endpoint_info(e; is_local=true)
+    @lock ctx.graph.lock ctx.graph.endpoints[String(key)] = info
+    _notify_graph_change!(ctx, EndpointInfo[info], EndpointInfo[])
+    info
+end
+
+"""
+    remove_endpoint!(ctx, key::AbstractString)
+
+Drop a locally-injected entity from the index (the close-side inverse of
+[`inject_endpoint!`](@ref)).
+"""
+function remove_endpoint!(ctx::Context, key::AbstractString)
+    removed = @lock ctx.graph.lock pop!(ctx.graph.endpoints, String(key), nothing)
+    removed === nothing || _notify_graph_change!(ctx, EndpointInfo[], EndpointInfo[removed])
+    removed
+end
+
+"""
+    endpoints_snapshot(ctx) -> Vector{EndpointInfo}
+
+An immutable snapshot of the index (copied out under the lock, §12.1) — a
+consistent instant, not a live alias. The §12 query layer (`endpoints`,
+`topic_names_and_types`, …) filters over this.
+"""
+endpoints_snapshot(ctx::Context) =
+    @lock ctx.graph.lock collect(values(ctx.graph.endpoints))
+
+"""
+    on_graph_change(f, node_or_ctx) -> f
+
+Register `f(change)` (`change.added` / `change.removed :: Vector{EndpointInfo}`)
+to fire on every discovery change (§12.3). Returns `f` so it can be removed.
+"""
+function on_graph_change(f::Function, ctx::Context)
+    @lock ctx.graph.lock push!(ctx.graph.listeners, f)
+    f
+end
+on_graph_change(f::Function, node) = on_graph_change(f, _ctx(node))
+
+# ── shutdown state machine + drain (§14) ────────────────────────────────────
+
+"""
+    is_shutdown(ctx) -> Bool
+
+True once the Context has begun shutting down (`:shutting_down` or `:shutdown`).
+The loop-guard predicate behind `while isopen(node)` / `!is_shutdown(ctx)` (§14).
+"""
+is_shutdown(ctx::Context) = (@atomic ctx._state) !== running
+
+"`isopen(ctx)` is the positive form of [`is_shutdown`](@ref)."
+Base.isopen(ctx::Context) = (@atomic ctx._state) === running
+
+"""
+    on_shutdown(f, ctx) -> f
+
+Register user cleanup `f()` to run during the drain (§14.1, step 2 — before the
+session closes), each bounded by a timeout so one hook can't stall the rest.
+Returns `f`.
+"""
+function on_shutdown(f::Function, ctx::Context)
+    @lock ctx._state_lock push!(ctx._on_shutdown, f)
+    f
+end
+on_shutdown(f::Function, node) = on_shutdown(f, _ctx(node))
+
+"""
+    register_resource!(ctx, handle) -> handle
+
+Track a `close`-able handle (node, endpoint, timer) so the drain undeclares it
+(§14.1, step 4). The entity layer calls this at construction; the drain walks the
+list in reverse so dependents close before their dependencies.
+"""
+function register_resource!(ctx::Context, handle)
+    @lock ctx._state_lock push!(ctx._resources, handle)
+    handle
+end
+
+"""
+    request_shutdown(ctx; reason="") -> Bool
+
+Begin a graceful drain (§14). Idempotent and async-safe: the first caller flips
+`:running → :shutting_down` and spawns the drain task; later calls are no-ops.
+Returns `true` if this call initiated shutdown. Does *not* wait — `close(ctx)`
+or `wait(ctx)`/`spin(ctx)` block for completion.
+"""
+function request_shutdown(ctx::Context; reason::AbstractString="")
+    initiated = false
+    @lock ctx._state_lock begin
+        if (@atomic ctx._state) === running
+            @atomic ctx._state = shutting_down
+            initiated = true
+        end
+    end
+    initiated || return false
+    isempty(reason) || @info "context shutting down" reason
+    # The drain runs on its own task so a signal/handler caller returns at once;
+    # `spin`/`wait`/`close` park on `_shutdown_done` until it finishes.
+    @async _drain!(ctx)
+    return true
+end
+
+# The one drain path (§14.1) every trigger funnels through. Ordered so peers see
+# a clean exit and in-flight work finishes:
+#   1. (already flipped to :shutting_down) wake clock-waits / blocked calls
+#   2. run on_shutdown hooks
+#   3. await in-flight tasks up to drain_timeout  (TODO: task tracking, §8/§9)
+#   4. undeclare entities (liveliness + routes)
+#   5. close the session  → :shutdown, notify spin/wait waiters
+function _drain!(ctx::Context)
+    # The whole drain is wrapped so the terminal state-flip + waiter notify in the
+    # `finally` *always* run — even if a step throws unexpectedly. This is the
+    # invariant `close`/`wait`/`spin` rely on: a drain that started always
+    # completes, so a blocked main task can never hang on a drain-internal bug.
+    try
+        # 1. Wake blocked clock-waits and the graph waits so they unwind with a
+        # ShutdownException rather than hanging the drain. Clock-wait interruption
+        # is the time layer's seam (TODO(layer): time.jl's `_interruptible_sleep`
+        # will register with us); the graph condition we own and wake here.
+        @lock ctx.graph.changed notify(ctx.graph.changed; all=true)
+
+        # 2. on_shutdown hooks, each bounded so one slow hook can't stall the rest.
+        hooks = @lock ctx._state_lock copy(ctx._on_shutdown)
+        for h in hooks
+            _run_bounded(ctx, "on_shutdown hook", ctx.drain_timeout) do
+                h()
+            end
+        end
+
+        # 3. Await in-flight goal/service handler tasks (incl. detached cleanup)
+        # up to drain_timeout. TODO(layer §8/§9): the Service/Action layers
+        # register their handler tasks with the Context; until then there is
+        # nothing to await and this is a no-op — the timeout still bounds the
+        # whole drain via steps 2 and 5.
+
+        # 4–5. Undeclare entities (clean graph departure, reverse order), stop
+        # discovery, then close the session — all **bounded by drain_timeout**. A
+        # wedged native close (e.g. libzenohc blocking under router contention) must
+        # not hang shutdown forever: the drain gives up after the timeout, its
+        # `finally` flips the state + wakes `close`/`spin`/`wait`, and the stuck
+        # native call dies with the process. (Without this bound a single stuck
+        # close is the catastrophic, SIGTERM-ignoring hang.)
+        _run_bounded(ctx, "drain teardown", ctx.drain_timeout) do
+            resources = @lock ctx._state_lock reverse(copy(ctx._resources))
+            for r in resources
+                try
+                    close(r)
+                catch err
+                    @error "drain: closing resource failed" exception=(err, catch_backtrace())
+                end
+            end
+            if ctx._lv_sub !== nothing
+                try
+                    close(ctx._lv_sub)
+                catch err
+                    @error "drain: closing discovery subscriber failed" exception=(err, catch_backtrace())
+                end
+                ctx._lv_sub = nothing
+            end
+            try
+                isopen(ctx.session) && close(ctx.session)
+            catch err
+                @error "drain: closing session failed" exception=(err, catch_backtrace())
+            end
+        end
+    finally
+        @atomic ctx._state = shutdown_done
+        @lock ctx._shutdown_done notify(ctx._shutdown_done; all=true)
+    end
+    return nothing
+end
+
+# Run `f()` with a wall-time bound: spawn it, poll for completion up to `secs`,
+# log on overrun (the task keeps running detached — we don't hard-kill a hook
+# mid-cleanup, the drain just moves on). Exceptions from `f` are logged, not
+# raised. `Base.timedwait` is the bound — note `Timer` here would resolve to
+# ROSNode's clock `Timer` (§7), so the wall-clock primitives are spelled `Base.`.
+function _run_bounded(f, ::Context, what::AbstractString, secs::Real)
+    t = @async try
+        f()
+    catch err
+        @error "$what threw" exception=(err, catch_backtrace())
+    end
+    Base.timedwait(() -> istaskdone(t), Float64(secs); pollint=0.02) === :ok ||
+        @warn "$what exceeded drain timeout; continuing" timeout_s=secs
+    nothing
+end
+
+"""
+    close(ctx::Context)
+
+Synchronous shutdown (§14): request the drain (idempotent) and block the calling
+task until it completes. Safe to call twice — a second `close` (e.g. a do-block
+block-exit after `spin` already drained) parks momentarily and returns.
+"""
+function Base.close(ctx::Context)
+    request_shutdown(ctx)
+    wait(ctx)
+    nothing
+end
+
+"""
+    wait(ctx::Context)
+
+Park the calling task until the Context has fully drained (`:shutdown`). Returns
+immediately if already drained. This is the body `spin` parks on.
+"""
+function Base.wait(ctx::Context)
+    (@atomic ctx._state) === shutdown_done && return nothing
+    @lock ctx._shutdown_done begin
+        while (@atomic ctx._state) !== shutdown_done
+            wait(ctx._shutdown_done)
+        end
+    end
+    nothing
+end
+
+"""
+    spin(ctx; handle_signals=false)
+
+Park the main task until the Context shuts down (§14). The scheduler runs the
+callbacks — `spin` does *not* pump an executor; it only keeps the process alive
+and gives signals a home. `handle_signals=true` installs SIGINT/SIGTERM handlers
+for the duration of the spin (opt-in so a library embedding us doesn't steal the
+host's handlers): first signal = graceful drain, a second SIGINT = hard
+`exit(130)`.
+"""
+function spin(ctx::Context; handle_signals::Bool=false)
+    if handle_signals
+        _with_signal_handlers(ctx) do
+            wait(ctx)
+        end
+    else
+        wait(ctx)
+    end
+    nothing
+end
+
+# Signal handling (§14.3): opt-in, scoped to the spin call. Installs handlers,
+# runs `f`, removes them on return. First signal → graceful `request_shutdown`;
+# a second SIGINT while draining → immediate `exit(130)`.
+# TODO(layer): a process-global manager that fans one signal to all opted-in
+# Contexts (multi-Context processes); today this installs per-spin handlers.
+function _with_signal_handlers(f, ctx::Context)
+    installed = false
+    try
+        _install_signal_handlers!(ctx)
+        installed = true
+    catch err
+        @warn "could not install signal handlers; spinning without them" exception=err
+    end
+    try
+        f()
+    finally
+        installed && _remove_signal_handlers!(ctx)
+    end
+end
+
+# Minimal handler per the design's "scheduler does the work": the OS handler only
+# requests the drain; a second SIGINT while already draining hard-exits. Julia
+# delivers SIGINT as InterruptException to the root task, so we hook that path
+# rather than raw sigaction. TODO(layer): SIGTERM + the uv_async_send relay; for
+# now SIGINT (Ctrl-C) drives the graceful path and a repeat hard-exits.
+function _install_signal_handlers!(ctx::Context)
+    # `wait(ctx)` runs in a try/catch so an InterruptException becomes a graceful
+    # shutdown request; the second one is caught while `is_shutdown` is already
+    # true and escalates. Implemented by wrapping the park in the spin caller;
+    # nothing to install at the OS level in this minimal stub.
+    Base.exit_on_sigint(false)
+    return nothing
+end
+_remove_signal_handlers!(::Context) = (Base.exit_on_sigint(true); nothing)
+
+# ── node ↔ context plumbing ────────────────────────────────────────────────
+# The §6 Node holds its Context; until that type lands, accept either a Context
+# directly or anything exposing a `.context` field (the shape Node will have).
+
+"Recover the owning `Context` from a node-or-context argument."
+_ctx(ctx::Context) = ctx
+_ctx(node) = hasproperty(node, :context) ? node.context :
+             throw(ArgumentError("expected a Context or a Node holding one"))
+
+# `Node` is the §6 layer's type. Declared here only so the `Context`/`Node`
+# vocabulary co-exports cleanly and duck-typed accessors above name it in docs;
+# the entity layer defines the concrete type and its constructors.
+# TODO(§6): the Node type + `Node(ctx, name; namespace)` constructor land in the
+# object-model file, which owns this name.
+function Node end

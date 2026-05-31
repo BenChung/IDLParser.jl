@@ -94,6 +94,33 @@ struct RAction
     feedback::RMessage
 end
 
+# ---- Referenced types (for transitive resolution) --------------------------
+
+"""
+    referenced_refs(x) -> Vector{Tuple{Union{Nothing, String}, String}}
+
+The nested-type references an IL interface (`RMessage`/`RService`/`RAction`) makes:
+`(package, name)` pairs, with `package === nothing` for a same-package (relative)
+reference. Primitive and string fields contribute nothing. A field's *element* base
+carries the ref (arrays/sequences flatten to `RType{base, ArraySpec}`), so walking
+`RField`s covers `T`, `T[]`, and `T[N]` alike. ROSNode's `@ros_import` uses this to
+resolve a type's transitive definition closure to generate.
+"""
+function referenced_refs(fields::Vector{RField})
+    out = Tuple{Union{Nothing, String}, String}[]
+    for f in fields
+        @match f.type.base begin
+            RBase.RRef(pkg, name) => push!(out, (pkg, name))
+            _ => nothing
+        end
+    end
+    return out
+end
+referenced_refs(m::RMessage) = referenced_refs(m.fields)
+referenced_refs(s::RService) = vcat(referenced_refs(s.request), referenced_refs(s.response))
+referenced_refs(a::RAction)  =
+    vcat(referenced_refs(a.goal), referenced_refs(a.result), referenced_refs(a.feedback))
+
 # ---- Unparsing IL → ROS interface text -------------------------------------
 
 unparse(node) = sprint(io -> unparse(io, node))

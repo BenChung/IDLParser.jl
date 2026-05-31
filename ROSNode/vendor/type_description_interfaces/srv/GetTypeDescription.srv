@@ -1,0 +1,27 @@
+# Retrieve the TypeDescription of a type, given its name and RIHS01 hash.
+# rmw_zenoh / rcl serve this on each node as ~/get_type_description so peers can
+# resolve a (name, hash) they see on the graph but don't have a definition for.
+
+# The fully-qualified name of the type, e.g. "rcl_interfaces/msg/Log".
+string type_name
+
+# The REP-2011 type hash string of the type, e.g. "RIHS01_<64 hex>".
+string type_hash
+
+# If true, the response should include the type description sources.
+bool include_type_sources
+---
+# True if the type was found and the returned description is valid.
+bool successful
+
+# A human-readable reason when `successful` is false.
+string failure_reason
+
+# The full description of the type and the types it references.
+TypeDescription type_description
+
+# The original interface sources of the type and referenced types, if requested.
+TypeSource[] type_sources
+
+# Additional application-specific key/value information about the type.
+KeyValue[] extra_information
