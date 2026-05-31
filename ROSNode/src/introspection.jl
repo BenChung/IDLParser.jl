@@ -184,6 +184,14 @@ function fetch_type_description(node, remote::AbstractString, type_name::Abstrac
                                   remote * "/get_type_description"
     client = ServiceClient(node, svc, GetTypeDescription_Request)
     try
+        # Discovery is eventually-consistent (§12.1): a query issued before the remote's
+        # queryable is routable matches nothing and never replies. Wait for the service
+        # to appear (same budget) before querying — else the get silently round-trips to
+        # nothing on a cold route.
+        if !wait_for_service(client; timeout = timeout_ms / 1000)
+            @debug "fetch_type_description: service not discovered" remote svc timeout_ms
+            return nothing
+        end
         resp = get_type_description(client, type_name; type_hash = hash_str,
                                     timeout_ms = timeout_ms)
         if !resp.successful

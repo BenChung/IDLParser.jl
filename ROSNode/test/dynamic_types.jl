@@ -65,6 +65,30 @@ module _LeafImport
     @ros_import "rcl_interfaces"                  # → module `rcl_interfaces` only
 end
 
+# A service import binds the `Foo` namespace module (→ `Foo.Request`/`Foo.Response`).
+module _SrvImport
+    using ROSNode
+    @ros_import "rcl_interfaces/srv/GetParameters"
+end
+
+# BYO interfaces: `from=` adds a local search root, types referenced by name and run
+# through the full registration pipeline (unlike raw `@ros_msgs`). Fixtures under
+# `test/fixtures/byo`; the relative root resolves against this source file.
+_dt("expanding @ros_import from= (BYO codegen)")
+module _ByoImport
+    using ROSNode
+    @ros_import from="fixtures/byo" "robot_msgs/msg/Widget" "robot_msgs/srv/DoThing" "robot_msgs/action/Process"
+end
+module _ByoAlias
+    using ROSNode
+    @ros_import from="fixtures/byo" "robot_msgs/msg/Widget" as W
+end
+module _ByoPkg
+    using ROSNode
+    @ros_import from="fixtures/byo" "robot_msgs"           # bare package → all interfaces
+end
+_dt("@ros_import from= modules ready")
+
 @testset "D5 dynamic type support" begin
 
     @testset "wire ⇄ internal TypeDescription preserves RIHS01" begin
@@ -114,7 +138,6 @@ end
         @test r2.include_type_sources == false
 
         # a Response carrying a real TypeDescription (Field + its FieldType closure)
-        fld = _wellknown_entries()[1]  # any; use the registry-built Field below instead
         fentry = only(filter(e -> endswith(e.info.name, "/msg/Field"), _wellknown_entries()))
         resp = GetTypeDescription_Response(successful = true, failure_reason = "",
                     type_description = to_wire_td(fentry.td),
@@ -229,6 +252,81 @@ end
         @test isdefined(_LeafImport, :rcl_interfaces)
         @test !isdefined(_LeafImport, :Log)
         @test isdefined(_LeafImport.rcl_interfaces.msg, :Log)
+    end
+
+    @testset "service/action sections get a Foo.Request namespace alias" begin
+        _dt("Foo.Request namespacing")
+        G = ROSNode.Interfaces.rcl_interfaces.srv
+        # `Foo` is a tag *type* (usable as a handle/type-param) exposing the sections
+        # by short name via getproperty; wire names/structs unchanged.
+        @test G.GetParameters isa Type && !(G.GetParameters isa Module)
+        @test G.GetParameters.Request === G.GetParameters_Request
+        @test G.GetParameters.Response === G.GetParameters_Response
+        @test nameof(G.GetParameters) === :GetParameters     # getfield fallback intact
+        # `@ros_import` of a service binds the bare `Foo` tag
+        @test _SrvImport.GetParameters isa Type
+        @test _SrvImport.GetParameters.Request === G.GetParameters_Request
+    end
+
+    @testset "@ros_import from=: BYO interfaces generate + leaf-bind" begin
+        _dt("BYO from= generation")
+        W = _ByoImport.robot_msgs.msg.Widget
+        @test _ByoImport.Widget === W                       # message leaf-binds
+        @test fieldnames(W) == (:label, :count, :samples)
+        w = W(label = "x", count = Int32(3), samples = Float64[1.0, 2.0])
+        @test w.label == "x" && w.count == Int32(3) && w.samples == [1.0, 2.0]
+        # service: sibling Request/Response + the Foo.Request namespace binding
+        @test isdefined(_ByoImport.robot_msgs.srv, :DoThing_Request)
+        @test _ByoImport.DoThing.Request === _ByoImport.robot_msgs.srv.DoThing_Request
+        @test _ByoImport.DoThing.Response === _ByoImport.robot_msgs.srv.DoThing_Response
+        # action: the three sibling sections
+        A = _ByoImport.robot_msgs.action
+        @test isdefined(A, :Process_Goal) && isdefined(A, :Process_Result) &&
+              isdefined(A, :Process_Feedback)
+    end
+
+    @testset "@ros_import from=: BYO types reach the registry (≠ @ros_msgs)" begin
+        _dt("BYO from= registration")
+        # The crux: `@ros_import` records `(type, TypeDescription-JSON)` for Context to
+        # register; raw `@ros_msgs` (see `_StrayTime`) emits structs but records nothing.
+        @test isdefined(_ByoImport, :__ros_static_types__)
+        @test !isdefined(_StrayTime, :__ros_static_types__)
+        pairs = _ByoImport.__ros_static_types__
+        @test any(p -> p[1] === _ByoImport.robot_msgs.msg.Widget, pairs)
+        # Absorbing interns the entry under its real wire name (what keyexpr-only
+        # resolution and the §13 server look up) — the registry coverage @ros_msgs lacks.
+        absorb_static_types!(_ByoImport)
+        @test any(e -> e.info.name == "robot_msgs/msg/Widget", _STATIC_TYPES.entries)
+        @test any(e -> e.info.name == "robot_msgs/srv/DoThing_Request", _STATIC_TYPES.entries)
+    end
+
+    @testset "@ros_import from=: as-alias and bare-package forms" begin
+        _dt("BYO from= as + bare package")
+        @test fieldnames(_ByoAlias.W) == (:label, :count, :samples)   # `as` → the struct
+        # bare package binds all interfaces in robot_msgs
+        @test isdefined(_ByoPkg.robot_msgs.msg, :Widget)
+        @test isdefined(_ByoPkg.robot_msgs.srv, :DoThing_Request)
+        @test isdefined(_ByoPkg.robot_msgs.action, :Process_Goal)
+        # `_ByoImport` already registered these, so the bare import *aliases* the
+        # provided msg/srv (single-copy) while still generating the action — the two
+        # must coexist under one `module robot_msgs` (a second would clobber the first).
+        @test _ByoPkg.robot_msgs.msg.Widget === _ByoImport.robot_msgs.msg.Widget
+        @test _ByoPkg.robot_msgs.srv.DoThing_Request === _ByoImport.robot_msgs.srv.DoThing_Request
+    end
+
+    @testset "@ros_import from=: search order is from-roots → vendored → ament" begin
+        _dt("BYO from= precedence")
+        byo    = abspath(joinpath(@__DIR__, "fixtures", "byo"))
+        shadow = abspath(joinpath(@__DIR__, "fixtures", "shadow"))   # a divergent Time copy
+        # a name only in the BYO root resolves there
+        @test ROSNode._resolve_one_iface("robot_msgs", "msg", "Widget", [byo]) ==
+              joinpath(byo, "robot_msgs", "msg", "Widget.msg")
+        # a name in BOTH a root and vendored resolves to the root (root shadows vendored)
+        @test ROSNode._resolve_one_iface("builtin_interfaces", "msg", "Time", [shadow]) ==
+              joinpath(shadow, "builtin_interfaces", "msg", "Time.msg")
+        # with no roots, the same name falls through to vendored
+        @test ROSNode._resolve_one_iface("builtin_interfaces", "msg", "Time") ==
+              joinpath(ROSNode._VENDOR_DIR, "builtin_interfaces", "msg", "Time.msg")
     end
 
     @testset "flush_type_cache exports the cache" begin

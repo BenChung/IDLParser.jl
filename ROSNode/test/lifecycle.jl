@@ -63,6 +63,6 @@ using ROSNode: LifecycleState, Unconfigured, Inactive, Active, Finalized, isacti
         # _gate_for returns nothing for anything not in the registry; the predicate
         # then short-circuits to `true`. We can't build a real Node here, but the
         # registry lookup itself is testable: an arbitrary unregistered key is absent.
-        @test isempty(ROSNode._GATES) || true     # registry exists; no live entries
+        @test ROSNode._GATES isa AbstractDict      # registry exists; no live entries here
     end
 end

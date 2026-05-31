@@ -62,15 +62,22 @@ end
 function _expand_msg_files(files::Vector{String})
     combined = Parse.Decl[]
     seen = Set{Tuple{String, String, String}}()
+    ifaces = Tuple{String, String, String}[]      # (pkg, kind, name), de-duped, in order
     for path in files
         pkg, kind, name = _pipeline_kind_from_path(path)
         key = (pkg, kind, name)
         key in seen && continue
         push!(seen, key)
+        push!(ifaces, key)
         append!(combined, _parse_one(path))
     end
     resolved = ConstResolution.resolve_constants(combined)
     code = Generation.generate_code(resolved)
+    # Julia-side `Foo.Goal`/`Foo.Request` namespacing: splice a `Foo` alias submodule
+    # *into* each service/action's generated `<pkg>.<kind>` module (wire names stay
+    # `Foo_Goal`/`Foo_Request`). Injected, not appended — re-opening a `module` via a
+    # second top-level expr replaces it (wiping the structs).
+    _inject_namespaces!(code, ifaces)
 
     # `Expr(:toplevel, ...)` — `module` definitions are top-level statements;
     # an `Expr(:block, ...)` would reject them as ordinary expressions.
@@ -80,6 +87,30 @@ function _expand_msg_files(files::Vector{String})
     end
     append!(block.args, code)
     return block
+end
+
+# Find the `module <name>` expr among a decl vector / module body, or `nothing`.
+function _find_module(args, name::Symbol)
+    for e in args
+        e isa Expr && e.head === :module && e.args[2] === name && return e
+    end
+    return nothing
+end
+
+# Splice each service/action's `Foo` alias submodule into its generated
+# `<pkg>.<kind>` module body (so `parentmodule(@__MODULE__)` resolves to the module
+# holding the section structs, and there's no `module` re-open).
+function _inject_namespaces!(code, ifaces)
+    for (pkg, kind, name) in ifaces
+        decls = namespace_alias_decls(kind, name)
+        isempty(decls) && continue
+        pkgmod = _find_module(code, Symbol(pkg))
+        pkgmod === nothing && continue
+        kindmod = _find_module(pkgmod.args[3].args, Symbol(kind))
+        kindmod === nothing && continue
+        append!(kindmod.args[3].args, decls)
+    end
+    return code
 end
 
 """

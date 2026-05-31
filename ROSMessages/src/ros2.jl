@@ -512,6 +512,41 @@ function action_protocol_decls(name::AbstractString; package::AbstractString="")
 end
 
 """
+    namespace_alias_module(kind, name) -> Union{Expr, Nothing}
+
+Julia-side namespacing for a service/action: a `<name>` submodule whose consts alias
+the generated sections to short names, so `Foo.Request`/`Foo.Goal` read better than
+the `Foo_Request`/`Foo_Goal` structs. Pure aliases (`const Goal = Foo_Goal`) — the
+ROS/wire type names are unchanged. The returned `module <name> … end` must be spliced
+*inside* the generated `<pkg>.<kind>` module (beside the section structs, after them),
+where `parentmodule(@__MODULE__)` resolves to that enclosing module — see
+`_inject_namespaces!`. `nothing` for a `msg` (a single, already-short struct).
+"""
+function namespace_alias_decls(kind::AbstractString, name::AbstractString)
+    fulls = if kind == "srv"
+        [string(name, "_Request"), string(name, "_Response")]
+    elseif kind == "action"
+        vcat([string(name, "_Goal"), string(name, "_Result"), string(name, "_Feedback")],
+             String[string(m.name) for m in _action_protocol_messages(name)])
+    else
+        return Expr[]
+    end
+    # `Foo` is an empty tag struct (a *type*, so it works as the action handle and as
+    # a type parameter) with a `getproperty` that maps short names to the section
+    # structs; the `getfield` fallback keeps `Foo.name`/`Foo.parameters` etc. intact.
+    # Spliced beside the section structs in `<pkg>.<kind>`, after they're defined.
+    branches = ["s === :$(chopprefix(f, string(name, "_"))) && return $f" for f in fulls]
+    src = "begin\n" *
+          "struct $name end\n" *
+          "function Base.getproperty(::Type{$name}, s::Symbol)\n" *
+          join(branches, "\n") * "\n" *
+          "return getfield($name, s)\n" *
+          "end\n" *
+          "end"
+    return Expr[e for e in Meta.parse(src).args if e isa Expr]
+end
+
+"""
     parse_file(path; package="")
 
 Dispatch on file extension (`.msg`, `.srv`, `.action`) and parse accordingly.

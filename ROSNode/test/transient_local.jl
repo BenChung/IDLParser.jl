@@ -125,7 +125,8 @@ _tlstep(msg::AbstractString) = (@info "  · $msg"; flush(stdout); flush(stderr))
                 put!(got, m)
             end
             activate!(ln)
-            @test (_tlrecv(got, 5.0)).value == "v1"            # first activation delivers
+            m = _tlrecv(got, 5.0)                              # first activation delivers
+            @test m isa WireKeyValue && m.value == "v1"
             @test _tlrecv(got, 0.4) === nothing
 
             _tlstep("lifecycle-recycle: deactivate, reactivate UNCHANGED ⇒ suppressed")
@@ -164,7 +165,8 @@ _tlstep(msg::AbstractString) = (@info "  · $msg"; flush(stdout); flush(stderr))
                 put!(got, m)
             end
             activate!(ln)
-            @test (_tlrecv(got, 5.0)).value == "v1"
+            m = _tlrecv(got, 5.0)
+            @test m isa WireKeyValue && m.value == "v1"
             _tlstep("lifecycle-force: reactivate ⇒ redelivered despite unchanged")
             deactivate!(ln)
             sleep(0.3)

@@ -31,25 +31,37 @@ export @ros_import, @ros_cache, flush_type_cache
 # Interface file extension for a qualifier.
 _iface_ext(qual::AbstractString) = qual == "srv" ? ".srv" : qual == "action" ? ".action" : ".msg"
 
-# Resolve one fully-qualified `(package, qualifier, bare)` to a source path, vendored
-# first (ships with ROSNode) then ament (a sourced ROS2 env). `nothing` if absent.
-function _resolve_one_iface(package::AbstractString, qualifier::AbstractString, bare::AbstractString)
+# Resolve one fully-qualified `(package, qualifier, bare)` to a source path: BYO
+# `from=` roots first (parent-of-packages, `<root>/<pkg>/<qual>/<Name>.<ext>`), then
+# ROSNode's vendored dir, then ament (a sourced ROS2 env). `nothing` if absent.
+function _resolve_one_iface(package::AbstractString, qualifier::AbstractString, bare::AbstractString,
+                            roots::Vector{String}=String[])
+    for root in roots
+        p = joinpath(root, package, qualifier, bare * _iface_ext(qualifier))
+        isfile(p) && return p
+    end
     vend = joinpath(_VENDOR_DIR, package, qualifier, bare * _iface_ext(qualifier))
     isfile(vend) && return vend
     return _find_ament_file("$package/$qualifier/$bare")
 end
 
-# All `(qualifier, bare, path)` interface files of a package (vendored ∪ ament).
-function _package_iface_files(package::AbstractString)
+# All `(qualifier, bare, path)` interface files of a package: BYO `from=` roots ∪
+# vendored (first source to declare a given `(qual, bare)` wins, BYO before vendored),
+# falling back to ament only when neither has the package.
+function _package_iface_files(package::AbstractString, roots::Vector{String}=String[])
     out = Tuple{String, String, String}[]
-    vdir = joinpath(_VENDOR_DIR, package)
-    if isdir(vdir)
+    seen = Set{Tuple{String, String}}()
+    for base in (roots..., _VENDOR_DIR)
+        pdir = joinpath(base, package)
+        isdir(pdir) || continue
         for qual in ("msg", "srv", "action")
-            qdir = joinpath(vdir, qual)
+            qdir = joinpath(pdir, qual)
             isdir(qdir) || continue
             for f in sort!(readdir(qdir))
                 e = splitext(f)
                 e[2] in (".msg", ".srv", ".action") || continue
+                (qual, e[1]) in seen && continue
+                push!(seen, (qual, e[1]))
                 push!(out, (qual, e[1], joinpath(qdir, f)))
             end
         end
@@ -76,10 +88,10 @@ end
 
 # Expand an `@ros_import` name to its initial `(package, qualifier, bare)` set: a
 # bare `"pkg"` → every interface in the package; else the single named type.
-function _expand_import_name(name::AbstractString)
+function _expand_import_name(name::AbstractString, roots::Vector{String}=String[])
     parts = split(name, '/')
     if length(parts) == 1
-        return [(String(name), q, b) for (q, b, _) in _package_iface_files(String(name))]
+        return [(String(name), q, b) for (q, b, _) in _package_iface_files(String(name), roots)]
     else
         pkg, qual, bare = split_ros_name(name)
         return [(pkg, qual, bare)]
@@ -97,11 +109,11 @@ end
 # Resolve the requested names to the full transitive set of interface specs
 # `(; package, qualifier, bare, path, il)` — following each interface's references
 # (`referenced_refs`) to its dependencies so generation is closed.
-function _resolve_import_closure(names::Vector{String})
+function _resolve_import_closure(names::Vector{String}, roots::Vector{String}=String[])
     specs = NamedTuple[]
     seen = Set{String}()
     work = Tuple{String, String, String}[]
-    for name in names, t in _expand_import_name(name)
+    for name in names, t in _expand_import_name(name, roots)
         push!(work, t)
     end
     while !isempty(work)
@@ -109,7 +121,7 @@ function _resolve_import_closure(names::Vector{String})
         qn = "$pkg/$qual/$bare"
         qn in seen && continue
         push!(seen, qn)
-        path = _resolve_one_iface(pkg, qual, bare)
+        path = _resolve_one_iface(pkg, qual, bare, roots)
         if path === nothing
             @warn "@ros_import: could not resolve $qn (not vendored or in AMENT_PREFIX_PATH)"
             continue
@@ -193,6 +205,19 @@ end
 
 # ── @ros_import ─────────────────────────────────────────────────────────────────
 
+# Lift a `from=` argument value (a string literal or a `["a", "b"]` vector literal)
+# to its list of root strings. Non-literals error — roots are resolved at macro time.
+function _from_literals(val)
+    if val isa AbstractString
+        return String[String(val)]
+    elseif val isa Expr && val.head === :vect && all(x -> x isa AbstractString, val.args)
+        return String[String(x) for x in val.args]
+    else
+        error("@ros_import: `from=` takes a string literal or a vector of string \
+               literals, e.g. `from=\"interfaces\"` or `from=[\"a\", \"b\"]`")
+    end
+end
+
 # Emit, per provided hit, `module <pkg> module <qual> const <Name> = <T> end end`
 # so the caller's `<pkg>.<qual>.<Name>` path *aliases* an already-compiled struct `T`
 # (one wire type ⇒ one Julia struct, §11/D5) instead of minting a duplicate. `T` is
@@ -221,13 +246,17 @@ function _alias_block(hits::Vector{Tuple{String, String, String, Any}})
     return out
 end
 
-# Resolve `names` to an import plan `(alias_hits, gen_paths, gen_jsons)`: provided
-# sections to alias (`[(pkg, qual, bare, Type)]`) vs. files to generate locally and
-# their registration JSON. Shared by the bare and `as` forms.
-function _import_plan(names::Vector{String})
-    specs = _resolve_import_closure(names)
+# Resolve `names` to an import plan
+# `(alias_hits, gen_paths, gen_jsons, alias_ifaces, byo_deps)`: provided sections to
+# alias (`[(pkg, qual, bare, Type)]`) vs. files to generate locally and their
+# registration JSON, plus the BYO (`from=`) source paths to register as precompile
+# dependencies (aliased *and* generated — editing a BYO file must re-trigger even if
+# it currently aliases away). Shared by the bare and `as` forms.
+function _import_plan(names::Vector{String}, roots::Vector{String}=String[])
+    specs = _resolve_import_closure(names, roots)
     isempty(specs) &&
-        error("@ros_import: no sources resolved for $(names) — vendored, or source a ROS2 env")
+        error("@ros_import: no sources resolved for $(names) — vendored, in a sourced \
+               ROS2 env (AMENT_PREFIX_PATH), or under a `from=` root")
     tds = _static_type_descriptions([(s.package, s.il) for s in specs])
     hashof = Dict{String, Any}()
     jsonof = Dict{String, String}()
@@ -244,32 +273,89 @@ function _import_plan(names::Vector{String})
     # (incl. actions — their implicit protocol types aren't provided) generates.
     aliasable(s) = s.qualifier in ("msg", "srv") &&
                    all(((p, q, b),) -> prov("$p/$q/$b") !== nothing, secs(s))
-    alias_hits = Tuple{String, String, String, Any}[]
-    gen_paths  = String[]
-    gen_qns    = Set{String}()
+    alias_hits   = Tuple{String, String, String, Any}[]
+    alias_ifaces = Tuple{String, String, String}[]   # provided srv/action, for Foo.* namespacing
+    gen_paths    = String[]
+    gen_qns      = Set{String}()
     for s in specs
         if aliasable(s)
             for (p, q, b) in secs(s)
                 push!(alias_hits, (p, q, b, prov("$p/$q/$b")))
             end
+            s.qualifier in ("srv", "action") && push!(alias_ifaces, (s.package, s.qualifier, s.bare))
         else
             push!(gen_paths, s.path)
             for (p, q, b) in secs(s); push!(gen_qns, "$p/$q/$b"); end
         end
     end
     gen_jsons = [(p, q, b, jsonof["$p/$q/$b"]) for (p, q, b, _) in tds if "$p/$q/$b" in gen_qns]
-    return (alias_hits, unique(gen_paths), gen_jsons)
+    # Precompile deps for BYO sources: every resolved path under a `from=` root (so an
+    # aliased-away BYO file still re-triggers on edit), plus the package dir of any
+    # bare-package import that hit a root (so adding/removing a file regenerates).
+    byo_deps = String[s.path for s in specs if _under_roots(s.path, roots)]
+    for name in names, root in roots
+        '/' in name && continue                      # bare package only
+        pdir = joinpath(root, name)
+        isdir(pdir) && push!(byo_deps, pdir)
+    end
+    return (alias_hits, unique(gen_paths), gen_jsons, alias_ifaces, unique(byo_deps))
 end
 
-# Append a plan's code to `block`: provided-type aliases first (so generated structs
-# resolve their refs), then the generated structs + their registration.
+# True if `path` lives under one of the BYO `from=` roots (vs. vendored/ament). The
+# trailing separator stops a sibling dir (`/a/bc`) from matching root `/a/b`.
+_under_roots(path::AbstractString, roots::Vector{String}) =
+    any(r -> startswith(normpath(path), normpath(r) * "/"), roots)
+
+# Map a module body's child `module` exprs by name. A module expr is
+# `Expr(:module, std_imports, name, body)`; we key the `body`'s sub-`module`s.
+_child_modules(body::Expr) =
+    Dict{Symbol, Expr}(c.args[2] => c for c in body.args if c isa Expr && c.head === :module)
+
+# Merge `src`'s body into `dst`'s body (both `module name (block …)`): same-named
+# sub-modules merge recursively (e.g. two `module msg`s — alias consts + generated
+# structs coexist); everything else from `src` is *prepended* so aliased sections
+# precede generated ones that may reference them within the same package.
+function _merge_module!(dst::Expr, src::Expr)
+    dstbody, srcbody = dst.args[3], src.args[3]
+    dstsubs = _child_modules(dstbody)
+    bring = Any[]
+    for c in srcbody.args
+        if c isa Expr && c.head === :module && haskey(dstsubs, c.args[2])
+            _merge_module!(dstsubs[c.args[2]], c)
+        else
+            push!(bring, c)
+        end
+    end
+    prepend!(dstbody.args, bring)
+    return dst
+end
+
+# Append a plan's code to `block`. Provided-type aliases for a package that is *also*
+# generated are merged into that package's generated `module` (a second `module pkg`
+# at the same scope would clobber the first, dropping the aliased sections); aliases
+# for packages with no generated section stay standalone and are emitted *before* the
+# generated modules, which reference them by path. A provided srv/action also gets its
+# `Foo.Request`/`Foo.Goal` namespace (generated ones get it from `_expand_msg_files`).
 function _plan_block!(block, plan)
-    (alias_hits, gen_paths, gen_jsons) = plan
-    append!(block.args, _alias_block(alias_hits))
-    if !isempty(gen_paths)
+    (alias_hits, gen_paths, gen_jsons, alias_ifaces, byo_deps) = plan
+    aliases = _alias_block(alias_hits)
+    ROSMessages._inject_namespaces!(aliases, alias_ifaces)
+    if isempty(gen_paths)
+        append!(block.args, aliases)
+    else
         gen = ROSMessages._expand_msg_files(gen_paths)       # structs + include_dependency
+        genmods = _child_modules(Expr(:block, gen.args...))  # generated top-level modules by pkg
+        for a in aliases                                     # each is `module <pkg> …`
+            g = get(genmods, a.args[2], nothing)
+            g === nothing ? append!(block.args, [a]) : _merge_module!(g, a)
+        end
         append!(block.args, gen.args)
         append!(block.args, _static_register_stmts(gen_jsons, nothing))
+    end
+    # Track BYO sources so edits/additions invalidate precompile (generated paths get
+    # this from `_expand_msg_files`; aliased BYO files and bare-package dirs don't).
+    for d in byo_deps
+        push!(block.args, :($Base.include_dependency($d)))
     end
     return block
 end
@@ -277,6 +363,7 @@ end
 """
     @ros_import "pkg" | "pkg/qual/Name" ...
     @ros_import "pkg/qual/Name" as Alias
+    @ros_import from="dir" "pkg/qual/Name" ...
 
 Statically generate ament/vendored ROS interface types *resolved by name* into the
 calling module (the static counterpart to dynamic discovery). Each name is a package
@@ -284,6 +371,18 @@ calling module (the static counterpart to dynamic discovery). Each name is a pac
 (`"sensor_msgs/msg/Imu"`); the transitive reference closure (e.g. `std_msgs/Header`)
 is pulled automatically. Sources are found in ROSNode's vendored dir and, when inside
 a sourced ROS2 env, `AMENT_PREFIX_PATH`.
+
+**BYO interfaces (`from=`).** Pass `from="dir"` (or `from=["a", "b"]`) to add local
+search roots for your own `.msg`/`.srv`/`.action` files, then reference them by name
+like any other type — they go through the *same* registration pipeline (RIHS01,
+single-copy aliasing, the §13 server), unlike raw `@ros_msg`/`@ros_msgs` which only
+emit structs. A root is a *parent-of-packages* dir laid out the ROS way,
+`<root>/<pkg>/<qual>/<Name>.<ext>` (e.g. `interfaces/robot_msgs/msg/Widget.msg` →
+`@ros_import from="interfaces" "robot_msgs/msg/Widget"`). Per name the search order is
+`from`-roots (in order) → vendored → ament, so a BYO package can supply types a
+sourced env lacks or shadow one it has; a dep not found in any root falls through the
+same way. Relative roots resolve against the source file (like `@ros_msg`). The roots'
+files are tracked as precompile dependencies, so edits re-trigger generation.
 
 Generation reuses the same pipeline as [`@ros_msg`](@ref) (structs +
 `include_dependency`); types land at `<pkg>.<qual>.<Name>`. They are additionally
@@ -312,26 +411,33 @@ different-RIHS01 versions). A *generated* `as` type is isolated in a hidden subm
 so its path can't clash with another import; a *provided* one binds straight through.
 """
 macro ros_import(names...)
-    # Split into bare imports and `"pkg/qual/Name" as Alias` triples.
+    # Split into bare imports, `"pkg/qual/Name" as Alias` triples, and `from=` roots.
     bare = String[]
     aliased = Tuple{String, Symbol}[]
+    rootsraw = String[]
     i = 1
     while i <= length(names)
         n = names[i]
-        if i + 2 <= length(names) && names[i + 1] === :as
+        if n isa Expr && n.head in (:(=), :kw) && n.args[1] === :from
+            append!(rootsraw, _from_literals(n.args[2])); i += 1
+        elseif i + 2 <= length(names) && names[i + 1] === :as
             (n isa AbstractString && names[i + 2] isa Symbol) ||
                 error("@ros_import: the `as` form is `@ros_import \"pkg/qual/Name\" as Alias`")
             push!(aliased, (String(n), names[i + 2])); i += 3
         elseif n isa AbstractString
             push!(bare, String(n)); i += 1
         else
-            error("@ros_import takes string literals (optionally `\"pkg/qual/Name\" as Alias`)")
+            error("@ros_import takes string literals (optionally `\"pkg/qual/Name\" as Alias` " *
+                  "or `from=\"dir\"`)")
         end
     end
     (isempty(bare) && isempty(aliased)) && error("@ros_import: nothing to import")
+    # Resolve `from=` roots against the source file (like `@ros_msg`), so a relative
+    # root is relative to the file the macro is written in, not the cwd.
+    roots = String[ROSMessages._resolve_macro_path(__source__, r) for r in rootsraw]
 
     block = Expr(:toplevel)
-    isempty(bare) || _plan_block!(block, _import_plan(bare))
+    isempty(bare) || _plan_block!(block, _import_plan(bare, roots))
 
     # Hybrid binding: an explicitly-listed fully-qualified *message* type also binds
     # its bare leaf name (like `import Mod: Name`) — so `@ros_import "pkg/msg/Image"`
@@ -342,15 +448,17 @@ macro ros_import(names...)
     leaves = Dict{Symbol, String}()
     for n in bare
         parts = split(n, '/')
-        (length(parts) == 3 && parts[2] == "msg") || continue
-        pkg, _, name = parts
+        (length(parts) == 3 && parts[2] in ("msg", "srv", "action")) || continue
+        pkg, qual, name = parts
         sym = Symbol(name)
         if haskey(leaves, sym)
             error("@ros_import: `$name` is imported from both `$(leaves[sym])` and " *
-                  "`$pkg/msg/$name`; use `@ros_import \"$pkg/msg/$name\" as <Alias>` to disambiguate")
+                  "`$n`; use `@ros_import \"$n\" as <Alias>` to disambiguate")
         end
-        leaves[sym] = "$pkg/msg/$name"
-        target = Expr(:., Expr(:., Symbol(pkg), QuoteNode(:msg)), QuoteNode(sym))
+        leaves[sym] = n
+        # msg → the struct `pkg.msg.Name`; srv/action → the `pkg.qual.Name` namespace
+        # module (so `Name.Request`/`Name.Goal`). Both already emitted above.
+        target = Expr(:., Expr(:., Symbol(pkg), QuoteNode(Symbol(qual))), QuoteNode(sym))
         push!(block.args, Expr(:const, Expr(:(=), sym, target)))
     end
 
@@ -361,7 +469,7 @@ macro ros_import(names...)
         qual == "msg" ||
             error("@ros_import … as $(asym): `as` aliasing is only for message types " *
                   "(\"pkg/msg/Name\"); a srv/action has no single struct to bind, got \"$tname\"")
-        (alias_hits, gen_paths, _) = plan = _import_plan([tname])
+        (alias_hits, gen_paths, _, _, _) = plan = _import_plan([tname], roots)
         if isempty(gen_paths)
             # Fully provided: bind `Alias` straight to the provided type (no submodule).
             j = findfirst(h -> (h[1], h[2], h[3]) == (pkg, qual, bare_name), alias_hits)
