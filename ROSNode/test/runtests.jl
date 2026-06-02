@@ -68,6 +68,9 @@ try
         _section("transient_local", "transient_local.jl")
         # D7: unified logging — pure level/format/maxlog + live /rosout dispatcher wrap.
         _section("rosout", "rosout.jl")
+        # D8: precompilation / warm-up — detector/@effectful/policy/_default_msg + live
+        # :precompile delivery-transparency and :execute effect-suppression / null-route.
+        _section("warmup", "warmup.jl")
     end
 finally
     _kill_router!()

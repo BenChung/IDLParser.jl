@@ -445,7 +445,9 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                              on_accepted::Union{Function, Nothing} = nothing,
                              concurrency::Concurrency = Serial(),
                              body::Union{Function, Nothing} = nothing,
-                             qos::QosProfile = default_qos()) where {A}
+                             qos::QosProfile = default_qos(),
+                             warmup::Union{Symbol, Nothing} = nothing,
+                             warmup_sync::Union{Bool, Nothing} = nothing) where {A}
     support = ActionTypeSupport(A)
     G = goal_type(support); R = result_type(support); F = feedback_type(support)
     fqn = resolve_name(node, name; kind=:service)
@@ -482,6 +484,15 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                                       ReentrantLock(), ReentrantLock(), true)
 
     _wire_action_server!(server)
+
+    # §D8: precompile goal-decode → per-goal execution callable → result/feedback
+    # encode. Precompile-only (no :execute — a fabricated long-running goal body
+    # over a live GoalHandle isn't safe to run at warm-up). `exec` is the do-block
+    # body (high-level) or the `on_accepted` callback (low-level).
+    pol = _resolve_warmup(node, warmup, warmup_sync)
+    exec = body !== nothing ? body : accepted
+    _warmup!(pol, () -> _warm_action(G, R, F, exec, GoalHandle{A, G, R, F}))
+
     return server
 end
 

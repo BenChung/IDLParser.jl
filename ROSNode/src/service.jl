@@ -139,7 +139,10 @@ fixed by the spelling.
 """
 function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
                        qos::QosProfile=default_qos(), view::Bool=false,
-                       concurrency::Concurrency=Serial()) where {Srv}
+                       concurrency::Concurrency=Serial(),
+                       warmup::Union{Symbol, Nothing}=nothing,
+                       warmup_sync::Union{Bool, Nothing}=nothing,
+                       warmup_sample=nothing) where {Srv}
     Req  = request_type(Srv)
     Resp = response_type(Srv)
     sname = resolve_name(node, name; kind=:service)
@@ -153,6 +156,11 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
     wire = _ServiceWire(qable, nothing, 0)
     ent.wire = wire
     wire.consumer = _spawn_service_consumer(ent, Req, Resp, handler, view, concurrency)
+
+    # §D8: precompile request-decode → handler → response-encode (and, under
+    # :execute, serve a default request once, its outbound `call`s null-routed).
+    pol = _resolve_warmup(node, warmup, warmup_sync)
+    _warmup!(pol, () -> _warm_service(pol, ent, Req, Resp, handler, warmup_sample))
 
     return ServiceHandle{Req, Resp}(ent)
 end
@@ -417,6 +425,12 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     tk = topic_keyexpr(ctx.format, e.endpoint)
 
     bytes = encode(req)
+    # §D8 :execute warm-up null-routes the wire op: `encode` above still compiles and
+    # runs, but there is no server during warm-up, so hand back a default `Resp` (the
+    # handler's continuation still compiles/runs) instead of issuing the `Zenoh.get`.
+    if _WARMUP[]
+        return async ? Threads.@spawn(_default_msg(Resp)) : _default_msg(Resp)
+    end
     seq = (@atomic client.seq += 1)
     ts = nanoseconds(Dates.now(e.node, System()))      # request-time wall ns (§3.4)
     attach = encode_attachment(seq, ts, gid(e))

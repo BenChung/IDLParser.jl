@@ -21,7 +21,8 @@ export QosProfile, TypeInfo, EndpointKind, default_qos,
        ShutdownException, Cancelled,
        SettlementStatus, success, failure, failed,
        succeeded, canceled, aborted, feedback,
-       Concurrency, Serial, Parallel
+       Concurrency, Serial, Parallel,
+       is_warming, @effectful
 
 # ── exceptions ───────────────────────────────────────────────────────────
 
@@ -158,3 +159,72 @@ fallthrough.
 macro unreachable(msg)
     :(error(string("unreachable: ", $(esc(msg)))))
 end
+
+# ── warm-up / precompilation (§D8) ─────────────────────────────────────────
+# The dispatch chain is specialized on the message type, so the *first*
+# `publish(::T)` / first handler-on-`::T` JITs the whole chain — a startup spike.
+# D8 precompiles that chain at entity construction (warmup.jl). `is_warming()` +
+# `@effectful` let user handlers stub their non-ROS effects during the `:execute`
+# warm-up (and during package precompilation) *without* specializing or folding
+# the wrong branch — it must be a runtime value flag, so both branches compile and
+# only one executes.
+
+"Runtime `:execute` warm-up scope. `true` only on a task the framework is warming."
+const _WARMUP = Base.ScopedValues.ScopedValue(false)
+
+"""
+    is_warming() -> Bool
+
+`true` while the framework is running a handler purely to warm its code path —
+either D8 `:execute` warm-up (the `_WARMUP` scope) or package precompilation
+(`jl_generating_output`). Lets handler code skip real side effects while still
+*compiling* them. A runtime value (not a type/`Val`) on purpose: both branches of
+a guard compile, only the live one runs — so warm-up exercises the stub yet still
+codegens the real branch. Must stay non-foldable (no `@pure`/`:foldable`), else a
+branch is DCE'd and the warm-up compiles the wrong specialization.
+"""
+@inline is_warming()::Bool =
+    _WARMUP[] || (ccall(:jl_generating_output, Cint, ()) != 0)
+
+"""
+    @effectful expr
+
+Run `expr` for its side effects only when *not* warming. While warming
+(`is_warming()`), `expr` is skipped but still **compiled** (the guard is a runtime
+value flag, so its branch codegens). Returns `expr`'s value at runtime, `nothing`
+while warming. For a value the warm-up path itself needs, write
+`is_warming() ? stub : real` directly instead.
+
+    Subscription(node, "/cmd", Twist) do msg
+        cmd = plan(msg)                  # compiled either way
+        @effectful arm_thrusters!(cmd)   # non-ROS effect: skipped while warming, still compiled
+        publish(throttle_pub, derive(cmd))   # ROS effect: framework null-routes during warm-up
+    end
+"""
+macro effectful(expr)
+    quote
+        ROSNode.is_warming() ? nothing : $(esc(expr))
+    end
+end
+
+"""
+    WarmupPolicy(mode, sync)
+
+Per-entity warm-up policy (§D8). `mode` is `:precompile` (default — a
+side-effect-free `precompile`-anchor of the dispatch chain), `:execute` (run the
+handler once on a sample message with side effects suppressed, reaching full
+native depth), or `:off` (no warm-up). `sync=false` (default) warms on a
+background task — zero construction latency; `sync=true` blocks the constructor
+until warm (first message guaranteed compiled — hard real-time).
+"""
+struct WarmupPolicy
+    mode::Symbol
+    sync::Bool
+    function WarmupPolicy(mode::Symbol, sync::Bool)
+        mode in (:precompile, :execute, :off) ||
+            throw(ArgumentError("warmup mode must be :precompile, :execute, or :off, got :$mode"))
+        new(mode, sync)
+    end
+end
+
+const _DEFAULT_WARMUP = WarmupPolicy(:precompile, false)

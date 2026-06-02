@@ -72,13 +72,17 @@ mutable struct Node
     _rosout_pub::Any                     # node-owned /rosout publisher, shared by every node logger
     _logger::Any                         # the default node `RosoutLogger`
     const _log_levels::Dict{String, Int32}  # §7 per-logger-name min levels (LogLevel.level)
+    # Default warm-up policy (§D8) for entities on this node; an entity ctor's own
+    # `warmup`/`warmup_sync` kwargs override per-endpoint.
+    const warmup::WarmupPolicy
     @atomic open::Bool
 end
 
 function Node(ctx::Context, name::AbstractString;
               namespace::Union{AbstractString, Nothing}=nothing,
               enclave::Union{AbstractString, Nothing}=nothing,
-              serve_type_description::Bool=true)
+              serve_type_description::Bool=true,
+              warmup::Symbol=:precompile, warmup_sync::Bool=false)
     ns  = _normalize_namespace(namespace === nothing ? ctx.namespace : String(namespace))
     enc = enclave === nothing ? ctx.enclave : String(enclave)
     nm  = String(name)
@@ -92,7 +96,7 @@ function Node(ctx::Context, name::AbstractString;
     node = Node(ctx, nm, ns, fqn, ent, lv_key, nothing,
                 Any[], Dict{DataType, Any}(), ReentrantLock(),
                 Pair{String, String}[], nothing, nothing,
-                Dict{String, Int32}(), true)
+                Dict{String, Int32}(), WarmupPolicy(warmup, warmup_sync), true)
 
     # Declare the node's liveliness token (peers discover the node), then inject
     # it into our own index so self-queries see it immediately (§12 authoritative).
@@ -691,20 +695,23 @@ method `declare_subscription!(entity, msgtype, handler; …)` which decodes a fi
 `T` directly.
 """
 function declare_subscription!(e::Entity, handler;
-                               concurrency::Concurrency=Serial())
+                               concurrency::Concurrency=Serial(),
+                               warmup::WarmupPolicy=e.node.warmup)
     ctx = e.node.context
     ke = _wildcard_data_keyexpr(ctx.format, e.endpoint)
     cap = _fifo_capacity(e.endpoint.qos)
     sub = Base.open(ctx.session, Keyexpr(ke); channel=:fifo, capacity=cap)
     e._route = sub
-    e._consumer = _spawn_dynamic_consumer(e, handler, concurrency)
+    e._consumer = _spawn_dynamic_consumer(e, handler, concurrency, warmup)
     return e
 end
 
-function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency)
+function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency,
+                                 warmup::WarmupPolicy)
     sched = _make_scheduler(concurrency)
     logged = Set{Tuple{String, TypeHash}}()      # S6: log each discovered type once
     loglk = ReentrantLock()
+    warmed = Set{DataType}()                      # §D8: warm each runtime type once at first sight
     # The buffer between the (sticky) Zenoh receiver and the resolve/codegen/dispatch
     # worker. Bounded to the QoS depth so it mirrors the FIFO's own backpressure: a
     # slow first-sight realize fills it to `cap`, then the receiver blocks on `put!`
@@ -720,7 +727,7 @@ function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency)
     # yields, so the scheduler reaches the worker; `-t>=2` adds true overlap.
     worker = Threads.@spawn try
         for (ke, bytes) in buf
-            _dynamic_dispatch(e, ke, bytes, handler, sched, logged, loglk)
+            _dynamic_dispatch(e, ke, bytes, handler, sched, logged, loglk, warmed, warmup)
         end
     catch err
         err isa ShutdownException && return
@@ -781,7 +788,7 @@ end
 # new-world code from there — so the per-message hot path crosses the world-age
 # boundary exactly once, not once per call.
 function _dynamic_dispatch(e::Entity, ke::AbstractString, bytes::Vector{UInt8},
-                           handler, sched, logged, loglk)
+                           handler, sched, logged, loglk, warmed, warmup::WarmupPolicy)
     try
         info = _sample_type_info(e, ke)
         info === nothing && return
@@ -791,6 +798,18 @@ function _dynamic_dispatch(e::Entity, ke::AbstractString, bytes::Vector{UInt8},
             return
         end
         _log_discovered_once(e, info, logged, loglk)
+        # §D8: warm this runtime type's codec once, before the first decode of it,
+        # on this worker (off the recv thread). `T` is runtime-born, so reach the
+        # warm anchor via `invokelatest` (newer world age). Precompile-only; skipped
+        # when the policy is :off.
+        if warmup.mode !== :off && !(T in warmed)
+            push!(warmed, T)
+            try
+                Base.invokelatest(_warm_dynamic, T, handler)
+            catch err
+                @warn "dynamic warm-up failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
+            end
+        end
         Base.invokelatest(_run_typed_dynamic, T, e, bytes, handler, sched)
     catch err
         err isa ShutdownException && return

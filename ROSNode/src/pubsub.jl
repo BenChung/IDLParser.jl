@@ -50,13 +50,21 @@ is fixed by the spelling. Publish with [`publish`](@ref).
 """
 function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          qos::QosProfile=default_qos(),
-                         congestion_control=nothing, priority=nothing) where {T}
+                         congestion_control=nothing, priority=nothing,
+                         warmup::Union{Symbol, Nothing}=nothing,
+                         warmup_sync::Union{Bool, Nothing}=nothing,
+                         warmup_sample=nothing) where {T}
     name = resolve_name(node, topic)
     ent = make_entity(node, Publisher, name, type_info_of(T); qos=qos)
     # `transient_local` routes to an AdvancedPublisher (sample cache, D4); the
     # concrete route type flows into `PublisherHandle{T,R}` so `put` stays monomorphic.
     route = declare_publisher!(ent; congestion_control=congestion_control, priority=priority)
-    return PublisherHandle{T, typeof(route)}(ent, route, 0)
+    pub = PublisherHandle{T, typeof(route)}(ent, route, 0)
+    # §D8: precompile the publish/encode chain (and, under :execute, publish once
+    # with the `put` null-routed) so the first real publish isn't a JIT spike.
+    pol = _resolve_warmup(node, warmup, warmup_sync)
+    _warmup!(pol, () -> _warm_publisher(pol, pub, warmup_sample))
+    return pub
 end
 
 """
@@ -80,6 +88,12 @@ function publish(pub::PublisherHandle{T}, msg::T) where {T}
     seq = (@atomic pub.seq += 1)
     ts = nanoseconds(Dates.now(e.node, System()))   # publish-time wall ns (§3.4)
     attach = encode_attachment(seq, ts, gid(e))
+    # §D8 :execute warm-up null-routes the wire op: everything above still compiles
+    # and runs (in-memory, harmless), only the actual `put` is skipped. The hot path
+    # reads the scoped value alone (not the full `is_warming()`) — `publish` never
+    # runs during package precompilation, so the `jl_generating_output` ccall is
+    # unneeded here.
+    _WARMUP[] && return nothing
     put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced)
     return nothing
 end
@@ -139,7 +153,10 @@ is fixed by the spelling.
 function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T};
                             qos::QosProfile=default_qos(), view::Bool=false,
                             concurrency::Concurrency=Serial(),
-                            force_relatch::Bool=false) where {T}
+                            force_relatch::Bool=false,
+                            warmup::Union{Symbol, Nothing}=nothing,
+                            warmup_sync::Union{Bool, Nothing}=nothing,
+                            warmup_sample=nothing) where {T}
     name = resolve_name(node, topic)
     ent = make_entity(node, Subscription, name, type_info_of(T); qos=qos)
     # `transient_local` ⇒ an AdvancedSubscriber with latched history (D4).
@@ -148,6 +165,10 @@ function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T
     # inputs); the default dedups replays by novelty.
     declare_subscription!(ent, T, handler; view=view, concurrency=concurrency,
                           force_relatch=force_relatch)
+    # §D8: precompile decode + the handler-dispatch frame (and, under :execute, run
+    # the handler once on a sample) so the first real message isn't a JIT spike.
+    pol = _resolve_warmup(node, warmup, warmup_sync)
+    _warmup!(pol, () -> _warm_subscription(pol, ent, T, handler, view, warmup_sample))
     return SubscriptionHandle{T}(ent)
 end
 
@@ -197,7 +218,9 @@ you what to write).
 """
 function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     qos::QosProfile=default_qos(),
-                                    concurrency::Concurrency=Serial())
+                                    concurrency::Concurrency=Serial(),
+                                    warmup::Union{Symbol, Nothing}=nothing,
+                                    warmup_sync::Union{Bool, Nothing}=nothing)
     # NB: no codegen on this (the caller's) task. Per-sample `realize!` runs on the
     # dispatch *worker* (node.jl), off the recv thread and while the receiver drains
     # the FIFO GC-safe, so the codegen's GC always completes. Running `Core.eval`
@@ -208,7 +231,13 @@ function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
     # No type identity: liveliness advertises the empty-type placeholder and the
     # data route wildcards type+hash (the type rides each sample's keyexpr, §11).
     ent = make_entity(node, Subscription, name, nothing; qos=qos)
-    declare_subscription!(ent, handler; concurrency=concurrency)
+    # §D8: no compile-time `T`, so warm-up is deferred to *first sight* of each
+    # runtime type (the dynamic consumer warms its codec via `invokelatest`). The
+    # resolved policy rides into the consumer; `:execute` degrades to `:precompile`
+    # there (a discovered handler can't be safely run on a synthesized sample —
+    # that's D9's manifest job).
+    pol = _resolve_warmup(node, warmup, warmup_sync)
+    declare_subscription!(ent, handler; concurrency=concurrency, warmup=pol)
     return DynamicSubscriptionHandle(ent)
 end
 

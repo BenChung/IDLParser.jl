@@ -26,6 +26,7 @@ include("parameters.jl")      # §12 Parameters
 include("graph.jl")           # §13 graph introspection
 include("typesupport.jl")     # type support / runtime type registry
 include("wellknown.jl")       # §11/§13 statically-compiled bootstrap interfaces (D5 S1)
+include("warmup.jl")          # §D8 precompilation / warm-up (after wellknown: needs Interfaces types)
 include("introspection.jl")   # message introspection
 include("staticgen.jl")       # §11/D5 @ros_import / @ros_cache static-gen + flush
 include("lifecycle.jl")       # managed lifecycle nodes
