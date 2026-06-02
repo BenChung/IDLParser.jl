@@ -25,6 +25,7 @@ include("action.jl")          # §11 Action server/client
 include("parameters.jl")      # §12 Parameters
 include("graph.jl")           # §13 graph introspection
 include("typesupport.jl")     # type support / runtime type registry
+include("manifest.jl")        # §D9 per-node dynamic-interaction manifest (after typesupport: needs the cache helpers)
 include("wellknown.jl")       # §11/§13 statically-compiled bootstrap interfaces (D5 S1)
 include("warmup.jl")          # §D8 precompilation / warm-up (after wellknown: needs Interfaces types)
 include("introspection.jl")   # message introspection

@@ -71,6 +71,9 @@ try
         # D8: precompilation / warm-up — detector/@effectful/policy/_default_msg + live
         # :precompile delivery-transparency and :execute effect-suppression / null-route.
         _section("warmup", "warmup.jl")
+        # D9: dynamic-discovery × precompilation — per-node interaction manifest
+        # (persistence/union/gating) + live record-on-dispatch and Tier-1 startup replay.
+        _section("dynamic_warm", "dynamic_warm.jl")
     end
 finally
     _kill_router!()

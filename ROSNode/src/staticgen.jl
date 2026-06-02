@@ -530,8 +530,13 @@ macro ros_cache(args...)
     dir = isempty(args) ? _default_project_cache_dir() :
           (args[1] isa AbstractString ? String(args[1]) :
            error("@ros_cache takes an optional string-literal directory"))
+    # Ensure the cache dir exists before depending on it: `include_dependency` errors
+    # on a missing path, and on the first run (empty cache) the dir does not exist yet.
+    # Creating it here registers the dependency from run 1, so a cache *grown* this run
+    # invalidates precompilation and re-bakes next load (the D5/D9 convergence).
+    isdir(dir) || mkpath(dir)
 
-    blobs = isdir(dir) ? sort!(filter(f -> endswith(f, ".json"), readdir(dir; join=true))) : String[]
+    blobs = sort!(filter(f -> endswith(f, ".json"), readdir(dir; join=true)))
     seen = Set{String}()
     specs = Tuple{String, Any}[]
     type_jsons = Tuple{String, String, String, String}[]   # (pkg, qual, bare, blobjson)

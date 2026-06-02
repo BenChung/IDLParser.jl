@@ -7,7 +7,7 @@
 
 using CDRSerialization: CDRReader, CDRWriter, CDRSizeCalculator, read_view,
                         iscompact, materialize, CDRView
-using Zenoh: ZBytes, Sample, payload, as_memory
+using Zenoh: ZBytes, Sample, AbstractSample, payload, as_memory
 import ROSZenoh
 # `TypeInfo` is already in scope (core.jl re-exports it); `TypeHash` is not.
 using ROSZenoh: TypeHash
@@ -65,7 +65,7 @@ view handler inside `with_memory` and hands us the borrowed memory through the
 The owned form copies the payload once (`as_memory`) so the decoded message
 outlives the sample. Both forms parse the 4-byte CDR preamble via `CDRReader`.
 """
-function decode(sample::Sample, ::Type{T}; view::Bool=false) where {T}
+function decode(sample::AbstractSample, ::Type{T}; view::Bool=false) where {T}
     # Owned: copy the payload into freshly-owned `Memory{UInt8}` so the decode
     # (and any aliasing views inside it) outlive the sample.
     mem = as_memory(payload(sample), UInt8)

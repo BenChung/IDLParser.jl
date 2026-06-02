@@ -12,7 +12,8 @@
 # agnostic: it takes an `EndpointKind` tag and builds the wire entity from it.
 
 using Zenoh: Zenoh, Keyexpr, Publisher as ZPublisher, SubscriberHandler,
-             LivelinessToken, Sample, with_memory, unsafe_memory, Reliabilities,
+             LivelinessToken, Sample, AbstractSample, SampleHolder, recv!,
+             with_memory, unsafe_memory, Reliabilities,
              CacheOptions, MissDetectionOptions, HistoryOptions, RecoveryOptions,
              DetectionOptions
 import Zenoh
@@ -400,7 +401,7 @@ end
 # The payload content-hash used by the gate (survives the advanced-cache replay that
 # strips attachment + timestamp). One `as_memory` copy of the payload — paid only for
 # transient_local subs, which are low-rate latched state.
-_payload_hash(sample::Sample) = hash(Zenoh.as_memory(Zenoh.payload(sample), UInt8))
+_payload_hash(sample::AbstractSample) = hash(Zenoh.as_memory(Zenoh.payload(sample), UInt8))
 
 """
     declare_publisher!(entity; kwargs...) -> AbstractPublisher
@@ -537,7 +538,7 @@ _zenoh_reliability(qos::QosProfile) =
 # the handler saw) and the D4 novelty gate (suppress re-latch replays). Returns
 # whether to deliver. Volatile subs pass `gate === nothing` and skip the attachment
 # decode entirely — the common fast path.
-@inline function _predispatch(e::Entity, sample::Sample, gate::Union{_NoveltyGate, Nothing})
+@inline function _predispatch(e::Entity, sample::AbstractSample, gate::Union{_NoveltyGate, Nothing})
     isactive(e) || return false               # §14.2 gate: drop while inactive (no record)
     gate === nothing && return true           # volatile fast path: no novelty work
     return _gate_deliver!(gate, _payload_hash(sample))   # D4: suppress re-latch replays
@@ -552,6 +553,12 @@ function _spawn_consumer(e::Entity, msgtype::Type, handler, view::Bool,
                          concurrency::Concurrency, sub::S,
                          gate::Union{_NoveltyGate, Nothing}) where {S<:Zenoh.AbstractSubscriberHandler}
     sched = _make_scheduler(concurrency)
+    defers = _defers(concurrency)
+    # Zero-allocation receive: refill one reused `SampleHolder` per `recv!` rather
+    # than allocating an owned `Sample` per message. The held sample is valid only
+    # until the next `recv!`, so anything that escapes this iteration (the
+    # Parallel view path) must copy out first; everything else uses it inline.
+    holder = SampleHolder()
     # Sticky task: the consumer (and, under `Serial()`, the handler it runs inline)
     # stays on the thread that declared the subscription. So a node's Serial
     # handlers all run cooperatively on one OS thread — never simultaneous, no data
@@ -559,19 +566,23 @@ function _spawn_consumer(e::Entity, msgtype::Type, handler, view::Bool,
     # individual handlers off this thread via the scheduler's `@spawn`.
     t = Task() do
         try
-            for sample in sub
+            while (sample = recv!(sub, holder)) !== nothing
                 _predispatch(e, sample, gate) || continue
-                if view
-                    # View path: the borrow must scope to the dispatch, so decode
-                    # happens *at the handler* under `with_memory` (D1). The sample
-                    # rides to the handler (inline Serial / worker Parallel); the
-                    # for-loop binds `sample` fresh per iteration, so the closure
-                    # captures the right one.
+                if view && defers
+                    # Parallel view: copy the payload into owned memory now (holder
+                    # still valid), then decode a view over it on the worker (D1).
+                    mem = Zenoh.as_memory(Zenoh.payload(sample), UInt8)
+                    sched(() -> _invoke_view_mem(e, mem, msgtype, handler))
+                elseif view
+                    # Serial view: handler runs inline before the next recv!, so the
+                    # borrow scopes to the dispatch — decode under `with_memory` (D1).
                     sched(() -> _invoke_view(e, sample, msgtype, handler))
                 else
                     # Owned path: decode on the consumer task (D1) — the handler
                     # receives an already-materialized message, so a slow handler
                     # never delays the next decode and decode stays off the worker.
+                    # The decode reads the holder inline, so reuse is safe under both
+                    # Serial and Parallel.
                     msg = _decode_on_consumer(e, sample, msgtype)
                     msg === nothing && continue
                     sched(() -> _invoke_owned(e, msg, handler))
@@ -593,7 +604,7 @@ end
 # Owned decode on the consumer task (D1). Returns the materialized message, or
 # `nothing` if decode threw — logged and skipped, so a malformed sample never kills
 # the consumer loop. (No ROS message type is `Nothing`, so the sentinel is safe.)
-function _decode_on_consumer(e::Entity, sample::Sample, msgtype::Type)
+function _decode_on_consumer(e::Entity, sample::AbstractSample, msgtype::Type)
     try
         return decode(sample, msgtype; view=false)
     catch err
@@ -621,7 +632,7 @@ end
 # View path: borrow the payload for the call via `with_memory` and decode a
 # `CDRView` aliasing it — escaping the scope is a `BorrowError`, not a
 # use-after-free (§3.2). Decode is at the dispatch so the borrow scopes here (D1).
-function _invoke_view(e::Entity, sample::Sample, msgtype::Type, handler)
+function _invoke_view(e::Entity, sample::AbstractSample, msgtype::Type, handler)
     try
         _with_node_logger(e.node) do          # D7: handler logs → node's /rosout
             with_memory(sample, UInt8) do b
@@ -634,6 +645,29 @@ function _invoke_view(e::Entity, sample::Sample, msgtype::Type, handler)
     end
     nothing
 end
+
+# View dispatch for the deferred (Parallel) path. The reused `SampleHolder`
+# can't outlive the consumer's next `recv!`, so the consumer copies the payload
+# into an owned `Memory` (one copy, inline while the holder is valid) and hands
+# it here; the worker decodes a `CDRView` aliasing that owned memory (min-copy
+# preserved) and the memory stays alive for the handler call via the closure.
+function _invoke_view_mem(e::Entity, mem, msgtype::Type, handler)
+    try
+        _with_node_logger(e.node) do
+            handler(decode(mem, msgtype; view=true))
+        end
+    catch err
+        err isa ShutdownException && return
+        @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
+    end
+    nothing
+end
+
+# Does the scheduler defer the thunk past the consumer's next receive? `Serial`
+# runs inline (the reused holder is still valid); `Parallel` spawns a worker
+# that may run after the next `recv!`, so a view sample must be copied out.
+_defers(::Serial)   = false
+_defers(::Parallel) = true
 
 # ── dynamic (keyexpr-only) subscription dispatch (§11/D5 S5) ───────────────────
 # A subscription created without a compile-time type. The route is a *wildcard*
@@ -712,6 +746,7 @@ function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency,
     logged = Set{Tuple{String, TypeHash}}()      # S6: log each discovered type once
     loglk = ReentrantLock()
     warmed = Set{DataType}()                      # §D8: warm each runtime type once at first sight
+    warmlk = ReentrantLock()                       # §D9: `warmed` is now shared with the Tier-1 replay task
     # The buffer between the (sticky) Zenoh receiver and the resolve/codegen/dispatch
     # worker. Bounded to the QoS depth so it mirrors the FIFO's own backpressure: a
     # slow first-sight realize fills it to `cap`, then the receiver blocks on `put!`
@@ -727,7 +762,7 @@ function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency,
     # yields, so the scheduler reaches the worker; `-t>=2` adds true overlap.
     worker = Threads.@spawn try
         for (ke, bytes) in buf
-            _dynamic_dispatch(e, ke, bytes, handler, sched, logged, loglk, warmed, warmup)
+            _dynamic_dispatch(e, ke, bytes, handler, sched, logged, loglk, warmed, warmlk, warmup)
         end
     catch err
         err isa ShutdownException && return
@@ -765,9 +800,63 @@ function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency,
     end
     t.sticky = true
     schedule(t)
+    # §D9 — Tier-1 startup warm: replay this node's interaction manifest for this
+    # topic, warming the codecs of types it used on prior runs *before* the first
+    # message arrives (shifting the JIT off the hot path). Runs concurrently with the
+    # receiver/worker; the shared `warmlk`-guarded `warmed` set makes the two paths
+    # idempotent (whichever warms a type first, the other skips it). Skipped when
+    # warm-up is off.
+    warmup.mode === :off ||
+        _spawn_manifest_warm(e, handler, warmed, warmlk, warmup)
     # `worker` needs no explicit handle: the scheduler roots it while it runs, and the
     # receiver's `finally close(buf)` (on route close) ends its drain loop cleanly.
     return t
+end
+
+# §D9 — schedule the Tier-1 manifest replay. `sync` runs it inline at construction
+# (hard real-time: first message guaranteed warm); otherwise a plain `Threads.@spawn`
+# (NOT sticky) — in cache-only mode the replay's `resolve_or_discover` may run
+# `realize!`→`Core.eval` codegen, whose GC must complete while the node's other
+# consumers keep safepoints reachable (the JIT-races-Zenoh discipline the dynamic
+# worker also follows, §D8). With `@ros_cache` baked, the resolve is a registry hit
+# and no codegen runs.
+function _spawn_manifest_warm(e::Entity, handler, warmed, warmlk, warmup::WarmupPolicy)
+    if warmup.sync
+        _replay_manifest_warm(e, handler, warmed, warmlk)
+    else
+        Threads.@spawn try
+            _replay_manifest_warm(e, handler, warmed, warmlk)
+        catch err
+            err isa ShutdownException && return
+            isopen(e) &&
+                @warn "dynamic manifest warm-up failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
+        end
+    end
+    nothing
+end
+
+# Resolve + warm each manifest entry for this subscription's topic. `wire=false`: a
+# node coming up must not block on a remote `~/get_type_description` — a genuinely-new
+# type still pays one reactive wire fetch on its first message, by design (§D9). A
+# stale entry whose type no longer resolves (cache evicted, version bump) returns
+# `nothing` and is skipped. Crosses to the runtime-born type's warm anchor via
+# `invokelatest` (newer world age), exactly as the worker does.
+function _replay_manifest_warm(e::Entity, handler, warmed, warmlk)
+    for it in load_manifest(e.node.fqn)
+        it.role === :subscription || continue
+        it.topic == e.endpoint.topic || continue
+        T = resolve_or_discover(e.node, it.name, it.hash; wire=false)
+        T === nothing && continue
+        isnew = @lock warmlk (T in warmed ? false : (push!(warmed, T); true))
+        isnew || continue
+        try
+            Base.invokelatest(_warm_dynamic, T, handler)
+        catch err
+            err isa ShutdownException && rethrow()
+            @warn "dynamic manifest warm-up: warming $(it.name) failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
+        end
+    end
+    nothing
 end
 
 # An owned `Vector{UInt8}` copy of a payload — independent of the sample's lifetime
@@ -788,7 +877,7 @@ end
 # new-world code from there — so the per-message hot path crosses the world-age
 # boundary exactly once, not once per call.
 function _dynamic_dispatch(e::Entity, ke::AbstractString, bytes::Vector{UInt8},
-                           handler, sched, logged, loglk, warmed, warmup::WarmupPolicy)
+                           handler, sched, logged, loglk, warmed, warmlk, warmup::WarmupPolicy)
     try
         info = _sample_type_info(e, ke)
         info === nothing && return
@@ -801,13 +890,19 @@ function _dynamic_dispatch(e::Entity, ke::AbstractString, bytes::Vector{UInt8},
         # §D8: warm this runtime type's codec once, before the first decode of it,
         # on this worker (off the recv thread). `T` is runtime-born, so reach the
         # warm anchor via `invokelatest` (newer world age). Precompile-only; skipped
-        # when the policy is :off.
-        if warmup.mode !== :off && !(T in warmed)
-            push!(warmed, T)
-            try
-                Base.invokelatest(_warm_dynamic, T, handler)
-            catch err
-                @warn "dynamic warm-up failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
+        # when the policy is :off. `warmed` is shared with the Tier-1 replay task, so
+        # the once-guard is taken under `warmlk` (D9).
+        if warmup.mode !== :off
+            isnew = @lock warmlk (T in warmed ? false : (push!(warmed, T); true))
+            if isnew
+                # §D9: record this real interaction so next run's Tier-1 warm replays
+                # it at startup (append-mostly union; a no-op once recorded).
+                note_interaction!(e.node.fqn, :subscription, info.hash, info.name, e.endpoint.topic)
+                try
+                    Base.invokelatest(_warm_dynamic, T, handler)
+                catch err
+                    @warn "dynamic warm-up failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
+                end
             end
         end
         Base.invokelatest(_run_typed_dynamic, T, e, bytes, handler, sched)

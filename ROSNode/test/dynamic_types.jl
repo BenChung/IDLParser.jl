@@ -181,6 +181,27 @@ _dt("@ros_import from= modules ready")
         end
     end
 
+    @testset "@ros_cache tolerates a not-yet-created cache dir (first run)" begin
+        _dt("@ros_cache first-run missing dir")
+        dir = joinpath(mktempdir(), "ros_typesupport")     # the first-run case: absent
+        @test !isdir(dir)
+        saved = copy(_STATIC_TYPES.cache_dirs)              # restore: the macro pushes the opt-in dir
+        try
+            # Expanding/running `@ros_cache` on a missing dir must not throw — its emitted
+            # `include_dependency(dir)` errors on a missing path. The macro now creates the
+            # dir so the precompile dependency is trackable from run 1 (D5/D9 convergence).
+            @eval module _D9CacheFirstRun
+                using ROSNode
+                @ros_cache $dir
+            end
+            @test isdir(dir)                                # created at expansion
+            @test dir in _STATIC_TYPES.cache_dirs           # opt-in absorbed
+        finally
+            empty!(_STATIC_TYPES.cache_dirs); union!(_STATIC_TYPES.cache_dirs, saved)
+            disable_project_cache!()
+        end
+    end
+
     @testset "@ros_import: canonical types alias to the single Interfaces copy" begin
         _dt("@ros_import aliasing")
         @test isdefined(_D5Import.type_description_interfaces.msg, :Field)
