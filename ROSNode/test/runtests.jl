@@ -62,6 +62,7 @@ try
         _section("lifecycle", "lifecycle.jl")             # §14.2 lifecycle state machine + gating predicate
         _section("roszenoh_roundtrip", "roszenoh_roundtrip.jl") # keyexpr/attachment round-trips through ROSZenoh
         _section("dynamic_types", "dynamic_types.jl")     # §11/D5 dynamic type support (conversions, cache, macros)
+        _section("resolution_d10b", "resolution_d10b.jl") # D10B per-module resolution tables + cross-materialize
         # Live D5 round-trips against the private router (§11/§13/D5 S2/S3/S5/S7).
         _section("dynamic_live", "dynamic_live.jl")
         # §4 concurrency: persistent worker-pool consumer (Parallel view/owned + Inf).

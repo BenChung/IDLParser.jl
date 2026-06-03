@@ -187,6 +187,10 @@ mutable struct Context
     # Registered close-able handles (nodes, entities, timers) undeclared on drain
     # (step 4). The entity layer pushes here; `close(ctx)` walks it in reverse.
     const _resources::Vector{Any}
+    # D10B S2: dynamic-resolution lens — the module whose baked `__ros_resolve__` table this
+    # Context looks through, so every node/sub on it sees one consistent, deterministic
+    # picture. `nothing` ⇒ content-canonical resolution only.
+    const home::Union{Module, Nothing}
 end
 
 # Render the session's `z_id_t` into ROSZenoh's canonical lowercase-hex form.
@@ -230,7 +234,8 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
                    localhost_only::Bool=false,
                    peers::AbstractVector{<:AbstractString}=String[],
                    drain_timeout::Real=5.0,
-                   shm_clients=nothing)
+                   shm_clients=nothing,
+                   home::Union{Module, Nothing}=nothing)
     dom = domain_id === nothing ? _env_domain_id() : Int(domain_id)
     ns  = _normalize_namespace(namespace === nothing ? _env_namespace() : String(namespace))
     enc = enclave === nothing ? _env_enclave() : String(enclave)
@@ -247,7 +252,7 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
                   0, TypeRegistry(), GraphIndex(), nothing,
                   Dict{DataType, Any}(), nothing,
                   ReentrantLock(), running, Any[], Threads.Condition(),
-                  Float64(drain_timeout), Any[])
+                  Float64(drain_timeout), Any[], home)
 
     # Register the statically-compiled bootstrap types (type_description_interfaces,
     # §11 S1) so the §13 server can serve them and discovery can use them, plus any
@@ -256,6 +261,7 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
     # wellknown (included after this file).
     _register_canonical_types!(ctx)
     _register_static_types!(ctx)
+    home === nothing && _maybe_hint_no_home()    # D10B S2: nudge if a resolvable home exists
 
     _start_discovery!(ctx)
     return ctx
@@ -269,6 +275,25 @@ function Context(f::Function; kwargs...)
         close(ctx)
     end
 end
+
+"""
+    @context([kwargs...]) do ctx … end
+
+Create a [`Context`](@ref) whose dynamic-resolution `home` is the calling module — sugar
+for `Context(f; home=@__MODULE__, kwargs...)` (D10B S2). Every keyexpr-only subscription
+on the Context then resolves wire types to *this* module's `@ros_import` structs, giving
+one consistent picture across the session. Use `Context(...; home=Mod)` for a different
+lens, or a plain `Context()` for content-canonical resolution only.
+"""
+macro context(args...)
+    isempty(args) && error("@context needs a trailing do-block: `@context(kwargs…) do ctx … end`")
+    body = esc(args[end])
+    kws  = map(esc, args[1:end-1])
+    m = __module__
+    return :(Context($body; home=$m, $(kws...)))
+end
+
+export @context
 
 Base.show(io::IO, ctx::Context) =
     print(io, "Context(domain=", ctx.domain_id, ", z_id=", ctx.z_id,

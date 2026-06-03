@@ -37,17 +37,38 @@ The SHM-move publish path (`zref(session, WireOf{T})`, §3.3) is a transport-lay
 choice made by the publisher, not here; this is the heap-borrow form.
 """
 function encode(msg)
+    # Borrow the heap buffer (copy=false): Zenoh keeps it alive for transmission.
+    return ZBytes(_encode_to_vector(msg))
+end
+
+# Size-then-write a message into an exact `Vector{UInt8}` (4-byte CDR_LE preamble +
+# payload). Shared by `encode` (which wraps it as a borrowed `ZBytes`) and `as` (which
+# decodes it straight into a sibling Julia type).
+function _encode_to_vector(msg)
     calc = CDRSizeCalculator()
     CDRSerialization.addValue!(calc, msg)
-    nbytes = position(calc)
-
-    buf = Vector{UInt8}(undef, nbytes)
-    w = CDRWriter(buf)              # emits the CDR_LE preamble into buf[1:4]
-    write(w, msg)
-
-    # Borrow the heap buffer (copy=false): Zenoh keeps it alive for transmission.
-    return ZBytes(buf)
+    buf = Vector{UInt8}(undef, position(calc))
+    write(CDRWriter(buf), msg)      # CDRWriter emits the CDR_LE preamble into buf[1:4]
+    return buf
 end
+
+"""
+    as(x, ::Type{T}) -> T
+
+Boundary cast: re-materialize `x` as the layout-compatible ROS type `T`. For two
+distinct Julia structs of the *same* wire type (equal RIHS01 ⇒ identical CDR form and
+field layout — e.g. two modules' aliases of `sensor_msgs/msg/Image`), this hands `x`'s
+value across the nominal-type boundary via the exact wire codec, correct by the same
+round-trip invariant the wire relies on. Identity when `typeof(x) === T`; a genuine
+layout mismatch surfaces as a decode error, never a silent reinterpretation.
+
+The explicit recovery when a value built as one alias reaches code expecting another —
+e.g. a handler on a Context whose `home` resolves the wire type to a different struct
+than the handler's body dispatches on: `f(as(msg, ThatType))`. (A `CDRView` re-tags
+zero-copy through `CDRSerialization.retag` — added with the intra-process work.)
+"""
+as(x, ::Type{T}) where {T} = typeof(x) === T ? x : decode(_encode_to_vector(x), T)
+export as
 
 # ── decode: ZBytes / Sample → message ────────────────────────────────────
 

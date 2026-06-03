@@ -949,7 +949,8 @@ function _replay_manifest_warm(e::Entity, handler, warmed, warmlk)
     for it in load_manifest(e.node.fqn)
         it.role === :subscription || continue
         it.topic == e.endpoint.topic || continue
-        T = resolve_or_discover(e.node, it.name, it.hash; wire=false)
+        T = _resolve_home(e.node, it.hash)                             # D10B S2: home table first
+        T === nothing && (T = resolve_or_discover(e.node, it.name, it.hash; wire=false))
         T === nothing && continue
         isnew = @lock warmlk (T in warmed ? false : (push!(warmed, T); true))
         isnew || continue
@@ -1006,6 +1007,16 @@ end
         (Ptr{UInt8}, Ptr{UInt8}, Csize_t), ptr, pointer(b), len) == 0)
 end
 
+# D10B S2: resolve a wire hash against the Context's `home` module's baked
+# `__ros_resolve__` table (per-module, deterministic). `nothing` when there is no home,
+# or the home's dependency closure never imported this type — the caller then falls to
+# `resolve_or_discover` (content-canonical / cache / wire / realize-on-miss).
+function _resolve_home(node, hash)
+    home = _ctx(node).home
+    home === nothing && return nothing
+    return resolve_in_home(home, Symbol(to_rihs_string(hash)))
+end
+
 function _dynamic_worker(e::Entity, buf, handler, sched, view::ViewMode, pool,
                          logged, loglk, warmed, warmlk, warmup::WarmupPolicy)
     # hash(keyexpr bytes) → (resolved type, keyexpr bytes for memcmp verify);
@@ -1052,7 +1063,8 @@ function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
                 pool === nothing || put!(pool, h)              # not dispatched → recycle the holder
                 continue
             end
-            Tnew = resolve_or_discover(e.node, info.name, info.hash)
+            Tnew = _resolve_home(e.node, info.hash)                    # D10B S2: home table first
+            Tnew === nothing && (Tnew = resolve_or_discover(e.node, info.name, info.hash))
             if Tnew === nothing
                 @warn "dynamic subscription: could not resolve type" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) maxlog=1
                 pool === nothing || put!(pool, h)              # not dispatched → recycle the holder

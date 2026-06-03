@@ -203,6 +203,30 @@ function _static_register_stmts(jsons, cache_dir)
     return stmts
 end
 
+# D10B S1 — emit the per-module resolution-table population. `jsons` are the module's
+# *own* (newly-generated) types `(pkg, qual, bare, json)`; aliased/transitive types arrive
+# via the dependency-closure fold inside `_merge_resolve!`, so a pure-alias import still
+# emits this (with no own entries) to inherit its deps' tables. Emitted at module top level
+# (NOT in `__init__`) so it runs and bakes at precompile — where the loaded-module set is
+# exactly this module's dependency closure, making the table deterministic and load-order
+# independent. (For a script/REPL module it runs at eval over the ambient set — the
+# documented degradation.)
+function _resolve_stmts(jsons)
+    own = Any[]
+    for (pkg, qual, bare, json) in jsons
+        tdmsg = _parse_type_description_json(json)
+        tdmsg === nothing && continue
+        rihs = calculate_rihs01_hash(tdmsg)        # RIHS01 string
+        push!(own, :(($(QuoteNode(Symbol(rihs))), $(Meta.parse("$pkg.$qual.$bare")))))
+    end
+    return Any[
+        :(if !$(Expr(:isdefined, _RESOLVE_GLOBAL))
+              global $(_RESOLVE_GLOBAL) = Dict{Symbol, ROSNode.ResolveEntry}()
+          end),
+        :(ROSNode._merge_resolve!(@__MODULE__, Tuple{Symbol, Type}[$(own...)])),
+    ]
+end
+
 # ── @ros_import ─────────────────────────────────────────────────────────────────
 
 # Lift a `from=` argument value (a string literal or a `["a", "b"]` vector literal)
@@ -352,6 +376,9 @@ function _plan_block!(block, plan)
         append!(block.args, gen.args)
         append!(block.args, _static_register_stmts(gen_jsons, nothing))
     end
+    # D10B S1: per-module resolution table — always (even pure-alias, which inherits its
+    # deps' tables via the closure fold). `gen_jsons` are this module's own mints.
+    append!(block.args, _resolve_stmts(gen_jsons))
     # Track BYO sources so edits/additions invalidate precompile (generated paths get
     # this from `_expand_msg_files`; aliased BYO files and bare-package dirs don't).
     for d in byo_deps
@@ -560,6 +587,9 @@ macro ros_cache(args...)
     # Bake registration for the cached types + the cache opt-in marker (`""` ⇒ the
     # project default dir, recomputed at load so it stays relocatable).
     append!(block.args, _static_register_stmts(type_jsons, isempty(args) ? "" : dir))
+    # D10B S1: cached types also join the per-module resolution table (content-canonical,
+    # in the home closure).
+    append!(block.args, _resolve_stmts(type_jsons))
     return esc(block)
 end
 

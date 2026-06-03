@@ -193,18 +193,20 @@ end
 _qos_match(pub_qos::QosProfile, sub_qos::QosProfile) =
     isempty(qos_compatible(sub_qos, pub_qos))
 
-# `ls::LocalSubscription{T}` for the publisher's own `T`: direct delivery hands the
-# sub the publisher's message object, so the sub's Julia type must *be* `T` — the
-# `LocalSubscription{T}` constraint enforces that at dispatch. A topic carrying two
-# different Julia types is a type mismatch (graph.jl flags it); we don't hand one
-# sub another type's object, so a non-`T` sub on the topic is simply not delivered
-# to here (it still receives over Zenoh, where the type-mismatch backstop applies).
-function _deliverable(pub::PublisherHandle{T}, ls::LocalSubscription{T}) where {T}
+# Deliver iff the endpoints carry the same *wire* type (`_types_match`: same name +
+# RIHS01) and the QoS is RxO-compatible — *regardless* of whether the publisher's and
+# subscriber's Julia structs are the identical alias. Under D10B two modules may hold
+# distinct same-`(name,hash)` structs for one wire type; `_invoke_local` cross-materializes
+# the publisher's `msg` into the subscriber's declared type. A genuinely *different* wire
+# type (different name or hash) fails `_types_match` and is dropped here — graph.jl's §12.2
+# detector flags that mismatch. (Same-session loopback is suppressed via `local_origin`, so
+# a matched local sub is served *only* by this direct path — hence we must deliver it, incl.
+# a sibling-alias sub that the old `{T}/{T}` constraint silently dropped → message loss.)
+function _deliverable(pub::PublisherHandle, ls::LocalSubscription)
     isopen(ls.entity) || return false
     _types_match(pub.entity.endpoint.type_info, _local_type(ls)) &&
         _qos_match(pub.entity.endpoint.qos, ls.qos)
 end
-_deliverable(::PublisherHandle, ::LocalSubscription) = false
 
 # ── direct delivery ───────────────────────────────────────────────────────────
 # Hand `msg` to each matching local sub. The `view` flag is the share/copy choice
@@ -264,7 +266,7 @@ end
 # publisher's task (order preserved); `Parallel(n)` a task per message. (D6's
 # "route local delivery through the endpoint worker, not inline" refinement is
 # still pending — for now Serial delivers inline, matching the prior behavior.)
-function _deliver_one(ls::LocalSubscription{T}, msg::T) where {T}
+function _deliver_one(ls::LocalSubscription, msg)
     if ls.concurrency isa Parallel
         Threads.@spawn _invoke_local(ls, msg)
     else
@@ -273,12 +275,15 @@ function _deliver_one(ls::LocalSubscription{T}, msg::T) where {T}
     nothing
 end
 
-# Hand the message to the handler with the share/copy semantics the sub's `view`
-# flag selects. Owned (default) copies so the handler may mutate freely; `view`
-# shares the publisher's object read-only. A handler throw is logged, never fatal.
-function _invoke_local(ls::LocalSubscription{T}, msg::T) where {T}
+# Hand the message to the handler *as the subscriber's declared type* `S`, with the
+# share/copy semantics the sub's `view` flag selects. Owned (default) yields an
+# independent value (mutate-freely); `view` shares read-only. When the publisher's
+# struct is a sibling alias of `S` (same wire type, different Julia struct — D10B), the
+# value is cross-materialized into `S` (`_ipc_own`/`_ipc_share`). A handler throw is
+# logged, never fatal.
+function _invoke_local(ls::LocalSubscription{S}, msg) where {S}
     try
-        payload = ls.view ? msg : _ipc_copy(msg)
+        payload = ls.view ? _ipc_share(S, msg) : _ipc_own(S, msg)
         ls.handler(payload)
     catch err
         err isa ShutdownException && return
@@ -301,3 +306,19 @@ end
 # heavier than the `view=true` share — which is exactly why `view=true` is the
 # opt-in for large arrays (§3.1 / the share/copy table).
 _ipc_copy(msg::T) where {T} = isbitstype(T) ? msg : deepcopy(msg)
+
+# Produce the subscriber's declared type `S` from the publisher's `msg` (§15.1, D10B).
+# Same-alias (`S === typeof(msg)`) keeps today's behavior; a *sibling* alias of the same
+# wire type — distinct Julia struct, equal RIHS01 ⇒ identical CDR form — is
+# cross-materialized: owned (`view=false`) owes an independent value, shared (`view=true`)
+# is zero-copy where a cast suffices.
+_ipc_own(::Type{S}, msg::S)   where {S} = _ipc_copy(msg)            # same alias, owned
+_ipc_share(::Type{S}, msg::S) where {S} = msg                      # same alias, shared
+# Cross-alias: owned round-trips through the codec (correct by the same invariant the wire
+# uses, and always cheaper than the Zenoh fallback). A `CDRView` re-tags zero-copy; any other
+# *materialized* sibling falls back to the owned copy — a var-length struct with a nested
+# *message* field can't be shared by reference (its `Vector{B.Point}` ≠ `Vector{A.Point}`),
+# the one corner where `view=true` loses zero-copy (isbits-bitcast is a deferred optimization).
+_ipc_own(::Type{S}, msg)          where {S} = as(msg, S)            # codec round-trip (== `as`)
+_ipc_share(::Type{S}, v::CDRView) where {S} = CDRSerialization.retag(v, S)
+_ipc_share(::Type{S}, msg)        where {S} = _ipc_own(S, msg)
