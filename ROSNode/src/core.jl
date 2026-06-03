@@ -22,6 +22,7 @@ export QosProfile, TypeInfo, EndpointKind, default_qos,
        SettlementStatus, success, failure, failed,
        succeeded, canceled, aborted, feedback,
        Concurrency, Serial, Parallel,
+       ViewMode, Owned, Checked, Unchecked,
        is_warming, @effectful
 
 # ── exceptions ───────────────────────────────────────────────────────────
@@ -146,6 +147,72 @@ end
 
 Base.show(io::IO, ::Serial)    = print(io, "Serial()")
 Base.show(io::IO, c::Parallel) = print(io, "Parallel(", isfinite(c.n) ? Int(c.n) : "Inf", ")")
+
+# ── view-borrow mode (only consulted when `view=true`) ───────────────────────
+# Three points on the safety↔speed curve for how a `view` handler borrows the
+# payload, as flag structs (dispatched on, like `Concurrency`) rather than a
+# Bool/Symbol — so the choice is type-stable and self-describing at the call site.
+
+"""
+    ViewMode
+
+How a subscription delivers each message to its handler — the single `view=` knob:
+
+  - [`Owned`](@ref) (default) — materialize a fully-owned message; storable,
+    forwardable, spawnable, no lifetime caveats.
+  - [`Checked`](@ref) — zero-copy `CDRView` aliasing the payload, with a runtime
+    escape guard (a view used after the handler returns throws `BorrowError`).
+  - [`Unchecked`](@ref) — the same zero-copy view with the guard removed: fastest,
+    zero-allocation, but an escaping view is undefined behaviour.
+
+`Checked` and `Unchecked` borrow over the *same* representation, so `Checked`
+validates exactly what `Unchecked` ships. `view=true`/`view=false` are accepted as
+shorthand for `Checked()`/`Owned()`.
+"""
+abstract type ViewMode end
+
+"""
+    Owned()
+
+Default delivery: the handler gets a fully-owned message (every field copied out
+of the payload), so it can be stored, forwarded, or spawned with no lifetime
+caveats (§3.1). `view=false` is shorthand for `Owned()`.
+"""
+struct Owned <: ViewMode end
+
+"""
+    Checked()
+
+Zero-copy delivery with a runtime escape guard: the handler gets a `CDRView`
+aliasing the payload, invalidated the instant it returns, so a `CDRView`/`CDRString`
+that escaped throws `BorrowError` on next access instead of reading freed memory.
+Allocates the guard (not zero-alloc), over the same representation [`Unchecked`](@ref)
+ships — so it validates the exact code you'll run unchecked. `view=true` is
+shorthand for `Checked()`. Run under `Checked()`, confirm no `BorrowError`, then
+switch to `Unchecked()`.
+"""
+struct Checked <: ViewMode end
+
+"""
+    Unchecked()
+
+The production fast path: zero-copy `CDRView` over a bare isbits `PayloadView` —
+**zero-allocation**, no escape checking. An escaping `CDRView`/`CDRString` is
+undefined behaviour; validate with [`Checked`](@ref) first.
+"""
+struct Unchecked <: ViewMode end
+
+Base.show(io::IO, ::Owned)     = print(io, "Owned()")
+Base.show(io::IO, ::Checked)   = print(io, "Checked()")
+Base.show(io::IO, ::Unchecked) = print(io, "Unchecked()")
+
+# `view=` accepts the `ViewMode` structs or the Bool shorthand.
+_view_mode(v::ViewMode) = v
+_view_mode(v::Bool) = v ? Checked() : Owned()
+# Whether a mode delivers a borrowed view (vs an owned message) — drives the
+# holder-lifetime choice in the consumers.
+_is_view(::Owned) = false
+_is_view(::ViewMode) = true
 
 # ── small shared helpers ─────────────────────────────────────────────────
 

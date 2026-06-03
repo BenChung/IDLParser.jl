@@ -6,7 +6,7 @@
 # per-message metadata rides separately in the Zenoh attachment (below).
 
 using CDRSerialization: CDRReader, CDRWriter, CDRSizeCalculator, read_view,
-                        iscompact, materialize, CDRView
+                        iscompact, materialize, CDRView, CDR_LE
 using Zenoh: ZBytes, Sample, AbstractSample, payload, as_memory
 import ROSZenoh
 # `TypeInfo` is already in scope (core.jl re-exports it); `TypeHash` is not.
@@ -86,14 +86,49 @@ the single-load fast path (`iscompact`), and the value is plain bits with no
 aliasing, so a "view" of one is already escapable.
 """
 function decode(mem::DenseVector{UInt8}, ::Type{T}; view::Bool=false) where {T}
-    r = CDRReader(mem)
-    if view && !iscompact(r, T)
-        # Zero-copy: variable-length fields alias `mem`; lifetime is the caller's.
-        return read_view(r, T)
-    end
-    # Owned (or compact, where view≡owned): full materialization, one field walk.
-    return read(r, T)
+    # Back-compat keyword entry. Prefer the type-stable `decode_view`/`decode_owned`
+    # on hot paths: a runtime `view::Bool` widens this method's return to
+    # `Union{T, CDRView{T}}` ⇒ inferred `Any` ⇒ every result is boxed and the decode
+    # is reached by dynamic dispatch. Each arm below is itself stable.
+    return view ? decode_view(mem, T) : decode_owned(mem, T)
 end
+
+"""
+    decode_owned(mem::DenseVector{UInt8}, ::Type{T}) -> T
+    decode_owned(sample::AbstractSample, ::Type{T}) -> T
+
+Type-stable owned decode: always materializes a fully-owned `T` (one field walk),
+storable / forwardable / spawnable with no lifetime caveats (§3.1). The sample
+overload copies the payload into freshly-owned `Memory{UInt8}` first, so the
+decode outlives the sample.
+"""
+@inline decode_owned(mem::DenseVector{UInt8}, ::Type{T}) where {T} = read(_ros_reader(mem), T)
+@inline decode_owned(sample::AbstractSample, ::Type{T}) where {T} =
+    decode_owned(as_memory(payload(sample), UInt8), T)
+
+"""
+    decode_view(mem::DenseVector{UInt8}, ::Type{T}) -> CDRView{T} | T
+
+Type-stable view decode: returns a `CDRView{T}` whose variable-length fields alias
+`mem` (valid only while the backing memory is live, §3.2), or — for a compact
+(`@cdr1_compat`) `T` — an owned `T`, since a "view" of plain bits is already
+escapable. `iscompact` is `@generated` and constant-folds per concrete `T`, so the
+`?:` dead-branches away and each specialization has a single concrete return type
+(no `Union`/`Any` box — contrast the `view::Bool`-keyword `decode`).
+"""
+@inline function decode_view(mem::DenseVector{UInt8}, ::Type{T}) where {T}
+    r = _ros_reader(mem)
+    return iscompact(r, T) ? read(r, T) : read_view(r, T)
+end
+
+# ROS2/rmw_zenoh serializes with `CDR_LE` (CDR v1, little-endian). Declaring the
+# encapsulation up front gives a *concrete* `CDRReader{B,false,true}` — its
+# `IsCDR2`/`LE` params (and the type of every `CDRString`/`CDRView` derived from
+# it) are then known at compile time, so `decode_view`/`decode_owned` infer to a
+# concrete return with no `Any`-box / dynamic dispatch (the data-derived
+# `CDRReader(mem)` widened them to `Any`; see §3.2). The preamble is still consumed
+# and validated — a non-`CDR_LE` payload throws noisily rather than mis-decoding.
+@inline _ros_reader(mem::DenseVector{UInt8}) = CDRReader(mem, Val(CDR_LE))
 
 """
     decode_owned(view::CDRView{T}) -> T

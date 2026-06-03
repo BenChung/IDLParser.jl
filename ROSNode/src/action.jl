@@ -849,7 +849,7 @@ const _CancelGoal_Response = Interfaces.action_msgs.srv.CancelGoal_Response
 function _decode_query(q::Query, ::Type{T}) where {T}
     pay = payload(q)
     pay === nothing && throw(ArgumentError("action request carried no payload"))
-    return decode(Zenoh.as_memory(pay, UInt8), T)
+    return decode_owned(Zenoh.as_memory(pay, UInt8), T)
 end
 
 # Decode `<A>_SendGoal_Request{goal_id::UUID, goal::G}` → (GoalId, G). The client
@@ -1000,7 +1000,7 @@ function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     accepted = false
     for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req), timeout_ms=5000)
         if Zenoh.is_ok(r)
-            resp = decode(Zenoh.sample(r), _send_goal_response_type(A))
+            resp = decode_owned(Zenoh.sample(r), _send_goal_response_type(A))
             accepted = resp.accepted
         end
         break                       # a service has a single reply
@@ -1068,7 +1068,7 @@ function Base.fetch(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     local result::R = _default_result(R)
     for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req), timeout_ms=0)
         if Zenoh.is_ok(r)
-            resp = decode(Zenoh.sample(r), _get_result_response_type(A))
+            resp = decode_owned(Zenoh.sample(r), _get_result_response_type(A))
             result_state = _client_state_from_status(resp.status)
             result = resp.result
         end

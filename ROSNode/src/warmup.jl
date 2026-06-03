@@ -119,13 +119,16 @@ end
 # Zenoh needed), decodes it (owned or view — the view aliases the buffer, which is
 # alive across the call), and runs the handler to full native depth.
 function _warm_subscription(policy::WarmupPolicy, e::Entity, ::Type{T}, handler::H,
-                            view::Bool, sample) where {T, H}
-    if view
-        precompile(decode, (Memory{UInt8}, Type{T}))
-        precompile(_invoke_view, (Entity, Sample, Type{T}, H))
+                            view::ViewMode, sample) where {T, H}
+    # The static and dynamic paths share `_dispatch_decoded` — warm it (the unit
+    # where decode + the handler call specialize together) for the holder the
+    # consumer actually borrows, in this subscription's view mode.
+    precompile(_dispatch_decoded, (Entity, SampleHolder, Type{T}, H, typeof(view)))
+    if _is_view(view)
+        precompile(decode_view, (Memory{UInt8}, Type{T}))
     else
-        precompile(decode, (Sample, Type{T}))
-        precompile(_decode_on_consumer, (Entity, Sample, Type{T}))
+        precompile(decode_owned, (Memory{UInt8}, Type{T}))
+        precompile(_decode_on_consumer, (Entity, SampleHolder, Type{T}))
         precompile(_invoke_owned, (Entity, T, H))
     end
     precompile(handler, (T,))
@@ -133,7 +136,11 @@ function _warm_subscription(policy::WarmupPolicy, e::Entity, ::Type{T}, handler:
         msg = _sample_msg(T, sample)
         buf = as_memory(encode(msg), UInt8)
         _run_warm(e.endpoint.topic) do
-            handler(decode(buf, T; view=view))
+            if _is_view(view)
+                handler(decode_view(buf, T))
+            else
+                handler(decode_owned(buf, T))
+            end
         end
     end
     nothing
@@ -144,7 +151,10 @@ end
 # `_run_typed_dynamic`, since `T` is runtime-born). Owned-only, precompile-only
 # (running a discovered handler on a synthesized sample is the D9 manifest's job).
 function _warm_dynamic(::Type{T}, handler::H) where {T, H}
-    precompile(decode, (Vector{UInt8}, Type{T}))
+    # The dynamic worker borrows a `Memory{UInt8}` (`with_payload_memory`) and
+    # decodes via `decode_view`/`decode_owned` per the sub's `view` flag — warm both.
+    precompile(decode_owned, (Memory{UInt8}, Type{T}))
+    precompile(decode_view, (Memory{UInt8}, Type{T}))
     precompile(handler, (T,))
     nothing
 end
@@ -154,7 +164,10 @@ end
 # and encodes the response it returns (warming the reply path to depth).
 function _warm_service(policy::WarmupPolicy, e::Entity, ::Type{Req}, ::Type{Resp},
                        handler::H, sample) where {Req, Resp, H}
-    precompile(decode, (Sample, Type{Req}))
+    # request decode runs over `as_memory(query payload)` via `decode_request`,
+    # which branches to `decode_view`/`decode_owned` over `Memory{UInt8}`.
+    precompile(decode_owned, (Memory{UInt8}, Type{Req}))
+    precompile(decode_view, (Memory{UInt8}, Type{Req}))
     precompile(handler, (Req,))
     precompile(encode, (Resp,))
     if policy.mode === :execute
@@ -175,7 +188,7 @@ end
 # the do-block body (high-level) or the `on_accepted` callback (low-level).
 function _warm_action(::Type{G}, ::Type{R}, ::Type{F}, exec::E,
                       ::Type{GH}) where {G, R, F, E, GH}
-    precompile(decode, (Sample, Type{G}))
+    precompile(decode_owned, (Memory{UInt8}, Type{G}))  # _decode_query → decode_owned
     precompile(exec, (GH,))
     precompile(encode, (R,))
     precompile(encode, (F,))
@@ -194,7 +207,8 @@ end
                   Interfaces.type_description_interfaces.msg.KeyValue)  # strings
             msg = _default_msg(T)
             z = encode(msg)
-            decode(as_memory(z, UInt8), T)
+            decode_owned(as_memory(z, UInt8), T)
+            decode_view(as_memory(z, UInt8), T)
         end
     end
 end

@@ -13,7 +13,8 @@
 
 using Zenoh: Zenoh, Keyexpr, Publisher as ZPublisher, SubscriberHandler,
              LivelinessToken, Sample, AbstractSample, SampleHolder, recv!,
-             with_memory, unsafe_memory, Reliabilities,
+             with_payload_memory, with_payload_memory_checked,
+             Reliabilities,
              CacheOptions, MissDetectionOptions, HistoryOptions, RecoveryOptions,
              DetectionOptions
 import Zenoh
@@ -425,7 +426,7 @@ function declare_publisher!(e::Entity; congestion_control=nothing, priority=noth
 end
 
 """
-    declare_subscription!(entity, msgtype, handler; view=false, concurrency=Serial())
+    declare_subscription!(entity, msgtype, handler; view=Owned(), concurrency=Serial())
 
 Declare the subscribe-side data route for a Subscription `entity` and start its
 dispatch runtime (§4). Opens a FIFO-channel Zenoh subscriber on the topic keyexpr
@@ -434,13 +435,16 @@ that lets a blocking handler keep buffering, §2.3), then spawns the consumer ta
 that decodes each sample to `msgtype` and runs `handler(msg)` per the concurrency
 policy. Returns the entity.
 
-`view=true` runs the handler over a zero-copy `CDRView` aliasing the payload
-(§3.2, valid only for the handler's duration); the default materializes an owned
-message.
+`view` is the [`ViewMode`](@ref): `Owned()` (default) materializes an owned
+message; `Checked()`/`Unchecked()` deliver a zero-copy `CDRView` aliasing the
+payload (valid only for the handler's duration, §3.2), guarded vs. bare. `true`
+(⇒ `Checked()`) and `false` (⇒ `Owned()`) are accepted as shorthand.
 """
 function declare_subscription!(e::Entity, msgtype::Type, handler;
-                               view::Bool=false, concurrency::Concurrency=Serial(),
+                               view::Union{Bool, ViewMode}=Owned(),
+                               concurrency::Concurrency=Serial(),
                                force_relatch::Bool=false)
+    view = _view_mode(view)
     ctx = e.node.context
     tk = topic_keyexpr(ctx.format, e.endpoint)
     cap = _fifo_capacity(e.endpoint.qos)
@@ -475,7 +479,7 @@ end
 # re-query. Arming before the join would race that delivery — the old consumer could
 # deliver a value after the snapshot froze, and the re-query would then deliver it a
 # second time (the value isn't yet in the snapshot it's checked against).
-function _do_relatch!(e::Entity, msgtype::Type, handler, view::Bool,
+function _do_relatch!(e::Entity, msgtype::Type, handler, view::ViewMode,
                       concurrency::Concurrency, gate::_NoveltyGate,
                       tk::AbstractString, cap::Integer, qos::QosProfile)
     isopen(e) || return nothing
@@ -549,64 +553,104 @@ end
 # local, so dispatch stays monomorphic regardless of which the QoS selected. (We do
 # NOT read `e._route::Any` here — an abstract-typed iteration would box every sample;
 # the bounded `S` recovers the type the erased field can't.)
-function _spawn_consumer(e::Entity, msgtype::Type, handler, view::Bool,
+# `T` is threaded as a type parameter (not a `::Type` value) so the per-message
+# decode/dispatch specializes: `decode(sample, T)` is return-type-stable, the
+# decoded message isn't boxed as `Any`, and the handler call is concrete. The
+# call from `declare_subscription!` (where `msgtype::Type` is a value) resolves
+# `T` with one dynamic dispatch per *subscription* — the per-*message* path
+# inside the workers is monomorphic.
+function _spawn_consumer(e::Entity, ::Type{T}, handler, view::ViewMode,
                          concurrency::Concurrency, sub::S,
-                         gate::Union{_NoveltyGate, Nothing}) where {S<:Zenoh.AbstractSubscriberHandler}
-    sched = _make_scheduler(concurrency)
-    defers = _defers(concurrency)
-    # Zero-allocation receive: refill one reused `SampleHolder` per `recv!` rather
-    # than allocating an owned `Sample` per message. The held sample is valid only
-    # until the next `recv!`, so anything that escapes this iteration (the
-    # Parallel view path) must copy out first; everything else uses it inline.
-    holder = SampleHolder()
-    # Sticky task: the consumer (and, under `Serial()`, the handler it runs inline)
-    # stays on the thread that declared the subscription. So a node's Serial
-    # handlers all run cooperatively on one OS thread — never simultaneous, no data
-    # races, no user-side locks (D3) — even under `julia -t N`. `Parallel(n)` opts
-    # individual handlers off this thread via the scheduler's `@spawn`.
-    t = Task() do
-        try
-            while (sample = recv!(sub, holder)) !== nothing
-                _predispatch(e, sample, gate) || continue
-                if view && defers
-                    # Parallel view: copy the payload into owned memory now (holder
-                    # still valid), then decode a view over it on the worker (D1).
-                    mem = Zenoh.as_memory(Zenoh.payload(sample), UInt8)
-                    sched(() -> _invoke_view_mem(e, mem, msgtype, handler))
-                elseif view
-                    # Serial view: handler runs inline before the next recv!, so the
-                    # borrow scopes to the dispatch — decode under `with_memory` (D1).
-                    sched(() -> _invoke_view(e, sample, msgtype, handler))
-                else
-                    # Owned path: decode on the consumer task (D1) — the handler
-                    # receives an already-materialized message, so a slow handler
-                    # never delays the next decode and decode stays off the worker.
-                    # The decode reads the holder inline, so reuse is safe under both
-                    # Serial and Parallel.
-                    msg = _decode_on_consumer(e, sample, msgtype)
-                    msg === nothing && continue
-                    sched(() -> _invoke_owned(e, msg, handler))
-                end
-            end
-        catch err
-            # A closed subscriber ends iteration cleanly (CHANNEL_DISCONNECTED →
-            # `nothing`); a genuine transport error or a shutdown lands here.
-            err isa ShutdownException && return
-            isopen(e) &&
-                @error "subscription consumer task failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
+                         gate::Union{_NoveltyGate, Nothing}) where {T, S<:Zenoh.AbstractSubscriberHandler}
+    # Persistent worker pool — no per-message task spawn. Each worker owns a
+    # reusable `SampleHolder` and runs its own recv!→dispatch loop, pulling
+    # concurrently from `sub` (recv! is mutex-serialized). Returns one task handle
+    # for `e._consumer` (the D4 re-latch `wait`s on it); workers exit when the
+    # subscriber closes (recv! → nothing).
+    if concurrency isa Serial
+        # One sticky worker: ordered, pinned to the declaring thread (D3) so a
+        # node's Serial handlers share one OS thread — no races, no user locks.
+        w = Task(() -> _consume_loop(e, T, handler, view, sub, gate))
+        w.sticky = true
+        schedule(w)
+        return w
+    elseif concurrency isa Parallel && !isfinite(concurrency.n)
+        return _spawn_unbounded_consumer(e, T, handler, view, sub, gate)
+    end
+    # Parallel(n): n non-sticky workers (run on OS threads, order not preserved),
+    # wrapped by a sticky supervisor that joins them so `wait(e._consumer)`
+    # transitively waits for every worker on close / re-latch.
+    nworkers = Int(concurrency.n)
+    sup = Task() do
+        workers = map(1:nworkers) do _
+            w = Task(() -> _consume_loop(e, T, handler, view, sub, gate))
+            w.sticky = false
+            schedule(w)
+            w
+        end
+        for w in workers
+            wait(w)
         end
     end
-    t.sticky = true
-    schedule(t)
-    return t
+    sup.sticky = true
+    schedule(sup)
+    return sup
 end
 
-# Owned decode on the consumer task (D1). Returns the materialized message, or
-# `nothing` if decode threw — logged and skipped, so a malformed sample never kills
-# the consumer loop. (No ROS message type is `Nothing`, so the sentinel is safe.)
-function _decode_on_consumer(e::Entity, sample::AbstractSample, msgtype::Type)
+# The single decode→dispatch leaf, shared by the static consumer (`_consume_loop`
+# and the `Parallel(Inf)` *view* path) and the dynamic worker (`_run_typed_dynamic`).
+# Given a concrete `T`, a live `sample`/holder, the handler, and the `ViewMode`, it
+# borrows the payload and runs the handler on the decoded message — ONE
+# implementation, so the static and dynamic paths can't drift. Type-stable: `T` is
+# concrete and `decode_view`/`decode_owned` infer concrete (the `CDR_LE` reader).
+# A handler/decode throw is logged and swallowed so one bad message never kills the
+# subscription; `ShutdownException` ends the dispatch quietly.
+@inline function _dispatch_decoded(e::Entity, sample::AbstractSample, ::Type{T},
+                                   handler, view::ViewMode) where {T}
     try
-        return decode(sample, msgtype; view=false)
+        _with_node_logger(e.node) do          # D7: handler logs → node's /rosout
+            _run(sample, T, handler, view)
+        end
+    catch err
+        err isa ShutdownException && return
+        @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
+    end
+    nothing
+end
+
+# Delivery strategies, dispatched on the (singleton) `ViewMode` so the choice is
+# static per subscription. All borrow the payload (no pre-copy) and run the handler
+# within the borrow scope (§3.2).
+#   Owned     — materialize a self-contained `T` from the borrowed bytes (safe to
+#               keep / forward / spawn).
+#   Checked   — zero-copy `CDRView` + runtime escape guard: a `CDRView`/`CDRString`
+#               used after the handler returns throws `BorrowError` instead of
+#               reading freed memory. Allocates the guard — the validation tier.
+#   Unchecked — bare isbits `PayloadView`: zero-copy, zero-alloc, no checks (an
+#               escaping view is UB). The production tier; validate with `Checked`.
+@inline _run(sample, ::Type{T}, handler, ::Owned) where {T} =
+    with_payload_memory(sample) do mem
+        handler(decode_owned(mem, T))
+    end
+@inline _run(sample, ::Type{T}, handler, ::Checked) where {T} =
+    with_payload_memory_checked(sample) do mem
+        handler(decode_view(mem, T))
+    end
+@inline _run(sample, ::Type{T}, handler, ::Unchecked) where {T} =
+    with_payload_memory(sample) do mem
+        handler(decode_view(mem, T))
+    end
+
+# Owned decode on the consumer task, returning the materialized message (or
+# `nothing` if decode threw — logged and skipped). Used only by the `Parallel(Inf)`
+# owned path, which must decode *inline* over its reused holder (before the next
+# `recv!` overwrites it) and then spawn only the handler on the owned result.
+# Borrow-based: materializes straight from the borrowed bytes, no payload pre-copy.
+function _decode_on_consumer(e::Entity, sample::AbstractSample, ::Type{T}) where {T}
+    try
+        return with_payload_memory(sample) do mem
+            decode_owned(mem, T)
+        end
     catch err
         err isa ShutdownException && rethrow()
         @error "subscription decode failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
@@ -615,7 +659,8 @@ function _decode_on_consumer(e::Entity, sample::AbstractSample, msgtype::Type)
 end
 
 # Run the handler on an already-decoded owned message; a throw is logged, never
-# fatal (one bad message must not kill the subscription).
+# fatal (one bad message must not kill the subscription). The `Parallel(Inf)` owned
+# path spawns this after an inline `_decode_on_consumer`.
 function _invoke_owned(e::Entity, msg, handler)
     try
         # D7: a plain `@info` inside the handler routes to this node's /rosout.
@@ -629,45 +674,66 @@ function _invoke_owned(e::Entity, msg, handler)
     nothing
 end
 
-# View path: borrow the payload for the call via `with_memory` and decode a
-# `CDRView` aliasing it — escaping the scope is a `BorrowError`, not a
-# use-after-free (§3.2). Decode is at the dispatch so the borrow scopes here (D1).
-function _invoke_view(e::Entity, sample::AbstractSample, msgtype::Type, handler)
+# One worker's receive loop. Owns a `SampleHolder` and runs the full
+# recv!→gate→decode→dispatch pipeline itself. N of these pull concurrently from
+# the same subscriber — `recv!` is `uv_mutex`-serialized, so each gets a distinct
+# sample, and the view path borrows the worker's *own* live holder (zero-copy,
+# valid for the whole dispatch). The novelty gate is `ReentrantLock`-guarded, so
+# concurrent delivery is safe. Decode runs here, on the worker (D1): with N
+# workers a slow handler in one never stalls another's decode.
+function _consume_loop(e::Entity, ::Type{T}, handler, view::ViewMode, sub::S, gate) where {T, S<:Zenoh.AbstractSubscriberHandler}
+    holder = SampleHolder()
     try
-        _with_node_logger(e.node) do          # D7: handler logs → node's /rosout
-            with_memory(sample, UInt8) do b
-                handler(decode(unsafe_memory(b), msgtype; view=true))
+        while (sample = recv!(sub, holder)) !== nothing
+            _predispatch(e, sample, gate) || continue
+            # Inline (the holder is live for the whole dispatch) — both view and
+            # owned go through the one shared leaf.
+            _dispatch_decoded(e, sample, T, handler, view)
+        end
+    catch err
+        err isa ShutdownException && return
+        isopen(e) &&
+            @error "subscription consumer task failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
+    end
+    nothing
+end
+
+# `Parallel(Inf)`: unbounded concurrency can't be a fixed pool, so keep the
+# spawn-per-message model (its per-message task-launch cost is the honest price
+# of "no ceiling"). A single receiver pulls and spawns a handler per message;
+# the view path receives into a *fresh* holder the spawned worker owns until GC
+# (still zero-copy), the owned path decodes inline and spawns on the message.
+function _spawn_unbounded_consumer(e::Entity, ::Type{T}, handler, view::ViewMode, sub::S, gate) where {T, S<:Zenoh.AbstractSubscriberHandler}
+    reused = SampleHolder()
+    t = Task() do
+        try
+            while true
+                h = _is_view(view) ? SampleHolder() : reused
+                recv!(sub, h) === nothing && break
+                _predispatch(e, h, gate) || continue
+                if _is_view(view)
+                    # Fresh holder per message → the spawned task owns it and can
+                    # borrow it for the full dispatch via the shared leaf.
+                    Threads.@spawn _dispatch_decoded(e, h, T, handler, view)
+                else
+                    # Owned must decode INLINE over the reused holder (before the
+                    # next recv! overwrites it); spawn only the handler on the owned
+                    # result.
+                    msg = _decode_on_consumer(e, h, T)
+                    msg === nothing && continue
+                    Threads.@spawn _invoke_owned(e, msg, handler)
+                end
             end
+        catch err
+            err isa ShutdownException && return
+            isopen(e) &&
+                @error "subscription consumer task failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
         end
-    catch err
-        err isa ShutdownException && return
-        @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
     end
-    nothing
+    t.sticky = true
+    schedule(t)
+    return t
 end
-
-# View dispatch for the deferred (Parallel) path. The reused `SampleHolder`
-# can't outlive the consumer's next `recv!`, so the consumer copies the payload
-# into an owned `Memory` (one copy, inline while the holder is valid) and hands
-# it here; the worker decodes a `CDRView` aliasing that owned memory (min-copy
-# preserved) and the memory stays alive for the handler call via the closure.
-function _invoke_view_mem(e::Entity, mem, msgtype::Type, handler)
-    try
-        _with_node_logger(e.node) do
-            handler(decode(mem, msgtype; view=true))
-        end
-    catch err
-        err isa ShutdownException && return
-        @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
-    end
-    nothing
-end
-
-# Does the scheduler defer the thunk past the consumer's next receive? `Serial`
-# runs inline (the reused holder is still valid); `Parallel` spawns a worker
-# that may run after the next `recv!`, so a view sample must be copied out.
-_defers(::Serial)   = false
-_defers(::Parallel) = true
 
 # ── dynamic (keyexpr-only) subscription dispatch (§11/D5 S5) ───────────────────
 # A subscription created without a compile-time type. The route is a *wildcard*
@@ -729,18 +795,37 @@ method `declare_subscription!(entity, msgtype, handler; …)` which decodes a fi
 `T` directly.
 """
 function declare_subscription!(e::Entity, handler;
+                               view::Union{Bool, ViewMode}=Owned(),
                                concurrency::Concurrency=Serial(),
                                warmup::WarmupPolicy=e.node.warmup)
+    view = _view_mode(view)
     ctx = e.node.context
     ke = _wildcard_data_keyexpr(ctx.format, e.endpoint)
     cap = _fifo_capacity(e.endpoint.qos)
     sub = Base.open(ctx.session, Keyexpr(ke); channel=:fifo, capacity=cap)
     e._route = sub
-    e._consumer = _spawn_dynamic_consumer(e, handler, concurrency, warmup)
+    e._consumer = _spawn_dynamic_consumer(e, handler, view, concurrency, warmup)
     return e
 end
 
-function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency,
+# A recycle pool of `SampleHolder`s for the dynamic receiver→worker handoff, so we
+# don't allocate one per message. Size = `cap` (buffered) + in-flight decodes + 1
+# (the receiver filling one). `nothing` for `Parallel(Inf)`: unbounded concurrent
+# decodes can't be bounded by a fixed pool, so that mode keeps a fresh holder per
+# message. The finalizer on each holder stays as a shutdown-time backstop — pooled
+# holders are reused, so it ~never fires per message.
+function _make_holder_pool(concurrency::Concurrency, cap::Integer)
+    concurrency isa Parallel && !isfinite(concurrency.n) && return nothing
+    inflight = concurrency isa Parallel ? Int(concurrency.n) : 1
+    sz = Int(cap) + inflight + 1
+    pool = Channel{SampleHolder}(sz)
+    for _ in 1:sz
+        put!(pool, SampleHolder())
+    end
+    return pool
+end
+
+function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency::Concurrency,
                                  warmup::WarmupPolicy)
     sched = _make_scheduler(concurrency)
     logged = Set{Tuple{String, TypeHash}}()      # S6: log each discovered type once
@@ -753,37 +838,56 @@ function _spawn_dynamic_consumer(e::Entity, handler, concurrency::Concurrency,
     # (upstream backpressure), never silently dropping. Closed by the receiver's
     # `finally` so the worker drains-then-exits on teardown.
     cap = _fifo_capacity(e.endpoint.qos)
-    buf = Channel{Tuple{String, Vector{UInt8}}}(cap)
-
+    # Carry an *owned* sample (a refcount bump, no payload copy) from receiver to
+    # worker, not a copied byte buffer — the worker decodes by borrowing it. The
+    # owned holder may sit in the buffer / be captured by a Parallel decode thunk
+    # without pinning the ring (recv! moved it out of the ring slot), so D1 holds.
+    buf = Channel{SampleHolder}(cap)
+    # Recycle the holders instead of allocating one per message: receiver takes a
+    # free holder, the decode thunk returns it after use. Sized for everything that
+    # can pin a holder at once — `cap` in the buffer + the in-flight decodes + the
+    # one the receiver is filling. `nothing` for `Parallel(Inf)` (unbounded in-flight
+    # can't be pooled → fall back to a fresh holder per message).
+    pool = _make_holder_pool(concurrency, cap)
     # Stage 2 — worker. A plain `@spawn` (NOT sticky): its codegen GC completes while
     # the receiver sits parked in the (GC-safe, yielding `@threadcall`) recv (D8).
-    # Drains the buffer in order (so `Serial()` order is preserved), resolving +
-    # dispatching each item via `_dynamic_dispatch`. Runs even under `-t1` — the recv
-    # yields, so the scheduler reaches the worker; `-t>=2` adds true overlap.
+    # Drains the buffer in order (so `Serial()` order is preserved) via the
+    # world-age trampoline (`_dynamic_worker`), which hoists the `invokelatest`
+    # from per-message to per-type. Runs even under `-t1` — the recv yields, so the
+    # scheduler reaches the worker; `-t>=2` adds true overlap.
     worker = Threads.@spawn try
-        for (ke, bytes) in buf
-            _dynamic_dispatch(e, ke, bytes, handler, sched, logged, loglk, warmed, warmlk, warmup)
-        end
+        _dynamic_worker(e, buf, handler, sched, view, pool, logged, loglk, warmed, warmlk, warmup)
     catch err
         err isa ShutdownException && return
         isopen(e) &&
             @error "dynamic subscription worker task failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
     end
 
-    # Stage 1 — receiver. Owns the blocking `z_recv`; copies the payload + keyexpr
-    # (D1: never pin the sample past the recv) and enqueues. Does nothing heavy, so
-    # it returns to `recv` promptly and keeps the FIFO drained — the property that
-    # lets the worker's GC complete. Closing the route ends this loop; `finally`
-    # closes the buffer so the worker exits.
+    # Stage 1 — receiver. `recv!`s each sample into a fresh owned `SampleHolder`
+    # (moved out of the ring slot, so the ring isn't pinned — D1) and enqueues it.
+    # No payload copy and no keyexpr String: the holder carries the refcounted
+    # payload *and* keyexpr to the worker, which decodes + resolves the type by
+    # borrowing them. Stays light, so it keeps the
+    # ring drained while the worker codegens (D8). recv! returns nothing on close →
+    # loop ends; `finally` closes the buffer so the worker drains-then-exits.
     t = Task() do
+        route = e._route::SubscriberHandler
         try
-            for sample in e._route::SubscriberHandler
-                ke = string(Zenoh.keyexpr(sample))
-                p = Zenoh.payload(sample)
-                p === nothing && continue
-                bytes = _own_bytes(p)
+            while true
+                h = pool === nothing ? SampleHolder() : take!(pool)
+                if recv!(route, h) === nothing                # subscriber closed
+                    pool === nothing || put!(pool, h)
+                    break
+                end
+                if Zenoh.payload(h) === nothing               # e.g. a delete/tombstone
+                    pool === nothing || put!(pool, h)         # recycle, don't enqueue
+                    continue
+                end
+                # No `string(keyexpr(h))` here: the owned holder carries the keyexpr,
+                # so the worker reads it by borrowing (hash + memcmp cache hit), and
+                # only a cold first-sight miss materializes the String.
                 try
-                    put!(buf, (ke, bytes))
+                    put!(buf, h)
                 catch err
                     # Buffer closed (teardown raced the route close) — stop cleanly.
                     err isa InvalidStateException && break
@@ -859,58 +963,128 @@ function _replay_manifest_warm(e::Entity, handler, warmed, warmlk)
     nothing
 end
 
-# An owned `Vector{UInt8}` copy of a payload — independent of the sample's lifetime
-# (the worker may run after the sample is freed under `Parallel`).
-function _own_bytes(p)
-    m = Zenoh.as_memory(p, UInt8)
-    owned = Vector{UInt8}(undef, length(m))
-    @inbounds copyto!(owned, m)
-    return owned
+# World-age trampoline for the dynamic worker. The per-message hot path must NOT
+# cross the world-age boundary (you can't specialize through `invokelatest`), so
+# instead of `invokelatest`-ing every message we hoist the crossing to once per
+# *type*: `_dynamic_worker` runs a flat loop of `invokelatest` entries into
+# `_drain_known`, which dispatches every already-seen type with a plain (cached)
+# dynamic call — no `invokelatest` — and only returns when it meets a *new* type
+# (whose `realize!` may have bumped the world). The outer loop then re-enters in
+# the fresher world. Steady state = one long-lived `_drain_known` whose inner
+# loop never returns ⇒ zero per-message `invokelatest`; the crossing count is
+# ~one per distinct type (+ the once-per-type `_warm_dynamic`).
+#
+# Invariant: a key in `cache` was first seen in a prior incarnation that
+# re-entered past its `realize!` world; worlds are monotonic, so it is ≤ this
+# incarnation's world ⇒ `_run_typed_dynamic{T}` is directly callable. A single
+# worker drains `buf` in order across re-entries, so `Serial` total order holds.
+# `realize!` still runs here (off the receiver) so the FIFO keeps draining (D8).
+
+# Incarnation counter — bumped once per `_drain_known` entry (i.e. once per
+# re-entry), so ≈ distinct-types + 1, never per message. Observability + a test
+# hook for "steady-state dispatch isn't re-`invokelatest`ing"; the increment is
+# off the per-message path, so it costs nothing hot.
+const _DYNAMIC_REENTRIES = Threads.Atomic{Int}(0)
+
+# Keyexpr cache key: a hash of the borrowed keyexpr bytes, so the hot path never
+# allocates a `String` (§3 alloc cleanup). FNV-1a over the raw bytes — allocation-
+# free, no `unsafe_wrap`. Collisions are resolved by a `memcmp` against the stored
+# bytes (`_ke_bytes_eq`), so the hash needn't be cryptographic, only well-spread.
+@inline function _ke_fnv1a(ptr::Ptr{UInt8}, len::Int)
+    h = 0xcbf29ce484222325 % UInt
+    for i in 1:len
+        h = (h ⊻ unsafe_load(ptr, i)) * (0x00000100000001b3 % UInt)
+    end
+    return h
 end
 
-# Resolve the sample's type on the worker task (a fast registry hit after first
-# sight; the first sample of a new type pays discovery + codegen here — possibly a
-# blocking wire call, HOL-blocking this sub only, by design, and off the receiver's
-# `z_recv` thread so it can't stall delivery, D8). Then cross into the new world
-# **once** via `invokelatest` into `_run_typed_dynamic`: the decode, the concurrency
-# dispatch (incl. the `@spawn` for `Parallel`), and the handler all run as compiled
-# new-world code from there — so the per-message hot path crosses the world-age
-# boundary exactly once, not once per call.
-function _dynamic_dispatch(e::Entity, ke::AbstractString, bytes::Vector{UInt8},
-                           handler, sched, logged, loglk, warmed, warmlk, warmup::WarmupPolicy)
-    try
-        info = _sample_type_info(e, ke)
-        info === nothing && return
-        T = resolve_or_discover(e.node, info.name, info.hash)
-        if T === nothing
-            @warn "dynamic subscription: could not resolve type" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) maxlog=1
-            return
-        end
-        _log_discovered_once(e, info, logged, loglk)
-        # §D8: warm this runtime type's codec once, before the first decode of it,
-        # on this worker (off the recv thread). `T` is runtime-born, so reach the
-        # warm anchor via `invokelatest` (newer world age). Precompile-only; skipped
-        # when the policy is :off. `warmed` is shared with the Tier-1 replay task, so
-        # the once-guard is taken under `warmlk` (D9).
-        if warmup.mode !== :off
-            isnew = @lock warmlk (T in warmed ? false : (push!(warmed, T); true))
-            if isnew
-                # §D9: record this real interaction so next run's Tier-1 warm replays
-                # it at startup (append-mostly union; a no-op once recorded).
-                note_interaction!(e.node.fqn, :subscription, info.hash, info.name, e.endpoint.topic)
-                try
-                    Base.invokelatest(_warm_dynamic, T, handler)
-                catch err
-                    @warn "dynamic warm-up failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
-                end
-            end
-        end
-        Base.invokelatest(_run_typed_dynamic, T, e, bytes, handler, sched)
-    catch err
-        err isa ShutdownException && return
-        @error "dynamic subscription resolve failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
+# memcmp the borrowed keyexpr (ptr,len) against a stored byte copy — the collision
+# check that makes the hash cache exact.
+@inline function _ke_bytes_eq(ptr::Ptr{UInt8}, len::Int, b::Vector{UInt8})
+    length(b) == len || return false
+    return GC.@preserve b (ccall(:memcmp, Cint,
+        (Ptr{UInt8}, Ptr{UInt8}, Csize_t), ptr, pointer(b), len) == 0)
+end
+
+function _dynamic_worker(e::Entity, buf, handler, sched, view::ViewMode, pool,
+                         logged, loglk, warmed, warmlk, warmup::WarmupPolicy)
+    # hash(keyexpr bytes) → (resolved type, keyexpr bytes for memcmp verify);
+    # worker-private (no lock). The byte copy is the collision-safety net.
+    cache   = Dict{UInt, Tuple{Type, Vector{UInt8}}}()
+    pending = nothing                     # just-realized item to dispatch first in the fresh world
+    while true
+        pending = Base.invokelatest(_drain_known, e, buf, handler, sched, view, pool, cache,
+                                    logged, loglk, warmed, warmlk, warmup, pending)::Union{Symbol, Nothing, Tuple{SampleHolder, Type}}
+        pending === :closed && break
     end
     nothing
+end
+
+function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
+                      cache::Dict{UInt, Tuple{Type, Vector{UInt8}}},
+                      logged, loglk, warmed, warmlk, warmup::WarmupPolicy, pending)
+    Threads.atomic_add!(_DYNAMIC_REENTRIES, 1)
+    if pending !== nothing
+        (h, T) = pending
+        _run_typed_dynamic(T, e, h, handler, sched, view, pool) # direct: realized ≤ our world
+    end
+    for h in buf
+        # Resolve the cached type by borrowing the keyexpr bytes (no String): hash
+        # them, look up, and `memcmp`-verify against the stored copy so a hash
+        # collision can't mis-dispatch. Returns the cached `T` or `nothing`.
+        T = Zenoh.keyexpr_view(h) do ptr, len
+            entry = get(cache, _ke_fnv1a(ptr, len), nothing)
+            (entry !== nothing && _ke_bytes_eq(ptr, len, entry[2])) ? entry[1] : nothing
+        end
+        if T !== nothing
+            _run_typed_dynamic(T, e, h, handler, sched, view, pool)  # HOT PATH — direct, no invokelatest
+            continue
+        end
+        # First sight of this keyexpr by this worker: materialize the String (cold,
+        # once per type) and resolve (the first sample of a new type pays discovery +
+        # codegen here, off the receiver, D8 — HOL-blocking this sub only). Then hand
+        # the item back so the outer loop re-enters in the post-`realize!` world, where
+        # `T` is directly callable for every later message.
+        ke = string(Zenoh.keyexpr(h))
+        try
+            info = _sample_type_info(e, ke)
+            if info === nothing
+                pool === nothing || put!(pool, h)              # not dispatched → recycle the holder
+                continue
+            end
+            Tnew = resolve_or_discover(e.node, info.name, info.hash)
+            if Tnew === nothing
+                @warn "dynamic subscription: could not resolve type" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) maxlog=1
+                pool === nothing || put!(pool, h)              # not dispatched → recycle the holder
+                continue                                       # unresolved: skip, no cache, no re-entry
+            end
+            # Key on the same FNV-1a the hot path computes; stash the bytes for memcmp.
+            kebytes = Vector{UInt8}(codeunits(ke))
+            cache[GC.@preserve kebytes _ke_fnv1a(pointer(kebytes), length(kebytes))] = (Tnew, kebytes)
+            _log_discovered_once(e, info, logged, loglk)
+            # §D8/§D9: warm this runtime type's codec once (off the recv thread); `T`
+            # is runtime-born so reach the warm anchor via `invokelatest`. `warmed` is
+            # shared with the Tier-1 replay task, so the once-guard is under `warmlk`.
+            if warmup.mode !== :off
+                isnew = @lock warmlk (Tnew in warmed ? false : (push!(warmed, Tnew); true))
+                if isnew
+                    note_interaction!(e.node.fqn, :subscription, info.hash, info.name, e.endpoint.topic)
+                    try
+                        Base.invokelatest(_warm_dynamic, Tnew, handler)
+                    catch err
+                        @warn "dynamic warm-up failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
+                    end
+                end
+            end
+            return (h, Tnew)                # hand off; outer loop re-enters in the fresh world
+        catch err
+            err isa ShutdownException && rethrow()
+            @error "dynamic subscription resolve failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
+            pool === nothing || put!(pool, h)                  # not dispatched → recycle the holder
+            continue
+        end
+    end
+    return :closed
 end
 
 # The new-world worker (reached only via `invokelatest`, since `T` is runtime-born):
@@ -918,16 +1092,19 @@ end
 # the latest world here, the `@spawn` inside `sched` (Parallel) captures it, so the
 # spawned task runs `handler(decode(bytes, T))` natively — the whole hot loop body
 # is compiled new-world code, no further `invokelatest`.
-function _run_typed_dynamic(::Type{T}, e::Entity, bytes::Vector{UInt8},
-                            handler, sched) where {T}
+function _run_typed_dynamic(::Type{T}, e::Entity, h::SampleHolder,
+                            handler, sched, view::ViewMode, pool) where {T}
+    # Dispatch inside the sched thunk, which captures the owned holder `h` — so under
+    # `Parallel` the spawned worker keeps the payload alive while the shared leaf
+    # borrows + decodes it. The thunk returns `h` to the pool when done (after the
+    # deferred decode under Parallel), recycling it for the next receive. The
+    # decode→dispatch itself is the same `_dispatch_decoded` leaf the static consumer
+    # runs — one implementation, no static/dynamic drift.
     sched() do
         try
-            _with_node_logger(e.node) do      # D7: handler logs → node's /rosout
-                handler(decode(bytes, T; view=false))
-            end
-        catch err
-            err isa ShutdownException && return
-            @error "dynamic subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
+            _dispatch_decoded(e, h, T, handler, view)
+        finally
+            pool === nothing || put!(pool, h)
         end
     end
     nothing

@@ -26,7 +26,9 @@ const _EP = isdefined(Main, :ROS_TEST_EP) ? Main.ROS_TEST_EP :
 _rosctx(f::Function) = Context(f; peers = [_EP], localhost_only = true)
 
 # Block up to `secs` for the next value matching `pred` on `ch`; `nothing` on timeout.
-function _recv(ch::Channel, secs::Real; pred = _ -> true)
+# Distinct name from dynamic_live.jl's `_recv` (both files include into `Main`) so the
+# two don't overwrite each other.
+function _recv_match(ch::Channel, secs::Real; pred = _ -> true)
     ref = Ref{Any}(nothing)
     timedwait(Float64(secs); pollint = 0.02) do
         while isready(ch)
@@ -114,7 +116,7 @@ end
 
             publish(trig, WireKeyValue(key = "go", value = ""))
 
-            log = _recv(logs, 4.0; pred = m -> occursin("handled", m.msg))
+            log = _recv_match(logs, 4.0; pred = m -> occursin("handled", m.msg))
             @test log !== nothing
             if log !== nothing
                 @test log.name == talker.fqn          # logger name = node FQN

@@ -275,7 +275,9 @@ end
 # TODO(view §3.2): zero-copy directly over the borrowed query payload.
 function decode_request(p, ::Type{Req}, view::Bool) where {Req}
     mem = Zenoh.as_memory(p, UInt8)
-    return decode(mem, Req; view=view)
+    # Branch on the runtime `view` Bool so each arm calls a single-return-type
+    # decode (no `Any` box from a `view`-keyword `decode`).
+    return view ? decode_view(mem, Req) : decode_owned(mem, Req)
 end
 
 # The cell's `deliver`: map a settled (status, payload) onto a Zenoh reply on the
@@ -474,7 +476,7 @@ call(client::ServiceClient{Req}, req; kwargs...) where {Req} =
 function _resolve_reply(gh, ::Type{Resp}, service::AbstractString) where {Resp}
     for r in gh
         if is_ok(r)
-            return decode(sample(r), Resp; view=false)
+            return decode_owned(sample(r), Resp)
         else
             msg = try
                 String(error_payload(r))

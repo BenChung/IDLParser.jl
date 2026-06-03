@@ -21,6 +21,7 @@ using ROSNode: WireKeyValue, GetTypeDescription_Request, get_type_description,
 using ROSMessages: message_il, lower, type_description_from_struct,
                    TypeDescription, TypeDescriptionMsg, calculate_rihs01_hash
 using ROSZenoh: TypeInfo, type_hash_from_rihs_string
+using Zenoh: BorrowError
 using Test
 
 # Connect every session ONLY to the per-run private router (set by runtests.jl) —
@@ -88,6 +89,105 @@ _step(msg::AbstractString) = (@info "  · $msg"; flush(stdout); flush(stderr))
             publish(pub, WireKeyValue(key="hello", value="d5"))
             msg = _recv(got, 5.0)
             @test msg isa WireKeyValue && msg !== nothing && msg.key == "hello"
+        end
+    end
+
+    # S5b — the world-age trampoline hoists `invokelatest` from per-message to
+    # per-type: many messages of one runtime type must cause a *constant* number
+    # of worker re-entries (≈ types + 1), not one per message.
+    @testset "S5b — dynamic dispatch hoists invokelatest per-type" begin
+        _step("S5b: dynamic sub, burst one type, count re-entries")
+        _rctx() do ctx
+            node = Node(ctx, "n_hoist")
+            got = Channel{Any}(64)
+            sub = Subscription(node, "/kvh") do msg; put!(got, msg); end
+            pub = Publisher(node, "/kvh", WireKeyValue)
+            sleep(0.4)
+            N = 20
+            before = ROSNode._DYNAMIC_REENTRIES[]
+            for i in 1:N
+                publish(pub, WireKeyValue(key = "k", value = string(i)))
+                sleep(0.002)
+            end
+            recv = Any[]
+            timedwait(5.0; pollint = 0.02) do
+                while isready(got); push!(recv, take!(got)); end
+                length(recv) >= N
+            end
+            delta = ROSNode._DYNAMIC_REENTRIES[] - before
+            @test length(recv) == N                 # every message delivered
+            @test all(m -> m isa WireKeyValue, recv)
+            @test delta <= 3                         # ≈ 1 initial + 1 per type — NOT ~N
+            @test delta < N                          # the property: re-entries don't scale with messages
+        end
+    end
+
+    # S5c — dynamic subscription with view=true: the handler gets a zero-copy
+    # CDRView aliasing the payload (no owned-message materialization). Verify it
+    # still delivers correct field values across a burst.
+    @testset "S5c — dynamic view=true round-trip" begin
+        _step("S5c: dynamic view sub, burst, read fields in-handler")
+        _rctx() do ctx
+            node = Node(ctx, "n_view")
+            got = Channel{String}(64)
+            sub = Subscription(node, "/kvv"; view = true) do msg
+                # msg is a CDRView{WireKeyValue}; materialize the field inside the
+                # handler (the view is valid only here).
+                put!(got, String(msg.value))
+            end
+            pub = Publisher(node, "/kvv", WireKeyValue)
+            sleep(0.4)
+            N = 15
+            for i in 1:N
+                publish(pub, WireKeyValue(key = "k", value = string(i)))
+                sleep(0.002)
+            end
+            recv = String[]
+            timedwait(5.0; pollint = 0.02) do
+                while isready(got); push!(recv, take!(got)); end
+                length(recv) >= N
+            end
+            @test length(recv) == N
+            @test sort(parse.(Int, recv)) == collect(1:N)
+        end
+    end
+
+    # ViewMode (§3.2): the `view=` knob is `Owned()`/`Checked()`/`Unchecked()`.
+    # `Checked()` guards the zero-copy view so a `CDRView`/`CDRString` that escapes the
+    # handler throws `BorrowError` on later access (not a use-after-free); `Unchecked()`
+    # is the bare zero-copy view. Both deliver correct fields when read in-handler.
+    @testset "view modes — Checked() guards escapes, Unchecked() is bare" begin
+        _step("view modes: Unchecked in-frame ok, Checked escape → BorrowError")
+        _rctx() do ctx
+            node = Node(ctx, "n_vm")
+            # Unchecked(): zero-copy view, materialize in-handler — correct, no error.
+            got_u = Channel{String}(16)
+            subu = Subscription(node, "/vm_u", WireKeyValue; view = Unchecked()) do msg
+                put!(got_u, String(msg.value))     # in-frame materialize: valid
+            end
+            # Checked(): materialize in-handler (valid) AND smuggle the view out (an
+            # anti-pattern, here only to prove a post-return access is caught).
+            got_c = Channel{String}(16)
+            escaped = Ref{Any}(nothing)
+            subc = Subscription(node, "/vm_c", WireKeyValue; view = Checked()) do msg
+                put!(got_c, String(msg.value))     # in-frame materialize: valid
+                escaped[] = msg                     # ESCAPE — never do this in real code
+            end
+            pubu = Publisher(node, "/vm_u", WireKeyValue)
+            pubc = Publisher(node, "/vm_c", WireKeyValue)
+            sleep(0.4)
+            publish(pubu, WireKeyValue(key = "k", value = "uncheck"))
+            publish(pubc, WireKeyValue(key = "k", value = "check"))
+            @test (timedwait(5.0; pollint = 0.02) do
+                       isready(got_u) && isready(got_c)
+                   end) === :ok
+            @test take!(got_u) == "uncheck"         # Unchecked in-frame read is correct
+            @test take!(got_c) == "check"           # Checked in-frame read is correct
+            # The handler has returned ⇒ the Checked guard is invalidated; the smuggled
+            # view throws BorrowError on access instead of reading freed memory.
+            sleep(0.1)
+            @test escaped[] !== nothing
+            @test_throws BorrowError String(escaped[].value)
         end
     end
 

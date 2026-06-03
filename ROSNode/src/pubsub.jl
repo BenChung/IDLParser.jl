@@ -133,14 +133,24 @@ mutable struct SubscriptionHandle{T}
 end
 
 """
-    Subscription(node, topic, ::Type{T}; qos=default_qos(), view=false,
+    Subscription(node, topic, ::Type{T}; qos=default_qos(), view=Owned(),
                  concurrency=Serial()) do msg … end -> SubscriptionHandle{T}
 
 Declare a subscription for ROS message type `T` on `topic` and start its dispatch
-runtime (§4/§6). The `do`-block handler runs once per received message — owned by
-default (storable / forwardable / spawnable, §3.1) or over a zero-copy `CDRView`
-aliasing the payload when `view = true` (valid only for the handler's duration,
-§3.2; `collect`/`decode_owned` to keep the data).
+runtime (§4/§6). The `do`-block handler runs once per received message, in the
+form chosen by `view` (a [`ViewMode`](@ref)):
+
+  - `Owned()` (default) — a fully-owned message: storable / forwardable /
+    spawnable, no lifetime caveats (§3.1).
+  - `Checked()` — a zero-copy `CDRView` aliasing the payload (valid only for the
+    handler's duration, §3.2; `collect`/`decode_owned` to keep it), with a runtime
+    guard so a view that escapes the handler throws `BorrowError` instead of
+    reading freed memory.
+  - `Unchecked()` — the same zero-copy view with the guard removed: zero-copy and
+    zero-allocation, but an escaping view is undefined behaviour. Validate under
+    `Checked()`, then switch.
+
+`view=true`/`view=false` are accepted as shorthand for `Checked()`/`Owned()`.
 
 `concurrency` is `Serial()` (one handler at a time on a single sticky thread,
 order preserved, no user-side locks needed — the default, D3) or `Parallel(n)`
@@ -151,12 +161,13 @@ throw is logged, never fatal.
 is fixed by the spelling.
 """
 function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T};
-                            qos::QosProfile=default_qos(), view::Bool=false,
+                            qos::QosProfile=default_qos(), view::Union{Bool, ViewMode}=Owned(),
                             concurrency::Concurrency=Serial(),
                             force_relatch::Bool=false,
                             warmup::Union{Symbol, Nothing}=nothing,
                             warmup_sync::Union{Bool, Nothing}=nothing,
                             warmup_sample=nothing) where {T}
+    view = _view_mode(view)
     name = resolve_name(node, topic)
     ent = make_entity(node, Subscription, name, type_info_of(T); qos=qos)
     # `transient_local` ⇒ an AdvancedSubscriber with latched history (D4).
@@ -212,12 +223,15 @@ boundary via `invokelatest`, so the handler *body* stays type-stable and fast wh
 only the dispatch boundary pays the hop. The first sample of a type pays discovery
 + codegen; the rest are fast registry lookups.
 
-Owned-only — the zero-copy `view` path needs the static fast path; graduating to
-`Subscription(node, topic, T)` is how you get it (the `@info` on first sight tells
-you what to write).
+`view` is the [`ViewMode`](@ref) (`Owned()` default; `Checked()`/`Unchecked()` for
+a zero-copy `CDRView{T}` aliasing the payload, guarded vs. bare — `true`/`false`
+shorthand accepted). (Graduating to `Subscription(node, topic, T)` is still faster
+— it drops the per-sample type resolution entirely — but a view mode removes the
+materialization either way.)
 """
 function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     qos::QosProfile=default_qos(),
+                                    view::Union{Bool, ViewMode}=Owned(),
                                     concurrency::Concurrency=Serial(),
                                     warmup::Union{Symbol, Nothing}=nothing,
                                     warmup_sync::Union{Bool, Nothing}=nothing)
@@ -237,7 +251,7 @@ function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
     # there (a discovered handler can't be safely run on a synthesized sample —
     # that's D9's manifest job).
     pol = _resolve_warmup(node, warmup, warmup_sync)
-    declare_subscription!(ent, handler; concurrency=concurrency, warmup=pol)
+    declare_subscription!(ent, handler; view=view, concurrency=concurrency, warmup=pol)
     return DynamicSubscriptionHandle(ent)
 end
 
