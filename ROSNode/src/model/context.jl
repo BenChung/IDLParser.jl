@@ -763,12 +763,37 @@ host's handlers): first signal = graceful drain, a second SIGINT = hard
 function spin(ctx::Context; handle_signals::Bool=false)
     if handle_signals
         _with_signal_handlers(ctx) do
-            wait(ctx)
+            _park_until_drained(ctx)
         end
     else
         wait(ctx)
     end
     nothing
+end
+
+# Park on the drain, turning SIGINT into a graceful shutdown. With
+# `exit_on_sigint(false)` set (see `_install_signal_handlers!`), Julia delivers a
+# Ctrl-C as an `InterruptException` thrown into this task at its `wait` yield-point
+# rather than exiting the process. The first one requests the drain (idempotent) and
+# re-parks until it completes; a second — the impatient "I said stop" — hard-exits.
+function _park_until_drained(ctx::Context)
+    interrupted = false
+    while true
+        try
+            wait(ctx)
+            return nothing
+        catch err
+            err isa InterruptException || rethrow()
+            if !interrupted
+                interrupted = true
+                @info "SIGINT — draining; press Ctrl-C again to force exit"
+                request_shutdown(ctx; reason="SIGINT")
+            else
+                @warn "second SIGINT — forcing exit"
+                exit(130)
+            end
+        end
+    end
 end
 
 # Signal handling (§14.3): opt-in, scoped to the spin call. Installs handlers,
@@ -791,16 +816,12 @@ function _with_signal_handlers(f, ctx::Context)
     end
 end
 
-# Minimal handler per the design's "scheduler does the work": the OS handler only
-# requests the drain; a second SIGINT while already draining hard-exits. Julia
-# delivers SIGINT as InterruptException to the root task, so we hook that path
-# rather than raw sigaction. TODO(layer): SIGTERM + the uv_async_send relay; for
-# now SIGINT (Ctrl-C) drives the graceful path and a repeat hard-exits.
-function _install_signal_handlers!(ctx::Context)
-    # `wait(ctx)` runs in a try/catch so an InterruptException becomes a graceful
-    # shutdown request; the second one is caught while `is_shutdown` is already
-    # true and escalates. Implemented by wrapping the park in the spin caller;
-    # nothing to install at the OS level in this minimal stub.
+# Per the design's "scheduler does the work": we don't install a raw sigaction.
+# `exit_on_sigint(false)` makes Julia route a Ctrl-C to the spin task as an
+# `InterruptException`; `_park_until_drained` catches it and drives the graceful
+# request_shutdown (first) / hard exit (second). TODO(layer): SIGTERM + the
+# uv_async_send relay; today SIGINT (Ctrl-C) is the only signal wired.
+function _install_signal_handlers!(::Context)
     Base.exit_on_sigint(false)
     return nothing
 end

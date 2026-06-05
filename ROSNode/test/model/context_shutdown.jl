@@ -143,14 +143,22 @@ end
         end
     end
 
-    # (6) SIGINT → graceful drain. `spin(ctx; handle_signals=true)` is a known-broken
-    # stub (Tier-1 #7): _install_signal_handlers! only flips exit_on_sigint and
-    # installs nothing, so a Ctrl-C is NOT turned into request_shutdown. Skipped (not
-    # run) so it documents the intended contract without an interactive signal in CI.
+    # (6) SIGINT → graceful drain. `exit_on_sigint(false)` (set while spinning) makes
+    # a Ctrl-C arrive as an InterruptException thrown into the spin task; the park
+    # loop catches it and drives request_shutdown. We simulate the OS delivery with
+    # `schedule(t, InterruptException(); error=true)` so the graceful path is tested
+    # deterministically — no interactive signal needed. (The second-Ctrl-C
+    # `exit(130)` path is not unit-tested here: it ends the process.)
     @testset "handle_signals: Ctrl-C drives a graceful drain" begin
-        # Intended: a SIGINT during `spin(ctx; handle_signals=true)` requests the
-        # drain and the spin returns drained. Unimplemented stub — do not run.
-        @test_skip false
+        ctx = _sdctx()
+        spun = Ref(false)
+        t = @async (spin(ctx; handle_signals = true); spun[] = true)
+        sleep(0.3)                       # let spin install handlers and park on the drain
+        @test !istaskdone(t)             # parked — not returned early nor thrown
+        schedule(t, InterruptException(); error = true)   # the "Ctrl-C"
+        @test Base.timedwait(() -> istaskdone(t), 5.0) === :ok
+        @test is_shutdown(ctx)           # the interrupt became a graceful drain
+        @test spun[]                     # spin returned normally; no exception escaped
     end
 
 end

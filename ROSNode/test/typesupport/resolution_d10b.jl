@@ -13,9 +13,9 @@ const RE = ROSNode.ResolveEntry
 # aliasing pool between imports (so the second mints its own instead of aliasing the
 # first) — the in-process stand-in for two independently-precompiled packages. The
 # `from=` root is a relative *literal* (resolved against this file → ROSNode/examples).
-module _DA; using ROSNode; @ros_import from="../examples/interfaces" "sensor_demo/msg/Reading"; end
+module _DA; using ROSNode; @ros_import from="../../examples/interfaces" "sensor_demo/msg/Reading"; end
 empty!(ROSNode._STATIC_TYPES.entries); empty!(ROSNode._STATIC_TYPES.seen)
-module _DB; using ROSNode; @ros_import from="../examples/interfaces" "sensor_demo/msg/Reading"; end
+module _DB; using ROSNode; @ros_import from="../../examples/interfaces" "sensor_demo/msg/Reading"; end
 
 @testset "D10B resolution + cross-materialize" begin
     @testset "fold/tie assembly rule (S1/S5)" begin

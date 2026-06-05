@@ -28,7 +28,7 @@ using Test
 # same structs in-process.
 module _ActTypes
     using ROSNode
-    @ros_import from="fixtures/byo" "robot_msgs/action/Process"
+    @ros_import from="../fixtures/byo" "robot_msgs/action/Process"
 end
 const Process          = _ActTypes.robot_msgs.action.Process
 const Process_Goal     = _ActTypes.robot_msgs.action.Process_Goal

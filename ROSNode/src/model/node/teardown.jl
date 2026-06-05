@@ -1,0 +1,63 @@
+# ── entity teardown (§6/§14) ──────────────────────────────────────────────────
+
+"""
+    close(entity::Entity)
+
+Undeclare the entity (§6): close the data route (which stops the consumer task's
+iteration for a Subscription), withdraw the liveliness token, drop it from the
+discovery index, and detach any pattern-layer wiring (`entity.wire`). Idempotent.
+"""
+function Base.close(e::Entity)
+    (@atomicswap e.open = false) || return nothing
+    ctx = e.node.context
+
+    # Close the data route first: undeclaring the subscriber disconnects its FIFO
+    # channel, so the consumer task's `for sample in …` loop terminates cleanly.
+    if e._route !== nothing
+        try
+            close(e._route)
+        catch err
+            @error "close(entity): closing data route failed" exception=(err, catch_backtrace())
+        end
+        e._route = nothing
+    end
+
+    # Pattern-layer wiring (queryable / querier / pending tables) shares our
+    # lifecycle; close it if it's close-able.
+    if e.wire !== nothing
+        try
+            applicable(close, e.wire) && close(e.wire)
+        catch err
+            @error "close(entity): closing pattern wiring failed" exception=(err, catch_backtrace())
+        end
+        e.wire = nothing
+    end
+
+    # Withdraw liveliness + drop from the index.
+    if e._lv_token !== nothing
+        try
+            close(e._lv_token)
+        catch err
+            @error "close(entity): withdrawing liveliness token failed" exception=(err, catch_backtrace())
+        end
+        e._lv_token = nothing
+    end
+    remove_endpoint!(ctx, e.lv_key)
+    _forget_lost_tracker!(e)        # §12.3: drop any message-lost state (no-op if none)
+    nothing
+end
+
+"""
+    dispose(node, entity::Entity)
+
+Close `entity` and remove it from `node`'s tracked set (the explicit early-close
+path, vs. waiting for `close(node)`). A no-op if `entity` isn't owned by `node`.
+"""
+function dispose(node::Node, e::Entity)
+    close(e)
+    @lock node.lock begin
+        i = findfirst(===(e), node.entities)
+        i === nothing || deleteat!(node.entities, i)
+    end
+    nothing
+end

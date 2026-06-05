@@ -17,5 +17,5 @@
 # wellknown.jl converts to/from ROSMessages' internal hashing forms.
 module Interfaces
     using ROSMessages: @ros_msgs
-    @ros_msgs "../vendor"
+    @ros_msgs "../../vendor"
 end

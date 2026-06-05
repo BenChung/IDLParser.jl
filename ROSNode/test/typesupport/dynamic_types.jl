@@ -47,7 +47,7 @@ _dt("@ros_import module ready")
 # produces (no aliasing). Used to exercise the single-copy convert guard.
 module _StrayTime
     using ROSMessages: @ros_msgs
-    @ros_msgs "../vendor/builtin_interfaces"
+    @ros_msgs "../../vendor/builtin_interfaces"
 end
 
 # `@ros_import … as Alias` on a (provided) vendored type binds straight to the
@@ -77,15 +77,15 @@ end
 _dt("expanding @ros_import from= (BYO codegen)")
 module _ByoImport
     using ROSNode
-    @ros_import from="fixtures/byo" "robot_msgs/msg/Widget" "robot_msgs/srv/DoThing" "robot_msgs/action/Process"
+    @ros_import from="../fixtures/byo" "robot_msgs/msg/Widget" "robot_msgs/srv/DoThing" "robot_msgs/action/Process"
 end
 module _ByoAlias
     using ROSNode
-    @ros_import from="fixtures/byo" "robot_msgs/msg/Widget" as W
+    @ros_import from="../fixtures/byo" "robot_msgs/msg/Widget" as W
 end
 module _ByoPkg
     using ROSNode
-    @ros_import from="fixtures/byo" "robot_msgs"           # bare package → all interfaces
+    @ros_import from="../fixtures/byo" "robot_msgs"           # bare package → all interfaces
 end
 _dt("@ros_import from= modules ready")
 
@@ -337,8 +337,8 @@ _dt("@ros_import from= modules ready")
 
     @testset "@ros_import from=: search order is from-roots → vendored → ament" begin
         _dt("BYO from= precedence")
-        byo    = abspath(joinpath(@__DIR__, "fixtures", "byo"))
-        shadow = abspath(joinpath(@__DIR__, "fixtures", "shadow"))   # a divergent Time copy
+        byo    = abspath(joinpath(@__DIR__, "..", "fixtures", "byo"))
+        shadow = abspath(joinpath(@__DIR__, "..", "fixtures", "shadow"))   # a divergent Time copy
         # a name only in the BYO root resolves there
         @test ROSNode._resolve_one_iface("robot_msgs", "msg", "Widget", [byo]) ==
               joinpath(byo, "robot_msgs", "msg", "Widget.msg")

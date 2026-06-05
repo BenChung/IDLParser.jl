@@ -26,7 +26,7 @@ using Test
 # server speak the *same* struct in-process.
 module _SrvTypes
     using ROSNode
-    @ros_import from="fixtures/byo" "robot_msgs/srv/DoThing"
+    @ros_import from="../fixtures/byo" "robot_msgs/srv/DoThing"
 end
 const DoThing_Request  = _SrvTypes.robot_msgs.srv.DoThing_Request
 const DoThing_Response = _SrvTypes.robot_msgs.srv.DoThing_Response

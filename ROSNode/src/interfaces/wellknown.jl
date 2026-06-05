@@ -42,7 +42,7 @@ const GetTypeDescription_Response    = _TDI.srv.GetTypeDescription_Response
 
 # Vendored source dir (shipped with the package); read at runtime to recover the
 # well-known types' IL + RIHS01 for registry registration.
-const _VENDOR_DIR = normpath(joinpath(@__DIR__, "..", "vendor"))
+const _VENDOR_DIR = normpath(joinpath(@__DIR__, "..", "..", "vendor"))
 
 # Generated-type lookup by fully-qualified ROS2 name, for registration.
 const _WELLKNOWN_TYPES = Dict{String, Any}(
