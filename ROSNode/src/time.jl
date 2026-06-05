@@ -370,12 +370,42 @@ end
 # `Clock` (the method above is strictly more specific for a `Clock` first arg).
 sleep_until(node, t::RTime{C}) where {C} = sleep_until(clock(node, C()), t)
 
-# The actual blocking wall sleep. TODO(graph): register with the owning
-# Context's shutdown so a drain wakes us early with a `ShutdownException`, and so
-# a ROS-clock sleep waiting on a stalled `/clock` is woken on close. Today we
-# just sleep wall time in slices so a future cooperative cancel can hook in.
-function _interruptible_sleep(::Clock, ns::Integer)
-    Base.sleep(ns / 1e9)
+# Recover the owning Context from a clock's node for shutdown interruption.
+# `Clock.node` is duck-typed: a Context (context-level clock), a Node (`.context`),
+# or — in tests — something context-less. Return `nothing` in the last case so the
+# sleep falls back to an uninterruptible wall sleep rather than throwing.
+function _clock_ctx(node)
+    node isa Context && return node
+    hasproperty(node, :context) && node.context isa Context && return node.context
+    nothing
+end
+
+# The actual blocking wall sleep, interruptible on Context shutdown (§14). Parks
+# on the Context's `_shutdown_wake` condition, which the drain notifies as step 1;
+# a one-shot `Base.Timer` bounds the wait to the requested span (a `Threads.Condition`
+# has no timed wait). Re-checks `is_shutdown` under the condition lock so a drain that
+# fires between the check and the `wait` can't be lost, then raises `ShutdownException`
+# — mirroring graph.jl's `_wait_on_graph` handshake. A clock with no resolvable
+# Context just sleeps the wall span.
+function _interruptible_sleep(c::Clock, ns::Integer)
+    ctx = _clock_ctx(c.node)
+    if ctx === nothing
+        Base.sleep(ns / 1e9)
+        return nothing
+    end
+    is_shutdown(ctx) && throw(ShutdownException())
+    @lock ctx._shutdown_wake begin
+        is_shutdown(ctx) && throw(ShutdownException())
+        t = Base.Timer(ns / 1e9) do _
+            @lock ctx._shutdown_wake notify(ctx._shutdown_wake)
+        end
+        try
+            wait(ctx._shutdown_wake)
+        finally
+            close(t)
+        end
+        is_shutdown(ctx) && throw(ShutdownException())
+    end
     nothing
 end
 
@@ -411,6 +441,13 @@ end
 Timer(node, period; clock::ClockSource=ROS()) =
     error("Timer requires a callback: `Timer(node, period; clock) do … end`")
 
+# §14.2 dispatch gate for a timer tick: a Timer on a non-Active managed node must
+# not fire. The gate keys on the owning node (`clk.node`); `isactive(::Node)` folds
+# in the LifecycleNode lookup (and is always `true` for an unmanaged node). A
+# context-level clock has no node to gate, so it always ticks. `isactive`/`Node`
+# land in later-included files — late-bound, fine at tick time.
+_timer_active(node) = node isa Node ? isactive(node) : true
+
 # Wall-clock timers (Steady/System): a `Base.Timer` re-arming each period. The
 # handler runs the user `f` guarding against its throws so one bad tick can't
 # kill the timer task.
@@ -418,6 +455,7 @@ function _start!(t::Timer{C}) where {C<:Union{Steady,System}}
     secs = t.period.ns / 1e9
     t.impl = Base.Timer(secs; interval=secs) do _
         (@atomic t.open) || return
+        _timer_active(t.clk.node) || return       # §14.2: gated (inactive) node ⇒ skip tick
         try
             t.f()
         catch err
@@ -436,6 +474,7 @@ function _start!(t::Timer{ROS})
     secs = t.period.ns / 1e9
     t.impl = Base.Timer(secs; interval=secs) do _
         (@atomic t.open) || return
+        _timer_active(t.clk.node) || return       # §14.2: gated (inactive) node ⇒ skip tick
         try
             t.f()
         catch err

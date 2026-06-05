@@ -108,10 +108,27 @@ resolve_constants(definition::Parse.ModuleDecl.Type, local_scope::Scope, file_sc
     end
 end
 
+# Bind a float const at the width its declared type names. A float literal is
+# parsed before its declared type is known, and a suffix-less literal defaults
+# to Float32, so without this a `const double` would bind a Float32 (8-byte wire
+# field carrying a 4-byte value). Coercing makes a `double` bind a Float64 and a
+# `float` a Float32. Integer widths are left to the literal/expression result
+# (their range is already guarded at parse time); non-float and non-`Real`
+# values (string/char/bool/enum ref) pass through untouched.
+_coerce_const(::Parse.TypeSpec.Type, val) = val
+_coerce_const(typ::Parse.TypeSpec.Type, val::Real) = @match typ begin
+    Parse.TypeSpec.TFloat(16) => Float16(val)
+    Parse.TypeSpec.TFloat(32) => Float32(val)
+    Parse.TypeSpec.TFloat(64) => Float64(val)
+    _ => val
+end
+
 resolve_constants(definition::Parse.ConstDecl.Type, local_scope::Scope, file_scope::Scope) = @match definition begin
     Parse.ConstDecl.CDecl(typ, name, val) => begin
+        # Coerce against the *parsed* type (a `Parse.TypeSpec`) before lowering it,
+        # since the float-width match keys on `Parse.TypeSpec.TFloat`.
+        val = _coerce_const(typ, resolve_constants(val, local_scope, file_scope))
         typ = resolve_constants(typ, local_scope, file_scope)
-        val = resolve_constants(val, local_scope, file_scope)
         local_scope.bindings[name] = val
         return ConstDecl.CDecl(typ, name, val)
     end

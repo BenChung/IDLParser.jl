@@ -17,6 +17,15 @@ using SHA: sha256
         @test all(==(0x00), le[3:16])
     end
 
+    @testset "to_le_bytes — odd-length hex (elided high nibble)" begin
+        # Zenoh elides a leading zero nibble, so the high byte can render as one
+        # char: "102" is big-endian 0x01,0x02 → LE [0x02,0x01,0,…].
+        le = to_le_bytes(ZenohId("102"))
+        @test le[1] == 0x02
+        @test le[2] == 0x01
+        @test all(==(0x00), le[3:16])
+    end
+
     @testset "entity_gid — matches sha256(zid_le ‖ id_le)[1:16]" begin
         id = 7
         id_le = UInt8[(UInt64(id) >> (8 * (i - 1))) & 0xff for i in 1:8]
@@ -55,8 +64,12 @@ using SHA: sha256
         @test g == gid
     end
 
-    @testset "encode_attachment — 32-byte wire size (8+8+16, gid unprefixed)" begin
+    @testset "encode_attachment — 33-byte wire size (8 + 8 + VarInt(16) + 16)" begin
+        # The gid is a length-prefixed `[u8;16]` (zenoh-ext fixed-array form), so
+        # the payload is 33 bytes: 8 (seq) + 8 (ts) + 1 (VarInt 16) + 16 (gid).
         payload = encode_attachment(0, 0, entity_gid(zid, 0))
-        @test length(payload) == 32
+        bytes = collect(ROSZenoh.Zenoh.as_memory(payload, UInt8))
+        @test length(bytes) == 33
+        @test bytes[17] == 0x10   # VarInt(16) prefix precedes the gid bytes
     end
 end

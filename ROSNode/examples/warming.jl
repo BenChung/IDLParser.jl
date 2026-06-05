@@ -36,11 +36,15 @@ using ROSNode
 # type-less subscriber below does NOT import it — that's the point.
 @ros_import from = "interfaces" "sensor_demo/msg/Reading"
 
-Context(; peers = ["tcp/localhost:7447"]) do ctx
+# `@context` makes *this module* the Context's resolution lens (`home=@__MODULE__`, D10B):
+# the type-less subscriber below resolves wire types against this module's `@ros_import`
+# closure, so it lands *this* module's `Reading` struct deterministically. (A plain
+# `Context()` resolves content-canonical types only and would `@info`-hint to set a home.)
+@context(peers = ["tcp/localhost:7447"]) do ctx
     node = Node(ctx, "recorder")
 
     # ── Dynamic subscriber: no compile-time type ────────────────────────────────
-    # The type-less `Subscription` resolves each sample's type at runtime (registry →
+    # The type-less `Subscription` resolves each sample's type at runtime (home table →
     # cache → ament → wire `GetTypeDescription`). `msg` is the REAL decoded `Reading`,
     # not a boxed `Any`, so field access is type-stable and fast. `warmup = :precompile`
     # (the node default) warms the decode→handler chain; on a repeat run the manifest

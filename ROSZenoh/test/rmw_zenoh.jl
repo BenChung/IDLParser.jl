@@ -78,7 +78,7 @@
         e = EndpointEntity(id=1, node=node, kind=Publisher,
                            topic="chatter",
                            type_info=TypeInfo("std_msgs/msg/String", TypeHash()))
-        @test topic_keyexpr(f, e) == "0/chatter/std_msgs/msg/String/$zerohash"
+        @test topic_keyexpr(f, e) == "0/chatter/std_msgs::msg::dds_::String_/$zerohash"
     end
 
     @testset "topic_keyexpr — preserves internal slashes" begin
@@ -108,17 +108,19 @@
         @test ke == "0/chatter/EMPTY_TOPIC_TYPE/EMPTY_TOPIC_HASH"
     end
 
-    @testset "topic_keyexpr — type name demangling" begin
-        # Type names with % are demangled to / in the topic KE.
+    @testset "topic_keyexpr — ROS type name rendered as the DDS name" begin
+        # The ROS form `pkg/sub/Type` becomes the DDS form `pkg::sub::dds_::Type_`
+        # (a single keyexpr component) on the wire, matching rmw_zenoh.
         node = NodeEntity(0, zid, 0, "test", "/", "")
         e = EndpointEntity(id=6, node=node, kind=Publisher, topic="chatter",
-                           type_info=TypeInfo("std_msgs%msg%String", TypeHash()))
+                           type_info=TypeInfo("std_msgs/msg/String", TypeHash()))
         ke = topic_keyexpr(f, e)
-        @test occursin("std_msgs/msg/String", ke)
+        @test occursin("std_msgs::msg::dds_::String_", ke)
+        @test !occursin("std_msgs/msg/String", ke)
     end
 
     @testset "parse_topic_keyexpr — simple" begin
-        r = parse_topic_keyexpr(f, "0/chatter/std_msgs/msg/String/$zerohash")
+        r = parse_topic_keyexpr(f, "0/chatter/std_msgs::msg::dds_::String_/$zerohash")
         @test r.domain_id == 0
         @test r.topic == "chatter"
         @test r.type_info.name == "std_msgs/msg/String"
@@ -126,7 +128,7 @@
     end
 
     @testset "parse_topic_keyexpr — topic with internal slashes" begin
-        r = parse_topic_keyexpr(f, "7/talker/get_type_description/std_srvs/srv/Trigger/$zerohash")
+        r = parse_topic_keyexpr(f, "7/talker/get_type_description/std_srvs::srv::dds_::Trigger_/$zerohash")
         @test r.domain_id == 7
         @test r.topic == "talker/get_type_description"
         @test r.type_info.name == "std_srvs/srv/Trigger"
@@ -161,7 +163,7 @@
                            topic="chatter",
                            type_info=TypeInfo("std_msgs/msg/String", TypeHash()))
         ke = liveliness_keyexpr(f, e)
-        expected = "@ros2_lv/0/$zid_str/0/1/MP/%/%/test_node/chatter/std_msgs%msg%String/$zerohash/::,10:,:,:,,"
+        expected = "@ros2_lv/0/$zid_str/0/1/MP/%/%/test_node/chatter/std_msgs::msg::dds_::String_/$zerohash/::,10:,:,:,,"
         @test ke == expected
     end
 

@@ -116,10 +116,20 @@ drop(x) = []
 @rule wide_character_literal = "L'" & (-"'" & (escape, r".") |> nth(2)) & r"'"p |> x -> x[2][1]
 @rule wide_string_literal = "L\"" & ((-"\"" & (escape, r".") |> nth(2))[*] |> sjoin) & r"\""p |> x -> x[2]
 
-# Hex/octal literals parse via the full UInt64 range then reinterpret to Int64,
-# so values like 0xFFFFFFFFFFFFFFFF (a valid IDL uint64 constant) don't overflow.
+# Hex/octal/decimal literals parse across the full UInt64 range then reinterpret
+# to Int64, so values like 0xFFFFFFFFFFFFFFFF or the decimal uint64 max
+# (18446744073709551615) — valid IDL uint64 constants — don't overflow.
 @rule integer_literal = (hex_integer_literal, octal_integer_literal, decimal_integer_literal)
-@rule decimal_integer_literal = r"[0-9]+"p |> x -> parse(Int, x)
+@rule decimal_integer_literal = r"[0-9]+"p |> _parse_decimal_int
+# Fits Int64 → keep as-is; else if it fits UInt64, reinterpret (matches the
+# hex/octal path); a genuinely out-of-uint64 literal errors clearly.
+function _parse_decimal_int(x)
+    v = tryparse(Int64, x)
+    v === nothing || return v
+    u = tryparse(UInt64, x)
+    u === nothing && error("integer literal `$x` does not fit in 64 bits")
+    return reinterpret(Int64, u)
+end
 @rule octal_integer_literal = r"0[0-7]+"p |> x -> reinterpret(Int64, parse(UInt64, x; base=8))
 @rule hex_integer_literal = r"(?:0x)([0-9a-fA-F]+)"ip |> x -> reinterpret(Int64, parse(UInt64, x[3:end]; base=16))
 

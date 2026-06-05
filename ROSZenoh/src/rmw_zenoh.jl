@@ -127,6 +127,23 @@ end
 
 # ---- Topic KE -------------------------------------------------------------
 
+# rmw_zenoh carries the message type in the keyexpr (and the liveliness token) as the
+# DDS/IDL type name `pkg::sub::dds_::Type_` — a SINGLE keyexpr component using `::`
+# separators — NOT the ROS form `pkg/sub/Type`. Convert at the wire boundary so our
+# pub/sub keyexprs and liveliness match a real `rmw_zenoh` peer (`std_msgs/msg/String`
+# <-> `std_msgs::msg::dds_::String_`; see hiroz `ke.rs` / `discovery.rs`).
+function _ros_to_dds_type(name::AbstractString)
+    parts = split(String(name), '/')
+    length(parts) < 2 && return String(name)            # non-standard; pass through
+    string(join(parts[1:end-1], "::"), "::dds_::", parts[end], "_")
+end
+function _dds_to_ros_type(name::AbstractString)
+    occursin("::dds_::", name) || return String(name)   # already ROS form / non-standard
+    pre, post = split(String(name), "::dds_::"; limit=2) # ("std_msgs::msg", "String_")
+    typ = endswith(post, '_') ? chop(post) : post
+    string(replace(pre, "::" => "/"), '/', typ)
+end
+
 function topic_keyexpr(f::RmwZenoh, e::EndpointEntity)
     e.node === nothing &&
         throw(ArgumentError("rmw_zenoh topic key requires a node"))
@@ -135,23 +152,18 @@ function topic_keyexpr(f::RmwZenoh, e::EndpointEntity)
     type_part = if e.type_info === nothing
         string(EMPTY_TOPIC_TYPE, '/', EMPTY_TOPIC_HASH)
     else
-        # Note: type *name* is demangled (so stored-mangled names like
-        # `std_msgs%msg%String` are rendered as `std_msgs/msg/String`).
-        # The hash string is also demangled — practically a no-op since
-        # `RIHS01_<hex>` never contains `%`, but it matches the reference.
-        type_name = demangle(f, e.type_info.name)
-        type_hash = demangle(f, to_rihs_string(e.type_info.hash))
-        string(type_name, '/', type_hash)
+        # The type is the DDS name (`pkg::sub::dds_::Type_`) — a single component.
+        string(_ros_to_dds_type(e.type_info.name), '/', to_rihs_string(e.type_info.hash))
     end
     return string(domain_id, '/', topic, '/', type_part)
 end
 
-# Inverse of the above. The topic and type name both preserve internal
-# slashes, so they can't be split positionally on their own — instead we anchor
-# on the fixed ends: domain is the first component, the RIHS hash is the last,
-# and a ROS2 type name is always exactly three components (`<pkg>/<qualifier>/
-# <Type>`). The empty-type placeholder uses two components
-# (`EMPTY_TOPIC_TYPE/EMPTY_TOPIC_HASH`) instead, so it's detected first.
+# Inverse of the above. The topic preserves internal slashes, but the DDS type name
+# (`pkg::sub::dds_::Type_`) is a SINGLE component (it uses `::`, not `/`), so we anchor
+# on the fixed ends: domain is the first component, the RIHS hash is the last, the type
+# is second-to-last, and the (slash-preserving) topic is everything between. The
+# empty-type placeholder uses two components (`EMPTY_TOPIC_TYPE/EMPTY_TOPIC_HASH`)
+# instead, so it's detected first.
 function parse_topic_keyexpr(f::RmwZenoh, ke::AbstractString)
     parts = split(String(ke), '/')
 
@@ -164,16 +176,16 @@ function parse_topic_keyexpr(f::RmwZenoh, ke::AbstractString)
         return (; domain_id, topic, type_info=nothing)
     end
 
-    # Real type: <domain>/<topic...>/<pkg>/<qualifier>/<Type>/<RIHS hash>.
-    # Need at least domain + 1 topic segment + 3 type segments + hash.
-    length(parts) >= 6 ||
-        throw(ArgumentError("rmw_zenoh topic key needs >= 6 components for a typed topic, got $(length(parts))"))
+    # Real type: <domain>/<topic...>/<dds_type_name>/<RIHS hash>.
+    # Need at least domain + 1 topic segment + the type + the hash.
+    length(parts) >= 4 ||
+        throw(ArgumentError("rmw_zenoh topic key needs >= 4 components for a typed topic, got $(length(parts))"))
 
     hash = type_hash_from_rihs_string(parts[end])
     hash === nothing && throw(ArgumentError("bad RIHS hash $(repr(String(parts[end])))"))
 
-    type_name = join(parts[end-3:end-1], '/')
-    topic = join(parts[2:end-4], '/')
+    type_name = _dds_to_ros_type(String(parts[end-1]))
+    topic = join(parts[2:end-2], '/')
 
     return (; domain_id, topic, type_info=TypeInfo(type_name, hash))
 end
@@ -194,7 +206,9 @@ function liveliness_keyexpr(f::RmwZenoh, e::EndpointEntity)
     type_part = if e.type_info === nothing
         string(EMPTY_TOPIC_TYPE, '/', EMPTY_TOPIC_HASH)
     else
-        string(mangle(f, e.type_info.name), '/', to_rihs_string(e.type_info.hash))
+        # DDS type name (`pkg::sub::dds_::Type_`) — a single token, no '/', as in the
+        # data keyexpr; mangling is therefore a no-op on it.
+        string(_ros_to_dds_type(e.type_info.name), '/', to_rihs_string(e.type_info.hash))
     end
 
     qos_str = encode_qos(f, e.qos)
@@ -266,7 +280,7 @@ function parse_liveliness(f::RmwZenoh, ke::AbstractString)
     else
         h = type_hash_from_rihs_string(topic_hash)
         h === nothing && (h = TypeHash(0x00, ntuple(_ -> 0x00, 32)))
-        TypeInfo(demangle(f, topic_type), h)
+        TypeInfo(_dds_to_ros_type(topic_type), h)
     end
 
     _, qos = decode_qos(f, qos_str)

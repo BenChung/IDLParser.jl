@@ -2,7 +2,7 @@ module ConstResolveTests
 using IDLParser
 using Test, PEG
 using Moshi.Match: @match
-import IDLParser.Parse: const_expr, type_spec, module_dcl, union_def, enum_dcl, struct_def
+import IDLParser.Parse: const_expr, type_spec, module_dcl, union_def, enum_dcl, struct_def, const_dcl
 import IDLParser.ConstResolution: resolve_constants, Scope
 import IDLParser.ConstResolution as CR
 
@@ -110,6 +110,26 @@ end
 # 64-bit hex literals no longer overflow
 @test resolve_constants(parse_whole(const_expr, "0xFFFFFFFFFFFFFFFF"), empty_scope, empty_scope) == -1
 @test resolve_constants(parse_whole(const_expr, "0x8000000000000000"), empty_scope, empty_scope) == typemin(Int64)
+
+# The decimal uint64 max parses without throwing (mirrors the hex path:
+# Int64-overflowing values reinterpret through UInt64).
+@test parse_whole(IDLParser.Parse.integer_literal, "18446744073709551615") == -1
+@test reinterpret(UInt64, parse_whole(IDLParser.Parse.integer_literal, "18446744073709551615")) == typemax(UInt64)
+
+# A const binds at the width its declared type names. A float literal defaults
+# to Float32 at parse time, so without coercion a `double` const would bind a
+# Float32; the declared type must win.
+cval(src) = @match resolve_constants(parse_whole(const_dcl, src), empty_scope, empty_scope) begin
+    CR.ConstDecl.CDecl(_, _, v) => v
+end
+@test cval("const double D = 1234.5678") isa Float64
+# Integer-valued doubles bind losslessly at full Float64 width.
+@test cval("const double E = 1234.0") === 1234.0
+# A `float` const stays Float32.
+@test cval("const float F = 1.5") === 1.5f0
+@test cval("const float G = 1.5f") === 1.5f0
+# A `double` written with the `d` suffix is lossless to the last digit.
+@test cval("const double H = 1234.5678d") === 1234.5678
 
 # Enclosing-scope lookup walks outward through parent modules
 let resolved = resolve_constants(parse_whole(module_dcl, """

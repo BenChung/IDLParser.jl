@@ -350,6 +350,174 @@ function rihs01_hash(struct_ast::Parse.TypeDecl.Type,
     return calculate_rihs01_hash(TypeDescriptionMsg(td, collect(references)))
 end
 
+# ---- service-level TypeDescription (rmw_zenoh service keyexpr hash) ---------
+#
+# rmw_zenoh names a service/client keyexpr by the *service* type (`pkg::srv::dds_::
+# Base_`), not the request message — and the RIHS01 in that keyexpr is the service
+# type hash. rosidl computes it over a synthesized umbrella: a `pkg/srv/Base`
+# type whose three fields reference the request, response, and a synthesized
+# `pkg/srv/Base_Event` message (`info` = service_msgs/ServiceEventInfo, plus
+# bounded-1 sequences of the request and response). The hash is over that umbrella
+# plus the name-sorted, deduplicated closure of all three.
+
+"""
+    service_type_description(service_name, request, response, service_event_info) -> TypeDescriptionMsg
+
+Build the ROS2 *service-level* `TypeDescriptionMsg` whose RIHS01 matches the
+service type hash rmw_zenoh puts in the service/client keyexpr. `service_name` is
+the fully-qualified `pkg/srv/Base`; `request`/`response` are the request/response
+`TypeDescriptionMsg`s (main + their own referenced closures, as the registry
+stores them); `service_event_info` is `service_msgs/msg/ServiceEventInfo`'s
+`TypeDescriptionMsg` (its closure supplies `builtin_interfaces/msg/Time`).
+"""
+function service_type_description(service_name::AbstractString,
+                                  request::TypeDescriptionMsg,
+                                  response::TypeDescriptionMsg,
+                                  service_event_info::TypeDescriptionMsg)
+    req_name   = request.type_description.type_name
+    resp_name  = response.type_description.type_name
+    sei_name   = service_event_info.type_description.type_name
+    event_name = string(service_name, "_Event")
+
+    nested(name) =
+        FieldTypeDescription(TYPE_ID_NESTED_TYPE, UInt64(0), UInt64(0), String(name))
+    # `<=1` bounded sequence of a nested type, the rosidl event-message shape.
+    bseq1(name) =
+        FieldTypeDescription(TYPE_ID_NESTED_TYPE + BOUNDED_SEQUENCE_OFFSET,
+                             UInt64(1), UInt64(0), String(name))
+
+    event = TypeDescription(event_name, FieldDescription[
+        FieldDescription("info",     nested(sei_name)),
+        FieldDescription("request",  bseq1(req_name)),
+        FieldDescription("response", bseq1(resp_name)),
+    ])
+    main = TypeDescription(service_name, FieldDescription[
+        FieldDescription("request_message",  nested(req_name)),
+        FieldDescription("response_message", nested(resp_name)),
+        FieldDescription("event_message",    nested(event_name)),
+    ])
+
+    # Deduplicate by type_name (each main + its refs), add the synthesized event,
+    # then sort — RIHS01's cross-implementation-stable reference order.
+    pool = Dict{String, TypeDescription}()
+    for tdm in (request, response, service_event_info)
+        pool[tdm.type_description.type_name] = tdm.type_description
+        for r in tdm.referenced_type_descriptions
+            pool[r.type_name] = r
+        end
+    end
+    pool[event.type_name] = event
+    refs = sort!(collect(values(pool)); by = t -> t.type_name)
+    return TypeDescriptionMsg(main, refs)
+end
+
+"""
+    service_rihs01(service_name, request, response, service_event_info) -> String
+
+The `"RIHS01_<hex>"` service type hash — [`service_type_description`](@ref) fed to
+[`calculate_rihs01_hash`](@ref).
+"""
+service_rihs01(service_name::AbstractString, request::TypeDescriptionMsg,
+               response::TypeDescriptionMsg, service_event_info::TypeDescriptionMsg) =
+    calculate_rihs01_hash(service_type_description(service_name, request, response,
+                                                   service_event_info))
+
+# ---- action-protocol service hashes (rmw_zenoh / hiroz) ---------------------
+#
+# A ROS2 action is three services on `<topic>/_action/{send_goal,get_result,
+# cancel_goal}`. rmw_zenoh keys each off a SERVICE type hash, and — matching the
+# reference rmw_zenoh/hiroz codegen — these are computed from FIXED, hardcoded
+# request/response shapes (NOT the generated wrapper structs) under the `action`
+# qualifier (the `is_action` path). The closures are intentionally the reference
+# impl's: SendGoal/GetResult carry the action Goal/Result *main* TD only (no
+# transitive deps), and CancelGoal omits the `goals_canceling` field and the UUID
+# dep entirely. Replicated bug-for-bug so our keyexpr matches a real ROS2 peer.
+#
+# The keyexpr *type name* differs from the hashed name for cancel_goal: it's
+# published as `action_msgs/srv/CancelGoal` but the hash is computed over the
+# `action`-path names below. Callers build the TypeInfo name separately.
+
+# Fixed dependency type descriptions (standard ROS2 types, byte-exact encodings).
+const _AP_UUID = TypeDescription("unique_identifier_msgs/msg/UUID",
+    [FieldDescription("uuid", FieldTypeDescription(TYPE_ID_UINT8 + ARRAY_OFFSET, UInt64(16), UInt64(0), ""))])
+const _AP_TIME = TypeDescription("builtin_interfaces/msg/Time",
+    [FieldDescription("sec", FieldTypeDescription(TYPE_ID_INT32)),
+     FieldDescription("nanosec", FieldTypeDescription(TYPE_ID_UINT32))])
+const _AP_GOALINFO = TypeDescription("action_msgs/msg/GoalInfo",
+    [FieldDescription("goal_id", FieldTypeDescription(TYPE_ID_NESTED_TYPE, UInt64(0), UInt64(0), "unique_identifier_msgs/msg/UUID")),
+     FieldDescription("stamp", FieldTypeDescription(TYPE_ID_NESTED_TYPE, UInt64(0), UInt64(0), "builtin_interfaces/msg/Time"))])
+const _AP_SEI = TypeDescription("service_msgs/msg/ServiceEventInfo",
+    [FieldDescription("event_type", FieldTypeDescription(TYPE_ID_UINT8)),
+     FieldDescription("stamp", FieldTypeDescription(TYPE_ID_NESTED_TYPE, UInt64(0), UInt64(0), "builtin_interfaces/msg/Time")),
+     FieldDescription("client_gid", FieldTypeDescription(TYPE_ID_UINT8 + ARRAY_OFFSET, UInt64(16), UInt64(0), "")),
+     FieldDescription("sequence_number", FieldTypeDescription(TYPE_ID_INT64))])
+const _AP_SEI_MSG = TypeDescriptionMsg(_AP_SEI, TypeDescription[_AP_TIME])
+
+_ap_nested(name) = FieldTypeDescription(TYPE_ID_NESTED_TYPE, UInt64(0), UInt64(0), String(name))
+
+"""
+    send_goal_service_rihs01(package, action_name, goal_td::TypeDescription) -> String
+
+The action `send_goal` service RIHS01. `goal_td` is the action's `<Name>_Goal`
+type description (main only, as the reference impl includes it).
+"""
+function send_goal_service_rihs01(package::AbstractString, action_name::AbstractString,
+                                  goal_td::TypeDescription)
+    base = string(package, "/action/", action_name, "_SendGoal")
+    req = TypeDescriptionMsg(
+        TypeDescription(string(base, "_Request"),
+            [FieldDescription("goal_id", _ap_nested("unique_identifier_msgs/msg/UUID")),
+             FieldDescription("goal", _ap_nested(string(package, "/action/", action_name, "_Goal")))]),
+        TypeDescription[_AP_UUID, goal_td])
+    resp = TypeDescriptionMsg(
+        TypeDescription(string(base, "_Response"),
+            [FieldDescription("accepted", FieldTypeDescription(TYPE_ID_BOOLEAN)),
+             FieldDescription("stamp", _ap_nested("builtin_interfaces/msg/Time"))]),
+        TypeDescription[])
+    return service_rihs01(base, req, resp, _AP_SEI_MSG)
+end
+
+"""
+    get_result_service_rihs01(package, action_name, result_td::TypeDescription) -> String
+
+The action `get_result` service RIHS01. `result_td` is the action's `<Name>_Result`
+type description (main only).
+"""
+function get_result_service_rihs01(package::AbstractString, action_name::AbstractString,
+                                   result_td::TypeDescription)
+    base = string(package, "/action/", action_name, "_GetResult")
+    req = TypeDescriptionMsg(
+        TypeDescription(string(base, "_Request"),
+            [FieldDescription("goal_id", _ap_nested("unique_identifier_msgs/msg/UUID"))]),
+        TypeDescription[_AP_UUID])
+    resp = TypeDescriptionMsg(
+        TypeDescription(string(base, "_Response"),
+            [FieldDescription("status", FieldTypeDescription(TYPE_ID_INT8)),
+             FieldDescription("result", _ap_nested(string(package, "/action/", action_name, "_Result")))]),
+        TypeDescription[result_td])
+    return service_rihs01(base, req, resp, _AP_SEI_MSG)
+end
+
+"""
+    cancel_goal_service_rihs01() -> String
+
+The action `cancel_goal` (`action_msgs/srv/CancelGoal`) service RIHS01 — a constant
+shared by every action. Matches the reference impl's incomplete description (the
+response carries only `return_code`; the UUID dep is omitted).
+"""
+function cancel_goal_service_rihs01()
+    base = "action_msgs/action/CancelGoal"
+    req = TypeDescriptionMsg(
+        TypeDescription(string(base, "_Request"),
+            [FieldDescription("goal_info", _ap_nested("action_msgs/msg/GoalInfo"))]),
+        TypeDescription[_AP_GOALINFO])
+    resp = TypeDescriptionMsg(
+        TypeDescription(string(base, "_Response"),
+            [FieldDescription("return_code", FieldTypeDescription(TYPE_ID_INT8))]),
+        TypeDescription[])
+    return service_rihs01(base, req, resp, _AP_SEI_MSG)
+end
+
 # ---- TypeDescription → IL (inverse of the AST→TypeDescription encoding) -----
 #
 # Lifts the type-id-encoded `TypeDescription` back into the interface IL. The

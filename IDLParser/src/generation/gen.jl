@@ -188,30 +188,41 @@ end
 # `read` (owned) / `read_view` (zero-copy `CDRString`/`CDRArray`). The registry
 # lets the classifier resolve a `TRef` (typedef vs struct vs enum) and recurse
 # into nested struct definitions without re-walking the AST for every field.
+#
+# Every entry is keyed by the type's full scoped path (module chain + name).
+# ROSMessages merges all packages into one `generate_code` call, so same-named
+# types (Header/Status/Result/…) routinely coexist; a flat bare-name key would
+# let one shadow another and misclassify fixedness. A `TRef` is resolved to a
+# full path the same way `resolve_type` emits it (see `_resolve_ref_path`), so
+# classification stays scope-correct exactly as emission already is.
 struct TypeRegistry
-    structs::Set{Symbol}
-    enums::Set{Symbol}
-    typedefs::Dict{Symbol, Tuple{CR.TypeSpec.Type, CR.Declarator.Type}}
-    struct_decls::Dict{Symbol, Any}
+    structs::Set{Vector{Symbol}}
+    enums::Set{Vector{Symbol}}
+    typedefs::Dict{Vector{Symbol}, Tuple{CR.TypeSpec.Type, CR.Declarator.Type}}
+    struct_decls::Dict{Vector{Symbol}, Any}
 end
 
-_collect_registry!(reg::TypeRegistry, def::CR.Annotated.Type) = @match def begin
-    CR.Annotated.Annotation(_, _, inner) => _collect_registry!(reg, inner)
+# `scope` is the module chain enclosing the decl being collected.
+_collect_registry!(reg::TypeRegistry, def::CR.Annotated.Type, scope::Vector{Symbol}) = @match def begin
+    CR.Annotated.Annotation(_, _, inner) => _collect_registry!(reg, inner, scope)
 end
-_collect_registry!(reg::TypeRegistry, def::CR.ModuleDecl.Type) = @match def begin
-    CR.ModuleDecl.MDecl(_, decls) => for d in decls; _collect_registry!(reg, d); end
+_collect_registry!(reg::TypeRegistry, def::CR.ModuleDecl.Type, scope::Vector{Symbol}) = @match def begin
+    CR.ModuleDecl.MDecl(name, decls) => begin
+        child = [scope; name]
+        for d in decls; _collect_registry!(reg, d, child); end
+    end
 end
-_collect_registry!(::TypeRegistry, ::CR.ConstDecl.Type) = nothing
-_collect_registry!(reg::TypeRegistry, def::CR.TypeDecl.Type) = @match def begin
-    CR.TypeDecl.StructDecl(name, _, decls) => (push!(reg.structs, name); reg.struct_decls[name] = decls)
-    CR.TypeDecl.StructFwdDecl(name)    => push!(reg.structs, name)
-    CR.TypeDecl.EnumDecl(name, _)      => push!(reg.enums, name)
+_collect_registry!(::TypeRegistry, ::CR.ConstDecl.Type, ::Vector{Symbol}) = nothing
+_collect_registry!(reg::TypeRegistry, def::CR.TypeDecl.Type, scope::Vector{Symbol}) = @match def begin
+    CR.TypeDecl.StructDecl(name, _, decls) => (push!(reg.structs, [scope; name]); reg.struct_decls[[scope; name]] = decls)
+    CR.TypeDecl.StructFwdDecl(name)    => push!(reg.structs, [scope; name])
+    CR.TypeDecl.EnumDecl(name, _)      => push!(reg.enums, [scope; name])
     CR.TypeDecl.TypedefDecl(target, declarators) => begin
         # Only `target isa TypeSpec` typedefs (the alias forms) are tracked;
         # anonymous nested-type typedefs aren't compact-eligible references.
         if target isa CR.TypeSpec.Type
             for decl in declarators
-                reg.typedefs[_declarator_name(decl)] = (target, decl)
+                reg.typedefs[[scope; _declarator_name(decl)]] = (target, decl)
             end
         end
     end
@@ -219,13 +230,31 @@ _collect_registry!(reg::TypeRegistry, def::CR.TypeDecl.Type) = @match def begin
 end
 
 function _build_registry(definitions)
-    reg = TypeRegistry(Set{Symbol}(), Set{Symbol}(),
-                       Dict{Symbol, Tuple{CR.TypeSpec.Type, CR.Declarator.Type}}(),
-                       Dict{Symbol, Any}())
+    reg = TypeRegistry(Set{Vector{Symbol}}(), Set{Vector{Symbol}}(),
+                       Dict{Vector{Symbol}, Tuple{CR.TypeSpec.Type, CR.Declarator.Type}}(),
+                       Dict{Vector{Symbol}, Any}())
     for def in definitions
-        _collect_registry!(reg, def)
+        _collect_registry!(reg, def, Symbol[])
     end
     return reg
+end
+
+# Resolve a `TRef`'s `(path, name)` (from `scope`, the module chain enclosing
+# the reference) to the target's full scoped path — the registry key. A
+# non-empty path is already absolute (a same-package `[pkg, :msg]` ref and a
+# cross-package `[otherpkg, :msg]` ref are both `[path...; name]`, mirroring how
+# `resolve_type` keys emission). An empty path (a sibling reference) is resolved
+# by walking outward from `scope`, per OMG IDL enclosing-scope lookup, and
+# returns the first defining scope that holds the name (else the innermost
+# candidate, which the caller's `haskey` will simply miss).
+function _resolve_ref_path(path::Vector{Symbol}, name::Symbol, scope::Vector{Symbol},
+                           reg::TypeRegistry)
+    isempty(path) || return [path; name]
+    for i in length(scope):-1:0
+        cand = [scope[1:i]; name]
+        (cand in reg.structs || cand in reg.enums || haskey(reg.typedefs, cand)) && return cand
+    end
+    return [scope; name]
 end
 
 _is_primitive_spec(ts::CR.TypeSpec.Type) = @match ts begin
@@ -239,53 +268,62 @@ _is_primitive_spec(ts::CR.TypeSpec.Type) = @match ts begin
     _ => false
 end
 
-# Classify a typedef alias chain as :primitive_scalar, :primitive_array,
-# :other, or :none (name not a tracked typedef).
-function _typedef_kind(name::Symbol, registry::TypeRegistry)
-    info = get(registry.typedefs, name, nothing)
+# Classify the typedef at full path `tdpath` as :primitive_scalar,
+# :primitive_array, :other, or :none (not a tracked typedef). A chained alias's
+# target `TRef` is resolved relative to that typedef's own defining scope
+# (`tdpath[1:end-1]`), where it was written.
+function _typedef_kind(tdpath::Vector{Symbol}, registry::TypeRegistry)
+    info = get(registry.typedefs, tdpath, nothing)
     info === nothing && return :none
     (tts, tdecl) = info
+    defscope = tdpath[1:end-1]
     isarray = @match tdecl begin
         CR.Declarator.DArray(_, _) => true
         CR.Declarator.DIdent(_)    => false
     end
-    isarray && return _spec_resolves_to_primitive(tts, registry) ? :primitive_array : :other
+    isarray && return _spec_resolves_to_primitive(tts, registry, defscope) ? :primitive_array : :other
     _is_primitive_spec(tts) && return :primitive_scalar
     return @match tts begin
-        CR.TypeSpec.TRef(CR.ScopedName.Name(_, n2, _)) => _typedef_kind(n2, registry)
+        CR.TypeSpec.TRef(CR.ScopedName.Name(path, n2, _)) =>
+            _typedef_kind(_resolve_ref_path(path, n2, defscope, registry), registry)
         _ => :other
     end
 end
 
-# Does `ts`, used as a scalar field, resolve to a primitive (directly or via a
-# scalar typedef alias)?
-function _spec_resolves_to_primitive(ts::CR.TypeSpec.Type, registry::TypeRegistry)
+# Does `ts`, used as a scalar field referenced from `scope`, resolve to a
+# primitive (directly or via a scalar typedef alias)?
+function _spec_resolves_to_primitive(ts::CR.TypeSpec.Type, registry::TypeRegistry,
+                                     scope::Vector{Symbol})
     _is_primitive_spec(ts) && return true
     @match ts begin
-        CR.TypeSpec.TRef(CR.ScopedName.Name(_, name, _)) =>
-            _typedef_kind(name, registry) === :primitive_scalar
+        CR.TypeSpec.TRef(CR.ScopedName.Name(path, name, _)) =>
+            _typedef_kind(_resolve_ref_path(path, name, scope, registry), registry) === :primitive_scalar
         _ => false
     end
 end
 
 # Is a single field (its TypeSpec + declarator) flat — i.e. a primitive, an
 # SArray of primitives, or a nested struct that is itself all-fixed — so the
-# whole struct can be a single `@cdr_fixed` value? `seen` guards against a
+# whole struct can be a single `@cdr_fixed` value? `scope` is the module chain
+# enclosing the field's struct, used to resolve a `TRef` to a registry key the
+# same way `resolve_type` emits it. `seen` (full scoped paths) guards against a
 # (degenerate) cyclic struct reference.
 function _field_is_fixed(ts::CR.TypeSpec.Type, decl::CR.Declarator.Type,
-                         registry::TypeRegistry, seen::Set{Symbol})
+                         registry::TypeRegistry, scope::Vector{Symbol},
+                         seen::Set{Vector{Symbol}})
     @match decl begin
         # `T name[N]` → SArray; eligible iff the element is a primitive
         # (`@cdr_fixed` rejects SArrays of structs).
-        CR.Declarator.DArray(_, _) => _spec_resolves_to_primitive(ts, registry)
+        CR.Declarator.DArray(_, _) => _spec_resolves_to_primitive(ts, registry, scope)
         # `T name` → primitive, a typedef to a primitive/primitive-array
         # (e.g. `float[3]`), or a nested all-fixed struct.
         CR.Declarator.DIdent(_) => begin
             _is_primitive_spec(ts) && return true
             @match ts begin
-                CR.TypeSpec.TRef(CR.ScopedName.Name(_, name, _)) => begin
-                    _typedef_kind(name, registry) in (:primitive_scalar, :primitive_array) && return true
-                    name in registry.structs && return _struct_all_fixed(name, registry, seen)
+                CR.TypeSpec.TRef(CR.ScopedName.Name(path, name, _)) => begin
+                    target = _resolve_ref_path(path, name, scope, registry)
+                    _typedef_kind(target, registry) in (:primitive_scalar, :primitive_array) && return true
+                    target in registry.structs && return _struct_all_fixed(target, registry, seen)
                     false
                 end
                 _ => false
@@ -294,19 +332,23 @@ function _field_is_fixed(ts::CR.TypeSpec.Type, decl::CR.Declarator.Type,
     end
 end
 
-# Is every field of struct `name` flat (recursively)? Unknown / forward-declared
-# structs (no stored decls) and cycles are treated as not-fixed.
-function _struct_all_fixed(name::Symbol, registry::TypeRegistry, seen::Set{Symbol})
-    name in seen && return false
-    decls = get(registry.struct_decls, name, nothing)
+# Is every field of the struct at full path `path` flat (recursively)? Unknown /
+# forward-declared structs (no stored decls) and cycles are treated as not-fixed.
+# A nested struct's fields are resolved relative to that struct's own scope
+# (`path[1:end-1]`), matching where they were declared.
+function _struct_all_fixed(path::Vector{Symbol}, registry::TypeRegistry,
+                           seen::Set{Vector{Symbol}})
+    path in seen && return false
+    decls = get(registry.struct_decls, path, nothing)
     decls === nothing && return false
-    seen2 = push!(copy(seen), name)
+    seen2 = push!(copy(seen), path)
+    inner_scope = path[1:end-1]
     for d in decls
         member = _unwrap_member(d)
         member isa Pair || return false
         ts, declarators = member
         for decl in declarators
-            _field_is_fixed(ts, decl, registry, seen2) || return false
+            _field_is_fixed(ts, decl, registry, inner_scope, seen2) || return false
         end
     end
     return true
@@ -322,10 +364,12 @@ function _unwrap_member(d)
     return d
 end
 
-# (name, julia_type_expr, is_fixed) for every declared field, in order. `seen`
-# seeds the cycle guard with the struct being rendered.
+# (name, julia_type_expr, is_fixed) for every declared field, in order.
+# `enclosing` is the package symbol (drives type-name emission); `scope` is the
+# struct's full enclosing module chain (drives scope-correct fixity lookup).
+# `seen` is seeded with the struct's own full path as the cycle guard.
 function _struct_fields(decls, enclosing::Union{Symbol, Nothing}, registry::TypeRegistry,
-                        seen::Set{Symbol})
+                        scope::Vector{Symbol}, seen::Set{Vector{Symbol}})
     fields = Tuple{Symbol, Any, Bool}[]
     for d in decls
         member = _unwrap_member(d)
@@ -334,7 +378,7 @@ function _struct_fields(decls, enclosing::Union{Symbol, Nothing}, registry::Type
         for decl in declarators
             jltype = resolve_type(ts; enclosing=enclosing)
             (fname, ftype) = resolve_declarator(decl, jltype)
-            push!(fields, (fname, ftype, _field_is_fixed(ts, decl, registry, seen)))
+            push!(fields, (fname, ftype, _field_is_fixed(ts, decl, registry, scope, seen)))
         end
     end
     return fields
@@ -354,8 +398,8 @@ end
 # generic `write` (a field-by-field inverse of `read`). The generator emits no
 # read/write — only the struct, a value `==`, and `@kwdef`'s keyword ctor.
 function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
-                        registry::TypeRegistry, tier::Symbol=:any)
-    fields = _struct_fields(decls, enclosing, registry, Set{Symbol}((name,)))
+                        registry::TypeRegistry, scope::Vector{Symbol}, tier::Symbol=:any)
+    fields = _struct_fields(decls, enclosing, registry, scope, Set{Vector{Symbol}}(([scope; name],)))
     field_decls = [Expr(:(::), n, t) for (n, t, _) in fields]
     field_names = Symbol[n for (n, _, _) in fields]
     all_fixed = !isempty(fields) && all(f -> f[3], fields)
@@ -428,7 +472,8 @@ generate_struct(definition::CR.TypeDecl.Type, genmod, registry::TypeRegistry, lc
     CR.TypeDecl.StructDecl(name, nothing, decls) => begin
         tier = _effective_tier(lc, name)
         refs = _collect_refs_members(decls)
-        genmod[name] = ModEntry(enc -> _render_struct(name, decls, enc, registry, tier), refs)
+        scope = lc.scope   # full enclosing module chain — drives scope-correct fixity
+        genmod[name] = ModEntry(enc -> _render_struct(name, decls, enc, registry, scope, tier), refs)
     end
 end
 _declarator_name(decl::CR.Declarator.Type) = @match decl begin

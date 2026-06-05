@@ -69,6 +69,9 @@ try
         _section("parallel_dispatch", "parallel_dispatch.jl")
         # Live D4: transient_local latched delivery + durability-aware lifecycle re-latch.
         _section("transient_local", "transient_local.jl")
+        # §8 services + §9 actions — live request/reply + full goal lifecycle.
+        _section("services", "services.jl")
+        _section("actions", "actions.jl")
         # D7: unified logging — pure level/format/maxlog + live /rosout dispatcher wrap.
         _section("rosout", "rosout.jl")
         # D8: precompilation / warm-up — detector/@effectful/policy/_default_msg + live
@@ -77,6 +80,9 @@ try
         # D9: dynamic-discovery × precompilation — per-node interaction manifest
         # (persistence/union/gating) + live record-on-dispatch and Tier-1 startup replay.
         _section("dynamic_warm", "dynamic_warm.jl")
+        # §14.1 Context drain/shutdown root — hook ordering, bounded slow hook,
+        # idempotent request_shutdown, reverse undeclare, wait/spin unblock.
+        _section("context_shutdown", "context_shutdown.jl")
     end
 finally
     _kill_router!()

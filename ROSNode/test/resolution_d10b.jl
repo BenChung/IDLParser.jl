@@ -39,6 +39,31 @@ module _DB; using ROSNode; @ros_import from="../examples/interfaces" "sensor_dem
         @test d5[:w].type === _FB && d5[:w].tied
     end
 
+    @testset "3-way fork: global argmin, order-independent (S1)" begin
+        # Three independently-minted structs for one wire type — the closure-reduction
+        # picks the globally-smallest FQN, NOT whichever pair settled first under an
+        # unordered `loaded_modules` walk. (A pairwise sticky fold would let a third,
+        # smaller arm be dropped once the first two marked `tied`.)
+        struct _GA end; struct _GB end; struct _GC end
+        reduce! = ROSNode._reduce_candidates
+        winner = argmin(string, (_GA, _GB, _GC))
+        # every permutation of the three forks reduces to the same global winner, tied
+        for perm in ([_GA,_GB,_GC], [_GC,_GB,_GA], [_GB,_GA,_GC], [_GC,_GA,_GB])
+            cs = [RE(T, Main, false) for T in perm]
+            r = reduce!(:g, cs)
+            @test r.type === winner && r.tied
+        end
+        # a third differing fork is NOT dropped just because two earlier arms settled:
+        # an already-`tied` non-winner arm still loses to the global-min raw arm.
+        notwin = argmax(string, (_GA, _GB, _GC))
+        r2 = reduce!(:g, [RE(notwin, Main, true), RE(winner, Main, false), RE(notwin, Main, true)])
+        @test r2.type === winner && r2.tied
+        # full agreement carries the settled flag forward (no spurious re-pick)
+        @test reduce!(:g, [RE(_GA,Main,false), RE(_GA,Main,true)]).type === _GA
+        @test reduce!(:g, [RE(_GA,Main,false), RE(_GA,Main,true)]).tied
+        @test !reduce!(:g, [RE(_GA,Main,false), RE(_GA,Main,false)]).tied
+    end
+
     @testset "per-module table + home lookup (S1/S2)" begin
         RA = _DA.sensor_demo.msg.Reading
         RB = _DB.sensor_demo.msg.Reading

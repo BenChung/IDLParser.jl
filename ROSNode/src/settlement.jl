@@ -120,18 +120,22 @@ function fill!(cell::ResultCell, status::SettlementStatus, payload)
     end
 end
 
-# Latch + deliver, caller holds the lock and has checked emptiness. Latching the
-# flag before `deliver` keeps the cell consistent even if delivery throws — a
-# half-delivered cell still reads as filled, so the fail-safe `finally` won't
-# re-settle it; the delivery error is the caller's to log.
+# Deliver + latch, caller holds the lock and has checked emptiness. `deliver` runs
+# *before* `filled` flips so its side effects (the action result cache, the wire
+# reply) are visible to any waiter the instant `filled` reads true — a `get_result`
+# waking on `wait_settled` must never see `filled` ahead of the cached result. The
+# flip is in a `finally` so a throwing `deliver` still latches: a half-delivered
+# cell reads as filled, the fail-safe `finally` won't re-settle it, and the
+# delivery error is the caller's to log. `notify` follows the flip so a woken
+# waiter sees a consistent, fully-latched cell.
 function _settle!(cell::ResultCell, status::SettlementStatus, payload)
     cell.status = status
-    @atomic cell.filled = true
-    # Wake parked waiters before `deliver`: the status is latched and `filled` is
-    # set, so a woken `get_result` reads a consistent outcome even if `deliver`
-    # throws (it reads the cell, not delivery's side effects). Caller holds `lock`.
-    notify(cell.cond)
-    cell.deliver(status, payload)
+    try
+        cell.deliver(status, payload)
+    finally
+        @atomic cell.filled = true
+        notify(cell.cond)
+    end
     return true
 end
 

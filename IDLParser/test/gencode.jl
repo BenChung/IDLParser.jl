@@ -88,4 +88,45 @@ module LayoutOverride end
     end
     @test isdefined(LayoutOverride.m, :P2)
 end
+
+# Two packages each define `msg::Status` — one all-fixed, one with a `string`
+# field — and a third package's messages reference each cross-package. A flat
+# bare-name registry would let whichever `Status` registered last decide a
+# field's fixedness, so the referencing message's @cdr_fixed/@kwdef choice
+# flipped with file order. Fixity must follow the *scoped* path, like emission.
+module ScopeFixedFirst end
+module ScopeDynFirst end
+@testset "same-named structs across packages classified by scope" begin
+    import IDLParser.Parse: specification
+    p(src) = resolve_constants(convert(Vector{IDLParser.Parse.Decl}, parse_whole(specification, src)))
+
+    fixed_pkg = "module pkga { module msg { struct Status { int32 code; }; }; };"
+    dyn_pkg   = "module pkgb { module msg { struct Status { string detail; }; }; };"
+    # `Report` references the all-fixed pkga::Status; `ReportB` references the
+    # string-bearing pkgb::Status. Correct classification ⇒ Report is compact,
+    # ReportB is not — regardless of which `Status` was registered last.
+    ref_pkg = """
+    module pkgc { module msg {
+        struct Report  { pkga::msg::Status s; };
+        struct ReportB { pkgb::msg::Status s; };
+    }; };
+    """
+
+    # Both file orderings must classify identically.
+    for (holder, srcs) in ((ScopeFixedFirst, (fixed_pkg, dyn_pkg, ref_pkg)),
+                           (ScopeDynFirst,   (dyn_pkg, fixed_pkg, ref_pkg)))
+        for c in generate_code(p(join(srcs, "\n")))
+            holder.eval(c)
+        end
+        # Leaf classification by scope.
+        @test iscompact(holder.pkga.msg.Status)
+        @test !iscompact(holder.pkgb.msg.Status)
+        # The referencing messages inherit fixedness from the *correct* Status.
+        @test iscompact(holder.pkgc.msg.Report)
+        @test !iscompact(holder.pkgc.msg.ReportB)
+        # Each field resolves to the scope-correct struct, not the same-named one.
+        @test fieldtype(holder.pkgc.msg.Report, :s)  === holder.pkga.msg.Status
+        @test fieldtype(holder.pkgc.msg.ReportB, :s) === holder.pkgb.msg.Status
+    end
+end
 end

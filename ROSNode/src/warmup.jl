@@ -81,18 +81,22 @@ _sample_msg(::Type{T}, sample) where {T} =
     _default_msg(::Type{T}) -> T
 
 A zero/empty instance of generated message type `T` for warm-up (§D8): every field
-defaulted by its type — `0`/`false` for numbers, `""` for strings, the zero
-`SVector` for fixed arrays, an empty `Vector` for sequences, recursively for nested
-messages. Built positionally so it works regardless of whether the struct has
-keyword defaults. `warmup_sample` overrides it when the caller supplies realism.
+defaulted by its type — `0`/`false` for numbers, `""` for strings, a fixed array
+(`SArray`) of its defaulted element, an empty `Vector` for sequences, recursively
+for nested messages. Built positionally so it works regardless of whether the struct
+has keyword defaults. `warmup_sample` overrides it when the caller supplies realism.
 """
 _default_msg(::Type{T}) where {T} = T(map(_default_field, fieldtypes(T))...)
 
+# A fixed array `T[N]` generates as `SArray{Tuple{N},T,1,N}` for *any* element
+# `T` — string/struct included — so we default per-element and rebuild the SArray
+# (`length(S)` is the flattened `prod(dims)` count, `eltype(S)` the element type).
+# `zero` only covers numeric elements; on strings/structs it MethodErrors.
 _default_field(::Type{S}) where {S} =
     S <: Number         ? zero(S) :
     S <: AbstractString ? convert(S, "") :
-    S <: Enum           ? first(instances(S)) :
-    S <: StaticArray    ? zero(S) :          # fixed primitive array (SVector)
+    S <: StaticArray    ? (eltype(S) <: Number ? zero(S) :
+                           S(ntuple(_ -> _default_field(eltype(S)), length(S)))) :
     S <: AbstractVector ? S(undef, 0) :      # sequence (Vector{E})
     _default_msg(S)                           # nested message struct
 
@@ -105,9 +109,12 @@ function _warm_publisher(policy::WarmupPolicy, pub::PublisherHandle{T, R}, sampl
     precompile(encode, (T,))
     precompile(publish, (PublisherHandle{T, R}, T))
     if policy.mode === :execute
-        msg = _sample_msg(T, sample)
+        # Sample build sits inside the warm try: a synthesizer failure (e.g. a
+        # field type the default-builder can't handle) degrades to precompile-only
+        # with a warning, never escaping to crash a sync constructor or vanish into
+        # an unhandled background-task throw.
         _run_warm(pub.entity.endpoint.topic) do
-            publish(pub, msg)
+            publish(pub, _sample_msg(T, sample))
         end
     end
     nothing
@@ -133,9 +140,10 @@ function _warm_subscription(policy::WarmupPolicy, e::Entity, ::Type{T}, handler:
     end
     precompile(handler, (T,))
     if policy.mode === :execute
-        msg = _sample_msg(T, sample)
-        buf = as_memory(encode(msg), UInt8)
+        # Sample build + encode inside the warm try (see `_warm_publisher`): a
+        # builder failure degrades to precompile-only, never fatal.
         _run_warm(e.endpoint.topic) do
+            buf = as_memory(encode(_sample_msg(T, sample)), UInt8)
             if _is_view(view)
                 handler(decode_view(buf, T))
             else
@@ -171,9 +179,10 @@ function _warm_service(policy::WarmupPolicy, e::Entity, ::Type{Req}, ::Type{Resp
     precompile(handler, (Req,))
     precompile(encode, (Resp,))
     if policy.mode === :execute
-        req = _sample_msg(Req, sample)
+        # Sample build inside the warm try (see `_warm_publisher`): a builder
+        # failure degrades to precompile-only, never fatal.
         _run_warm(e.endpoint.topic) do
-            resp = handler(req)
+            resp = handler(_sample_msg(Req, sample))
             resp isa Resp && encode(resp)
         end
     end

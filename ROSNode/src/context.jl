@@ -183,6 +183,11 @@ mutable struct Context
     @atomic _state::ShutdownState
     const _on_shutdown::Vector{Any}      # user cleanup hooks, run during the drain
     const _shutdown_done::Threads.Condition  # `spin`/`wait` park here until drained
+    # Woken `all=true` as the *first* drain step so blocked clock-waits
+    # (`_interruptible_sleep`, Rate, sleep_until) unwind with a ShutdownException
+    # instead of sleeping out their full span. Distinct from `_shutdown_done`
+    # (the terminal condition): this fires at drain start, that at drain end.
+    const _shutdown_wake::Threads.Condition
     const drain_timeout::Float64         # seconds to await in-flight work
     # Registered close-able handles (nodes, entities, timers) undeclared on drain
     # (step 4). The entity layer pushes here; `close(ctx)` walks it in reverse.
@@ -252,7 +257,7 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
                   0, TypeRegistry(), GraphIndex(), nothing,
                   Dict{DataType, Any}(), nothing,
                   ReentrantLock(), running, Any[], Threads.Condition(),
-                  Float64(drain_timeout), Any[], home)
+                  Threads.Condition(), Float64(drain_timeout), Any[], home)
 
     # Register the statically-compiled bootstrap types (type_description_interfaces,
     # §11 S1) so the §13 server can serve them and discovery can use them, plus any
@@ -502,9 +507,13 @@ end
 function _notify_graph_change!(ctx::Context, added::Vector{EndpointInfo},
                                removed::Vector{EndpointInfo})
     @lock ctx.graph.changed notify(ctx.graph.changed)
-    isempty(ctx.graph.listeners) && return nothing
+    # Snapshot under the index lock, then fire outside it: listeners may query the
+    # graph or register more, and a concurrent `push!` must not reallocate the
+    # Vector mid-iteration.
+    fns = @lock ctx.graph.lock copy(ctx.graph.listeners)
+    isempty(fns) && return nothing
     change = (; added=added, removed=removed)
-    for f in ctx.graph.listeners
+    for f in fns
         try
             f(change)
         catch err
@@ -639,9 +648,10 @@ function _drain!(ctx::Context)
     # completes, so a blocked main task can never hang on a drain-internal bug.
     try
         # 1. Wake blocked clock-waits and the graph waits so they unwind with a
-        # ShutdownException rather than hanging the drain. Clock-wait interruption
-        # is the time layer's seam (TODO(layer): time.jl's `_interruptible_sleep`
-        # will register with us); the graph condition we own and wake here.
+        # ShutdownException rather than hanging the drain. `_shutdown_wake` releases
+        # `_interruptible_sleep`/Rate/sleep_until (time.jl), `graph.changed` the §12
+        # graph waits; both re-check `is_shutdown` and raise.
+        @lock ctx._shutdown_wake notify(ctx._shutdown_wake; all=true)
         @lock ctx.graph.changed notify(ctx.graph.changed; all=true)
 
         # 2. on_shutdown hooks, each bounded so one slow hook can't stall the rest.

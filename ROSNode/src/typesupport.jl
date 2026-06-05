@@ -183,9 +183,25 @@ A codegen/eval failure is logged and leaves the entry unrealized (`mod`/`type`
 stay `nothing`) so a single bad type can't abort discovery; the subscription path
 then falls back to raw bytes for that topic (DESIGN §until-ready).
 """
+# Serializes the codegen+register critical section across concurrent first-uses.
+const _REALIZE_LOCK = ReentrantLock()
+
 function realize!(entry::RegistryEntry)
     entry.mod === nothing || return entry
-    package, _, _ = split_ros_name(entry.info.name)
+    # Serialize codegen+register: the dynamic worker and the Tier-1 manifest warm can
+    # both reach a fresh entry's first use concurrently — without this they each eval a
+    # gensym module for the same type (wasteful, two evals of the "same" code). The
+    # critical section runs no user handler code (codegen + binding reads only), so it
+    # is deadlock-free to hold across. Re-check under the lock so the second caller
+    # reuses the first's result.
+    @lock _REALIZE_LOCK begin
+        entry.mod === nothing || return entry
+        package, _, _ = split_ros_name(entry.info.name)
+        return _realize_locked!(entry, package)
+    end
+end
+
+function _realize_locked!(entry::RegistryEntry, package::AbstractString)
     try
         mod = _eval_module(entry.il, package)
         entry.mod = mod
@@ -505,11 +521,15 @@ end
 # so a reload reconstructs the `TypeInfo` without re-parsing the name out of the blob.
 
 # Cache opt-in state. `dir === nothing` ⇒ use the project-local default when enabled.
+# `dirs` is the ordered read search-list (a project may register several `@ros_cache`
+# dirs); `dir` is the single primary *write* dir (the deterministic min of `dirs`, or
+# the last explicit `enable_project_cache!`). Reads consult every entry in `dirs`.
 mutable struct _CacheState
     enabled::Bool
     dir::Union{String, Nothing}
+    dirs::Vector{String}
 end
-const _CACHE = _CacheState(false, nothing)
+const _CACHE = _CacheState(false, nothing, String[])
 
 # The project-local default cache dir: `<active-project-dir>/ros_typesupport`. Falls
 # back to the cwd when no project is active (a bare `julia` REPL).
@@ -529,14 +549,34 @@ Turn on project-local persistence of dynamically-discovered type descriptions
 adding the macro. Returns the (created) directory.
 """
 function enable_project_cache!(dir::AbstractString=_default_project_cache_dir())
+    d = String(dir)
     _CACHE.enabled = true
-    _CACHE.dir = String(dir)
-    isdir(_CACHE.dir) || mkpath(_CACHE.dir)
+    _CACHE.dir = d
+    _CACHE.dirs = String[d]          # explicit opt-in: this dir is the read+write set
+    isdir(d) || mkpath(d)
+    return d
+end
+
+# Register a set of `@ros_cache` opt-in dirs deterministically (D5). Multiple dirs no
+# longer collapse to whichever the unordered set yielded last: all become the read
+# search-list and the lexicographically smallest is the single (stable) write dir. A
+# `>1`-dir project is warned — discovery still persists, but only to one of them.
+function _register_cache_dirs!(dirs)
+    ds = sort!(unique(String[String(d) for d in dirs]))
+    isempty(ds) && return _CACHE.dir
+    _CACHE.enabled = true
+    _CACHE.dirs = ds
+    _CACHE.dir = ds[1]               # deterministic primary write dir
+    for d in ds
+        isdir(d) || mkpath(d)
+    end
+    length(ds) > 1 && @warn "typesupport: multiple @ros_cache directories registered; \
+        reads search all of them, new discoveries persist only to $(ds[1])" dirs=ds maxlog=1
     return _CACHE.dir
 end
 
 "Disable project-local type-description persistence (the default state)."
-disable_project_cache!() = (_CACHE.enabled = false; nothing)
+disable_project_cache!() = (_CACHE.enabled = false; _CACHE.dirs = String[]; nothing)
 
 # Is the on-disk cache active? The env override force-enables (ops/test escape hatch).
 _cache_enabled() = haskey(ENV, "ROS_TYPESUPPORT_CACHE") || _CACHE.enabled
@@ -550,12 +590,22 @@ function _cache_dir()
     return base
 end
 
-# Cache file for a hash: `<dir>/<64-hex>.json`. The bare hex (not the `RIHS01_`
-# prefix) names the file — content-addressed by the 32-byte digest.
-function _cache_path(info::TypeInfo)
-    hex = bytes2hex(collect(info.hash.value))
-    return joinpath(_cache_dir(), hex * ".json")
+# The ordered read search-list. The env override (single dir) wins; else every
+# registered `@ros_cache` dir (deterministic order); else the project-local default. A
+# type cached under any one of them resolves — reads are not pinned to the write dir.
+function _cache_read_dirs()
+    base = get(ENV, "ROS_TYPESUPPORT_CACHE", "")
+    isempty(base) || return String[base]
+    isempty(_CACHE.dirs) || return _CACHE.dirs
+    return String[_CACHE.dir === nothing ? _default_project_cache_dir() : _CACHE.dir]
 end
+
+# The content-addressed leaf for a hash: `<64-hex>.json`. The bare hex (not the
+# `RIHS01_` prefix) names the file — content-addressed by the 32-byte digest.
+_cache_leaf(info::TypeInfo) = bytes2hex(collect(info.hash.value)) * ".json"
+
+# Cache file for a hash under the primary (write) dir.
+_cache_path(info::TypeInfo) = joinpath(_cache_dir(), _cache_leaf(info))
 
 # Persist a `TypeDescriptionMsg` to the cache (best-effort; a write failure is
 # logged, never fatal — the type is already in the live registry). The first line
@@ -574,13 +624,23 @@ function _cache_store(info::TypeInfo, td::TypeDescriptionMsg)
     nothing
 end
 
-# Load + self-validate a cached `TypeDescriptionMsg` for `info`. Recomputes the
-# RIHS01 over the parsed blob and discards on mismatch (a stale/corrupt entry can
-# never decode wrong, DESIGN §cache). Returns `nothing` on miss, parse failure, or
-# hash mismatch.
+# Load + self-validate a cached `TypeDescriptionMsg` for `info`, searching every
+# registered cache dir in order (first hit wins). Recomputes the RIHS01 over the parsed
+# blob and discards on mismatch (a stale/corrupt entry can never decode wrong, DESIGN
+# §cache). Returns `nothing` on miss, parse failure, or hash mismatch across all dirs.
 function _cache_load(info::TypeInfo)
     _cache_enabled() || return nothing
-    path = _cache_path(info)
+    leaf = _cache_leaf(info)
+    for dir in _cache_read_dirs()
+        td = _cache_load_path(joinpath(dir, leaf), info)
+        td === nothing || return td
+    end
+    return nothing
+end
+
+# Load + self-validate one cache file. `nothing` on miss / parse failure / hash mismatch;
+# a mismatched blob is removed (it can never decode right).
+function _cache_load_path(path::AbstractString, info::TypeInfo)
     isfile(path) || return nothing
     td = try
         content = read(path, String)
@@ -909,6 +969,63 @@ function type_info_of(::Type{T}) where {T}
     entry === nothing ? type_info(T) : entry.info
 end
 
+# The registry entry bound to a generated type (`.td` is the wire TypeDescription),
+# or `nothing` if the type was never registered.
+_entry_of(::Type{T}) where {T} =
+    @lock _TYPE_TO_ENTRY_LOCK get(_TYPE_TO_ENTRY, T, nothing)
+
+# ── service-level type identity (rmw_zenoh service/client keyexpr, §8) ──────────
+# rmw_zenoh keys a service/client off the SERVICE type (`pkg::srv::dds_::Base_` +
+# the service RIHS01), not the request message — so a service keyexpr built from
+# the request type's info never matches a peer. `service_type_info_of` synthesizes
+# the rosidl service type description (ROSMessages.service_rihs01) and returns the
+# service-level `TypeInfo`. The synthesized service-event closure references
+# `service_msgs/msg/ServiceEventInfo`, which we read from the vendored canonical set.
+
+const _SERVICE_EVENT_INFO_NAME = "service_msgs/msg/ServiceEventInfo"
+const _SEI_TD = Ref{Union{Nothing, TypeDescriptionMsg}}(nothing)
+const _SEI_LOCK = ReentrantLock()
+
+# The vendored `service_msgs/msg/ServiceEventInfo` type description (memoized).
+function _service_event_info_td()
+    @lock _SEI_LOCK begin
+        _SEI_TD[] === nothing || return _SEI_TD[]
+        for e in _canonical_entries()
+            if e.info.name == _SERVICE_EVENT_INFO_NAME && e.td !== nothing
+                return _SEI_TD[] = e.td
+            end
+        end
+        return nothing
+    end
+end
+
+"""
+    service_type_info_of(Req, Resp) -> Union{TypeInfo, Nothing}
+
+The rmw_zenoh *service-level* [`TypeInfo`](@ref) for a service whose request /
+response message types are `Req` / `Resp`: the service type name (`pkg/srv/Base`,
+keyed on the wire as `pkg::srv::dds_::Base_`) and the ROS2 service RIHS01 the
+service/client keyexpr must carry to match a peer (§8). Built by stripping the
+`_Request` suffix off the request's qualified name and hashing the synthesized
+service type description. Returns `nothing` unless both message types are
+registered with their wire `TypeDescription`s and the vendored
+`service_msgs/msg/ServiceEventInfo` is available — the caller then falls back to
+the request type's own info (self-consistent locally, but not peer-compatible).
+"""
+function service_type_info_of(::Type{Req}, ::Type{Resp}) where {Req, Resp}
+    re = _entry_of(Req)
+    rs = _entry_of(Resp)
+    (re === nothing || rs === nothing || re.td === nothing || rs.td === nothing) &&
+        return nothing
+    sei = _service_event_info_td()
+    sei === nothing && return nothing
+    name = re.td.type_description.type_name
+    sname = endswith(name, "_Request") ? name[1:end-length("_Request")] : name
+    h = type_hash_from_rihs_string(ROSMessages.service_rihs01(sname, re.td, rs.td, sei))
+    h === nothing && return nothing
+    return TypeInfo(sname, h)
+end
+
 # ── statically-generated type registration (@ros_import / @ros_cache, D5) ───────
 # `@ros_import` (ament/vendored, by name) and `@ros_cache` (baked from the
 # discovered-type cache) generate static types into the caller module and record
@@ -1026,11 +1143,14 @@ function _register_static_types!(ctx)
             # last-`__init__`-wins global clobber while keeping advertised types describable.
             lookup_type(reg, e.info) === nothing && register_type!(reg, e.info, e)
         end
-        for dir in _STATIC_TYPES.cache_dirs
+        # Register every `@ros_cache` opt-in dir deterministically: reads search them
+        # all, writes go to a single stable (min-string) dir — no last-wins collapse over
+        # the unordered set.
+        if !isempty(_STATIC_TYPES.cache_dirs)
             try
-                enable_project_cache!(dir)
+                _register_cache_dirs!(_STATIC_TYPES.cache_dirs)
             catch err
-                @error "typesupport: enabling project cache failed" dir exception=err
+                @error "typesupport: enabling project cache failed" dirs=collect(_STATIC_TYPES.cache_dirs) exception=err
             end
         end
     end
@@ -1099,22 +1219,62 @@ function _fold_resolve!(dst::Dict{Symbol, ResolveEntry}, src::Dict{Symbol, Resol
     return dst
 end
 
+# Reduce all candidate entries for one wire RIHS01 (gathered across the whole closure)
+# to the single winner. Agreement is a no-op (carry the `tied` flag forward if any arm
+# was already settled). A fork — two or more distinct structs — is settled by a true
+# *global* `argmin` over the fully-qualified type string, so the survivor is the
+# globally smallest FQN regardless of the order candidates were gathered in (a pairwise
+# sticky fold would instead let the first-settled pair win and drop a later, smaller
+# arm). Warns once, naming the global winner against a representative loser.
+function _reduce_candidates(sym::Symbol, cands::Vector{ResolveEntry})
+    keep = cands[1]                      # global argmin(string(type))
+    drop = cands[1]                      # global argmax — a deterministic representative loser
+    for e in cands
+        string(e.type) < string(keep.type) && (keep = e)
+        string(e.type) > string(drop.type) && (drop = e)
+    end
+    if keep.type !== drop.type           # fork: distinct structs for one wire type
+        _warn_tie(sym, keep, drop)
+        return ResolveEntry(keep.type, keep.origin, true)
+    end
+    # All agreed: settled iff some arm was already tied lower in the tree.
+    return any(e -> e.tied, cands) ? ResolveEntry(keep.type, keep.origin, true) : keep
+end
+
 """
     _merge_resolve!(mod::Module, own::Vector{<:Tuple{Symbol, Type}}) -> Dict
 
-Populate `mod.__ros_resolve__` (D10B S1): fold every loaded module's table into it (at
-precompile that is exactly `mod`'s dependency closure — diamond/fork resolved here),
-then add `mod`'s own freshly-minted `(rihs, T)` entries (own wins for `mod`). Idempotent
-across multiple `@ros_import`/`@ros_cache` calls in one module. Emitted by the macros at
-module top level so it runs — and bakes — at precompile.
+Populate `mod.__ros_resolve__` (D10B S1): globally reduce every loaded module's table
+into it (at precompile that is exactly `mod`'s dependency closure — diamond/fork resolved
+here), then add `mod`'s own freshly-minted `(rihs, T)` entries (own wins for `mod`).
+Idempotent across multiple `@ros_import`/`@ros_cache` calls in one module. Emitted by the
+macros at module top level so it runs — and bakes — at precompile.
+
+The closure pick is a *global* `argmin(string(type))` over all candidates for a wire
+type, not a pairwise sticky fold: with three or more forks the survivor is the globally
+smallest FQN regardless of `loaded_modules` iteration order (a `Dict`, unordered), so the
+documented "deterministic pick by fully-qualified type string" holds beyond two sources.
 """
 function _merge_resolve!(mod::Module, own)
     tbl = getglobal(mod, _RESOLVE_GLOBAL)::Dict{Symbol, ResolveEntry}
+    # Gather every closure candidate per wire type (incl. any already in `tbl` from a
+    # prior `@ros_import`/`@ros_cache` call in this module, for idempotency), then reduce
+    # each set to its global winner — order-independent by construction.
+    cands = Dict{Symbol, Vector{ResolveEntry}}()
+    for (sym, e) in tbl
+        push!(get!(() -> ResolveEntry[], cands, sym), e)
+    end
     for D in values(Base.loaded_modules)
         D === mod && continue
         isdefined(D, _RESOLVE_GLOBAL) || continue
         dt = getglobal(D, _RESOLVE_GLOBAL)
-        dt isa Dict{Symbol, ResolveEntry} && _fold_resolve!(tbl, dt)
+        dt isa Dict{Symbol, ResolveEntry} || continue
+        for (sym, e) in dt
+            push!(get!(() -> ResolveEntry[], cands, sym), e)
+        end
+    end
+    for (sym, cs) in cands
+        tbl[sym] = _reduce_candidates(sym, cs)
     end
     for (sym, T) in own                               # mod's own mints — own wins
         prev = get(tbl, sym, nothing)

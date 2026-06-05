@@ -7,17 +7,17 @@
 
 using ROSNode
 
-@ros_import "std_msgs/msg/String"
+@ros_import "std_msgs/msg/String" from="interfaces"
 
-Context(; peers = ["tcp/localhost:7447"]) do ctx
+Context(; peers = ["tcp/localhost:7447"], home=@__MODULE__) do ctx
     node = Node(ctx, "listener")
 
     # The do-block handler runs once per message. `msg` is an owned, decoded
     # `std_msgs.msg.String` — safe to keep or hand to another task. The default
     # `concurrency = Serial()` delivers in order on one task (no locking needed);
     # pass `Parallel(n)` to fan out across threads.
-    sub = Subscription(node, "/chatter", std_msgs.msg.String) do msg
-        @info "heard" msg.data
+    sub = Subscription(node, "/chatter") do msg
+        @info "heard" typeof(msg.data) msg.data
     end
 
     # Julia's scheduler is the executor — no explicit spin() needed. Just keep the

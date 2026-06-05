@@ -248,6 +248,11 @@ mutable struct Entity
     # Slot for the pattern layer to stash its kind-specific wiring (queryable,
     # querier, pending-reply table) so it shares this handle's lifecycle.
     wire::Any
+    # §12.3 message-lost: set true the first time an `on_message_lost` listener
+    # registers (graph.jl). The consumer hot path reads it per sample to decide
+    # whether to do the attachment-sequence bookkeeping (`note_sequence!`); the
+    # common no-listener case is one atomic load, no decode, no alloc.
+    @atomic _track_lost::Bool
     @atomic open::Bool
 end
 
@@ -276,7 +281,7 @@ function make_entity(node::Node, kind::EndpointKind, topic::AbstractString,
     gid = entity_gid(endpoint)
 
     ent = Entity(node, endpoint, lv_key, gid, nothing, nothing, nothing,
-                 nothing, nothing, true)
+                 nothing, nothing, false, true)
     # Declare liveliness first (peers discover us), then inject locally so our own
     # graph queries are immediately authoritative (§12).
     ent._lv_token = LivelinessToken(ctx.session, Keyexpr(lv_key))
@@ -491,9 +496,12 @@ function _do_relatch!(e::Entity, msgtype::Type, handler, view::ViewMode,
     end
     # Join the old consumer so its in-flight deliveries land (and record in the gate)
     # before we snapshot. Its loop ends when the route's FIFO disconnects. Skip only if
-    # we're somehow on that very task.
+    # we're somehow on that very task. Bounded (mirrors `close(::_ServiceWire)`): a
+    # consumer wedged in a native call must not wedge the Inactive→Active transition —
+    # move on after the budget and let the stuck task die with the process.
     if old_consumer isa Task && old_consumer !== current_task()
-        try; wait(old_consumer); catch; end
+        Base.timedwait(() -> istaskdone(old_consumer), 3.0; pollint=0.02) === :ok ||
+            @warn "relatch: old consumer didn't end within budget; proceeding" topic=e.endpoint.topic
     end
     _arm_relatch!(gate)        # freeze the now-complete delivered set as the baseline
     sub = Base.open(e.node.context.session, Keyexpr(tk); channel=:fifo, capacity=cap,
@@ -605,12 +613,16 @@ end
 # concrete and `decode_view`/`decode_owned` infer concrete (the `CDR_LE` reader).
 # A handler/decode throw is logged and swallowed so one bad message never kills the
 # subscription; `ShutdownException` ends the dispatch quietly.
+#
+# D7: the node logger is installed once per consumer/worker task (`_consume_loop` /
+# the `Parallel(Inf)` task / the dynamic worker) and inherited by every handler call
+# (and any task they spawn), so a plain `@info` inside the handler routes to the
+# node's /rosout — without the per-message `with_logger` scope (which allocates
+# ~270 B/call, measured GC-off on 1.11/1.12, breaking the `Unchecked()` zero-alloc tier).
 @inline function _dispatch_decoded(e::Entity, sample::AbstractSample, ::Type{T},
                                    handler, view::ViewMode) where {T}
     try
-        _with_node_logger(e.node) do          # D7: handler logs → node's /rosout
-            _run(sample, T, handler, view)
-        end
+        _run(sample, T, handler, view)
     catch err
         err isa ShutdownException && return
         @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
@@ -663,10 +675,10 @@ end
 # path spawns this after an inline `_decode_on_consumer`.
 function _invoke_owned(e::Entity, msg, handler)
     try
-        # D7: a plain `@info` inside the handler routes to this node's /rosout.
-        _with_node_logger(e.node) do
-            handler(msg)
-        end
+        # D7: the node logger is the active logger here — set once on the spawning
+        # consumer task and inherited by this spawned handler task — so a plain `@info`
+        # inside the handler routes to the node's /rosout.
+        handler(msg)
     catch err
         err isa ShutdownException && return
         @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
@@ -684,11 +696,17 @@ end
 function _consume_loop(e::Entity, ::Type{T}, handler, view::ViewMode, sub::S, gate) where {T, S<:Zenoh.AbstractSubscriberHandler}
     holder = SampleHolder()
     try
-        while (sample = recv!(sub, holder)) !== nothing
-            _predispatch(e, sample, gate) || continue
-            # Inline (the holder is live for the whole dispatch) — both view and
-            # owned go through the one shared leaf.
-            _dispatch_decoded(e, sample, T, handler, view)
+        # D7: install the node logger once for the whole task (not per message — that
+        # `with_logger` scope allocates); handlers and any task they spawn inherit it,
+        # so a plain `@info` inside the handler still routes to the node's /rosout.
+        _with_node_logger(e.node) do
+            while (sample = recv!(sub, holder)) !== nothing
+                _note_lost(e, sample)             # §12.3, only when a listener is registered
+                _predispatch(e, sample, gate) || continue
+                # Inline (the holder is live for the whole dispatch) — both view and
+                # owned go through the one shared leaf.
+                _dispatch_decoded(e, sample, T, handler, view)
+            end
         end
     catch err
         err isa ShutdownException && return
@@ -697,6 +715,13 @@ function _consume_loop(e::Entity, ::Type{T}, handler, view::ViewMode, sub::S, ga
     end
     nothing
 end
+
+# §12.3 message-lost feed: report attachment-sequence gaps to `on_message_lost`
+# listeners. Gated on a per-entity flag so the common no-listener path is one atomic
+# load (no attachment decode, no alloc); only a sub with a registered listener pays
+# the per-sample `note_sequence!` decode.
+@inline _note_lost(e::Entity, sample::AbstractSample) =
+    (@atomic e._track_lost) && (note_sequence!(e, sample); nothing)
 
 # `Parallel(Inf)`: unbounded concurrency can't be a fixed pool, so keep the
 # spawn-per-message model (its per-message task-launch cost is the honest price
@@ -707,21 +732,27 @@ function _spawn_unbounded_consumer(e::Entity, ::Type{T}, handler, view::ViewMode
     reused = SampleHolder()
     t = Task() do
         try
-            while true
-                h = _is_view(view) ? SampleHolder() : reused
-                recv!(sub, h) === nothing && break
-                _predispatch(e, h, gate) || continue
-                if _is_view(view)
-                    # Fresh holder per message → the spawned task owns it and can
-                    # borrow it for the full dispatch via the shared leaf.
-                    Threads.@spawn _dispatch_decoded(e, h, T, handler, view)
-                else
-                    # Owned must decode INLINE over the reused holder (before the
-                    # next recv! overwrites it); spawn only the handler on the owned
-                    # result.
-                    msg = _decode_on_consumer(e, h, T)
-                    msg === nothing && continue
-                    Threads.@spawn _invoke_owned(e, msg, handler)
+            # D7: node logger installed once for the receiver task; spawned handler
+            # tasks inherit it (so handler `@info` routes to /rosout) without a
+            # per-message `with_logger` scope.
+            _with_node_logger(e.node) do
+                while true
+                    h = _is_view(view) ? SampleHolder() : reused
+                    recv!(sub, h) === nothing && break
+                    _note_lost(e, h)              # §12.3, only when a listener is registered
+                    _predispatch(e, h, gate) || continue
+                    if _is_view(view)
+                        # Fresh holder per message → the spawned task owns it and can
+                        # borrow it for the full dispatch via the shared leaf.
+                        Threads.@spawn _dispatch_decoded(e, h, T, handler, view)
+                    else
+                        # Owned must decode INLINE over the reused holder (before the
+                        # next recv! overwrites it); spawn only the handler on the owned
+                        # result.
+                        msg = _decode_on_consumer(e, h, T)
+                        msg === nothing && continue
+                        Threads.@spawn _invoke_owned(e, msg, handler)
+                    end
                 end
             end
         catch err
@@ -856,7 +887,12 @@ function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency
     # from per-message to per-type. Runs even under `-t1` — the recv yields, so the
     # scheduler reaches the worker; `-t>=2` adds true overlap.
     worker = Threads.@spawn try
-        _dynamic_worker(e, buf, handler, sched, view, pool, logged, loglk, warmed, warmlk, warmup)
+        # D7: node logger installed once for the worker (and inherited by the handler
+        # tasks the scheduler spawns), so a dynamic-sub handler's `@info` routes to
+        # /rosout — without a per-message `with_logger` scope.
+        _with_node_logger(e.node) do
+            _dynamic_worker(e, buf, handler, sched, view, pool, logged, loglk, warmed, warmlk, warmup)
+        end
     catch err
         err isa ShutdownException && return
         isopen(e) &&
@@ -883,6 +919,7 @@ function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency
                     pool === nothing || put!(pool, h)         # recycle, don't enqueue
                     continue
                 end
+                _note_lost(e, h)                              # §12.3, only when a listener is registered
                 # No `string(keyexpr(h))` here: the owned holder carries the keyexpr,
                 # so the worker reads it by borrowing (hash + memcmp cache hit), and
                 # only a cold first-sight miss materializes the String.
@@ -1064,7 +1101,15 @@ function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
                 continue
             end
             Tnew = _resolve_home(e.node, info.hash)                    # D10B S2: home table first
-            Tnew === nothing && (Tnew = resolve_or_discover(e.node, info.name, info.hash))
+            source = :home                                            # a-priori: the Context's `home` module
+            if Tnew === nothing
+                Tnew = resolve_or_discover(e.node, info.name, info.hash)
+                # Tag the resolution source for the hint: a resolved entry's provenance —
+                # `:static`/`:cache`/`:ament` mean we already knew the type locally; `:wire`
+                # means we fetched + generated it from the publisher's ~/get_type_description.
+                ent = Tnew === nothing ? nothing : lookup_type(registry(_ctx(e.node)), info)
+                source = ent === nothing ? :wire : ent.provenance
+            end
             if Tnew === nothing
                 @warn "dynamic subscription: could not resolve type" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) maxlog=1
                 pool === nothing || put!(pool, h)              # not dispatched → recycle the holder
@@ -1073,7 +1118,7 @@ function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
             # Key on the same FNV-1a the hot path computes; stash the bytes for memcmp.
             kebytes = Vector{UInt8}(codeunits(ke))
             cache[GC.@preserve kebytes _ke_fnv1a(pointer(kebytes), length(kebytes))] = (Tnew, kebytes)
-            _log_discovered_once(e, info, logged, loglk)
+            _log_discovered_once(e, info, source, logged, loglk)
             # §D8/§D9: warm this runtime type's codec once (off the recv thread); `T`
             # is runtime-born so reach the warm anchor via `invokelatest`. `warmed` is
             # shared with the Tier-1 replay task, so the once-guard is under `warmlk`.
@@ -1150,13 +1195,25 @@ end
 
 # Log a discovered (name, hash) once per subscription (§S6): tell the user what to
 # write to graduate to the static fast path.
-function _log_discovered_once(e::Entity, info::TypeInfo, logged, loglk)
+function _log_discovered_once(e::Entity, info::TypeInfo, source::Symbol, logged, loglk)
     isnew = @lock loglk (info.name, info.hash) in logged ? false :
                         (push!(logged, (info.name, info.hash)); true)
     isnew || return nothing
     bare = split(info.name, '/')[end]
-    @info "dynamic subscription discovered a type — for the min-copy fast path, \
-           rewrite to the static form" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) graduate="Subscription(node, \"$(e.endpoint.topic)\", $(bare))"
+    graduate = "Subscription(node, \"$(e.endpoint.topic)\", $(bare))"
+    rihs = to_rihs_string(info.hash)
+    if source === :wire
+        # No local definition — we fetched the TypeDescription from the publisher and
+        # generated the struct at runtime (distinct from resolving a type we already knew).
+        @info "dynamic subscription auto-generated a type over the wire — fetched its \
+               definition from the publisher's ~/get_type_description (no local copy); \
+               register it (e.g. `@ros_import`) to skip wire discovery, or use the static \
+               form for the min-copy fast path" topic=e.endpoint.topic type=info.name hash=rihs graduate=graduate
+    else
+        # Resolved a type we already knew (home/registry/cache/ament) — no wire trip.
+        @info "dynamic subscription resolved a known type — for the min-copy fast path, \
+               use the static form" topic=e.endpoint.topic type=info.name hash=rihs source=source graduate=graduate
+    end
     nothing
 end
 
@@ -1205,6 +1262,7 @@ function Base.close(e::Entity)
         e._lv_token = nothing
     end
     remove_endpoint!(ctx, e.lv_key)
+    _forget_lost_tracker!(e)        # §12.3: drop any message-lost state (no-op if none)
     nothing
 end
 

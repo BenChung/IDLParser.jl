@@ -576,12 +576,21 @@ function _commit!(s::ParameterServer{P}, base::P,
     # Atomic whole-struct swap — readers see old-or-new, never partial.
     @atomic s.value = candidate
 
+    # Snapshot the dynamic tier's prior values *before* the commit overwrites them,
+    # keyed by the override names — the event classifier needs them to tell an
+    # updated existing dynamic param (changed) from a fresh one (new), and to drop
+    # an idempotent re-set.
+    dyn_previous = Dict{Symbol, Any}()
+    for k in keys(dyn_overrides)
+        haskey(s.dynamic, k) && (dyn_previous[k] = s.dynamic[k])
+    end
+
     # Commit dynamic-tier overrides under the same lock (wire-atomic across tiers).
     for (k, v) in dyn_overrides
         s.dynamic[k] = v
     end
 
-    _emit_parameter_event!(s, base, candidate, overrides, dyn_overrides)
+    _emit_parameter_event!(s, base, candidate, overrides, dyn_overrides, dyn_previous)
     return candidate
 end
 
@@ -673,7 +682,8 @@ end
 # listeners + the wire publisher. `use_sim_time` flips the node's clock routing
 # (§7) — that hook is fired here when it changes. Caller holds `s.lock`.
 function _emit_parameter_event!(s::ParameterServer{P}, old::P, new::P,
-                                overrides::AbstractDict, dyn_overrides::AbstractDict) where {P}
+                                overrides::AbstractDict, dyn_overrides::AbstractDict,
+                                dyn_previous::AbstractDict) where {P}
     changed  = Dict{Symbol, Any}()
     previous = Dict{Symbol, Any}()
     for name in keys(overrides)
@@ -682,6 +692,12 @@ function _emit_parameter_event!(s::ParameterServer{P}, old::P, new::P,
         changed[name] = nv; previous[name] = ov
     end
     for (k, v) in dyn_overrides
+        # An existing dynamic key carries its prior value (classifies as changed);
+        # a re-set to the same value is a no-op, matching the declared-field path.
+        if haskey(dyn_previous, k)
+            isequal(v, dyn_previous[k]) && continue
+            previous[k] = dyn_previous[k]
+        end
         changed[k] = v
     end
     isempty(changed) && return nothing

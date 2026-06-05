@@ -27,7 +27,7 @@ import ROSZenoh
 export endpoints, publishers_info, subscriptions_info,
        count_publishers, count_subscribers,
        topic_names_and_types, node_names,
-       service_is_ready, wait_for_service, wait_for_graph_change,
+       service_is_ready, wait_for_service, wait_for_action_server, wait_for_graph_change,
        on_type_mismatch, on_qos_incompatible, on_message_lost,
        TypeMismatch, QosIncompatible, MessageLost,
        qos_compatible, QosIncompatibility
@@ -207,17 +207,24 @@ function service_is_ready(client)
 end
 
 """
-    wait_for_service(client; timeout=nothing) -> Bool
+    wait_for_service(client::ServiceClient; timeout=nothing) -> Bool
     wait_for_service(node, service_name; timeout=nothing) -> Bool
 
-Block the calling task until a matching service server appears in the graph
-(§12.1), or `timeout` seconds elapse (`nothing` = forever). Returns `true` if the
-service became ready, `false` on timeout. Raises [`ShutdownException`](@ref) if the
-Context drains while waiting.
+Block the calling task until a matching service server is reachable, or `timeout`
+seconds elapse (`nothing` = forever). Returns `true` when ready, `false` on
+timeout; raises [`ShutdownException`](@ref) if the Context drains while waiting.
 
-Parks on the discovery change stream (wakes on each liveliness event and
-re-checks [`service_is_ready`](@ref)) — *why* it exists: remotes are
-eventually-consistent, so a client created before its server must wait.
+The **client form** waits on a real *routing* match — the client's `Querier`
+actually matched a server's queryable ([`service_matched`](@ref)) — the strong
+guarantee that a subsequent [`call`](@ref) will reach a server. The **name form**
+has no querier handle, so it waits on graph *liveliness* (a `Service` endpoint on
+the resolved name, [`service_is_ready`](@ref)); for a same-process server that is
+authoritative the instant the service is declared, *before* routing settles, so
+prefer the client form whenever you hold the client.
+
+Both park on the discovery change stream and re-check — *why* they exist: remotes
+(and routing) are eventually-consistent, so a client created before its server
+must wait.
 """
 function wait_for_service(node, service_name::AbstractString;
                           timeout::Union{Real, Nothing}=nothing)
@@ -226,9 +233,41 @@ function wait_for_service(node, service_name::AbstractString;
     _wait_on_graph(ctx, () -> _service_present(ctx, want); timeout=timeout)
 end
 
+# Client form: wait on the routing-plane match (`service_matched`) — the guarantee
+# that `call` will actually reach a server, not just liveliness. The (lazily
+# declared) match listener notifies `ctx.graph.changed`, so we reuse
+# `_wait_on_graph` for timeout + shutdown-interruptibility for free.
+function wait_for_service(client::ServiceClient; timeout::Union{Real, Nothing}=nothing)
+    _ensure_match_listener!(client)
+    ctx = client.entity.node.context
+    _wait_on_graph(ctx, () -> service_matched(client); timeout=timeout)
+end
+
+# Generic fallback for any other handle carrying an `.entity` (or an `Entity`):
+# liveliness only — it has no querier to read routing match from.
 function wait_for_service(client; timeout::Union{Real, Nothing}=nothing)
     e = _client_entity(client)
     wait_for_service(e.node, e.endpoint.topic; timeout=timeout)
+end
+
+"""
+    wait_for_action_server(client::ActionClient; timeout=nothing) -> Bool
+
+Block until the action client is routing-matched to a server — its `send_goal`
+*and* `get_result` Queriers both matched the server's queryables (§9) — or
+`timeout` seconds elapse (`nothing` = forever). Returns `true` when matched,
+`false` on timeout; raises [`ShutdownException`](@ref) if the Context drains.
+
+The action analogue of the client form of [`wait_for_service`](@ref), reusing the
+same routing-match machinery (lazily-declared Queriers + [`action_server_matched`](@ref)).
+Matching *both* services is what matters: `send` retries discovery on its own, but
+`fetch`'s `get_result` is a one-shot get with a long timeout — so awaiting its match
+keeps a `send`→`fetch` sequence from blocking. (cancel_goal/feedback aren't gated:
+`cancel` is opt-in and feedback is a subscription.)
+"""
+function wait_for_action_server(client::ActionClient; timeout::Union{Real, Nothing}=nothing)
+    ws = _ensure_action_match!(client)
+    _wait_on_graph(client.node.context, () -> all(_wire_matched, ws); timeout=timeout)
 end
 
 # Predicate over the snapshot: a Service endpoint on `want` exists.
@@ -601,6 +640,9 @@ function on_message_lost(f::Function, sub)
     e = _client_entity(sub)
     t = _lost_tracker(e)
     @lock t.lock push!(t.listeners, f)
+    # Flip the consumer hot-path gate so per-sample `note_sequence!` starts running
+    # for this endpoint (the common no-listener path skips the attachment decode).
+    @atomic e._track_lost = true
     f
 end
 
@@ -613,11 +655,9 @@ from that `gid`, fire the `on_message_lost` listeners and return the `MessageLos
 Returns `nothing` when in-order (or the very first message from a gid, or the
 attachment is absent). The subscription dispatch path calls this per sample.
 """
-# TODO(§12.3): unwired — no caller in the subscription consumer loop (node.jl), so
-# `on_message_lost` is dormant despite the docstring. Tracked as a standalone follow-up
-# (DESIGN-ADDENDA: "message-lost wiring stays a separate follow-up"; dropped from
-# PLAN-D4 §1). Wiring = call `note_sequence!(e, sample)` per received sample and
-# `_forget_lost_tracker!(e)` from `close(::Entity)`.
+# Called from the subscription consumer/receiver per received sample, but only when an
+# `on_message_lost` listener is registered (node.jl gates on `Entity._track_lost`), so
+# the common no-listener path never decodes the attachment.
 function note_sequence!(sub, sample)
     e = _client_entity(sub)
     seq, _, srcgid = try
@@ -646,11 +686,8 @@ function note_sequence!(sub, sample)
     lost
 end
 
-# Drop a subscription's detector state when it closes; safe to call for entities that
-# never registered one.
-# TODO(§12.3): not yet called from `close(::Entity)` (node.jl), so a sub that registered
-# an `on_message_lost` listener leaks its `_LOST` entry. Wire alongside `note_sequence!`
-# (see above) — same message-lost follow-up.
+# Drop a subscription's detector state when it closes (called from `close(::Entity)`,
+# node.jl); safe to call for entities that never registered one.
 function _forget_lost_tracker!(e::Entity)
     @lock _LOST_LOCK delete!(_LOST, objectid(e))
     nothing

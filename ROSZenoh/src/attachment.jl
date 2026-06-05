@@ -1,13 +1,18 @@
 # Per-message attachment — rmw_zenoh's per-sample metadata that rides in the
 # Zenoh `put`/`reply` attachment, a separate channel from liveliness tokens.
 #
-# Wire shape (matches hiroz `Attachment`, byte-for-byte):
-#   sequence_number :: i64
-#   source_timestamp:: i64   (Unix nanoseconds)
-#   source_gid      :: [u8; 16]
-# = 8 + 8 + 16 = 32 bytes. The gid is the FIXED `[u8; 16]` form (no length
-# prefix), so it must stay `NTuple{16,UInt8}` through the serializer — a
-# `Vector{UInt8}` would be length-prefixed and break parity.
+# Wire shape (matches hiroz `Attachment` / zenoh-cpp rmw_zenoh, byte-for-byte):
+#   sequence_number :: i64       (8 bytes LE)
+#   source_timestamp:: i64       (8 bytes LE, Unix nanoseconds)
+#   source_gid      :: [u8; 16]  (VarInt(16) length prefix + 16 bytes)
+# = 8 + 8 + 1 + 16 = 33 bytes. zenoh-ext's `Serialize for [T; N]` routes through
+# the same length-prefixed slice path as `Vec<u8>` (`serialize_slice` writes
+# `VarInt(len)` first), and its `Deserialize` rejects with `ZDeserializeError`
+# unless that prefix == N. So the gid MUST carry the VarInt(16) prefix — we
+# serialize it as a `Vector{UInt8}` (the length-prefixed path) and rebuild the
+# `NTuple{16,UInt8}` on decode. An unprefixed 16 raw bytes round-trips only
+# Julia↔Julia (symmetric); a Rust/C++ peer reads the first gid byte as the length
+# and errors.
 
 # ---- gid derivation -------------------------------------------------------
 #
@@ -25,7 +30,10 @@ little-endian storage order, and zero-pad the unused high bytes (which sit at th
 tail of the LE array).
 """
 function to_le_bytes(z::ZenohId)
-    disp = hex2bytes(z.hex)        # display order: disp[1] is most-significant
+    # Zenoh elides a leading zero *nibble* too, so the high byte may render as a
+    # single hex char — left-pad to even length before parsing.
+    hex = isodd(length(z.hex)) ? "0" * z.hex : z.hex
+    disp = hex2bytes(hex)          # display order: disp[1] is most-significant
     le = zeros(UInt8, 16)
     n = length(disp)
     @inbounds for i in 1:n
@@ -76,17 +84,23 @@ end
     encode_attachment(seq, ts, gid::NTuple{16,UInt8}) -> ZBytes
 
 Serialize the `(sequence_number, source_timestamp, source_gid)` attachment into a
-payload for `put`/`reply`. `seq` and `ts` are coerced to `Int64`; `gid` must be
-the fixed-width `NTuple{16,UInt8}` (the parity pivot — see file header).
+payload for `put`/`reply`. `seq` and `ts` are coerced to `Int64`; `gid` is the
+fixed-width `NTuple{16,UInt8}`, emitted as a length-prefixed `[u8;16]` to match
+zenoh-ext's fixed-array encoding (the VarInt(16) prefix — see file header).
 """
 encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8}) =
-    Zenoh.serialize((Int64(seq), Int64(ts), gid))
+    Zenoh.serialize((Int64(seq), Int64(ts), collect(gid)))
 
 """
     decode_attachment(sample) -> (seq::Int64, ts::Int64, gid::NTuple{16,UInt8})
 
 Read an attachment back from a received `Sample` (or `ZBytes`). The inverse of
-[`encode_attachment`](@ref).
+[`encode_attachment`](@ref); the gid arrives length-prefixed (`[u8;16]`) and is
+rebuilt into the fixed-width `NTuple{16,UInt8}`.
 """
-decode_attachment(sample) =
-    Zenoh.deserialize(Tuple{Int64, Int64, NTuple{16, UInt8}}, sample)
+function decode_attachment(sample)
+    seq, ts, gid = Zenoh.deserialize(Tuple{Int64, Int64, Vector{UInt8}}, sample)
+    length(gid) == 16 ||
+        throw(ArgumentError("attachment gid is $(length(gid)) bytes, expected 16"))
+    return (seq, ts, NTuple{16, UInt8}(gid))
+end
