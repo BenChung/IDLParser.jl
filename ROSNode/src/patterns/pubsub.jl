@@ -94,7 +94,8 @@ function publish(pub::PublisherHandle{T}, msg::T) where {T}
     # runs during package precompilation, so the `jl_generating_output` ccall is
     # unneeded here.
     _WARMUP[] && return nothing
-    put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced)
+    deliver_local(pub, msg)                           # §15.1: hand to same-Context subs directly (no-op when disabled)
+    put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced); remote subs (local loopback suppressed)
     return nothing
 end
 
@@ -152,6 +153,12 @@ form chosen by `view` (a [`ViewMode`](@ref)):
 
 `view=true`/`view=false` are accepted as shorthand for `Checked()`/`Owned()`.
 
+`match=:weak` opts into a *weak-static* subscription: it still declares type `T`
+(advertised in the graph) but wildcard-matches the topic, so an off-type sample
+reaches a per-sample backstop — a wire type/version ≠ `T` fires `on_type_mismatch`
+(§12.2) and is dropped instead of decoded. The default `:exact` matches only `T`'s
+keyexpr (the wire can't even deliver a wrong type to it).
+
 `concurrency` is `Serial()` (one handler at a time on a single sticky thread,
 order preserved, no user-side locks needed — the default, D3) or `Parallel(n)`
 (up to `n` handlers on OS threads, order not preserved, opt-in, D2). A handler
@@ -164,9 +171,12 @@ function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T
                             qos::QosProfile=default_qos(), view::Union{Bool, ViewMode}=Owned(),
                             concurrency::Concurrency=Serial(),
                             force_relatch::Bool=false,
+                            match::Symbol=:exact,
                             warmup::Union{Symbol, Nothing}=nothing,
                             warmup_sync::Union{Bool, Nothing}=nothing,
                             warmup_sample=nothing) where {T}
+    match in (:exact, :weak) ||
+        throw(ArgumentError("Subscription `match` must be :exact or :weak, got :$match"))
     view = _view_mode(view)
     name = resolve_name(node, topic)
     ent = make_entity(node, Subscription, name, type_info_of(T); qos=qos)
@@ -175,7 +185,7 @@ function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T
     # regardless of sequence (for idempotent handlers that rebuild from latched
     # inputs); the default dedups replays by novelty.
     declare_subscription!(ent, T, handler; view=view, concurrency=concurrency,
-                          force_relatch=force_relatch)
+                          force_relatch=force_relatch, weak = match === :weak)
     # §D8: precompile decode + the handler-dispatch frame (and, under :execute, run
     # the handler once on a sample) so the first real message isn't a JIT spike.
     pol = _resolve_warmup(node, warmup, warmup_sync)

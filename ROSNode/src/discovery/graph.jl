@@ -460,6 +460,20 @@ function _emit_type_mismatch(d::_Detectors, local_e, remote, reason, suggestion)
     _fire(d.lock, d.type_listeners, ev, "on_type_mismatch")
 end
 
+# Route a pre-built `TypeMismatch` — from the per-sample weak-static backstop
+# (`check_sample_type`, §12.2/A2) — through the SAME dedupe/throttle + listener
+# fan-out as the graph-match detector, so one logical mismatch reports once across
+# both the on-the-wire and graph paths (signature mirrors `_emit_type_mismatch`).
+function report_type_mismatch!(ctx::Context, tm::TypeMismatch)
+    d = _detectors(ctx)
+    sig = (:type, tm.local_endpoint.topic, tm.local_endpoint.kind,
+           tm.remote_endpoint.kind, tm.reason)
+    _mark_seen!(d, sig) || return nothing
+    @warn "type mismatch detected (on the wire)" topic=tm.local_endpoint.topic reason=tm.reason suggestion=tm.suggestion
+    _fire(d.lock, d.type_listeners, tm, "on_type_mismatch")
+    nothing
+end
+
 function _emit_qos_incompat(d::_Detectors, local_e, remote, issues, suggestion)
     sig = (:qos, local_e.topic, local_e.kind, remote.kind,
            Tuple(i.policy for i in issues))

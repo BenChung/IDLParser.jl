@@ -69,6 +69,8 @@ try
         _section("parallel_dispatch", "model/parallel_dispatch.jl")
         # Live D4: transient_local latched delivery + durability-aware lifecycle re-latch.
         _section("transient_local", "patterns/transient_local.jl")
+        # §12.2/A2: weak-static on-the-wire type backstop (wildcard match + check_sample_type).
+        _section("type_mismatch", "discovery/type_mismatch.jl")
         # §8 services + §9 actions — live request/reply + full goal lifecycle.
         _section("services", "patterns/services.jl")
         _section("actions", "patterns/actions.jl")
@@ -79,6 +81,8 @@ try
         # D8: precompilation / warm-up — detector/@effectful/policy/_default_msg + live
         # :precompile delivery-transparency and :execute effect-suppression / null-route.
         _section("warmup", "performance/warmup.jl")
+        # §15.1 intra-process short-circuit (opt-in): direct same-Context delivery, no double-delivery.
+        _section("intraprocess", "performance/intraprocess.jl")
         # D9: dynamic-discovery × precompilation — per-node interaction manifest
         # (persistence/union/gating) + live record-on-dispatch and Tier-1 startup replay.
         _section("dynamic_warm", "typesupport/dynamic_warm.jl")

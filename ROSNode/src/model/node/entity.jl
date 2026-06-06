@@ -42,6 +42,11 @@ mutable struct Entity
     # Slot for the pattern layer to stash its kind-specific wiring (queryable,
     # querier, pending-reply table) so it shares this handle's lifecycle.
     wire::Any
+    # A2 weak-static Subscription: a typed sub that wildcard-matches the topic and
+    # runs the per-sample `check_sample_type` backstop (drop + `on_type_mismatch` on a
+    # name/hash mismatch). Set by `declare_subscription!` (match=:weak); false for every
+    # other entity. Written once before the consumer starts, so no atomic is needed.
+    _weak_static::Bool
     # §12.3 message-lost: set true the first time an `on_message_lost` listener
     # registers (graph.jl). The consumer hot path reads it per sample to decide
     # whether to do the attachment-sequence bookkeeping (`note_sequence!`); the
@@ -75,7 +80,7 @@ function make_entity(node::Node, kind::EndpointKind, topic::AbstractString,
     gid = entity_gid(endpoint)
 
     ent = Entity(node, endpoint, lv_key, gid, nothing, nothing, nothing,
-                 nothing, nothing, false, true)
+                 nothing, nothing, false, false, true)
     # Declare liveliness first (peers discover us), then inject locally so our own
     # graph queries are immediately authoritative (§12).
     ent._lv_token = LivelinessToken(ctx.session, Keyexpr(lv_key))
@@ -242,10 +247,16 @@ payload (valid only for the handler's duration, §3.2), guarded vs. bare. `true`
 function declare_subscription!(e::Entity, msgtype::Type, handler;
                                view::Union{Bool, ViewMode}=Owned(),
                                concurrency::Concurrency=Serial(),
-                               force_relatch::Bool=false)
+                               force_relatch::Bool=false,
+                               weak::Bool=false)
     view = _view_mode(view)
     ctx = e.node.context
-    tk = topic_keyexpr(ctx.format, e.endpoint)
+    # A2: a weak-static sub wildcard-matches the topic so off-type samples arrive for
+    # the per-sample backstop, while still advertising its declared type in liveliness
+    # /graph (make_entity set type_info); an exact sub uses its concrete type keyexpr.
+    e._weak_static = weak
+    tk = weak ? _wildcard_data_keyexpr(ctx.format, e.endpoint) :
+                topic_keyexpr(ctx.format, e.endpoint)
     cap = _fifo_capacity(e.endpoint.qos)
     qos = e.endpoint.qos
     # transient_local ⇒ an AdvancedSubscriber whose declaration issues a history
@@ -253,11 +264,16 @@ function declare_subscription!(e::Entity, msgtype::Type, handler;
     # novelty gate is created only for the latched case (deduplicates re-latch
     # replays); a `nothing` gate is the volatile fast path (no per-sample work).
     sub = Base.open(ctx.session, Keyexpr(tk); channel=:fifo, capacity=cap,
-                    _advanced_sub_kwargs(qos)...)
+                    allowed_origin = local_origin(ctx), _advanced_sub_kwargs(qos)...)
     gate = qos.durability === :transient_local ?
         _NoveltyGate(_cache_depth(qos); force=force_relatch) : nothing
     e._route = sub
     e._consumer = _spawn_consumer(e, msgtype, handler, view, concurrency, sub, gate)
+    # §15.1: register for the intra-process short-circuit (a no-op when disabled). The
+    # Zenoh sub above was opened with `allowed_origin = local_origin(ctx)`, so when the
+    # short-circuit is on, the loopback of a same-Context publish is suppressed and the
+    # data arrives via the direct path only — no double-delivery.
+    register_local_subscription!(e, msgtype, handler; view = _is_view(view), concurrency = concurrency)
     # The re-latch thunk (D4): a managed node's Inactive→Active redeclares the
     # advanced subscriber to re-run the history query, novelty-gated. Only meaningful
     # for transient_local — volatile subs leave `_relatch` nothing.
@@ -299,7 +315,7 @@ function _do_relatch!(e::Entity, msgtype::Type, handler, view::ViewMode,
     end
     _arm_relatch!(gate)        # freeze the now-complete delivered set as the baseline
     sub = Base.open(e.node.context.session, Keyexpr(tk); channel=:fifo, capacity=cap,
-                    _advanced_sub_kwargs(qos)...)
+                    allowed_origin = local_origin(e.node.context), _advanced_sub_kwargs(qos)...)
     e._route = sub
     e._consumer = _spawn_consumer(e, msgtype, handler, view, concurrency, sub, gate)
     return nothing

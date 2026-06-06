@@ -13,6 +13,13 @@
 # decode entirely — the common fast path.
 @inline function _predispatch(e::Entity, sample::AbstractSample, gate::Union{_NoveltyGate, Nothing})
     isactive(e) || return false               # §14.2 gate: drop while inactive (no record)
+    # A2 weak-static backstop: a wildcard-matching typed sub can receive an off-type
+    # sample; a wire (name,hash) ≠ our declared type is decode-unsafe, so fire
+    # on_type_mismatch (deduped with the graph detector) and drop before decode.
+    if e._weak_static
+        tm = check_sample_type(e, sample)
+        tm === nothing || (report_type_mismatch!(e.node.context, tm); return false)
+    end
     gate === nothing && return true           # volatile fast path: no novelty work
     return _gate_deliver!(gate, _payload_hash(sample))   # D4: suppress re-latch replays
 end

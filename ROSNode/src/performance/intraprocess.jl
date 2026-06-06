@@ -1,8 +1,9 @@
 # §15.1 Intra-process short-circuit. When a publisher and a subscriber share a
 # Context, the publisher hands the message object to the subscriber's handler
-# directly — skipping the CDR serialize, the Zenoh hop, and the decode. Designed to
-# be on by default, but **not yet wired** into publish/declare/close (see the Wiring
-# note below) and not yet tested: today same-Context delivery rides Zenoh's loopback.
+# directly — skipping the CDR serialize, the Zenoh hop, and the decode. Wired into
+# publish/declare/close and tested, but **off by default** for now (opt in with
+# `set_intra_process!(true)`) pending broad-suite validation before flipping the
+# design's on-by-default; with it off, same-Context delivery rides Zenoh's loopback.
 # The realization that keeps it API-minimal (DESIGN §Intra-process):
 # *intra-process is the same receive model with an in-heap Julia object as the
 # buffer instead of a Zenoh payload*, so the existing knobs carry it:
@@ -14,12 +15,13 @@
 #     REMOTE` on its Zenoh subscriber so the loopback of a local publication is
 #     ignored and the data arrives via the direct path only.
 #
-# Wiring (the verify step threads these into the existing files):
-#   - `Subscription` registration calls `register_local_subscription!` (and uses
-#     `local_origin(ctx)` for its subscriber's `allowed_origin`); `close` calls
+# Wiring (threaded into the existing files):
+#   - `declare_subscription!` calls `register_local_subscription!` and opens its Zenoh
+#     subscriber with `allowed_origin = local_origin(ctx)`; `close(::Entity)` calls
 #     `unregister_local_subscription!`.
-#   - `publish` calls `deliver_local(pub, msg)` before the Zenoh `put` — direct to
-#     local subs, then `put` still runs once for any remote subscribers.
+#   - `publish` calls `deliver_local(pub, msg)` before the Zenoh `put` — handing the
+#     message to each local sub's per-endpoint worker (not inline on the publisher's
+#     task), then `put` still runs once for any remote subscribers.
 #
 # Scope is same-Context (§15.2): two Contexts in one process have separate Zenoh
 # sessions, so cross-Context-same-process is a cross-registry match, deferred.
@@ -33,14 +35,16 @@ using Zenoh: Localities
 # yet (context.jl is a lower layer), so the switch is process-global here. When the
 # flag lands on `Context`, `intra_process_enabled(ctx)` is the single seam to
 # consult it instead.
-const _INTRA_PROCESS = Ref(true)
+const _INTRA_PROCESS = Ref(false)
 
 """
     set_intra_process!(on::Bool) -> Bool
 
-Enable/disable the intra-process short-circuit (§15.1) process-wide. On by
-default. Returns the previous setting. Affects only same-Context delivery; the
-Zenoh data path is unchanged.
+Enable/disable the intra-process short-circuit (§15.1) process-wide. **Off by
+default** for now (the mechanism is wired + tested but not yet flipped to the
+design's on-by-default, pending broad-suite validation); opt in with
+`set_intra_process!(true)`. Returns the previous setting. Affects only
+same-Context delivery; the Zenoh data path is unchanged.
 
 TODO(§5): when the `Context` carries a per-Context `intra_process` flag this
 becomes its default; [`intra_process_enabled`](@ref) is the seam to read it.
@@ -87,6 +91,10 @@ struct LocalSubscription{T}
     handler::Any
     view::Bool
     concurrency::Concurrency
+    # Per-endpoint local-delivery queue. `deliver_local` `put!`s the publisher's
+    # message here (so the publisher's task is never the one running the handler);
+    # a worker task drains it and dispatches (D3-safe, see `register_local_subscription!`).
+    inbox::Channel{Any}
 end
 
 # The type name + RIHS01 hash of the subscription's type (for matching). Recovered
@@ -134,13 +142,45 @@ function register_local_subscription!(e::Entity, ::Type{T}, handler;
                                       concurrency::Concurrency=Serial()) where {T}
     ctx = e.node.context
     intra_process_enabled(ctx) || return e
-    ls = LocalSubscription{T}(e, e.endpoint.qos, handler, view, concurrency)
+    inbox = Channel{Any}(max(1, _fifo_capacity(e.endpoint.qos)))
+    ls = LocalSubscription{T}(e, e.endpoint.qos, handler, view, concurrency, inbox)
     reg = _registry(ctx)
     @lock reg.lock begin
         subs = get!(() -> LocalSubscription[], reg.by_topic, e.endpoint.topic)
         push!(subs, ls)
     end
+    # The per-endpoint local-delivery worker (the "endpoint worker", D6). Serial ⇒ one
+    # task pinned `sticky` to the SAME declaring thread as this sub's Zenoh consumer
+    # (_spawn_consumer): two sticky tasks on one thread are cooperative, never
+    # concurrent, so the handler still runs single-threaded on its declaring thread —
+    # the §4/D3 guarantee — across BOTH local and remote deliveries. Parallel ⇒ a
+    # non-sticky drainer that spawns a task per message (order not preserved, as on the
+    # Zenoh path). The worker ends when `inbox` is closed (unregister, on close).
+    w = Task(() -> _local_consume_loop(ls))
+    w.sticky = concurrency isa Serial
+    schedule(w)
     return e
+end
+
+# Drain the local inbox and dispatch each message exactly as the §4 runtime would.
+# `_with_node_logger` mirrors the Zenoh consumer so a handler's `@info` still routes to
+# the node's /rosout. A closed inbox ends the loop (clean shutdown).
+function _local_consume_loop(ls::LocalSubscription)
+    try
+        _with_node_logger(ls.entity.node) do
+            for msg in ls.inbox
+                if ls.concurrency isa Parallel
+                    Threads.@spawn _invoke_local(ls, msg)
+                else
+                    _invoke_local(ls, msg)
+                end
+            end
+        end
+    catch err
+        err isa ShutdownException && return
+        @error "intra-process consumer task failed" topic=ls.entity.endpoint.topic exception=(err, catch_backtrace())
+    end
+    nothing
 end
 
 """
@@ -154,13 +194,18 @@ function unregister_local_subscription!(e::Entity)
     ctx = e.node.context
     reg = @lock _REGISTRIES_LOCK get(_REGISTRIES, ctx, nothing)
     reg === nothing && return nothing
+    removed = nothing
     @lock reg.lock begin
         subs = get(reg.by_topic, e.endpoint.topic, nothing)
         subs === nothing && return nothing
         i = findfirst(ls -> ls.entity === e, subs)
-        i === nothing || deleteat!(subs, i)
+        if i !== nothing
+            removed = subs[i]
+            deleteat!(subs, i)
+        end
         isempty(subs) && delete!(reg.by_topic, e.endpoint.topic)
     end
+    removed === nothing || close(removed.inbox)   # end the local-delivery worker
     return nothing
 end
 
@@ -258,23 +303,18 @@ function deliver_local(pub::PublisherHandle{T}, msg::T) where {T}
     end
     isempty(targets) && return false
 
+    # Hand off to each sub's per-endpoint worker (D6) — never run the handler on the
+    # publisher's task. A closed inbox (the sub is closing concurrently) is skipped.
+    delivered = false
     for ls in targets
-        _deliver_one(ls, msg)
+        try
+            put!(ls.inbox, msg)
+            delivered = true
+        catch err
+            err isa InvalidStateException || rethrow()   # inbox closed mid-flight
+        end
     end
-    return true
-end
-
-# Schedule one delivery per the sub's concurrency policy. `Serial()` inline on the
-# publisher's task (order preserved); `Parallel(n)` a task per message. (D6's
-# "route local delivery through the endpoint worker, not inline" refinement is
-# still pending — for now Serial delivers inline, matching the prior behavior.)
-function _deliver_one(ls::LocalSubscription, msg)
-    if ls.concurrency isa Parallel
-        Threads.@spawn _invoke_local(ls, msg)
-    else
-        _invoke_local(ls, msg)
-    end
-    nothing
+    return delivered
 end
 
 # Hand the message to the handler *as the subscriber's declared type* `S`, with the

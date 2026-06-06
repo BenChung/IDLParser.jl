@@ -12,9 +12,8 @@
 # Both are wired against the vendored `type_description_interfaces` / `rcl_interfaces`
 # wire types (the `Interfaces` subtree, wellknown.jl): `~/get_type_description`
 # serves real `TypeDescription`s from the §11 registry, and the `/rosout` bridge
-# publishes `rcl_interfaces/msg/Log`. The type-source side (`include_type_sources`)
-# is the only piece still staged (`describe_type` returns the description; sources
-# need IL.unparse).
+# publishes `rcl_interfaces/msg/Log`. A request with `include_type_sources` also gets
+# `type_sources` regenerated from each served entry's IL (`IL.unparse`).
 
 import Logging
 using Logging: AbstractLogger, LogLevel
@@ -284,6 +283,46 @@ _gtd_not_found(type_name::AbstractString) =
         type_description = _empty_wire_td(),
         type_sources = WireTypeSource[], extra_information = WireKeyValue[])
 
+# One `WireTypeSource` regenerated from a registry entry's IL (§13,
+# `include_type_sources`): `encoding` is the IL kind's qualifier
+# (`msg`/`srv`/`action`), `raw_file_contents` the `IL.unparse` text — mirrors
+# `_export_interface_text`. The entry stores no original source, so the text is
+# regenerated (fields-only for wire-discovered types, faithful for static/ament/
+# well-known). The try/catch contains a bad unparse (exotic IL) to an empty body so
+# one type can't fail the whole reply.
+function _entry_type_source(entry::RegistryEntry)
+    encoding, _ = _il_qualifier_ext(entry.il)
+    raw = try
+        sprint(IL.unparse, entry.il)
+    catch
+        ""
+    end
+    return WireTypeSource(type_name = entry.info.name, encoding = encoding,
+                          raw_file_contents = raw)
+end
+
+# Sources for the served closure (§13): main type first, then each referenced type
+# in the (already-sorted) served `tdmsg`, each looked up by name in `reg` and
+# regenerated via `_entry_type_source`. Iterating the served `tdmsg` (not a fresh
+# registry walk) keeps sources and `type_description` in lockstep. De-dup by name;
+# skip names with no entry (a concurrently-removed type ⇒ fewer sources, no crash).
+function _type_sources(reg, tdmsg::TypeDescriptionMsg)
+    out = WireTypeSource[]
+    seen = Set{String}()
+    names = String[tdmsg.type_description.type_name]
+    for t in tdmsg.referenced_type_descriptions
+        push!(names, t.type_name)
+    end
+    for name in names
+        name in seen && continue
+        push!(seen, name)
+        entry = _lookup_any_version(reg, name)
+        entry isa RegistryEntry || continue
+        push!(out, _entry_type_source(entry))
+    end
+    return out
+end
+
 """
     wire_get_type_description!(node) -> ServiceHandle
 
@@ -295,17 +334,20 @@ request for an unknown `(name, hash)` is a clean `successful=false` reply. Every
 node serves this so peers can fetch the descriptions it advertises. The handle is
 tracked on `node` (closed with it) like any other entity.
 
-Sources (`type_sources`) are not yet populated (the description suffices for
-decode); `include_type_sources` is accepted but currently returns an empty list.
+When `include_type_sources` is set, `type_sources` is populated from the served
+closure's registry entries via [`_type_sources`](@ref) (one per type, the
+`IL.unparse` text); otherwise it is empty (the description alone suffices for decode).
 """
 function wire_get_type_description!(node)
     return Service(node, "~/get_type_description", GetTypeDescription_Request) do req
         tdmsg = describe_type(node, req.type_name, req.type_hash)
         tdmsg === nothing && return _gtd_not_found(req.type_name)
+        sources = req.include_type_sources ?
+            _type_sources(registry(_ctx(node)), tdmsg) : WireTypeSource[]
         return GetTypeDescription_Response(
             successful = true, failure_reason = "",
             type_description = to_wire_td(tdmsg),
-            type_sources = WireTypeSource[],          # TODO: IL.unparse sources when requested
+            type_sources = sources,
             extra_information = WireKeyValue[])
     end
 end

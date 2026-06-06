@@ -127,6 +127,34 @@ _dt("@ros_import from= modules ready")
         @test all(e -> e.type !== nothing && e.mod !== nothing, values(es))
     end
 
+    @testset "type_sources regenerate from registry IL (include_type_sources)" begin
+        _dt("type_sources from registry IL")
+        # Session-free: build a real TypeRegistry from the well-known entries (a bare
+        # registry suffices — `_type_sources` takes `reg` directly, never `_ctx`, which
+        # has no method for a TypeRegistry). Serve the multi-source TypeDescription
+        # closure (Field, FieldType, IndividualTypeDescription) off its stored `.td`.
+        reg = ROSNode.TypeRegistry()
+        for e in _wellknown_entries()
+            ROSNode.register_type!(reg, e.info, e)
+        end
+        fentry = only(filter(e -> endswith(e.info.name, "/msg/TypeDescription"),
+                             _wellknown_entries()))
+        tdmsg = fentry.td                                # well-known entries carry `.td`
+        srcs = ROSNode._type_sources(reg, tdmsg)
+        @test eltype(srcs) === ROSNode.WireTypeSource
+        @test !isempty(srcs)
+        @test length(srcs) > 1                           # main + referenced closure
+        # main first; .msg encoding; every name fully-qualified
+        @test srcs[1].type_name == "type_description_interfaces/msg/TypeDescription"
+        @test srcs[1].encoding == "msg"
+        @test all(s -> occursin("/", s.type_name), srcs)
+        # regenerated source text — assert a token unique to a field line (the
+        # `referenced_type_descriptions` field), not a short token (`name`/`type`/
+        # `description`) that also appears in nested type-name lines.
+        @test !isempty(srcs[1].raw_file_contents)
+        @test occursin("referenced_type_descriptions", srcs[1].raw_file_contents)
+    end
+
     @testset "GetTypeDescription request/response CDR marshal" begin
         _dt("GetTypeDescription CDR marshal")
         req = GetTypeDescription_Request(type_name = "std_msgs/msg/String",

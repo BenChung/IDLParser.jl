@@ -13,16 +13,18 @@
 
 using ROSNode
 using ROSNode: Context, Node, ParameterClient, wait_for_service,
-               get_parameters, get_parameter_types, set_parameters_atomically,
+               get_parameters, get_parameter_types, set_parameters, set_parameters_atomically,
                list_parameters, describe_parameters, parameter, set_parameter!,
                transaction, on_parameter_event, ParameterRejection,
-               ParameterDescriptor, PARAMETER_INTEGER, PARAMETER_STRING
+               ParameterDescriptor, PARAMETER_INTEGER, PARAMETER_STRING, PARAMETER_NOT_SET
 using Test
 
-# The shared schema the server bakes in and the typed client lenses onto.
+# The shared schema the server bakes in and the typed client lenses onto. `frame` is
+# read-only, so a runtime set is rejected over the wire (the §10 read-only gate).
 @parameters struct LiveParams
     "maximum speed"  max_speed::Int64 = 50 ∈ 0..100
     "planner mode"   mode::String = "auto" ∈ ("auto", "manual")
+    "fixed frame"    frame::String = "map" |> readonly
 end
 
 const _EP = isdefined(Main, :ROS_TEST_EP) ? Main.ROS_TEST_EP :
@@ -63,6 +65,32 @@ end
         end
     end
 
+    # `set_parameters` (the per-item verb the file otherwise never drives): a
+    # `Vector{Tuple{Bool,String}}`, one `(true, "")` per pair, and the change is on
+    # the server (proves it crossed the wire + committed, not echoed by the client).
+    @testset "L0 set_parameters (per-item verb)" begin
+        _pstep("L0: set_parameters batch")
+        _server_client(server_name = "psrv_set") do server, client
+            results = set_parameters(client, [:max_speed => 60, :mode => "manual"])
+            @test results isa Vector{Tuple{Bool, String}}
+            @test results == [(true, ""), (true, "")]
+            @test server.parameters.max_speed == 60            # Int64 value crossed the wire
+            @test server.parameters.max_speed isa Int64
+            @test server.parameters.mode == "manual"
+            @test get_parameters(client, [:max_speed, :mode]) == [60, "manual"]
+        end
+    end
+
+    # An unknown name reads back unset over the wire: `nothing` for the value and
+    # `PARAMETER_NOT_SET` for the type — the §10 sentinel a foreign client relies on.
+    @testset "L0 NOT_SET for unknown" begin
+        _pstep("L0: unknown name → nothing / NOT_SET")
+        _server_client(server_name = "psrv_unk") do server, client
+            @test get_parameters(client, [:nope]) == [nothing]
+            @test get_parameter_types(client, [:nope]) == [PARAMETER_NOT_SET]
+        end
+    end
+
     # L2: the Julian structure — `fetch` materializes a typed `LiveParams`, and
     # `transaction` mutates the remote with the same do-block as the local server.
     @testset "L2 typed snapshot + transaction" begin
@@ -87,12 +115,29 @@ end
     @testset "rejection is uniform (remote + client-side pre-check)" begin
         _pstep("reject: out-of-range set + transaction")
         _server_client(server_name = "psrv_rej") do server, client
+            @test occursin("ParameterClient{LiveParams}", sprint(show, client))
             @test_throws ParameterRejection set_parameter!(client, :max_speed, 999)
             @test server.parameters.max_speed == 50            # remote rejected → nothing applied
             @test_throws ParameterRejection transaction(client) do d
                 d.max_speed = 999                              # fails the client-side pre-check
             end
             @test server.parameters.max_speed == 50
+        end
+    end
+
+    # A read-only field rejected *over the wire*: `set_parameter!` goes through
+    # `set_parameters_atomically` (no client-side validate), so the rejection is the
+    # server's read-only gate replying `(false, reason)`, re-raised as the same
+    # `ParameterRejection` — uniform with the local path, the field left untouched.
+    @testset "read-only rejected over the wire" begin
+        _pstep("reject: read-only field set over the wire")
+        _server_client(server_name = "psrv_ro") do server, client
+            @test get_parameters(client, [:frame]) == ["map"]
+            @test_throws ParameterRejection set_parameter!(client, :frame, "odom")
+            @test server.parameters.frame == "map"             # read-only → nothing applied
+            @test get_parameters(client, [:frame]) == ["map"]  # and the remote still reads "map"
+            d = describe_parameters(client, [:frame])[1]
+            @test d.read_only === true                         # the descriptor carries read-only on the wire
         end
     end
 
@@ -106,6 +151,7 @@ end
             @test d.type === Int64
             @test d.ptype == PARAMETER_INTEGER
             @test d.read_only === false
+            @test d.constraint === nothing                     # the 0..100 range is dropped on the wire
             names = list_parameters(client)
             @test :max_speed in names && :mode in names
             @test client[:max_speed] == 50                     # L1 read

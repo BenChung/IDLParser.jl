@@ -44,6 +44,7 @@ function Base.close(e::Entity)
     end
     remove_endpoint!(ctx, e.lv_key)
     _forget_lost_tracker!(e)        # §12.3: drop any message-lost state (no-op if none)
+    unregister_local_subscription!(e)   # §15.1: drop from the intra-process registry + stop its worker (no-op if not registered)
     nothing
 end
 
