@@ -1,4 +1,8 @@
 
+# Abstract syntax tree for OMG IDL, the grammar ROS 2 .msg/.idl/.srv definitions
+# compile to. Each @data type models one IDL production.
+# https://design.ros2.org/articles/idl_interface_definition.html
+
 using Moshi.Derive: @derive
 using Moshi.Data: @data
 

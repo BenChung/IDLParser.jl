@@ -27,10 +27,10 @@ const RUN_CLIENT = ROLE in ("both", "client")
     node = Node(ctx, "add_two_ints")
 
     # ── Server ──────────────────────────────────────────────────────────────
-    # The handler receives the decoded request and returns the response message.
-    # That return becomes a reply-ok. To fail explicitly, `respond!(req, failed, msg)`
+    # The handler receives the decoded request and returns the response message,
+    # which becomes a reply-ok. To fail explicitly, `respond!(req, failed, msg)`
     # — the client's `call` then raises. A throw or a return-without-responding is
-    # caught and turned into an error reply, so a buggy handler can't hang a caller.
+    # caught and turned into an error reply, guaranteeing every call resolves.
     srv = nothing
     if RUN_SERVER
         srv = Service(node, "/add_two_ints", AddTwoInts.Request) do req
@@ -42,8 +42,8 @@ const RUN_CLIENT = ROLE in ("both", "client")
     # ── Client ──────────────────────────────────────────────────────────────
     if RUN_CLIENT
         client = ServiceClient(node, "/add_two_ints", AddTwoInts.Request)
-        # Block until the client↔server are routing-matched — no sleep. Returns
-        # `false` on timeout (e.g. no server up), so we don't fire calls into the void.
+        # Block until the client and server are routing-matched, returning `false` on
+        # timeout so calls only fire once a server is reachable.
         if wait_for_service(client; timeout = 5)
             for b in (40, 41, 42, 43)
                 resp = call(client, AddTwoInts.Request(a = 2, b = b); timeout_ms = 5000)
@@ -57,8 +57,7 @@ const RUN_CLIENT = ROLE in ("both", "client")
         close(client)
     end
 
-    # Server-only: keep serving until interrupted. (In `both`, the client already ran,
-    # so fall through and shut down; in `client`, there's nothing to keep alive.)
+    # Server-only role keeps serving until interrupted; other roles fall through to shutdown.
     if RUN_SERVER && !RUN_CLIENT
         @info "serving /add_two_ints — Ctrl-C to stop"
         spin(ctx; handle_signals = true)

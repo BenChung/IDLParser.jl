@@ -50,17 +50,19 @@ export ActionServer, ActionClient, GoalHandle,
 # (`<A>_SendGoal_Request/_Response`, `<A>_GetResult_Request/_Response`,
 # `<A>_FeedbackMessage`) are generated as siblings of `A` (§ROSMessages
 # `action_protocol_decls`) and resolved reflectively off `A` (`_action_wrapper`),
-# so the wire framing is built through real ctors rather than byte seams.
+# so the wire framing is built through the generated ctors.
 
 """
     ActionTypeSupport{A, G, R, F}
 
-Resolves the sub-message types of an action type `A` into its `Goal` (`G`),
-`Result` (`R`), and `Feedback` (`F`) structs (§9). Built from the action type
-argument to `ActionServer`/`ActionClient`; the three types drive the data-route
-key expressions and the handler signatures. The protocol wrappers
-(`SendGoal`/`GetResult` request/response, `FeedbackMessage`) are resolved off `A`
-on demand via [`_action_wrapper`](@ref) — they're generated siblings of `A`.
+Type-level handle on an action type `A` and its three sub-message structs:
+`Goal` (`G`), `Result` (`R`), and `Feedback` (`F`) (§9). The sub-types drive the
+data-route key expressions and the handler signatures. Built from the action
+type argument to `ActionServer`/`ActionClient`. The protocol wrappers
+(`SendGoal`/`GetResult` request/response, `FeedbackMessage`) are generated
+siblings of `A`, resolved off `A` on demand via [`_action_wrapper`](@ref).
+
+See the ROS 2 actions concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
 struct ActionTypeSupport{A, G, R, F} end
 
@@ -175,11 +177,13 @@ _is_zero_uuid(id::GoalId) = all(==(0x00), id)
 """
     GoalState
 
-The ROS2 goal lifecycle (`action_msgs/msg/GoalStatus`): `ACCEPTED` → `EXECUTING`
-→ {`SUCCEEDED`, `CANCELED`, `ABORTED`}, with `CANCELING` between executing and
-canceled. Integer values match the wire enum so they publish directly to the
-`status` topic. `:unknown`/`:rejected` are local-only (never published as a live
-goal).
+The ROS 2 goal lifecycle (`action_msgs/msg/GoalStatus`): `ACCEPTED` → `EXECUTING`
+→ {`SUCCEEDED`, `CANCELED`, `ABORTED`}, with `CANCELING` between `EXECUTING` and
+`CANCELED`. Integer values match the wire enum, so they publish directly to the
+`status` topic. `:unknown`/`:rejected` stay local — they label a handle but are
+never sent on the wire.
+
+See the ROS 2 actions concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
 @enum GoalState::Int8 begin
     GOAL_UNKNOWN   = 0
@@ -191,9 +195,8 @@ goal).
     GOAL_ABORTED   = 6
 end
 
-# Public state symbols (the client/server `state(goal)` surface, §9). Kept as
-# Symbols at the API edge — they read naturally (`state(goal) === :executing`)
-# and don't leak the wire enum.
+# Public `state(goal)` surface (§9): Symbols at the API edge keep the wire enum
+# internal and read naturally (`state(goal) === :executing`).
 _state_symbol(s::GoalState) =
     s === GOAL_ACCEPTED  ? :accepted  :
     s === GOAL_EXECUTING ? :executing :

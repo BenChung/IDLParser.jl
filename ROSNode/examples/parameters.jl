@@ -8,9 +8,9 @@
 # A node declares a typed parameter schema baked in via `Node(ctx, name, Schema)`;
 # that wires the six standard `rcl_interfaces` parameter services, so the node is
 # driveable uniformly by any ROS2 parameter client — rclcpp, rclpy, or the Hiroz
-# master — and by our own `ParameterClient`. Unlike the other examples this one is
-# self-contained: the parameter service types are vendored, so it needs no sourced
-# ROS2 install, just a router.
+# master — and by our own `ParameterClient`. The parameter service types are
+# vendored, so this example is self-contained: it runs against a router alone, with
+# no sourced ROS2 install.
 #
 # Interop: with a matching router + `ROS_DOMAIN_ID`, `server` is driveable by
 #   ros2 param get  /client_demo_server max_speed
@@ -53,8 +53,8 @@ const RUN_CLIENT = ROLE in ("both", "client")
         # to a node whose schema you don't have — then it's dynamic (`Any`/NamedTuple).
         client = ParameterClient(node, "/client_demo_server", DemoParams)
 
-        # Block until the parameter services are routing-matched — no sleep. `false`
-        # on timeout (e.g. no server up), so we don't fire calls into the void.
+        # Block until the parameter services are routing-matched; returns `false` on
+        # timeout (e.g. no server up), gating the calls below to a live server.
         if wait_for_service(client; timeout = 5)
             # ── L0: the low-level verbs, 1:1 with the hiroz client ──────────────
             @info "remote values" get_parameters(client, [:max_speed])              # → Any[50]

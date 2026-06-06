@@ -1,11 +1,11 @@
-# §8 services: one callback, a write-once result cell, no feedback. Under
-# rmw_zenoh a service is a Zenoh queryable — the request rides the query payload,
-# the response the reply. The fail-safe settlement core (settlement.jl) guarantees
-# every handler exit fills the cell exactly once: `return resp` → reply-ok; an
-# explicit `respond!(req, failed, …)`, a throw, or a non-responding return → a
-# Zenoh query *error* reply, so the client's blocking `call` raises rather than
-# getting a plausible zeroed response. Async/detached responses settle the cell
-# from any task — the framework holds the owned `Query` until that fill delivers.
+# §8 services: one callback and a write-once result cell. Under rmw_zenoh a
+# service is a Zenoh queryable — the request rides the query payload, the response
+# the reply. The fail-safe settlement core (settlement.jl) guarantees every handler
+# exit fills the cell exactly once: `return resp` → reply-ok; an explicit
+# `respond!(req, failed, …)`, a throw, or a non-responding return → a Zenoh query
+# error reply, so the client's blocking `call` raises rather than returning a
+# plausible zeroed response. Async/detached responses settle the cell from any
+# task — the framework holds the owned `Query` until that fill delivers.
 #
 # Client side: `call(client, req)` is a `Zenoh.get` whose handler we drain on the
 # *calling* task (it yields), raising on an error reply; `async=true` returns a
@@ -77,9 +77,10 @@ _strip_suffix(s::AbstractString, suffix::AbstractString) =
 """
     ServiceHandle{Req, Resp}
 
-A service server for request type `Req` / response type `Resp` on a service name
-(§8). Wraps the generic [`Entity`](@ref) (id, liveliness token) and owns the
-Zenoh `Queryable` route + its consumer task. `close`-able; dies with its node.
+A [service](https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html)
+server for request type `Req` / response type `Resp` on a service name (§8).
+Wraps the generic [`Entity`](@ref) (id, liveliness token) and owns the Zenoh
+`Queryable` route plus its consumer task. `close`-able; dies with its node.
 
 Constructed via the `Service(node, name, SrvType) do req … end` spelling — see
 [`Service`](@ref).
@@ -314,13 +315,12 @@ function _decode_request(query::Query, ::Type{Req}, view::Bool) where {Req}
     return decode_request(p, Req, view)
 end
 
-# Decode from a `ZBytes`. We copy the payload into owned `Memory` first (the
-# query/payload buffer is borrowed and shouldn't be aliased past the handler),
+# Decode from a `ZBytes`. Copy the payload into owned `Memory` first (the
+# query/payload buffer is borrowed and must not be aliased past the handler),
 # mirroring the subscription owned path (serialization.jl `decode(::Sample, …)`).
 # `view=true` then returns a `CDRView` aliasing that *owned* copy — safe to use
-# (and escape) for as long as the view is reachable, since the copy outlives the
-# query. The zero-copy-over-the-live-payload variant (§3.2, as in the
-# subscription `with_memory` path) is the future optimization.
+# and escape for as long as the view is reachable, since the copy outlives the
+# query.
 # TODO(view §3.2): zero-copy directly over the borrowed query payload.
 function decode_request(p, ::Type{Req}, view::Bool) where {Req}
     mem = Zenoh.as_memory(p, UInt8)
@@ -444,10 +444,11 @@ end
 """
     ServiceClient{Req, Resp}
 
-A service client for request type `Req` / response type `Resp` (§8). Wraps the
-generic [`Entity`](@ref) (so it shows up in the graph and `close(node)` reaps
-it) and owns a long-lived Zenoh `Querier` — the transport every [`call`](@ref)
-queries through, and the handle behind [`service_matched`](@ref) /
+A [service](https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html)
+client for request type `Req` / response type `Resp` (§8). Wraps the generic
+[`Entity`](@ref) (so it shows up in the graph and `close(node)` reaps it) and
+owns a long-lived Zenoh `Querier` — the transport every [`call`](@ref) queries
+through, and the handle behind [`service_matched`](@ref) /
 [`wait_for_service`](@ref). `close`-able.
 
 Constructed via `ServiceClient(node, name, SrvType)`.
@@ -475,9 +476,9 @@ function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
     # Service-level keyexpr type, matching the server's queryable (see `_make_service`).
     sti = something(service_type_info_of(Req, Resp), type_info_of(Req))
     ent = make_entity(node, Client, sname, sti; qos=qos)
-    # The call transport: a Querier on the service keyexpr. `:best_matching`
-    # mirrors the old one-shot get — a ROS service has one server, so the first
-    # matching reply settles the call. Stashed in `entity.wire` (reaped on close).
+    # The call transport: a Querier on the service keyexpr. `:best_matching` fits a
+    # ROS service's single server — the first matching reply settles the call.
+    # Stashed in `entity.wire` (reaped on close).
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
     querier = Querier(ctx.session, Keyexpr(tk); target=:best_matching)
@@ -533,12 +534,13 @@ Base.showerror(io::IO, e::ServiceError) = print(io, "ServiceError: ", e.msg)
 """
     call(client::ServiceClient, req; async=false, timeout_ms=0) -> Resp | fetchable
 
-Invoke the service: serialize `req`, query the client's `Querier` on the service
-keyexpr with the per-request attachment, and resolve the reply (§8). Synchronously
-(`async=false`, default) this blocks the *calling* task — it yields while the
-reply is in flight — and returns the decoded `Resp`, raising [`ServiceError`](@ref)
-on an error reply. With `async=true` the same work runs on a spawned task and a
-fetchable is returned; `fetch` it for the `Resp` (which rethrows on error).
+Invoke the [service](https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html):
+serialize `req`, query the client's `Querier` on the service keyexpr with the
+per-request attachment, and resolve the reply (§8). Synchronously (`async=false`,
+the default) this blocks the *calling* task — it yields while the reply is in
+flight — and returns the decoded `Resp`, raising [`ServiceError`](@ref) on an
+error reply. With `async=true` the same work runs on a spawned task and returns
+a fetchable; `fetch` it for the `Resp` (which rethrows on error).
 
 `timeout_ms` bounds the wait (`0` = no timeout); a timeout yields no reply, which
 raises `ServiceError`.
@@ -562,9 +564,7 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     attach = encode_attachment(seq, ts, gid(e))
 
     run = function ()
-        # The Querier bakes in the service keyexpr + `:best_matching` (a ROS service
-        # has one server, so the first matching reply settles the call). A querier get
-        # carries no per-call timeout in libzenoh, so we bound it with a
+        # A querier get carries no per-call timeout in libzenoh, so bound it with a
         # `CancellationToken` armed on a deadline timer: cancel fires → the in-flight
         # get ends → the drain completes cleanly (no abandoned task). `timeout_ms == 0`
         # ⇒ no token (unbounded, still backstopped by the outer `timedwait` below).

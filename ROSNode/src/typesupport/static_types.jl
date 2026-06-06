@@ -1,30 +1,24 @@
-# ── statically-generated type registration (@ros_import / @ros_cache, D5) ───────
-# `@ros_import` (ament/vendored, by name) and `@ros_cache` (baked from the
-# discovered-type cache) generate static types into the caller module and record
-# them in a module-local global
-#   `__ros_static_types__::Vector{Tuple{Type, String}}`
-# — each generated type paired with its canonical wire `TypeDescription` JSON. The
-# macro creates the global once (idempotently) and appends to it; the value is baked
-# into the module image (package) or built at eval (script/REPL). At Context creation
-# we find those globals — across loaded packages *and* Main's own submodule tree (so
-# script/REPL interface modules, absent from `loaded_modules`, are covered) — and
-# register each: bind the precompiled type to its real RIHS01 + a `:static` entry, so
-# keyexpr-only resolution and the §13 server use it directly (no runtime codegen, the
-# D9 "converge to fast" endgame). A plain module-local global — no method-table
-# reflection, no `__init__` to clobber.
+# Static type registration for the `@ros_import` / `@ros_cache` macros.
+#
+# Each macro generates interface types into the caller module and records them in a
+# module-local global `__ros_static_types__::Vector{Tuple{Type, String}}`: each type
+# paired with its canonical wire `TypeDescription` JSON. The global bakes into a
+# package image, or builds at eval in a script/REPL module. At Context creation these
+# globals are absorbed and each type is bound to its real RIHS01 hash, so keyexpr-only
+# resolution and the type-description server use the precompiled type directly.
 
-# The conventional module-local globals the macros populate: the baked static types,
-# and (for `@ros_cache`) the opt-in marker carrying the persistence dir (`""` ⇒ the
-# project default).
+# Module-local globals the macros populate: the baked static types, and the
+# `@ros_cache` persistence-dir marker (`""` selects the project default).
 const _STATIC_GLOBAL = :__ros_static_types__
 const _CACHE_MARKER  = :__ros_cache_dir__
 const _STATIC_ENTRY_CACHE = IdDict{Any, RegistryEntry}()
 const _STATIC_ENTRY_LOCK = ReentrantLock()
 
-# Intern (once, memoized) the registry entry for a statically-generated type `T` from
-# its baked JSON: parse → internal `TypeDescriptionMsg` → real hash → bind `mod`/`type`
-# to the compiled `T` (so `realize!` is a no-op). Records the reverse mapping so
-# `type_info_of(T)` reports the real hash. `nothing` on an unparseable blob.
+# Build and memoize the registry entry for a statically-generated type `T` from its
+# baked JSON: parse to a `TypeDescriptionMsg`, compute the RIHS01 hash, and bind the
+# entry's `mod`/`type` to the compiled `T` so `realize!` is a no-op. Records the
+# reverse mapping so `type_info_of(T)` reports the hash. Returns `nothing` when the
+# JSON fails to parse.
 function _intern_static_entry!(@nospecialize(T), json::AbstractString)
     @lock _STATIC_ENTRY_LOCK begin
         haskey(_STATIC_ENTRY_CACHE, T) && return _STATIC_ENTRY_CACHE[T]
@@ -42,12 +36,11 @@ function _intern_static_entry!(@nospecialize(T), json::AbstractString)
     end
 end
 
-# The ROSNode-local singleton the macros flush into and Context pulls from — so no
-# module-table or method-table scanning is needed. `@ros_import`/`@ros_cache` emit
-# code in the caller that calls `_absorb_static_module!` at module load (a generated
-# `__init__` for precompiled packages; a guarded top-level call at eval for
-# script/REPL modules), reading the module-local accumulator into here. Interned by
-# type, so repeated absorbs are idempotent.
+# ROSNode-local singleton that the macros flush into and Context pulls from.
+# `@ros_import`/`@ros_cache` emit a call to `_absorb_static_module!` at module load —
+# from a generated `__init__` in precompiled packages, or a top-level call at eval in
+# script/REPL modules — which reads the module's accumulator into here. Entries are
+# interned by type, so repeated absorbs are idempotent.
 struct _StaticTypeIndex
     lock::ReentrantLock
     entries::Vector{RegistryEntry}        # interned static type entries
@@ -61,9 +54,11 @@ const _STATIC_TYPES = _StaticTypeIndex(ReentrantLock(), RegistryEntry[], Set{Any
 
 Flush a module's baked `@ros_import`/`@ros_cache` declarations (its
 `__ros_static_types__` / `__ros_cache_dir__` globals) into ROSNode's static-type
-singleton (D5). The macros call this at module load automatically — call it yourself
-only from a *custom* `__init__` in a module that uses these macros (the macro defers
-to a user-defined `__init__` rather than clobber it). Idempotent.
+singleton. The macros call this at module load. Call it yourself only when the module
+defines its own `__init__`, which the macros defer to. Idempotent.
+
+These declarations carry precompiled ROS 2 interface types and their
+`TypeDescription` JSON; see https://design.ros2.org/articles/idl_interface_definition.html.
 """
 function absorb_static_types!(mod::Module)
     if isdefined(mod, _CACHE_MARKER)
@@ -98,21 +93,23 @@ const _absorb_static_module! = absorb_static_types!   # internal alias used by t
 """
     _register_static_types!(ctx) -> ctx
 
-Pull every absorbed static type (`@ros_import`/`@ros_cache`) and cache opt-in from the
-[`_STATIC_TYPES`](@ref) singleton into `ctx` (D5): register each entry (binding the
-precompiled type to its real RIHS01, so keyexpr-only resolution and the §13 server use
-it directly — no runtime codegen) and enable project-local persistence for any
-`@ros_cache` dir. Called at Context creation alongside the well-known bootstrap types.
+Register every absorbed static type and cache opt-in from the [`_STATIC_TYPES`](@ref)
+singleton into `ctx`: bind each precompiled type to its RIHS01 hash so keyexpr-only
+resolution and the type-description server use it directly, and enable project-local
+persistence for each `@ros_cache` dir. Called at Context creation alongside the
+well-known bootstrap types.
+
+The RIHS01 hash identifies a ROS 2 interface type; see
+https://design.ros2.org/articles/idl_interface_definition.html.
 """
 function _register_static_types!(ctx)
     reg = registry(ctx)
     @lock _STATIC_TYPES.lock begin
         for e in _STATIC_TYPES.entries
-            # D10B S3: first-wins (skip a present `(name,hash)`) — never clobber. Decode
-            # identity is now per-module (the `home` table, S1/S2), so this registry only
-            # feeds the §13 server (any same-`(name,hash)` struct serves the identical
-            # descriptor) and the no-home/canonical fallback. This removes the old
-            # last-`__init__`-wins global clobber while keeping advertised types describable.
+            # First-wins: skip a present `(name, hash)`, never clobber. Decode identity is
+            # per-module via the `home` table, so this registry only feeds the
+            # type-description server (any struct with the same `(name, hash)` serves the
+            # identical descriptor) and the canonical fallback.
             lookup_type(reg, e.info) === nothing && register_type!(reg, e.info, e)
         end
         # Register every `@ros_cache` opt-in dir deterministically: reads search them

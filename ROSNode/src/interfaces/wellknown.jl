@@ -1,22 +1,21 @@
-# §11/§13 — the statically-compiled bootstrap interfaces (PLAN-D5 S1).
+# Statically-compiled bootstrap interfaces (§11/§13).
 #
-# Dynamic discovery fetches an unknown type's definition by *calling* a remote's
+# Dynamic discovery fetches an unknown type's definition by calling a remote's
 # `~/get_type_description` (`type_description_interfaces/srv/GetTypeDescription`).
-# That handshake needs the GetTypeDescription request/response types and the
-# `type_description_interfaces/msg/*` vocabulary they carry — themselves ROS types.
-# So we vendor those `.msg`/`.srv` and generate them *statically* (compiled into
-# ROSNode's image), the bootstrap §11/§13 assume: a known type used to fetch
-# unknown ones.
+# That handshake itself needs the GetTypeDescription request/response types and the
+# `type_description_interfaces/msg/*` vocabulary they carry, which are themselves ROS
+# types. These are vendored and generated statically (compiled into ROSNode's image):
+# a known type used to fetch the unknown ones.
 #
 # Two halves live here:
 #   • `WellKnown` — the generated wire structs (CDR-codable), via `@ros_msgs` over
 #     `../vendor/type_description_interfaces`.
-#   • the wire ⇄ internal bridge: ROSMessages' *internal* hashing `TypeDescription`
-#     (rihs01.jl) and the generated *wire* `type_description_interfaces/msg/
+#   • the wire ⇄ internal bridge: ROSMessages' internal hashing `TypeDescription`
+#     (rihs01.jl) and the generated wire `type_description_interfaces/msg/
 #     TypeDescription` are distinct types with the same shape; `to_wire_td` /
-#     `from_wire_td` convert between them losslessly (verified: RIHS01 is preserved
-#     across the round-trip). The registry/serving side speaks the internal form;
-#     the client/server marshal speaks the wire form.
+#     `from_wire_td` convert between them, preserving RIHS01 across the round-trip.
+#     The registry/serving side speaks the internal form; the client/server marshal
+#     speaks the wire form.
 #
 # The well-known types are also registered into every Context's registry on
 # creation (`_register_wellknown_types!`) so the §13 server can answer for them and
@@ -60,7 +59,7 @@ const _WELLKNOWN_TYPES = Dict{String, Any}(
 # ROSMessages' internal `TypeDescription`/`FieldDescription`/`FieldTypeDescription`
 # (rihs01.jl, the form `calculate_rihs01_hash`/`lift` consume) ⇄ the generated wire
 # `type_description_interfaces/msg/*`. Field-for-field; `default_value` is dropped
-# (RIHS01 excludes it, and `lift` never carries it). Verified hash-preserving.
+# (RIHS01 excludes it, and `lift` never carries it), so the round-trip preserves RIHS01.
 
 to_wire_field_type(ft::FieldTypeDescription) =
     WireFieldType(; type_id = ft.type_id, capacity = ft.capacity,
@@ -80,8 +79,10 @@ to_wire_individual(td::TypeDescription) =
 
 Convert ROSMessages' internal hashing `TypeDescriptionMsg` (main + referenced
 closure) into the generated wire `type_description_interfaces/msg/TypeDescription`
-for serving over `~/get_type_description` (§13). Field-for-field; lossless w.r.t.
-RIHS01 (constants/defaults are RIHS-excluded anyway).
+for serving over `~/get_type_description` (§13). Field-for-field; preserves RIHS01
+(constants/defaults are RIHS-excluded).
+
+See the [IDL type-description design](https://design.ros2.org/articles/idl_interface_definition.html).
 """
 to_wire_td(m::TypeDescriptionMsg) =
     WireTypeDescription(; type_description = to_wire_individual(m.type_description),
@@ -116,7 +117,7 @@ from_wire_td(w) =
 # Build the registry entries for the vendored types: parse each source → IL, recover
 # its RIHS01 (with the referenced closure, so referencing types hash exactly), and
 # point the entry's `mod`/`type` at the *already-compiled* WellKnown struct so
-# `realize!` is a no-op (these are static, never re-codegen'd).
+# `realize!` is a no-op (these are static — compiled in, resolved by alias).
 #
 # Source preference: when running inside a sourced ROS2 env that ships
 # `type_description_interfaces`, read each interface from there (so the bootstrap
@@ -180,10 +181,10 @@ function _build_wellknown_entries()
         qn = "$pkg/srv/$sec"
         ast = _scan_for_struct(lower(secil; package = pkg))
         ast === nothing && error("wellknown: no struct AST for $qn")
-        # The section's own name is the srv-qualified `qn` (passed fully-qualified so
-        # it's used as-is); `qualifier="msg"` then governs only how its *relative*
-        # refs resolve — a bare `TypeDescription` in a .srv is the same-package *msg*
-        # `…/msg/TypeDescription`, not `…/srv/…`, so the closure finds it in the pool.
+        # The section's own name is the srv-qualified `qn` (passed fully-qualified, used
+        # as-is); `qualifier="msg"` governs only how its *relative* refs resolve — a bare
+        # `TypeDescription` in a .srv resolves to the same-package `…/msg/TypeDescription`,
+        # so the closure finds it in the pool.
         pool[qn] = type_description_from_struct(ast, qn; package = pkg, qualifier = "msg")
         ilmap[qn] = secil
     end
@@ -218,7 +219,7 @@ function _wellknown_entries()
 end
 
 # ── canonical type index: every vendored type, bound to its compiled `Interfaces`
-# struct — the single-copy home (§11/D5) ──────────────────────────────────────
+# struct — the single-copy home (§11) ─────────────────────────────────────────
 # `@ros_import`/`@ros_cache` consult [`canonical_type`](@ref) and *alias* a hit
 # (`const Name = Interfaces.<pkg>.<qual>.<Name>`) instead of re-generating, so a
 # given wire type (name + RIHS01) has exactly one Julia struct process-wide. Built
@@ -321,15 +322,15 @@ function _register_canonical_types!(ctx)
     return ctx
 end
 
-# ── single-copy guard: a nice error for the residual duplicate case (§11/D5) ──
+# ── single-copy guard: clear error for the residual duplicate case (§11) ──
 # Aliasing (`@ros_import`) collapses vendored types to one `Interfaces` copy, but a
-# *stray* copy can still arise — e.g. `@ros_msgs` run directly on the vendored
-# sources, which doesn't alias. Passing such a stray where a canonical type is
-# expected would otherwise fail with a cryptic `convert` MethodError. We install a
-# `Base.convert` method on each canonical `Interfaces` struct (we own them — not
-# piracy) that fires only for a non-matching value (Base's identity
-# `convert(::Type{T}, ::T)` is more specific) and explains the fix. Installed at
-# ROSNode precompile so the methods belong to ROSNode, never a downstream package.
+# stray copy can still arise — e.g. `@ros_msgs` run directly on the vendored sources,
+# which doesn't alias. Passing such a stray where a canonical type is expected hits a
+# cryptic `convert` MethodError. The `Base.convert` method installed on each canonical
+# `Interfaces` struct (owned here, so not piracy) fires only for a mismatched value
+# (Base's identity `convert(::Type{T}, ::T)` is more specific) and explains the fix.
+# Installed at ROSNode precompile so the methods belong to ROSNode, not a downstream
+# package.
 function _canonical_convert_guard(::Type{T}, @nospecialize(x)) where {T}
     name  = type_info_of(T).name
     sx    = typeof(x)

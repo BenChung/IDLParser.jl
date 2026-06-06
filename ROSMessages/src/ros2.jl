@@ -372,7 +372,6 @@ function _apply_array(base_ts, arr::IL.ArraySpec.Type, name::Symbol)
     end
 end
 
-# Wrap a member in a `@default(value=...)` annotation.
 function _wrap_default(member, expr)
     ann_name = Parse.ScopedName.Name(Symbol[], :default, true)
     return Parse.Annotated.Annotation(ann_name, [:value => expr], member)
@@ -446,6 +445,8 @@ end
     parse_msg(source; name, package="")
 
 Parse the contents of a ROS2 `.msg` file into a vector of IDL declarations.
+
+ROS2 interface definitions: https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html
 """
 parse_msg(source::AbstractString; name::AbstractString, package::AbstractString="") =
     lower(message_il(source; name=name); package=package)
@@ -512,15 +513,16 @@ function action_protocol_decls(name::AbstractString; package::AbstractString="")
 end
 
 """
-    namespace_alias_module(kind, name) -> Union{Expr, Nothing}
+    namespace_alias_decls(kind, name) -> Vector{Expr}
 
-Julia-side namespacing for a service/action: a `<name>` submodule whose consts alias
-the generated sections to short names, so `Foo.Request`/`Foo.Goal` read better than
-the `Foo_Request`/`Foo_Goal` structs. Pure aliases (`const Goal = Foo_Goal`) — the
-ROS/wire type names are unchanged. The returned `module <name> … end` must be spliced
-*inside* the generated `<pkg>.<kind>` module (beside the section structs, after them),
-where `parentmodule(@__MODULE__)` resolves to that enclosing module — see
-`_inject_namespaces!`. `nothing` for a `msg` (a single, already-short struct).
+Julia-side namespacing for a service/action: a `<name>` tag struct with a
+`getproperty` that maps short names to the generated section structs, so
+`Foo.Request`/`Foo.Goal` read better than the `Foo_Request`/`Foo_Goal`
+structs. The ROS/wire type names stay unchanged. Splice the returned exprs
+*inside* the generated `<pkg>.<kind>` module, after the section structs, where
+`parentmodule(@__MODULE__)` resolves to that enclosing module — see
+`_inject_namespaces!`. A `msg` (a single, already-short struct) yields an empty
+vector.
 """
 function namespace_alias_decls(kind::AbstractString, name::AbstractString)
     fulls = if kind == "srv"

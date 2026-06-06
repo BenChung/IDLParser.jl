@@ -1,34 +1,26 @@
-# §D9 — per-node interaction manifest.
+# Per-node manifest of runtime-discovered message types a node used.
 #
-# The persistent record of which *dynamic* (runtime-discovered, §11/D5) type
-# interactions a node actually exercised — `(role, RIHS01 hash, name, topic)` — keyed
-# by node identity (`node.fqn`). It is the "what to warm" list for dynamic types,
-# the dynamic-side analogue of the declared entities D8 warms for static ones.
+# Each record is `(role, RIHS01 hash, name, topic)`, keyed by node fully-qualified
+# name. The manifest is the "what to warm" list for dynamic types: startup warm
+# (`_replay_manifest_warm` in node.jl) resolves each type and runs `_warm_dynamic`
+# while the node is still starting, moving first-message JIT cost to startup.
 #
-# Across runs it is **append-mostly union**: each run records the interactions it
-# newly used, so the file monotonically approaches the deployment's full dynamic
-# participant set, and the next run's Tier-1 startup warm (node.jl
-# `_replay_manifest_warm`) replays it — resolving each type from the cache / baked
-# statics and running `_warm_dynamic` *before going live*, shifting the first-message
-# JIT to startup. Warm-up cost decreases monotonically toward zero as the manifest
-# saturates (D9 convergence).
+# Persistence is append-only union. A run appends the interactions it newly used,
+# so a node's file grows toward the deployment's full set and warm-up cost falls as
+# it saturates. Records are keyed on the RIHS01 type hash, so an entry whose type no
+# longer resolves is skipped — the hash guards against a wrong decode.
 #
-# Correctness-safe by construction (inherited from §11): everything keys on RIHS01,
-# so a stale entry whose type no longer resolves is simply skipped — never a wrong
-# decode. Only *used* interactions are recorded (the writer hook is the dynamic
-# dispatch's first-sight branch), never everything seen on the graph.
-#
-# Persistence shares the blob cache's opt-in (`_cache_enabled()` — `@ros_cache` /
-# `enable_project_cache!` / the `$ROS_TYPESUPPORT_CACHE` env override): no surprise
-# files, and the manifest is only useful when Tier-1 can resolve its entries (same
-# gate). On-disk form is line-oriented TSV under a `manifests/` subdir of the cache
-# dir, one record per line — append-friendly, crash-safe, no JSON dependency.
+# Writes share the blob cache's opt-in (`_cache_enabled()`: `@ros_cache`,
+# `enable_project_cache!`, or the `$ROS_TYPESUPPORT_CACHE` env override); a manifest
+# is useful only when startup warm can resolve its entries, so the same gate covers
+# both. On-disk form is one TSV record per line under a `manifests/` subdir of the
+# cache dir, which makes appends crash-safe and needs no JSON dependency.
 
-# One recorded interaction. `role` is `:subscription` today (the keyexpr-only
-# `Subscription`, D5 S5, is the only path that meets a runtime-born type; the field
-# is carried for fidelity to D9 and so a future dynamic pub/service needs no
-# migration). `name`/`hash` are the resolved `TypeInfo` (name kept so Tier-1 can
-# `resolve_or_discover` without scanning blobs); `topic` scopes the warm to the sub.
+# One recorded interaction. `role` is `:subscription` today — the keyexpr-only
+# `Subscription` is the only path that meets a runtime-born type — but the field is
+# stored so a future dynamic publisher or service needs no on-disk migration.
+# `name`/`hash` identify the resolved type (`name` lets Tier-1 `resolve_or_discover`
+# without scanning blobs); `topic` scopes the warm to the subscription.
 struct Interaction
     role::Symbol
     hash::TypeHash
@@ -36,9 +28,9 @@ struct Interaction
     topic::String
 end
 
-# In-memory state for one node's manifest: the union of recorded interactions (both
-# the prior-run entries loaded from disk and this run's, so a record is written at
-# most once), guarded by a lock. `loaded` makes the disk read lazy + once.
+# In-memory state for one node's manifest, guarded by `lock`. `lines` is the union key
+# (prior-run entries plus this run's), so each record is written at most once; `loaded`
+# makes the disk read lazy and once-only.
 mutable struct _ManifestState
     const lock::ReentrantLock
     const lines::Set{String}          # canonical serialized lines already recorded (the union key)
@@ -60,16 +52,16 @@ function _manifest_dir()
 end
 
 # A filesystem-safe leaf for an fqn (`/ns/node` → `_ns_node`): every char outside
-# `[A-Za-z0-9_-]` becomes `_`. Collisions across distinct fqns are not a correctness
-# hazard (entries self-validate by RIHS01), only a (vanishingly unlikely) sharing.
+# `[A-Za-z0-9_-]` becomes `_`. A collision between two fqns only shares a file (an
+# entry still self-validates by its RIHS01 hash), so it stays correct.
 _sanitize_fqn(fqn::AbstractString) = replace(String(fqn), r"[^A-Za-z0-9_-]" => "_")
 
 _manifest_path(fqn::AbstractString) = joinpath(_manifest_dir(), _sanitize_fqn(fqn) * ".tsv")
 
 # Serialize / parse one record as `role \t RIHS01_hash \t name \t topic`. ROS names
-# and topics cannot contain tabs, so the split is unambiguous. Parsing tolerates
-# malformed lines (returns `nothing`, skipped) and a bad hash (the RIHS string fails
-# to parse) so a corrupt manifest degrades to "warm less", never an error.
+# and topics contain no tabs, so the split is unambiguous. A malformed line or
+# unparseable hash yields `nothing` and is skipped, so a corrupt manifest degrades
+# to warming fewer types and stays non-fatal.
 _serialize_interaction(it::Interaction) =
     string(it.role, '\t', to_rihs_string(it.hash), '\t', it.name, '\t', it.topic)
 
@@ -81,10 +73,10 @@ function _parse_interaction(line::AbstractString)
     return Interaction(Symbol(parts[1]), h, String(parts[3]), String(parts[4]))
 end
 
-# Get-or-create the state for `fqn`, reading + parsing the on-disk file once. Holds
-# the table lock only to fetch the per-node state; the file read happens under that
-# state's own lock (so two nodes load concurrently). Best-effort: a read failure
-# leaves an empty (but `loaded`) state — we warm nothing rather than erroring.
+# Get-or-create the state for `fqn`, reading and parsing the on-disk file once. The
+# table lock is held only to fetch the per-node state; the file read runs under that
+# state's own lock, so two nodes load concurrently. Best-effort: a read failure leaves
+# an empty but `loaded` state, so the node warms nothing this run.
 function _manifest_state(fqn::AbstractString)
     st = @lock _MANIFESTS_LOCK get!(() -> _ManifestState(), _MANIFESTS, String(fqn))
     @lock st.lock begin
@@ -114,9 +106,14 @@ end
 """
     load_manifest(fqn) -> Vector{Interaction}
 
-The recorded dynamic-type interactions for node `fqn` (§D9), the union of every run
-that wrote to its manifest. Empty when persistence is off (`_cache_enabled()`) or the
-node has none yet. Used by Tier-1 startup warm (`_replay_manifest_warm`).
+The recorded dynamic-type interactions for node `fqn`, the union of every run that
+wrote to its manifest. Startup warm (`_replay_manifest_warm`) consumes this to
+resolve and warm each type before the node goes live. Empty when persistence is off
+(`_cache_enabled()`) or the node has recorded none yet.
+
+The `hash` field of each entry is the RIHS01 type description hash that identifies
+the interface (`.msg`/`.srv`/`.action`). See
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html
 """
 function load_manifest(fqn::AbstractString)
     _cache_enabled() || return Interaction[]
@@ -127,11 +124,12 @@ end
 """
     note_interaction!(fqn, role, hash, name, topic) -> Bool
 
-Record that node `fqn` used dynamic type `(name, hash)` in `role` on `topic` (§D9).
-Append-mostly union: a record already present (this run or a prior one) is a no-op;
-a new one is appended to the node's manifest file. Returns `true` iff newly recorded.
-Off (returns `false`) unless persistence is enabled — same opt-in as the blob cache.
-Best-effort: a write failure is logged, never fatal (the type is already live).
+Record that node `fqn` used dynamic type `(name, hash)` in `role` on `topic`.
+Append-only union: an already-present record (this run or a prior one) is a no-op,
+and a new one is appended to the node's manifest file. Returns `true` when the
+record is newly added, `false` when it was already present or when persistence is
+off (the same opt-in as the blob cache). A write failure is logged and the call
+still returns; the type is already live, so the manifest is an optimization.
 """
 function note_interaction!(fqn::AbstractString, role::Symbol, hash::TypeHash,
                            name::AbstractString, topic::AbstractString)

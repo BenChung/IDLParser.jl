@@ -1,7 +1,7 @@
 # Request-vs-Offered (RxO) QoS compatibility — the ROS2/DDS rule that a
-# subscription *requests* a profile and a publisher *offers* one, and the offered
-# must be **at least as strong as** the requested per policy. Formatter-agnostic:
-# this is the ROS2-level rule, independent of how the profile is wire-encoded.
+# subscription requests a profile and a publisher offers one, and the offered
+# must rank at least as strong as the requested for every policy. This is the
+# ROS2-level rule, independent of how a profile is wire-encoded.
 #
 # ROSNode consumes this for `on_qos_incompatible` (and the throttled warnings).
 # See ROSNode/DESIGN.md → "QoS-incompatibility detection".
@@ -33,13 +33,17 @@ _period_nanos(d::Duration) = UInt128(d.sec) * 1_000_000_000 + UInt128(d.nsec)
 """
     qos_compatible(requested::QosProfile, offered::QosProfile) -> Vector{QosIncompatibility}
 
-Check a *requested* profile (the subscription side) against an *offered* one (the
-publisher side) under the DDS RxO rule. Returns the list of violations — empty
-means compatible. Direction matters: for our subscription ↔ remote publisher,
-`requested` is ours; for our publisher ↔ remote subscription, `offered` is ours.
+Check a requested profile (the subscription side) against an offered one (the
+publisher side) under the DDS Request-vs-Offered rule, returning the list of
+policy violations; an empty list means the two profiles are compatible.
+Direction follows the connection: on our subscription ↔ remote publisher,
+`requested` is ours; on our publisher ↔ remote subscription, `offered` is ours.
 
-Covers reliability, durability, deadline, and liveliness (kind + lease). History
-and depth are local resource policies, not part of RxO, so they're ignored.
+Covers the four RxO-governed policies: reliability, durability, deadline, and
+liveliness (kind + lease). History and depth are local resource policies that
+DDS evaluates per endpoint, so they fall outside this check.
+
+See https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Quality-of-Service-Settings.html
 """
 function qos_compatible(requested::QosProfile, offered::QosProfile)
     issues = QosIncompatibility[]
@@ -50,7 +54,6 @@ function qos_compatible(requested::QosProfile, offered::QosProfile)
     if _DURABILITY_RANK[requested.durability] > _DURABILITY_RANK[offered.durability]
         push!(issues, QosIncompatibility(:durability, requested.durability, offered.durability))
     end
-    # Offered deadline must be ≤ requested (offered period no longer than requested).
     if _period_nanos(offered.deadline) > _period_nanos(requested.deadline)
         push!(issues, QosIncompatibility(:deadline, requested.deadline, offered.deadline))
     end

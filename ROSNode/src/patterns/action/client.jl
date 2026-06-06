@@ -7,9 +7,12 @@
 """
     ActionClient{A, G, R, F}
 
-A ROS2 action client for action type `A` (§9). `close`-able; dies with its node.
+A ROS 2 action client for action type `A` (§9). `close`-able; dies with its node.
 Use [`send`](@ref) to dispatch a goal, then iterate [`feedback`](@ref), block on
 [`fetch`](@ref) for the result, and [`cancel`](@ref) to request cancellation.
+
+See the ROS 2 actions concept:
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
 mutable struct ActionClient{A, G, R, F}
     const node::Node
@@ -17,11 +20,9 @@ mutable struct ActionClient{A, G, R, F}
     const support::ActionTypeSupport{A, G, R, F}
     const qos::QosProfile
     @atomic open::Bool
-    # Lazy routing-match probes (`_ClientWire`s, service.jl) on the services the
-    # send→fetch flow uses — `send_goal` and `get_result` — declared on the first
-    # `wait_for_action_server`/`action_server_matched`, `nothing` until then (a client
-    # that never awaits declares no extra Queriers). `send`/`fetch` use one-shot gets
-    # and never touch these.
+    # Lazy routing-match probes (`_ClientWire`s, service.jl) for `send_goal` and
+    # `get_result`, declared on first `wait_for_action_server`/`action_server_matched`
+    # and `nothing` until then. `send`/`fetch` use one-shot gets and never read these.
     @atomic _match::Union{Vector{_ClientWire}, Nothing}
     const _match_lock::ReentrantLock
 end
@@ -59,13 +60,12 @@ Base.show(io::IO, c::ActionClient{A}) where {A} =
     print(io, "ActionClient(", c.name, ", ", nameof(A),
           isopen(c) ? "" : ", closed", ")")
 
-# Lazily declare the matching probes (Queriers on the same keyexprs `send`/`fetch`
-# query) the first time the server is awaited; reuses the shared `_ClientWire`
-# machinery (service.jl). We probe BOTH `send_goal` and `get_result`: `send` retries
-# discovery on its own, but `fetch`'s `get_result` is a one-shot get with a long
-# timeout, so awaiting its match is what keeps `fetch` from blocking on an unmatched
-# service. `send`/`fetch` themselves don't need these, so a client that never awaits
-# pays nothing.
+# Lazily declare matching probes (Queriers on the keyexprs `send`/`fetch` query) on
+# first await of the server, reusing the shared `_ClientWire` machinery (service.jl).
+# Probe both `send_goal` and `get_result`: `send` retries discovery itself, but
+# `fetch`'s `get_result` is a one-shot get with a long timeout, so awaiting its match
+# is what spares `fetch` from blocking on an unmatched service. A client that never
+# awaits declares no probes.
 function _ensure_action_match!(client::ActionClient)
     ws = @atomic client._match
     ws === nothing || return ws
@@ -90,10 +90,10 @@ end
 """
     action_server_matched(client::ActionClient) -> Bool
 
-True iff the client is routing-matched to an action server right now — its
-`send_goal` *and* `get_result` Queriers both matched the server's queryables (§9).
-That's the guarantee both [`send`](@ref) and [`fetch`](@ref) will reach the server
-immediately rather than block/retry on discovery. The routing-plane signal behind
+True iff the client is routing-matched to an action server right now: its
+`send_goal` and `get_result` Queriers have both matched the server's queryables (§9).
+When true, both [`send`](@ref) and [`fetch`](@ref) reach the server immediately;
+until then they retry on discovery. The routing-plane signal behind
 [`wait_for_action_server`](@ref); lazily declares the probes on first use. `false`
 for a closed client.
 """
@@ -120,7 +120,7 @@ mutable struct ClientGoal{A, G, R, F}
     # framework `get_result` task (started lazily by `fetch` or `feedback`) fills
     # `_outcome` once — `Some(result)` on success, an `Exception` on failure — and
     # notifies `_settled`. `fetch` returns/raises it (idempotent across repeat calls);
-    # `feedback` ends its stream when it fills, so the caller never spawns a fetch.
+    # `feedback` ends its stream when it fills.
     @atomic _outcome::Union{Some{R}, Exception, Nothing}
     const _settled::Threads.Condition
     @atomic _result_started::Bool
@@ -150,10 +150,10 @@ function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     # `<A>_SendGoal_Response{accepted, stamp}`.
     req = _send_goal_request_type(A)(; goal_id = _to_uuid(id), goal = goal)
     # The send_goal queryable can lag the liveliness token a peer discovers it by, so a
-    # one-shot `get` to a not-yet-route-matched queryable returns NO reply — which must
-    # not be read as a reject. Retry on an empty result until a reply arrives (then it is
-    # authoritative) or the window elapses (no server ⇒ rejected). A retried `get`
-    # re-sends only when no reply came back — i.e. the server never received it.
+    # one-shot `get` to a not-yet-route-matched queryable returns no reply — an empty
+    # result here means undiscovered, not rejected. Retry until a reply arrives (then it
+    # is authoritative) or the window elapses (no server ⇒ rejected); a retried `get`
+    # only re-fires while the route stays empty.
     accepted = false
     got_reply = false
     for _ in 1:40                                          # up to ~2s of 50ms backoffs
@@ -193,8 +193,8 @@ function feedback(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     end
     g._feedback_sub = sub
     # The framework drives `get_result` (the single settlement signal), so the stream
-    # ends on settle without the caller spawning a fetch. The closer waits on the
-    # result slot — no polling — then tears the subscription down.
+    # ends on settle even without a `fetch` call. The closer blocks on the result slot,
+    # then tears the subscription down.
     _ensure_result!(g)
     errormonitor(Threads.@spawn begin
         try
@@ -240,10 +240,10 @@ function _drive_result!(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
 end
 
 # One `get_result` round-trip → the `Result`, or throws. Like `send_goal`, the
-# queryable can lag discovery — a one-shot get to an unmatched queryable returns NO
-# reply — so retry until a reply lands (mirroring `send`). Once matched the server
-# holds the reply until the goal settles, so the matched attempt blocks (to the
-# timeout) for the real result; retries only re-fire while the route is still empty.
+# queryable can lag discovery, so a get to an unmatched route returns no reply; retry
+# until one lands. Once matched the server holds the reply until the goal settles, so
+# the matched attempt blocks to the timeout for the real result; retries only re-fire
+# while the route is still empty.
 function _get_result_once(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     client = g.client
     ctx = client.node.context

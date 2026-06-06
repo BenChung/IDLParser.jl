@@ -1,7 +1,9 @@
-
+# Abstract syntax tree for OMG IDL, the language ROS 2 interface (.idl/.msg) definitions compile to.
+# https://design.ros2.org/articles/idl_interface_definition.html
 using Moshi.Derive: @derive
 using Moshi.Data: @data
 
+# Constant-expression literals stay untyped until const resolution assigns a TypeSpec.
 const IDLValue = Any
 
 @data ScopedName begin

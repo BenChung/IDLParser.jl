@@ -32,7 +32,7 @@ apply_op(op::Parse.Binop.Type, lhs, rhs) = @match op begin
 
 
 apply_op(op::Parse.Unop.Type, val) = @match op begin
-        Parse.Unop.Plus() => val # ????
+        Parse.Unop.Plus() => val
         Parse.Unop.Neg() => -val
         Parse.Unop.Inv() => ~val
     end
@@ -108,13 +108,11 @@ resolve_constants(definition::Parse.ModuleDecl.Type, local_scope::Scope, file_sc
     end
 end
 
-# Bind a float const at the width its declared type names. A float literal is
-# parsed before its declared type is known, and a suffix-less literal defaults
-# to Float32, so without this a `const double` would bind a Float32 (8-byte wire
-# field carrying a 4-byte value). Coercing makes a `double` bind a Float64 and a
-# `float` a Float32. Integer widths are left to the literal/expression result
-# (their range is already guarded at parse time); non-float and non-`Real`
-# values (string/char/bool/enum ref) pass through untouched.
+# Bind a float const at the width its declared type names: a suffix-less literal
+# parses as Float32, so a `const double` must be widened to Float64 to match its
+# 8-byte wire field. Integer widths come from the literal/expression result
+# (their range is already guarded at parse time); non-`Real` values
+# (string/char/bool/enum ref) pass through.
 _coerce_const(::Parse.TypeSpec.Type, val) = val
 _coerce_const(typ::Parse.TypeSpec.Type, val::Real) = @match typ begin
     Parse.TypeSpec.TFloat(16) => Float16(val)
@@ -125,8 +123,7 @@ end
 
 resolve_constants(definition::Parse.ConstDecl.Type, local_scope::Scope, file_scope::Scope) = @match definition begin
     Parse.ConstDecl.CDecl(typ, name, val) => begin
-        # Coerce against the *parsed* type (a `Parse.TypeSpec`) before lowering it,
-        # since the float-width match keys on `Parse.TypeSpec.TFloat`.
+        # Coerce while `typ` is still a `Parse.TypeSpec`: the float-width match keys on `Parse.TypeSpec.TFloat`.
         val = _coerce_const(typ, resolve_constants(val, local_scope, file_scope))
         typ = resolve_constants(typ, local_scope, file_scope)
         local_scope.bindings[name] = val
@@ -134,9 +131,9 @@ resolve_constants(definition::Parse.ConstDecl.Type, local_scope::Scope, file_sco
     end
 end
 
-require_positive_int(val::Nothing) = val # allow nothings
-require_positive_int(val::Integer) = val < 0 ? error("$val must be a positive integer!") : val
-require_positive_int(val) = error("$val must be a positive integer!")
+require_positive_int(val::Nothing) = val # unbounded length (no upper bound)
+require_positive_int(val::Integer) = val < 0 ? error("$val must be a non-negative integer") : val
+require_positive_int(val) = error("$val must be a non-negative integer")
 
 resolve_constants(::Nothing, local_scope::Scope, file_scope::Scope) = nothing
 resolve_constants(definition::Parse.TypeSpec.Type, local_scope::Scope, file_scope::Scope) = @match definition begin

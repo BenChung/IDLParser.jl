@@ -116,13 +116,16 @@ end
 """
     @ros_msg "path/to/Foo.msg"
 
-Parse a single ROS2 interface file (`.msg`, `.srv`, or `.action`) and splice
+Parse a single ROS 2 interface file (`.msg`, `.srv`, or `.action`) and splice
 the generated Julia types into the current module at macro-expansion time.
-The package is inferred from the path layout — the directory containing
+The package is inferred from the path layout: the directory containing
 `msg`/`srv`/`action` is the package.
 
-Relative paths resolve against the source file containing the macro call.
-The file is registered as a precompile dependency.
+Relative paths resolve against the source file containing the macro call, and
+the file is registered as a precompile dependency.
+
+See the ROS 2 interface definition concept:
+<https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html>.
 """
 macro ros_msg(path)
     # `esc` so the generated `module` blocks land in the caller's namespace

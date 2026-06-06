@@ -8,13 +8,10 @@
 # version tag. This file owns the entry *shape* (`RegistryEntry`), the acquisition
 # front-ends, the content-addressed on-disk cache, and `export_typesupport`.
 #
-# Runtime codegen runs the existing macro pipeline programmatically:
-#   lift → lower → resolve_constants → generate_code → eval into a fresh module.
-# Because a dynamic type is born at runtime (a newer world age than the compiled
-# dispatcher), its decode/handler calls cross the boundary via `invokelatest` — the
-# "static is fast, dynamic is correct-but-boxed" line. The programmatic eval entry
-# is the one piece that genuinely depends on a clean codegen module target; where it
-# isn't fully wired it is marked `# TODO(§11):` and does not break precompilation.
+# Runtime codegen runs the macro pipeline programmatically:
+#   lower → resolve_constants → generate_code → eval into a fresh module.
+# A dynamic type is born in a newer world age than the compiled dispatcher, so its
+# decode/handler calls cross that boundary via `invokelatest`.
 
 using ROSMessages: ROSMessages, IL, lift, lower, message_il,
                    TypeDescription, TypeDescriptionMsg, FieldDescription,
@@ -45,14 +42,15 @@ export TypeRegistry, RegistryEntry, register_type!, lookup_type,
     RegistryEntry
 
 A single type registry record (§11). Keyed in the [`TypeRegistry`](@ref) by
-`(type_name, RIHS01-hash)`. Carries:
+`(type_name, RIHS01-hash)`. ROS 2 interface/type-description concepts:
+<https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html>. Carries:
 
 - `info` — the `TypeInfo` (qualified name + hash) this entry answers for.
 - `il` — the `ROSMessages.IL` (`RMessage`/`RService`/`RAction`), the hub form
   every consumer reads from.
 - `td` — the wire `TypeDescriptionMsg` (main + referenced closure), the source of
   truth for persistence and the type-description service; `nothing` for a
-  statically-acquired type that never carried one.
+  statically-acquired type, which has no wire description.
 - `provenance` — `:static` / `:ament` / `:wire` / `:cache`, where the type came
   from (orthogonal to how it is used).
 - `mod` — the generated `Module` once codegen has run (lazy; `nothing` until
@@ -112,11 +110,10 @@ end
 # `lower` yields a loosely-typed `Vector{Any}`; `resolve_constants` dispatches on
 # `Vector{<:Parse.CanAnnotate{Parse.Decl}}`, so we retype into `Parse.Decl[]` (what
 # the `@ros_msgs` macro feeds it) before the call.
-# `emit_imports=true` makes the generated package modules carry an inline
-# `import StaticArrays, CDRSerialization` — needed only for the `:julia` *textual*
-# export (where the source is reparsed and the spliced module objects degrade to
-# bare names). Eval paths leave it false: the live module-object splices resolve
-# without the imports, so neither is a required dep of the eval site.
+# `emit_imports=true` adds an inline `import StaticArrays, CDRSerialization` to the
+# generated package modules, required by the `:julia` textual export: reparsing the
+# source degrades the spliced module objects to bare names. Eval paths splice live
+# module objects, which resolve without the imports.
 function _generate_exprs(il, package::AbstractString; emit_imports::Bool=false)
     decls = IDLParser.Parse.Decl[]
     append!(decls, lower(il; package=package))
@@ -124,18 +121,14 @@ function _generate_exprs(il, package::AbstractString; emit_imports::Bool=false)
     return IDLParser.Generation.generate_code(resolved; emit_imports=emit_imports)
 end
 
-# Eval an interface's generated code into a fresh module and return that module.
-# Generated code is now import-free — it splices the `StaticArrays`/`CDRSerialization`
-# module objects directly (gen.jl), so it resolves them regardless of the eval
-# target's project deps. We still root the gensym'd target under `CDRSerialization`:
-# it's a stable, always-loaded host, and the module is gensym-named so it can't clash
-# with a static include.
+# Eval an interface's generated code into a fresh module and return it. Generated
+# code splices the `StaticArrays`/`CDRSerialization` module objects directly, so it
+# resolves them regardless of the eval target's deps. The gensym'd target is rooted
+# under `CDRSerialization` (a stable, always-loaded host); its gensym name keeps it
+# from clashing with a static include.
 #
-# TODO(§11): rooting under CDRSerialization means dynamic types accumulate as
-# hidden submodules there rather than under ROSNode. Acceptable (they're
-# gensym-isolated and reached via invokelatest), but a dedicated runtime-codegen
-# root module would localize them — and is now unconstrained by imports, so it can
-# live anywhere. Pin once the codegen entry exposes an explicit target-module param.
+# TODO: dynamic types accumulate as hidden submodules of CDRSerialization rather
+# than ROSNode. A dedicated runtime-codegen root module would localize them.
 function _eval_module(il, package::AbstractString)
     name = gensym(isempty(package) ? :ros_dynamic : Symbol(package))
     target = Core.eval(CDRSerialization, :(module $name end))
@@ -181,19 +174,15 @@ newer world age than the compiled dispatcher, §11).
 
 A codegen/eval failure is logged and leaves the entry unrealized (`mod`/`type`
 stay `nothing`) so a single bad type can't abort discovery; the subscription path
-then falls back to raw bytes for that topic (DESIGN §until-ready).
+then falls back to raw bytes for that topic.
 """
-# Serializes the codegen+register critical section across concurrent first-uses.
 const _REALIZE_LOCK = ReentrantLock()
 
 function realize!(entry::RegistryEntry)
     entry.mod === nothing || return entry
-    # Serialize codegen+register: the dynamic worker and the Tier-1 manifest warm can
-    # both reach a fresh entry's first use concurrently — without this they each eval a
-    # gensym module for the same type (wasteful, two evals of the "same" code). The
-    # critical section runs no user handler code (codegen + binding reads only), so it
-    # is deadlock-free to hold across. Re-check under the lock so the second caller
-    # reuses the first's result.
+    # Serialize codegen so concurrent first-uses share one eval instead of each
+    # building a gensym module for the same type. The section runs only codegen and
+    # binding reads (no user handler code), so holding it across is deadlock-free.
     @lock _REALIZE_LOCK begin
         entry.mod === nothing || return entry
         package, _, _ = split_ros_name(entry.info.name)
@@ -206,7 +195,7 @@ function _realize_locked!(entry::RegistryEntry, package::AbstractString)
         mod = _eval_module(entry.il, package)
         entry.mod = mod
         # A message has one umbrella struct to bind as `entry.type`; a service /
-        # action has *sections* (`Foo_Request`/`Foo_Goal`/…) and no umbrella type,
+        # action has sections (`Foo_Request`/`Foo_Goal`/…) and no umbrella type,
         # so leave `entry.type === nothing` and let the service/action layer fetch
         # its sections from `entry.mod` (no warning — that's the expected shape).
         if entry.il isa IL.RMessage
@@ -215,7 +204,7 @@ function _realize_locked!(entry::RegistryEntry, package::AbstractString)
                 @warn "typesupport: codegen produced no type for $(entry.info.name); \
                        delivered raw bytes for this topic"
             else
-                _record_type_entry!(entry)     # type → entry, so type_info_of recovers the real hash
+                _record_type_entry!(entry)     # map type → entry so type_info_of recovers the hash
             end
         end
     catch err

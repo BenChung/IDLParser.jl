@@ -50,6 +50,10 @@ filter by the owning node's name/namespace. A `nothing` filter is a wildcard.
 Self entities are authoritative (injected immediately on construction); remotes
 are eventually-consistent via liveliness — which is why [`wait_for_service`](@ref)
 exists.
+
+The primary entry into the ROS graph as this stack sees it; for the ROS 2
+discovery model see
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Discovery.html.
 """
 function endpoints(node_or_ctx; topic::Union{AbstractString, Nothing}=nothing,
                    kind::Union{EndpointKind, Nothing}=nothing,
@@ -125,7 +129,7 @@ function node_names(node_or_ctx)
     seen = Set{Tuple{String, String}}()
     out = NodeInfo[]
     for e in endpoints_snapshot(ctx)
-        isempty(e.node_name) && continue              # no node identity on this token
+        isempty(e.node_name) && continue
         key = (e.namespace, e.node_name)
         key in seen && continue
         push!(seen, key)
@@ -362,8 +366,8 @@ end
 _Detectors() = _Detectors(ReentrantLock(), Any[], Any[], Dict{Any, Float64}(),
                           false, 5.0)
 
-# One detector-state per Context, keyed weakly by the Context's graph identity so
-# we don't extend the Context struct. `objectid` of the GraphIndex is stable.
+# One detector-state per Context, keyed by `objectid(ctx.graph)` so we don't extend
+# the Context struct. The GraphIndex object's identity is stable for its lifetime.
 const _DETECTORS = Dict{UInt, _Detectors}()
 const _DETECTORS_LOCK = ReentrantLock()
 
@@ -436,9 +440,9 @@ end
 # `qos_compatible(requested, offered)` (ROSZenoh) returns the violations.
 function _check_qos_incompat(d::_Detectors, local_e::EndpointInfo, remote::EndpointInfo)
     requested, offered = if local_e.kind === Subscription || local_e.kind === Client
-        (local_e.qos, remote.qos)          # we request, they offer
+        (local_e.qos, remote.qos)
     else
-        (remote.qos, local_e.qos)          # they request, we offer
+        (remote.qos, local_e.qos)
     end
     issues = qos_compatible(requested, offered)
     isempty(issues) && return nothing
@@ -669,9 +673,8 @@ from that `gid`, fire the `on_message_lost` listeners and return the `MessageLos
 Returns `nothing` when in-order (or the very first message from a gid, or the
 attachment is absent). The subscription dispatch path calls this per sample.
 """
-# Called from the subscription consumer/receiver per received sample, but only when an
-# `on_message_lost` listener is registered (node.jl gates on `Entity._track_lost`), so
-# the common no-listener path never decodes the attachment.
+# node.jl gates this call on `Entity._track_lost`, so the common no-listener path
+# never decodes the attachment.
 function note_sequence!(sub, sample)
     e = _client_entity(sub)
     seq, _, srcgid = try

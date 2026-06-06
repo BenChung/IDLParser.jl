@@ -84,9 +84,12 @@ end
     encode_attachment(seq, ts, gid::NTuple{16,UInt8}) -> ZBytes
 
 Serialize the `(sequence_number, source_timestamp, source_gid)` attachment into a
-payload for `put`/`reply`. `seq` and `ts` are coerced to `Int64`; `gid` is the
-fixed-width `NTuple{16,UInt8}`, emitted as a length-prefixed `[u8;16]` to match
-zenoh-ext's fixed-array encoding (the VarInt(16) prefix — see file header).
+payload for `put`/`reply`. This is rmw_zenoh's per-sample metadata; matching its
+wire format byte-for-byte is what lets a Julia peer interop with C++/Rust rmw_zenoh
+nodes (see [RMW / middleware vendors](https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Different-Middleware-Vendors.html)).
+`seq` and `ts` are coerced to `Int64`; `gid` is the fixed-width `NTuple{16,UInt8}`,
+emitted as a length-prefixed `[u8;16]` to match zenoh-ext's fixed-array encoding
+(the VarInt(16) prefix — see file header).
 """
 encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8}) =
     Zenoh.serialize((Int64(seq), Int64(ts), collect(gid)))

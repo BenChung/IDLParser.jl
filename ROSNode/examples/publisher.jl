@@ -28,4 +28,4 @@ using ROSNode
         @info "published" msg.data
         sleep(1.0)
     end
-end  # ctx drains: undeclares the publisher, closes the node and session.
+end

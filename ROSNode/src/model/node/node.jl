@@ -1,15 +1,15 @@
 # §6 Nodes & entities + §4 runtime. A `Node(ctx, "name"; namespace)` inherits the
 # Context's shared state, materializes a `ROSZenoh.NodeEntity`, and declares its
 # node liveliness token. Entities (pub/sub/service/client) are created with
-# *type-constructors, not `open`* (the `Timer(f,…)` precedent, §6): a registered
+# type-constructors following the `Timer(f,…)` precedent (§6): a registered
 # callback that lives until `close` and dies with the node. This file owns the
 # Node type and the generic close-able `Entity` base the §6 pattern files plug
 # into, plus the §4 subscription dispatch runtime.
 #
-# Naming: `Publisher`/`Subscription`/`Service`/`Client` are the `EndpointKind`
-# *enum instances* re-exported by core.jl — the pattern layer (separate files)
-# owns the user-facing constructors of the same spelling. This file stays kind-
-# agnostic: it takes an `EndpointKind` tag and builds the wire entity from it.
+# Naming: `Publisher`/`Subscription`/`Service`/`Client` here are the `EndpointKind`
+# enum instances re-exported by core.jl; the pattern layer (separate files) owns the
+# user-facing constructors of the same spelling. This file stays kind-agnostic: it
+# takes an `EndpointKind` tag and builds the wire entity from it.
 
 using Zenoh: Zenoh, Keyexpr, Publisher as ZPublisher, SubscriberHandler,
              LivelinessToken, Sample, AbstractSample, SampleHolder, recv!,
@@ -22,10 +22,9 @@ using ROSZenoh: ROSZenoh, NodeEntity, EndpointEntity, EndpointKind, QosProfile,
                 TypeInfo, TypeHash, default_qos, liveliness_keyexpr, topic_keyexpr,
                 parse_topic_keyexpr, entity_gid, to_rihs_string,
                 RmwZenoh, KeyExprFormat
-# `Subscription`/`Publisher` are the `EndpointKind` enum instances: `Subscription`
-# is reused as the node-presence shell's kind tag and the dynamic-sub graph match;
-# the pub/sub/service/client *constructors* of the same spelling are the §6 pattern
-# layer's, plugging into this file's `make_entity`.
+# `Subscription` here doubles as the node-presence shell's kind tag and the
+# dynamic-sub graph match; the same-spelled §6 pattern-layer constructors plug into
+# this file's `make_entity`.
 using ROSZenoh: Subscription, Publisher
 
 export Node, Entity, dispose
@@ -40,10 +39,11 @@ export Node, Entity, dispose
 """
     Node(ctx, name; namespace=nothing, enclave=nothing)
 
-A ROS2 node sharing Context `ctx`'s session (§6). `name` is the bare node name;
-`namespace` defaults to the Context's (FQN = `namespace`/`name`). Constructing a
-Node allocates an entity id, builds a `ROSZenoh.NodeEntity`, and declares the
-node liveliness token so peers discover it.
+A ROS 2 node sharing Context `ctx`'s session (§6); see
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Nodes.html. `name` is the
+bare node name; `namespace` defaults to the Context's (FQN = `namespace`/`name`).
+Constructing a Node allocates an entity id, builds a `ROSZenoh.NodeEntity`, and
+declares the node liveliness token so peers discover it.
 
 Entities (publishers, subscriptions, services, …) are created against the node
 with type-constructors and tracked here: `close(node)` undeclares its token and
@@ -75,8 +75,8 @@ mutable struct Node
     _logger::Any                         # the default node `RosoutLogger`
     const _log_levels::Dict{String, Int32}  # §7 per-logger-name min levels (LogLevel.level)
     # §10 parameters: a `ParameterServer{P}` when the node is built via the schema
-    # form `Node(ctx, name, P)`, else `nothing`. Reached as `node.parameters` (a
-    # plain field — no custom `getproperty`, so atomic `open` reads stay direct).
+    # form `Node(ctx, name, P)`, else `nothing`. A plain field, so `node.parameters`
+    # and atomic `open` reads go through Julia's default `getproperty`.
     parameters::Any
     # Default warm-up policy (§D8) for entities on this node; an entity ctor's own
     # `warmup`/`warmup_sync` kwargs override per-endpoint.
@@ -126,11 +126,11 @@ function Node(ctx::Context, name::AbstractString;
     return node
 end
 
-# The graph index keys on `EndpointInfo`, but a node token (`NN`) carries no
-# endpoint — the wire side skips it (`_ingest_liveliness!` ignores `NodeEntity`).
-# So our own node's presence is injected as a topic-less endpoint shell carrying
-# just the node identity; `node_names` (§12) recovers (name, namespace) from it,
-# and the kind is immaterial there (we use `Subscription` as an arbitrary tag).
+# The graph index keys on `EndpointInfo`, and a node token (`NN`) carries no
+# endpoint (the wire side's `_ingest_liveliness!` skips `NodeEntity`). Our own
+# node's presence is therefore a topic-less endpoint shell carrying just the node
+# identity; `node_names` (§12) recovers (name, namespace) from it, with the kind
+# immaterial (`Subscription` is an arbitrary tag).
 _node_endpoint(ent::NodeEntity) =
     EndpointEntity(; id=ent.id, node=ent, kind=Subscription, topic="",
                    type_info=nothing, qos=default_qos())
@@ -153,14 +153,13 @@ context(node::Node) = node.context
 Undeclare everything the node owns (§6/§14): close each entity in reverse
 creation order, withdraw the node liveliness token, and drop the node from the
 discovery index. Idempotent — a second close is a no-op. Entity `close` failures
-are logged so one can't abort the rest of the teardown.
+are logged and teardown continues to the remaining entities.
 """
 function Base.close(node::Node)
     (@atomicswap node.open = false) || return nothing
-    # §7: leave the Context's sim-time set (idempotent — a no-op if this node never opted
-    # in; tears down the `/clock` source if it was the last user). Done *after* marking the
-    # node closed so the deactivation jump is skipped for it (`_fire_jumps_to!` guards on
-    # `isopen`) — close shouldn't deliver callbacks.
+    # §7: leave the Context's sim-time set (idempotent; tears down the `/clock` source
+    # if this was the last user). Runs after marking the node closed so `_fire_jumps_to!`
+    # (which guards on `isopen`) skips the deactivation jump — close delivers no callbacks.
     try
         set_use_sim_time!(node.context, node, false)
     catch err
@@ -190,8 +189,8 @@ function Base.close(node::Node)
 end
 
 # ── concurrency policy (§4, D2/D3) ────────────────────────────────────────────
-# The `Concurrency` type (core.jl) selects the dispatch strategy. A *scheduler* is
-# a `thunk -> nothing` closure built once per subscription that decides *where* the
+# The `Concurrency` type (core.jl) selects the dispatch strategy. A scheduler is a
+# `thunk -> nothing` closure built once per subscription that decides where the
 # per-sample work runs: `Serial()` runs it inline on the (sticky) consumer task —
 # single OS thread, order preserved, no user-side locks; `Parallel(n)` runs it on
 # an OS thread bounded to `n` in flight by a semaphore (the Zenoh FIFO buffers

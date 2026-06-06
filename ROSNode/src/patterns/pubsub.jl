@@ -25,9 +25,10 @@ export Publisher, Subscription, publish
 """
     PublisherHandle{T}
 
-A publisher for message type `T` on a topic (§6). Wraps the generic [`Entity`](@ref)
-(id, liveliness token, Zenoh `Publisher` route) and owns the monotone attachment
-sequence counter (§3.4). `close`-able; dies with its node.
+A publisher for message type `T` on a topic ([ROS 2 topics](https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html), §6).
+Wraps the generic [`Entity`](@ref) (id, liveliness token, Zenoh `Publisher` route)
+and owns the monotone attachment sequence counter (§3.4). `close`-able; dies with
+its node.
 
 Constructed via the `Publisher(node, topic, T)` spelling — see [`Publisher`](@ref).
 """
@@ -76,8 +77,9 @@ carries the per-message attachment `(sequence_number, source_timestamp,
 source_gid)` (§3.4): the sequence increments per publisher, the timestamp is
 publish-time wall ns (distinct from `header.stamp`, §7), the gid is the entity's.
 
-A publish on a closed publisher (or closed node) is a no-op, as is a publish while
-the node is gated inactive (§14.2 lifecycle gate) — a managed publisher drops.
+Publishing returns immediately as a no-op in three cases: the publisher is closed,
+its node is closed, or the node is gated inactive (§14.2 lifecycle gate — a managed
+publisher drops the message).
 """
 function publish(pub::PublisherHandle{T}, msg::T) where {T}
     e = pub.entity
@@ -88,14 +90,13 @@ function publish(pub::PublisherHandle{T}, msg::T) where {T}
     seq = (@atomic pub.seq += 1)
     ts = nanoseconds(Dates.now(e.node, System()))   # publish-time wall ns (§3.4)
     attach = encode_attachment(seq, ts, gid(e))
-    # §D8 :execute warm-up null-routes the wire op: everything above still compiles
-    # and runs (in-memory, harmless), only the actual `put` is skipped. The hot path
-    # reads the scoped value alone (not the full `is_warming()`) — `publish` never
-    # runs during package precompilation, so the `jl_generating_output` ccall is
-    # unneeded here.
+    # §D8 :execute warm-up compiles and runs the encode/attach path in-memory but
+    # skips the wire `put`. The hot path reads only the scoped value: `publish` never
+    # runs during package precompilation, so the `jl_generating_output` check in
+    # `is_warming()` is unneeded here.
     _WARMUP[] && return nothing
     deliver_local(pub, msg)                           # §15.1: hand to same-Context subs directly (no-op when disabled)
-    put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced); remote subs (local loopback suppressed)
+    put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced route)
     return nothing
 end
 
@@ -121,10 +122,10 @@ entity(pub::PublisherHandle) = pub.entity
 """
     SubscriptionHandle{T}
 
-A subscription for message type `T` on a topic (§6). Wraps the generic
-[`Entity`](@ref), whose consumer task (started by `declare_subscription!`, §4)
-decodes each sample and runs the stored handler per the `concurrency` policy.
-`close`-able; dies with its node.
+A subscription for message type `T` on a topic ([ROS 2 topics](https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html), §6).
+Wraps the generic [`Entity`](@ref), whose consumer task (started by
+`declare_subscription!`, §4) decodes each sample and runs the stored handler per
+the `concurrency` policy. `close`-able; dies with its node.
 
 Constructed via the `Subscription(node, topic, T) do msg … end` spelling — see
 [`Subscription`](@ref).
@@ -147,17 +148,17 @@ form chosen by `view` (a [`ViewMode`](@ref)):
     handler's duration, §3.2; `collect`/`decode_owned` to keep it), with a runtime
     guard so a view that escapes the handler throws `BorrowError` instead of
     reading freed memory.
-  - `Unchecked()` — the same zero-copy view with the guard removed: zero-copy and
-    zero-allocation, but an escaping view is undefined behaviour. Validate under
+  - `Unchecked()` — the same zero-copy view, unguarded: zero-copy and
+    zero-allocation; an escaping view is undefined behaviour. Validate under
     `Checked()`, then switch.
 
 `view=true`/`view=false` are accepted as shorthand for `Checked()`/`Owned()`.
 
-`match=:weak` opts into a *weak-static* subscription: it still declares type `T`
-(advertised in the graph) but wildcard-matches the topic, so an off-type sample
-reaches a per-sample backstop — a wire type/version ≠ `T` fires `on_type_mismatch`
-(§12.2) and is dropped instead of decoded. The default `:exact` matches only `T`'s
-keyexpr (the wire can't even deliver a wrong type to it).
+`match=:weak` opts into a *weak-static* subscription: it declares type `T` in the
+graph and wildcard-matches the topic, so an off-type sample reaches a per-sample
+backstop — a wire type/version other than `T` fires `on_type_mismatch` (§12.2) and
+the sample is dropped. The default `:exact` matches only `T`'s keyexpr, so the wire
+delivers only matching-type samples.
 
 `concurrency` is `Serial()` (one handler at a time on a single sticky thread,
 order preserved, no user-side locks needed — the default, D3) or `Parallel(n)`
@@ -203,11 +204,11 @@ Base.show(io::IO, sub::SubscriptionHandle{T}) where {T} =
 entity(sub::SubscriptionHandle) = sub.entity
 
 # ── DynamicSubscription (§11/D5 S5): the keyexpr-only variant ──────────────────
-# A subscription created *without* a compile-time type. It wildcards the data route
-# (so samples of any type on the topic arrive), and resolves each sample's type at
-# runtime via §11 discovery, decoding + dispatching through `invokelatest`. The
-# user observes the real typed `msg`, learns what to write, then graduates to the
-# static `Subscription(node, topic, T)` for the min-copy fast path (D5's point).
+# A subscription with a runtime-resolved message type. It wildcards the data route
+# so samples of any type on the topic arrive, resolves each sample's type at runtime
+# via §11 discovery, and decodes + dispatches through `invokelatest`. The user
+# observes the real typed `msg`, learns what to write, then graduates to the static
+# `Subscription(node, topic, T)` for the min-copy fast path (D5's point).
 
 """
     DynamicSubscriptionHandle
@@ -216,7 +217,7 @@ A keyexpr-only subscription (§11/D5): no compile-time message type — the data
 is wildcarded and each sample's type is resolved at runtime (registry → cache →
 ament → wire `GetTypeDescription`). Wraps the generic [`Entity`](@ref); `close`-able
 and dies with its node. Constructed via the type-less
-`Subscription(node, topic) do msg … end` spelling. Owned-only (no `view`).
+`Subscription(node, topic) do msg … end` spelling.
 """
 mutable struct DynamicSubscriptionHandle
     const entity::Entity
@@ -245,12 +246,11 @@ function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     concurrency::Concurrency=Serial(),
                                     warmup::Union{Symbol, Nothing}=nothing,
                                     warmup_sync::Union{Bool, Nothing}=nothing)
-    # NB: no codegen on this (the caller's) task. Per-sample `realize!` runs on the
+    # Trap: keep codegen off the caller's task. Per-sample `realize!` runs on the
     # dispatch *worker* (node.jl), off the recv thread and while the receiver drains
-    # the FIFO GC-safe, so the codegen's GC always completes. Running `Core.eval`
-    # codegen here instead — while the node already has live Zenoh sessions (its own
-    # `get_type_description` queryable, liveliness traffic) — is the JIT-racing-Zenoh
-    # GC stall the worker design exists to avoid (§11/D8).
+    # the FIFO GC-safe, so the codegen's GC always completes. `Core.eval` codegen on
+    # this task — with the node's Zenoh sessions live (its `get_type_description`
+    # queryable, liveliness traffic) — stalls on a JIT-vs-Zenoh GC race (§11/D8).
     name = resolve_name(node, topic)
     # No type identity: liveliness advertises the empty-type placeholder and the
     # data route wildcards type+hash (the type rides each sample's keyexpr, §11).

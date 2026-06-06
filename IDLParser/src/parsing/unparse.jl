@@ -1,5 +1,16 @@
 using Moshi.Match: @match
 
+"""
+    unparse(node) -> String
+
+Render a parsed IDL AST node back to OMG IDL source text, the inverse of the
+parser. The method family below emits the syntax for each node kind (literals,
+scoped names, expressions, type specifications, declarators, and
+type/const/module declarations), so a parse then unparse cycle round-trips.
+
+The IDL subset modeled here is ROS 2's interface definition language; see
+https://design.ros2.org/articles/idl_interface_definition.html.
+"""
 unparse(node) = sprint(io -> unparse(io, node))
 
 const _STRING_ESCAPES = Dict{Char, String}(
@@ -148,9 +159,7 @@ unparse(io::IO, decl::Declarator.Type, indent::Int=0) = @match decl begin
     Declarator.DIdent(name) => print(io, name)
 end
 
-# Plain strings as the wrapped subject of an Annotation are used in tests
-# (chunk 1 doesn't unparse Decls yet); chunk 2's Decl methods don't conflict
-# with this since Decls aren't AbstractStrings.
+# An annotation's wrapped subject may be a bare string.
 unparse(io::IO, s::AbstractString, indent::Int=0) = print(io, s)
 
 unparse(io::IO, ann::Annotated.Type, indent::Int=0) = @match ann begin
@@ -158,7 +167,6 @@ unparse(io::IO, ann::Annotated.Type, indent::Int=0) = @match ann begin
         print(io, '@')
         unparse(io, name)
         if isempty(params)
-            # no parens
         elseif length(params) == 1 && params[1].first === :value
             print(io, '(')
             unparse(io, params[1].second)
@@ -412,9 +420,8 @@ unparse(io::IO, m::ModuleDecl.Type, indent::Int=0) = @match m begin
     end
 end
 
-# Top-level entry for a parsed `specification` — every definition gets a
-# trailing `;` (per the `definition` rule), one per line. Accepts AbstractVector
-# because PEG.jl hands back `Vector{Any}` rather than a typed decl vector.
+# Top-level entry for a parsed `specification`. Accepts AbstractVector because
+# PEG.jl hands back `Vector{Any}` rather than a typed decl vector.
 function unparse(io::IO, decls::AbstractVector, indent::Int=0)
     pad = _pad(indent)
     for d in decls

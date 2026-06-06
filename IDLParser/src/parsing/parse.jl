@@ -1,3 +1,9 @@
+"""
+PEG.jl grammar for OMG IDL v4, parsing ROS 2 interface text (`.idl`, plus the `.msg`/`.srv`/`.action` forms compiled to IDL) into typed AST nodes.
+
+See the IDL interface definition design: https://design.ros2.org/articles/idl_interface_definition.html
+"""
+
 using PEG
 
 include_rgx = r"#include(?|<([^>\"]+)>|\"([^>\"]+)\")"
@@ -13,9 +19,8 @@ function preprocessor(idl, include_resolver=resolve_file)
         r"(//[^\n\r]*)(\r{0,1}\n)" => s"\2",
         r"/\*.*?\*/"s => m -> "\n"^count(==('\n'), m))
     resolve_includes = replace(no_comments, include_rgx => inc -> include_resolver(inc, idl -> preprocessor(idl, include_resolver)))
-    # Drop any remaining `#`-directives (e.g. `#pragma`). IDL doesn't define
-    # semantics for these, but they appear in real-world IDL files (often
-    # emitted by ROS / DDS tooling), so silently ignore rather than fail.
+    # Drop remaining `#`-directives (e.g. `#pragma`): ROS/DDS tooling emits them
+    # but IDL gives them no semantics, so ignoring them keeps real files parseable.
     no_directives = replace(resolve_includes, r"#[^\n\r]*" => "")
     return no_directives
 end
@@ -31,10 +36,9 @@ function open_idl(file)
     end
 end
 
-# Rule names that name a terminal-ish category the user might recognize
-# (identifier, string_literal, ...). Wrapper/structural rules (definition,
-# annotated_definition, struct_dcl wrapping struct_def + struct_forward_dcl)
-# are noise next to the literal keyword they expand to, so they are dropped.
+# Rule names worth surfacing in a parse error: terminal-ish categories the user
+# recognizes (identifier, string_literal, ...). Structural wrapper rules expand
+# to a literal keyword that is shown instead, so listing them would be noise.
 const _DISPLAYABLE_RULES = Set([
     "identifier", "scoped_name",
     "string_literal", "character_literal", "wide_string_literal", "wide_character_literal",
@@ -59,9 +63,9 @@ end
 """
     format_parse_error(msg::AbstractString) -> String
 
-Rewrite a PEG.jl `Meta.ParseError` message: dedupe the "expected one of"
-list, extract keyword/punctuation literals out of raw regex strings, and
-drop noisy wrapper rule names.
+Rewrite a PEG.jl `Meta.ParseError` into a reader-friendly "expected one of"
+list: dedupe candidates, lift keyword/punctuation literals out of the raw
+regex strings PEG.jl prints, and keep only the recognizable rule names.
 """
 function format_parse_error(msg::AbstractString)
     m = match(r"^(.*?expected one of the following: )(.+?)\n?$"s, msg)

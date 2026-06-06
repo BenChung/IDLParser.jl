@@ -1,35 +1,22 @@
-# ── dynamic (keyexpr-only) subscription dispatch (§11/D5 S5) ───────────────────
-# A subscription created without a compile-time type. The route is a *wildcard*
-# data keyexpr matching every type on the topic; the type rides in each sample's
-# keyexpr. Per sample we recover `(name, hash)`, resolve_or_discover the real
-# runtime type `T`, then cross the world-age boundary with `invokelatest` for both
-# decode and the handler call (`T` is born at runtime, §11). Owned-only — the
-# min-copy `view` path is the static fast path you graduate to.
+# Type-less subscription dispatch. The route is a wildcard data keyexpr matching
+# every type on the topic; each sample carries its `(name, hash)`, which we resolve
+# to a runtime-born type `T` and cross the world-age boundary with `invokelatest`
+# for decode and handler. Owned-only; the static form takes the min-copy `view` path.
 #
-# Two-stage pipeline (D8 — decouple reception from codegen). The first sight of a
-# type runs `realize!` → `Core.eval` (heavy-allocating codegen that triggers GC).
-# If that ran on the task owning the blocking `z_recv`, the FIFO would stop draining
-# mid-codegen; a libzenohc foreign thread mid-handoff would never reach a Julia
-# safepoint, and the GC the codegen needs could never complete — a hang (the JIT
-# racing Zenoh). So we split:
-#   • a *receiver* task (sticky, owns the recv) does nothing but copy bytes and
-#     enqueue them — it stays parked in the recv and keeps the FIFO drained, so
-#     foreign threads always reach safepoints;
-#   • a *worker* task (a plain `@spawn`) drains the buffer and does resolve →
-#     codegen → dispatch. Its GC can now complete (the receiver is parked in a
-#     GC-safe recv and draining), breaking the deadlock at the source.
-# This holds even single-threaded: Zenoh.jl's FIFO recv is a `@threadcall` (the
-# blocking C recv runs on a libuv pool thread; the Julia task yields), so the worker
-# is scheduled even with `-t1`. While the worker is mid-`Core.eval` (no yield points)
-# the libuv thread keeps draining Zenoh's ring — Zenoh QoS buffers upstream — and
-# Julia resumes the receiver when codegen yields. `-t>=2` just adds true parallelism
-# (worker codegen overlapping reception); it isn't required for correctness.
-# The buffer is sized to the QoS depth: a slow first-sight realize backs samples up
-# to that bound, then the receiver blocks on `put!` (real backpressure upstream),
-# never a silent drop and never a process-wide hang (the recoverable soft-lock).
+# Two tasks, so codegen never deadlocks against the blocking recv:
+#   • receiver (sticky): owns `z_recv`, only copies bytes and enqueues, staying
+#     parked in a GC-safe recv so foreign zenohc threads keep reaching safepoints;
+#   • worker (plain `@spawn`): drains the buffer and does resolve → `realize!`
+#     codegen → dispatch. Its GC completes because the receiver keeps the FIFO
+#     draining.
+# Correct single-threaded: the FIFO recv is a `@threadcall` (blocking C recv on a
+# libuv pool thread; the Julia task yields), so the worker runs even under `-t1`;
+# `-t>=2` adds overlap as an optimization. The buffer is QoS-depth-sized, so a slow
+# first-sight realize backs up to that bound and the receiver blocks on `put!` —
+# upstream backpressure, no drop.
 
-# Strip exactly one leading/trailing slash (mirrors ROSZenoh's topic stripping) so
-# we can match a parsed-keyexpr topic (no slashes) against a graph FQN topic.
+# Strip one leading and trailing slash so a parsed-keyexpr topic (no slashes) can
+# be matched against a graph FQN topic.
 function _strip_one_slash_local(s::AbstractString)
     s = startswith(s, "/") ? SubString(s, nextind(s, 1)) : SubString(s, 1)
     s = endswith(s, "/")   ? SubString(s, 1, prevind(s, lastindex(s))) : s
@@ -50,12 +37,14 @@ _wildcard_data_keyexpr(fmt::KeyExprFormat, ep::EndpointEntity) = topic_keyexpr(f
 """
     declare_subscription!(entity, handler; concurrency=Serial())
 
-The no-`msgtype` method of [`declare_subscription!`](@ref): declare a *type-less*
-(dynamic, §11/D5 S5) subscription route — a FIFO Zenoh subscriber on the wildcard
-data keyexpr (so samples of any type on the topic arrive), plus a consumer that
-per-sample resolves the type and dispatches via `invokelatest`. Contrast the typed
-method `declare_subscription!(entity, msgtype, handler; …)` which decodes a fixed
-`T` directly.
+Declare a type-less (dynamic) subscription route: a FIFO Zenoh subscriber on the
+topic's wildcard data keyexpr, accepting samples of every type published on the
+topic, plus a consumer that resolves each sample's type at runtime and dispatches
+it through `invokelatest`. The typed method `declare_subscription!(entity, msgtype,
+handler; …)` decodes a fixed `T` directly for the min-copy fast path.
+
+ROS 2 topic/subscription model:
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html
 """
 function declare_subscription!(e::Entity, handler;
                                view::Union{Bool, ViewMode}=Owned(),
@@ -71,12 +60,10 @@ function declare_subscription!(e::Entity, handler;
     return e
 end
 
-# A recycle pool of `SampleHolder`s for the dynamic receiver→worker handoff, so we
-# don't allocate one per message. Size = `cap` (buffered) + in-flight decodes + 1
-# (the receiver filling one). `nothing` for `Parallel(Inf)`: unbounded concurrent
-# decodes can't be bounded by a fixed pool, so that mode keeps a fresh holder per
-# message. The finalizer on each holder stays as a shutdown-time backstop — pooled
-# holders are reused, so it ~never fires per message.
+# Recycle pool of `SampleHolder`s for the receiver→worker handoff, avoiding a
+# per-message allocation. Size = `cap` (buffered) + in-flight decodes + 1 (the one
+# the receiver is filling). `Parallel(Inf)` returns `nothing` (unbounded in-flight
+# decodes can't share a fixed pool), so that mode allocates a fresh holder per message.
 function _make_holder_pool(concurrency::Concurrency, cap::Integer)
     concurrency isa Parallel && !isfinite(concurrency.n) && return nothing
     inflight = concurrency isa Parallel ? Int(concurrency.n) : 1
@@ -91,37 +78,28 @@ end
 function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency::Concurrency,
                                  warmup::WarmupPolicy)
     sched = _make_scheduler(concurrency)
-    logged = Set{Tuple{String, TypeHash}}()      # S6: log each discovered type once
+    logged = Set{Tuple{String, TypeHash}}()      # log each discovered type once
     loglk = ReentrantLock()
-    warmed = Set{DataType}()                      # §D8: warm each runtime type once at first sight
-    warmlk = ReentrantLock()                       # §D9: `warmed` is now shared with the Tier-1 replay task
-    # The buffer between the (sticky) Zenoh receiver and the resolve/codegen/dispatch
-    # worker. Bounded to the QoS depth so it mirrors the FIFO's own backpressure: a
-    # slow first-sight realize fills it to `cap`, then the receiver blocks on `put!`
-    # (upstream backpressure), never silently dropping. Closed by the receiver's
-    # `finally` so the worker drains-then-exits on teardown.
+    warmed = Set{DataType}()                      # warm each runtime type once at first sight
+    warmlk = ReentrantLock()                      # guards `warmed`, shared with the manifest-replay task
     cap = _fifo_capacity(e.endpoint.qos)
-    # Carry an *owned* sample (a refcount bump, no payload copy) from receiver to
-    # worker, not a copied byte buffer — the worker decodes by borrowing it. The
-    # owned holder may sit in the buffer / be captured by a Parallel decode thunk
-    # without pinning the ring (recv! moved it out of the ring slot), so D1 holds.
+    # Buffer between receiver and worker, QoS-depth-bounded so a slow first-sight
+    # realize backs up to `cap` and the receiver then blocks on `put!` (upstream
+    # backpressure, no drop). The receiver's `finally` closes it so the worker
+    # drains-then-exits.
+    # Holders carry an owned sample (refcount bump, no payload copy); recv! moves it
+    # out of the ring slot, so a holder sitting in the buffer or captured by a
+    # Parallel decode thunk never pins the ring.
     buf = Channel{SampleHolder}(cap)
-    # Recycle the holders instead of allocating one per message: receiver takes a
-    # free holder, the decode thunk returns it after use. Sized for everything that
-    # can pin a holder at once — `cap` in the buffer + the in-flight decodes + the
-    # one the receiver is filling. `nothing` for `Parallel(Inf)` (unbounded in-flight
-    # can't be pooled → fall back to a fresh holder per message).
     pool = _make_holder_pool(concurrency, cap)
-    # Stage 2 — worker. A plain `@spawn` (NOT sticky): its codegen GC completes while
-    # the receiver sits parked in the (GC-safe, yielding `@threadcall`) recv (D8).
-    # Drains the buffer in order (so `Serial()` order is preserved) via the
-    # world-age trampoline (`_dynamic_worker`), which hoists the `invokelatest`
-    # from per-message to per-type. Runs even under `-t1` — the recv yields, so the
-    # scheduler reaches the worker; `-t>=2` adds true overlap.
+    # Worker: a plain `@spawn` (not sticky) so its codegen GC completes while the
+    # receiver stays parked in the GC-safe recv. Drains the buffer in order via the
+    # world-age trampoline `_dynamic_worker`, which hoists `invokelatest` from
+    # per-message to per-type.
     worker = Threads.@spawn try
-        # D7: node logger installed once for the worker (and inherited by the handler
-        # tasks the scheduler spawns), so a dynamic-sub handler's `@info` routes to
-        # /rosout — without a per-message `with_logger` scope.
+        # Install the node logger once for the worker and the handler tasks the
+        # scheduler spawns, so handler `@info` routes to /rosout without a
+        # per-message `with_logger` scope.
         _with_node_logger(e.node) do
             _dynamic_worker(e, buf, handler, sched, view, pool, logged, loglk, warmed, warmlk, warmup)
         end
@@ -131,13 +109,12 @@ function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency
             @error "dynamic subscription worker task failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
     end
 
-    # Stage 1 — receiver. `recv!`s each sample into a fresh owned `SampleHolder`
-    # (moved out of the ring slot, so the ring isn't pinned — D1) and enqueues it.
-    # No payload copy and no keyexpr String: the holder carries the refcounted
-    # payload *and* keyexpr to the worker, which decodes + resolves the type by
-    # borrowing them. Stays light, so it keeps the
-    # ring drained while the worker codegens (D8). recv! returns nothing on close →
-    # loop ends; `finally` closes the buffer so the worker drains-then-exits.
+    # Receiver. `recv!`s each sample into an owned `SampleHolder` and enqueues it,
+    # with no payload copy and no keyexpr String — the holder carries the refcounted
+    # payload and keyexpr, and the worker decodes and resolves by borrowing them.
+    # Staying light keeps the ring drained while the worker codegens. `recv!` returns
+    # nothing on close, ending the loop; `finally` closes the buffer so the worker
+    # drains-then-exits.
     t = Task() do
         route = e._route::SubscriberHandler
         try
@@ -173,26 +150,22 @@ function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency
     end
     t.sticky = true
     schedule(t)
-    # §D9 — Tier-1 startup warm: replay this node's interaction manifest for this
-    # topic, warming the codecs of types it used on prior runs *before* the first
-    # message arrives (shifting the JIT off the hot path). Runs concurrently with the
-    # receiver/worker; the shared `warmlk`-guarded `warmed` set makes the two paths
-    # idempotent (whichever warms a type first, the other skips it). Skipped when
-    # warm-up is off.
+    # Startup warm: replay this node's interaction manifest for this topic, warming
+    # the codecs of types used on prior runs ahead of the first message to keep the
+    # JIT off the hot path. Concurrent with the receiver/worker; the `warmlk`-guarded
+    # `warmed` set makes whichever path warms a type first win, the other skip it.
     warmup.mode === :off ||
         _spawn_manifest_warm(e, handler, warmed, warmlk, warmup)
-    # `worker` needs no explicit handle: the scheduler roots it while it runs, and the
-    # receiver's `finally close(buf)` (on route close) ends its drain loop cleanly.
+    # `worker` needs no handle: the scheduler roots it while it runs, and the
+    # receiver's `finally close(buf)` ends its drain loop on route close.
     return t
 end
 
-# §D9 — schedule the Tier-1 manifest replay. `sync` runs it inline at construction
-# (hard real-time: first message guaranteed warm); otherwise a plain `Threads.@spawn`
-# (NOT sticky) — in cache-only mode the replay's `resolve_or_discover` may run
-# `realize!`→`Core.eval` codegen, whose GC must complete while the node's other
-# consumers keep safepoints reachable (the JIT-races-Zenoh discipline the dynamic
-# worker also follows, §D8). With `@ros_cache` baked, the resolve is a registry hit
-# and no codegen runs.
+# Schedule the manifest replay. `sync` runs it inline at construction, guaranteeing
+# the first message is warm; otherwise a plain `Threads.@spawn` so its potential
+# `realize!` codegen GC completes while the node's other consumers keep safepoints
+# reachable (same JIT-vs-Zenoh discipline as the dynamic worker). With `@ros_cache`
+# baked, the resolve is a registry hit and no codegen runs.
 function _spawn_manifest_warm(e::Entity, handler, warmed, warmlk, warmup::WarmupPolicy)
     if warmup.sync
         _replay_manifest_warm(e, handler, warmed, warmlk)
@@ -208,17 +181,16 @@ function _spawn_manifest_warm(e::Entity, handler, warmed, warmlk, warmup::Warmup
     nothing
 end
 
-# Resolve + warm each manifest entry for this subscription's topic. `wire=false`: a
-# node coming up must not block on a remote `~/get_type_description` — a genuinely-new
-# type still pays one reactive wire fetch on its first message, by design (§D9). A
-# stale entry whose type no longer resolves (cache evicted, version bump) returns
-# `nothing` and is skipped. Crosses to the runtime-born type's warm anchor via
-# `invokelatest` (newer world age), exactly as the worker does.
+# Resolve and warm each manifest entry for this subscription's topic. `wire=false`
+# keeps a node coming up from blocking on a remote `~/get_type_description`; a
+# genuinely-new type instead pays one reactive wire fetch on its first message. A
+# stale entry (cache evicted, version bump) resolves to `nothing` and is skipped.
+# Crosses to the runtime-born type's warm anchor via `invokelatest`, as the worker does.
 function _replay_manifest_warm(e::Entity, handler, warmed, warmlk)
     for it in load_manifest(e.node.fqn)
         it.role === :subscription || continue
         it.topic == e.endpoint.topic || continue
-        T = _resolve_home(e.node, it.hash)                             # D10B S2: home table first
+        T = _resolve_home(e.node, it.hash)                             # home table first
         T === nothing && (T = resolve_or_discover(e.node, it.name, it.hash; wire=false))
         T === nothing && continue
         isnew = @lock warmlk (T in warmed ? false : (push!(warmed, T); true))
@@ -233,27 +205,22 @@ function _replay_manifest_warm(e::Entity, handler, warmed, warmlk)
     nothing
 end
 
-# World-age trampoline for the dynamic worker. The per-message hot path must NOT
-# cross the world-age boundary (you can't specialize through `invokelatest`), so
-# instead of `invokelatest`-ing every message we hoist the crossing to once per
-# *type*: `_dynamic_worker` runs a flat loop of `invokelatest` entries into
-# `_drain_known`, which dispatches every already-seen type with a plain (cached)
-# dynamic call — no `invokelatest` — and only returns when it meets a *new* type
-# (whose `realize!` may have bumped the world). The outer loop then re-enters in
-# the fresher world. Steady state = one long-lived `_drain_known` whose inner
-# loop never returns ⇒ zero per-message `invokelatest`; the crossing count is
-# ~one per distinct type (+ the once-per-type `_warm_dynamic`).
+# World-age trampoline for the dynamic worker. The per-message hot path can't cross
+# the world-age boundary (you can't specialize through `invokelatest`), so the
+# crossing is hoisted to once per type: `_dynamic_worker` `invokelatest`s into
+# `_drain_known`, which dispatches every already-seen type with a plain cached
+# dynamic call and returns only on a new type (whose `realize!` may have bumped the
+# world). The outer loop re-enters in the fresher world. Steady state is one
+# long-lived `_drain_known` whose inner loop never returns, so crossings run ~once
+# per distinct type.
 #
-# Invariant: a key in `cache` was first seen in a prior incarnation that
-# re-entered past its `realize!` world; worlds are monotonic, so it is ≤ this
-# incarnation's world ⇒ `_run_typed_dynamic{T}` is directly callable. A single
-# worker drains `buf` in order across re-entries, so `Serial` total order holds.
-# `realize!` still runs here (off the receiver) so the FIFO keeps draining (D8).
+# Invariant: a key in `cache` was first seen in a prior incarnation that re-entered
+# past its `realize!` world; worlds are monotonic, so it is ≤ this incarnation's
+# world and `_run_typed_dynamic{T}` is directly callable. A single worker drains
+# `buf` in order across re-entries, so `Serial` total order holds.
 
-# Incarnation counter — bumped once per `_drain_known` entry (i.e. once per
-# re-entry), so ≈ distinct-types + 1, never per message. Observability + a test
-# hook for "steady-state dispatch isn't re-`invokelatest`ing"; the increment is
-# off the per-message path, so it costs nothing hot.
+# Re-entry counter, bumped once per `_drain_known` entry (≈ distinct-types + 1,
+# never per message). A test hook asserting steady-state dispatch stops re-entering.
 const _DYNAMIC_REENTRIES = Threads.Atomic{Int}(0)
 
 # Keyexpr cache key: a hash of the borrowed keyexpr bytes, so the hot path never
@@ -276,10 +243,10 @@ end
         (Ptr{UInt8}, Ptr{UInt8}, Csize_t), ptr, pointer(b), len) == 0)
 end
 
-# D10B S2: resolve a wire hash against the Context's `home` module's baked
-# `__ros_resolve__` table (per-module, deterministic). `nothing` when there is no home,
-# or the home's dependency closure never imported this type — the caller then falls to
-# `resolve_or_discover` (content-canonical / cache / wire / realize-on-miss).
+# Resolve a wire hash against the Context's `home` module's baked `__ros_resolve__`
+# table (per-module, deterministic). Returns `nothing` when there is no home or the
+# home's dependency closure never imported this type, leaving the caller to fall
+# back to `resolve_or_discover`.
 function _resolve_home(node, hash)
     home = _ctx(node).home
     home === nothing && return nothing
@@ -332,8 +299,8 @@ function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
                 pool === nothing || put!(pool, h)              # not dispatched → recycle the holder
                 continue
             end
-            Tnew = _resolve_home(e.node, info.hash)                    # D10B S2: home table first
-            source = :home                                            # a-priori: the Context's `home` module
+            Tnew = _resolve_home(e.node, info.hash)                    # home table first
+            source = :home
             if Tnew === nothing
                 Tnew = resolve_or_discover(e.node, info.name, info.hash)
                 # Tag the resolution source for the hint: a resolved entry's provenance —
@@ -376,19 +343,15 @@ function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
     return :closed
 end
 
-# The new-world worker (reached only via `invokelatest`, since `T` is runtime-born):
-# dispatch the decode+handler per the concurrency policy. Because we are already in
-# the latest world here, the `@spawn` inside `sched` (Parallel) captures it, so the
-# spawned task runs `handler(decode(bytes, T))` natively — the whole hot loop body
-# is compiled new-world code, no further `invokelatest`.
+# Dispatch decode+handler per the concurrency policy. Reached only via
+# `invokelatest` (since `T` is runtime-born), so we are in the latest world: the
+# `@spawn` inside `sched` (Parallel) captures it and the spawned task runs
+# `handler(decode(bytes, T))` as compiled new-world code, no further `invokelatest`.
 function _run_typed_dynamic(::Type{T}, e::Entity, h::SampleHolder,
                             handler, sched, view::ViewMode, pool) where {T}
-    # Dispatch inside the sched thunk, which captures the owned holder `h` — so under
-    # `Parallel` the spawned worker keeps the payload alive while the shared leaf
-    # borrows + decodes it. The thunk returns `h` to the pool when done (after the
-    # deferred decode under Parallel), recycling it for the next receive. The
-    # decode→dispatch itself is the same `_dispatch_decoded` leaf the static consumer
-    # runs — one implementation, no static/dynamic drift.
+    # The sched thunk captures the owned holder `h`, so under `Parallel` the spawned
+    # task keeps the payload alive while the leaf decodes it, then returns `h` to the
+    # pool. `_dispatch_decoded` is the same leaf the static consumer runs.
     sched() do
         try
             _dispatch_decoded(e, h, T, handler, view)
@@ -435,8 +398,8 @@ function _log_discovered_once(e::Entity, info::TypeInfo, source::Symbol, logged,
     graduate = "Subscription(node, \"$(e.endpoint.topic)\", $(bare))"
     rihs = to_rihs_string(info.hash)
     if source === :wire
-        # No local definition — we fetched the TypeDescription from the publisher and
-        # generated the struct at runtime (distinct from resolving a type we already knew).
+        # No local definition: we fetched the TypeDescription from the publisher and
+        # generated the struct at runtime.
         @info "dynamic subscription auto-generated a type over the wire — fetched its \
                definition from the publisher's ~/get_type_description (no local copy); \
                register it (e.g. `@ros_import`) to skip wire discovery, or use the static \

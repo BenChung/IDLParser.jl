@@ -33,7 +33,6 @@ function Base.close(e::Entity)
         e.wire = nothing
     end
 
-    # Withdraw liveliness + drop from the index.
     if e._lv_token !== nothing
         try
             close(e._lv_token)
@@ -51,8 +50,9 @@ end
 """
     dispose(node, entity::Entity)
 
-Close `entity` and remove it from `node`'s tracked set (the explicit early-close
-path, vs. waiting for `close(node)`). A no-op if `entity` isn't owned by `node`.
+Close `entity` and remove it from `node`'s tracked set, releasing it before the
+node itself is closed. `close(node)` tears down any entities still tracked at that
+point. A no-op if `entity` isn't owned by `node`.
 """
 function dispose(node::Node, e::Entity)
     close(e)

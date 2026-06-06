@@ -1,7 +1,7 @@
 # The write-once result cell and fail-safe settlement (§8 services, §9 actions).
 #
-# A client always blocks on the result, so a handler has *no non-terminal exit*:
-# every exit fills the cell exactly once before the task is reaped. This file is
+# A client always blocks on the result, so every handler exit must settle: the
+# cell is filled exactly once before the task is reaped. This file is
 # the mechanism — generic over the handle (Service request / action GoalHandle)
 # and the result type — so both reuse one settlement core. The status tokens
 # (`success`/`failure`, `succeeded`/`canceled`/`aborted`, `feedback`) come from
@@ -19,6 +19,13 @@
 Write-once settlement slot shared by services (§8) and actions (§9). `H` is the
 handle type (a service request or an action `GoalHandle`) carried so the deliver
 closure can reach it; `R` is the user result type.
+
+This is the result-delivery contract behind both layers: a ROS 2 service returns
+exactly one response per request, and a ROS 2 action delivers one final result per
+goal.
+
+- Services: https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html
+- Actions:  https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 
 Filled exactly once: the first terminal write — explicit [`respond!`](@ref), the
 handler's return value, or the fail-safe wrapper — wins and runs `deliver`. The
@@ -106,11 +113,10 @@ end
 Fill the cell *only if still empty*; a no-op (returns `false`) once settled. This
 is the non-authoritative path the framework uses — the return-value fallback and
 the fail-safe wrapper — so a handler that already called [`respond!`](@ref) has
-its return value ignored rather than triggering the double-settle error
-(DESIGN: "ignored, not error").
+its return value ignored rather than triggering the double-settle error.
 
-The empty-check and the write are one atomic section under the lock, so a
-return-value fill and a racing detached `respond!` can't both deliver.
+The empty-check and the write are one atomic section under the lock, so exactly
+one of a return-value fill and a racing detached `respond!` delivers.
 """
 function fill!(cell::ResultCell, status::SettlementStatus, payload)
     is_terminal(status) || return false
@@ -174,7 +180,7 @@ function settle_handler!(cell::ResultCell, body;
     try
         v = body()
         # `respond!` is authoritative: only fill from the return value if the
-        # handler didn't already settle (DESIGN: return value ignored once full).
+        # handler didn't already settle.
         isfilled(cell) || fill!(cell, success_status, v)
     catch e
         if !isfilled(cell)
@@ -244,9 +250,8 @@ seconds: when it returns true the wait is abandoned and `wait_settled` returns
 `false`. Pass `() -> is_shutdown(ctx)` so a drain can't wedge a request task here.
 `Threads.Condition` has no timed wait, so we arm a one-shot `Base.Timer` each
 iteration to re-notify ourselves — that bound also self-heals any missed `notify`.
-A full cell takes precedence over abandonment (matching the old poll, which
-re-checked `filled` before shutdown), so a goal that settles as we drain still
-replies its result.
+A full cell takes precedence over abandonment, so a goal that settles as we
+drain still replies its result.
 """
 function wait_settled(cell::ResultCell, should_abandon; recheck::Real = 0.25)
     isfilled(cell) && return true

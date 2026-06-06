@@ -32,7 +32,7 @@ export QosProfile, TypeInfo, EndpointKind, default_qos,
 
 Raised into every blocked wait (clock sleeps, `call`, `wait_for_service`, graph
 waits, …) when the owning Context drains (§14). Catching it is the cooperative
-signal to unwind — it is not an error, so the drain path logs it as such.
+signal to unwind cleanly, so the drain path logs it as expected shutdown.
 """
 struct ShutdownException <: Exception end
 
@@ -53,11 +53,10 @@ Base.showerror(io::IO, ::Cancelled) =
     print(io, "Cancelled: goal was canceled")
 
 # ── settlement status tokens ─────────────────────────────────────────────
-# The write-once-cell verbs of services (§8) and actions (§9). They are *tags*
-# passed to `respond!`/`fill!` to select an outcome — modeled as singletons of
-# a sealed abstract type (the ClockSource §7 precedent) so dispatch on the
-# token is a compile-time choice and an unknown token is a `MethodError`, not a
-# silently-wrong branch.
+# The write-once-cell verbs of services (§8) and actions (§9): tags passed to
+# `respond!` to select an outcome. Singletons of a sealed abstract type (the
+# ClockSource §7 precedent) make dispatch on the token a compile-time choice, so
+# an unknown token is a `MethodError` rather than a silently-wrong branch.
 #
 #   service:  return resp                  ⇒ success
 #             respond!(req, failure, msg)   ⇒ query error reply (client `call` raises)
@@ -103,19 +102,27 @@ Base.show(io::IO, ::Canceled)  = print(io, "canceled")
 Base.show(io::IO, ::Aborted)   = print(io, "aborted")
 Base.show(io::IO, ::Feedback)  = print(io, "feedback")
 
-# Terminal tokens fill the write-once cell; `feedback` is a stream and never
-# does. Used by §8/§9 settlement to reject a `feedback` where a result is due.
+# Terminal tokens fill the write-once result cell; `feedback` is a stream verb.
+# §8/§9 settlement uses this to reject `feedback` where a result is due.
 is_terminal(::SettlementStatus) = true
 is_terminal(::Feedback)         = false
 
 # ── concurrency policy (§4, D2/D3) ───────────────────────────────────────
 # How an endpoint dispatches its handlers, as a sealed type (the SettlementStatus
-# / ClockSource precedent). **The default is single-threaded cooperative**:
-# `Serial()` runs handlers on one *sticky* task, so they interleave only at yield
-# points and never run simultaneously — node-local handler state needs no
-# locks/atomics (rclcpp single-threaded-executor semantics, D3). A user opts a
-# specific endpoint into OS-thread parallelism with `Parallel(n)`.
+# / ClockSource precedent). The default `Serial()` runs handlers on one sticky
+# task: they interleave only at yield points, so node-local handler state needs no
+# locks/atomics (rclcpp single-threaded-executor semantics). `Parallel(n)` opts a
+# specific endpoint into OS-thread parallelism.
 
+"""
+    Concurrency
+
+Per-endpoint handler-dispatch policy: [`Serial`](@ref) (one sticky cooperative
+task, the default) or [`Parallel`](@ref) (up to `n` handlers on OS threads).
+Mirrors the rclcpp executor choice between single-threaded and multi-threaded
+dispatch; see the ROS 2 executor concepts:
+https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Executors.html
+"""
 abstract type Concurrency end
 
 """
@@ -175,8 +182,8 @@ abstract type ViewMode end
     Owned()
 
 Default delivery: the handler gets a fully-owned message (every field copied out
-of the payload), so it can be stored, forwarded, or spawned with no lifetime
-caveats (§3.1). `view=false` is shorthand for `Owned()`.
+of the payload), free to store, forward, or spawn beyond the handler's return
+(§3.1). `view=false` is shorthand for `Owned()`.
 """
 struct Owned <: ViewMode end
 
@@ -185,11 +192,10 @@ struct Owned <: ViewMode end
 
 Zero-copy delivery with a runtime escape guard: the handler gets a `CDRView`
 aliasing the payload, invalidated the instant it returns, so a `CDRView`/`CDRString`
-that escaped throws `BorrowError` on next access instead of reading freed memory.
-Allocates the guard (not zero-alloc), over the same representation [`Unchecked`](@ref)
-ships — so it validates the exact code you'll run unchecked. `view=true` is
-shorthand for `Checked()`. Run under `Checked()`, confirm no `BorrowError`, then
-switch to `Unchecked()`.
+that escaped throws `BorrowError` on next access. The guard costs one allocation
+and borrows over the same representation [`Unchecked`](@ref) ships, so it validates
+the exact code you'll run unchecked. `view=true` is shorthand for `Checked()`. Run
+under `Checked()`, confirm no `BorrowError`, then switch to `Unchecked()`.
 """
 struct Checked <: ViewMode end
 
@@ -256,11 +262,11 @@ branch is DCE'd and the warm-up compiles the wrong specialization.
 """
     @effectful expr
 
-Run `expr` for its side effects only when *not* warming. While warming
-(`is_warming()`), `expr` is skipped but still **compiled** (the guard is a runtime
-value flag, so its branch codegens). Returns `expr`'s value at runtime, `nothing`
-while warming. For a value the warm-up path itself needs, write
-`is_warming() ? stub : real` directly instead.
+Run `expr` for its side effects on the live path, skipping it while warming
+(`is_warming()`). The skipped branch still **compiles** (the guard is a runtime
+value flag, so its branch codegens), so warm-up exercises the same specialization
+the real run will. Returns `expr`'s value at runtime, `nothing` while warming. For
+a value the warm-up path itself needs, write `is_warming() ? stub : real` directly.
 
     Subscription(node, "/cmd", Twist) do msg
         cmd = plan(msg)                  # compiled either way

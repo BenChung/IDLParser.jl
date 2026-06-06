@@ -23,19 +23,21 @@
     ParameterClient(node, target) -> ParameterClient{Nothing}
     ParameterClient(node, target, ::Type{P}) -> ParameterClient{P}
 
-A client for the parameters of the *remote* node at FQN `target` (e.g.
+A client for the parameters of the remote node at FQN `target` (e.g.
 `"/planner"`), §10. The dual of the local `node.parameters` server: it drives the
 remote's six standard parameter services and `/parameter_events` over the wire.
 
+See the ROS 2 parameter concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
+
 Passing a [`@parameters`](@ref) schema `P` (the same struct the remote baked in via
-`Node(ctx, name, P)`) makes it a *typed* lens — `fetch(client)` returns a `P` and
+`Node(ctx, name, P)`) makes it a typed lens — `fetch(client)` returns a `P` and
 `transaction(client) do p … end` mutates it type-stably. Without a schema it is
 dynamic (returns `NamedTuple`/`Any`), for talking to an arbitrary ROS2 node.
 
 The underlying [`ServiceClient`](@ref)s are built lazily per service and reaped by
 `close(client)`. Calls are fallible: a timeout or error reply raises
 [`ServiceError`](@ref) (and a rejected set raises [`ParameterRejection`](@ref)).
-Use [`wait_for_service`](@ref) before the first call so a cold route doesn't drop it.
+Call [`wait_for_service`](@ref) first so the route is matched before the opening request.
 """
 mutable struct ParameterClient{P}
     const node::Any
@@ -68,8 +70,8 @@ function _param_req_type(sym::Symbol)
     throw(ArgumentError("unknown parameter service $(repr(sym))"))
 end
 
-# Lazily build (and cache) the `ServiceClient` for `<target>/<sym>`. The service is
-# the remote's node-private `~/<sym>`, which resolves to this absolute name.
+# Lazily build and cache the `ServiceClient` for `<target>/<sym>`: the remote's
+# node-private `~/<sym>` service resolved to its absolute name.
 function _svc(c::ParameterClient, sym::Symbol)
     @lock c.lock begin
         haskey(c.clients, sym) && return c.clients[sym]
@@ -163,8 +165,9 @@ end
 """
     set_parameters(client, params; timeout_ms=2000) -> Vector{Tuple{Bool,String}}
 
-Remote `SetParameters` (§10): each pair its own transaction, so a per-item
-`(successful, reason)` result (independent success/failure, vs the atomic variant).
+Remote `SetParameters` (§10): each pair is its own transaction, so each gets an
+independent `(successful, reason)` result. Use `set_parameters_atomically` to apply
+all pairs as a single all-or-nothing transaction.
 """
 function set_parameters(c::ParameterClient, params; timeout_ms::Integer = 2000)
     req = _RCL_SRV.SetParameters_Request(parameters = _to_wire_params(_param_pairs(params)))
@@ -190,9 +193,9 @@ end
     describe_parameters(client, names; timeout_ms=2000) -> Vector{ParameterDescriptor}
 
 Remote `DescribeParameters` (§10): a [`ParameterDescriptor`](@ref) per name. The
-wire form carries name/type/description/read-only faithfully; the numeric-range and
-choice-set `constraint` is not round-tripped (it lives only as the human
-`additional_constraints` string on the wire), so it reads back as `nothing`.
+wire form carries name/type/description/read-only faithfully. The wire encodes the
+numeric-range and choice-set `constraint` only as the human `additional_constraints`
+string, so the structured `constraint` field reads back as `nothing`.
 """
 function describe_parameters(c::ParameterClient, names; timeout_ms::Integer = 2000)
     req = _RCL_SRV.DescribeParameters_Request(names = String[String(n) for n in names])
@@ -299,9 +302,9 @@ _descriptor_map(::Type{P}) where {P} =
 
 Remote mutation with the same do-block shape as the server's [`transaction`](@ref)
 (§10): runs `f` against a draft of the fetched current value, then pushes the diff
-as one `set_parameters_atomically`. The candidate is validated *client-side* first
-(per-field constraints + read-only gate + user `validate`) for fast feedback before
-the wire; the remote re-validates authoritatively. Returns the new `P` on success,
+as one `set_parameters_atomically`. The client validates the candidate locally first
+(per-field constraints + read-only gate + user `validate`) for fast feedback, then
+the remote re-validates authoritatively. Returns the new `P` on success,
 or raises [`ParameterRejection`](@ref) on a rejected set — uniform with the local
 path. Requires a typed client (schemaless remotes use `set_parameters_atomically`).
 """
@@ -327,8 +330,8 @@ end
 Watch the remote's parameter changes (§10): subscribe `/parameter_events`, filter to
 this client's `target`, and call `f(batch::ParameterEventBatch)` per event. The
 remote analog of the server-side `on_parameter_event`. For a typed client the changed
-values are coerced to their field types. The wire event carries no prior values, so
-`batch.previous` is empty. The subscription is reaped by `close(client)`.
+values are coerced to their field types. `batch.previous` is empty: the wire event
+carries only current values. The subscription is reaped by `close(client)`.
 """
 function on_parameter_event(f, c::ParameterClient{P}) where {P}
     sub = Subscription(c.node, "/parameter_events", _ParameterEvent) do ev

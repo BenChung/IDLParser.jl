@@ -1,7 +1,5 @@
-# Entity types mirroring `hiroz-protocol::entity` and `::qos`. These are plain
-# records — sum types aren't needed because every field is always present (the
-# Rust `Option` cases stay as `Union{T, Nothing}`, and a few enums become
-# `@enum`s or `Symbol`s where Symbol reads more naturally in Julia).
+# Entity types mirroring `hiroz-protocol::entity` and `::qos`. Rust `Option`
+# cases map to `Union{T, Nothing}`; Rust enums map to `@enum` or `Symbol`.
 
 # Liveliness placeholders. RmwZenoh-specific values are duplicated here as
 # consts rather than hidden in `rmw_zenoh.jl` because parse_liveliness needs
@@ -15,9 +13,9 @@ const EMPTY_TOPIC_HASH   = "EMPTY_TOPIC_HASH"
 
 The Zenoh session identifier as it appears in a key expression. Zenoh stores
 this as a 16-byte little-endian id and renders it as a lowercase hex string
-with leading zero-bytes elided, so length is variable (≤32 chars). We keep
-the canonical hex string rather than the raw bytes because the key-expression
-output is always the hex form anyway.
+with leading zero-bytes elided, so length is variable (≤32 chars). Holding
+the canonical hex string keeps the type aligned with the key-expression form
+it is read from and written to.
 """
 struct ZenohId
     hex::String
@@ -90,6 +88,8 @@ end
 
 A ROS2 type identity: the fully-qualified ROS2 type name (e.g.
 `"std_msgs/msg/String"`) together with its RIHS01 hash.
+
+See https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html
 """
 struct TypeInfo
     name::String
@@ -99,8 +99,8 @@ end
 TypeInfo(name::AbstractString, hash::TypeHash) = TypeInfo(String(name), hash)
 
 # Endpoint kind. Two-letter codes (`MP`, `MS`, `SS`, `SC`) are the on-wire
-# encoding shared by both formatters; `NN` is for nodes (handled separately
-# at parse time — we don't put Node in this enum).
+# encoding shared by both formatters. Nodes use `NN`, handled separately at
+# parse time.
 @enum EndpointKind Publisher Subscription Service Client
 
 const _KIND_CODE = Dict(
@@ -140,14 +140,16 @@ end
                  liveliness=:automatic, liveliness_lease=nothing)
 
 DDS-style QoS profile attached to publishers and subscriptions. The fields
-mirror ROS2 RMW values; `keyless` is **not** a QoS attribute here — it's a
-runtime flag passed alongside the profile to `encode_qos`/`decode_qos`
-because rmw_zenoh ignores it but ros2dds prepends it to the encoding.
+mirror ROS2 RMW values. `keyless` lives outside this profile as a runtime
+flag passed alongside it to `encode_qos`/`decode_qos`: rmw_zenoh ignores it,
+while ros2dds prepends it to the encoding.
 
 `history == :keep_all` ignores `depth`. `deadline`, `lifespan`, and
 `liveliness_lease` are `Union{Nothing, Duration}` where `nothing` is the ROS2
 default (infinite / unset). `liveliness` is `:automatic` (default) or
 `:manual_by_topic`.
+
+See https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Quality-of-Service-Settings.html
 """
 struct QosProfile
     reliability::Symbol   # :reliable | :best_effort
@@ -187,10 +189,10 @@ default_qos() = QosProfile()
 """
     NodeEntity(domain_id, z_id, id, name, namespace, enclave)
 
-A ROS2 node. `namespace` and `enclave` may be empty strings (rendered as the
-`%` placeholder in liveliness tokens). The enclave field is preserved on the
-Julia side but is **not** round-trippable through liveliness encoding —
-rmw_zenoh always writes `%` in the enclave slot.
+A ROS2 node. `namespace` and `enclave` may be empty strings, rendered as the
+`%` placeholder in liveliness tokens. The `enclave` field is preserved
+in-memory only: rmw_zenoh always writes `%` in the enclave slot, so the value
+does not survive a liveliness encode/decode round trip.
 """
 struct NodeEntity
     domain_id::Int
@@ -208,10 +210,9 @@ NodeEntity(domain_id::Integer, z_id::ZenohId, id::Integer,
 """
     EndpointEntity(id, node, kind, topic, type_info, qos)
 
-A publisher/subscription/service/client owned by a node (or with `node ===
-nothing` for the rare case where an endpoint is observed without its node —
-ros2dds liveliness tokens carry no node identity, so parsing always yields
-`node === nothing` there).
+A publisher/subscription/service/client owned by a node. `node === nothing`
+when the endpoint is observed without its node: ros2dds liveliness tokens
+carry no node identity, so parsing them always yields `node === nothing`.
 """
 struct EndpointEntity
     id::Int

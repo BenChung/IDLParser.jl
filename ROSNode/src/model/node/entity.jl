@@ -6,9 +6,8 @@
 # consumer task for Subscription). Service/Client carry the entity + token only;
 # their Zenoh queryable/querier wiring is the §8 layer's, attached via `wire`.
 #
-# The pattern files don't subtype this — they *hold* an `Entity` and add their
-# typed surface (message type, handler, result cells). This keeps the id/token/
-# route/graph lifecycle in exactly one place.
+# Pattern files hold an `Entity` and add their typed surface (message type,
+# handler, result cells), keeping the id/token/route/graph lifecycle in one place.
 
 """
     Entity
@@ -19,8 +18,8 @@ and its data route (a Zenoh `Publisher` or a `SubscriberHandler` + consumer task
 depending on `kind`). Created via [`make_entity`](@ref); `close` undeclares the
 route, withdraws the token, and drops the endpoint from the graph.
 
-Pattern types (the publisher/subscription/service objects) *hold* an `Entity`
-rather than subtype it — the id/token/route/graph lifecycle lives here once.
+Pattern types (the publisher/subscription/service objects) hold an `Entity` so
+the id/token/route/graph lifecycle lives here once.
 """
 mutable struct Entity
     const node::Node
@@ -102,16 +101,16 @@ gid(e::Entity) = e.gid
 # `DURABILITY_TRANSIENT_LOCAL` (latched/cached delivery to late joiners) rides
 # Zenoh's advanced pub/sub, byte/protocol-compatible with rmw_zenoh/hiroz: the
 # publisher keeps a sample cache, the subscriber issues a history query on join.
-# `volatile` (the default) takes neither — the plain `Publisher`/`open` route,
-# zero overhead. Zenoh.jl routes the plain constructors to the advanced variants
-# transparently when an advanced option keyword is present, so these builders just
-# decide *which* keywords to pass (empty NamedTuple ⇒ plain).
+# `volatile` (the default) uses the plain `Publisher`/`open` route at zero overhead.
+# Zenoh.jl routes the plain constructors to the advanced variants transparently when
+# an advanced option keyword is present, so these builders just decide which keywords
+# to pass (empty NamedTuple ⇒ plain).
 
 const _DEFAULT_HISTORY_DEPTH = 42          # RMW_ZENOH_DEFAULT_HISTORY_DEPTH (KeepAll)
 const _ADVANCED_HEARTBEAT_MS = 500         # rmw_zenoh sample-miss / recovery heartbeat
-# History-query timeout for a joining subscriber. hiroz uses effectively-∞; we pick
-# a generous finite bound so latched state from a momentarily-slow publisher still
-# arrives, without wedging forever. (Open: byte-verify against an rmw_zenoh capture.)
+# History-query timeout for a joining subscriber: a generous finite bound so latched
+# state from a momentarily-slow publisher still arrives, without wedging forever
+# (hiroz uses effectively-∞).
 const _ADVANCED_QUERY_TIMEOUT_MS = 60_000
 
 # Cache/history sample count for a transient_local endpoint: the QoS depth, or the
@@ -119,9 +118,9 @@ const _ADVANCED_QUERY_TIMEOUT_MS = 60_000
 _cache_depth(qos::QosProfile) =
     qos.history === :keep_all ? _DEFAULT_HISTORY_DEPTH : max(1, qos.depth)
 
-# Advanced *publisher* keywords for a transient_local publisher (empty ⇒ plain):
+# Advanced publisher keywords for a transient_local publisher (empty ⇒ plain):
 # a sample cache sized to depth, liveliness detection, plus a periodic heartbeat
-# for reliable (sample-miss detection — matches hiroz; best-effort omits it).
+# for reliable sample-miss detection (best-effort omits it).
 function _advanced_pub_kwargs(qos::QosProfile)
     qos.durability === :transient_local || return NamedTuple()
     base = (cache = CacheOptions(max_samples = _cache_depth(qos)),
@@ -132,7 +131,7 @@ function _advanced_pub_kwargs(qos::QosProfile)
         base
 end
 
-# Advanced *subscriber* keywords for a transient_local subscriber (empty ⇒ plain):
+# Advanced subscriber keywords for a transient_local subscriber (empty ⇒ plain):
 # history replay on join (back-filling late publishers too), a bounded query
 # timeout, liveliness detection, plus gap recovery for reliable.
 function _advanced_sub_kwargs(qos::QosProfile)
@@ -153,20 +152,18 @@ end
 # may already have processed. Replaying an effectful handler (replan, re-arm) on an
 # unchanged value is the hazard D4 names. The gate suppresses it.
 #
-# Why we key on the *payload content-hash*, not the attachment `(gid, seq)` of §3.4:
-# Zenoh's advanced-pubsub cache serves history replies as **bare payloads** — neither
-# our per-message attachment nor a sample timestamp survives the cache round-trip
-# (verified: `z_sample_attachment`/`z_sample_timestamp` are null on replays). The
-# payload is the only thing that does, and for a latched *state* topic it is exactly
-# the right key: an unchanged value is identical bytes (suppress), an updated value is
-# different bytes (deliver) — D4's table verbatim.
+# The gate keys on the payload content-hash because Zenoh's advanced-pubsub cache
+# serves history replies as bare payloads: `z_sample_attachment`/`z_sample_timestamp`
+# are null on replays, so the §3.4 attachment `(gid, seq)` and the sample timestamp
+# are both gone, and the payload is all that survives the cache round-trip. For a
+# latched state topic the payload is exactly the right key: an unchanged value is
+# identical bytes (suppress), an updated value is different bytes (deliver).
 #
 #   • `delivered` — a bounded FIFO of recently-delivered payload hashes. Capped at the
-#     cache depth, which is the *most* the publisher can ever replay, so an evicted
-#     hash can't reappear — bounded memory with no correctness loss (and no leak on a
-#     high-cardinality topic). Pushed only on delivery (NOT receipt): a sample dropped
-#     by the inactive-window lifecycle gate doesn't record, so a value updated while
-#     inactive still reads as novel on reactivation.
+#     cache depth, the maximum the publisher can ever replay, so an evicted hash can't
+#     reappear: bounded memory with no correctness loss (and no leak on a high-cardinality
+#     topic). Recorded on delivery, not receipt, so a sample the inactive-window lifecycle
+#     gate drops still reads as novel on reactivation.
 #   • `snapshot` — frozen at each re-latch (`_arm_relatch!`) to a copy of `delivered`.
 #     A replayed sample whose hash ∈ snapshot is one we've already delivered → suppress;
 #     a new hash is a genuine update → deliver. `nothing` (no re-latch yet) ⇒ deliver
@@ -241,8 +238,9 @@ policy. Returns the entity.
 
 `view` is the [`ViewMode`](@ref): `Owned()` (default) materializes an owned
 message; `Checked()`/`Unchecked()` deliver a zero-copy `CDRView` aliasing the
-payload (valid only for the handler's duration, §3.2), guarded vs. bare. `true`
-(⇒ `Checked()`) and `false` (⇒ `Owned()`) are accepted as shorthand.
+payload (valid for the handler's duration only, §3.2), `Checked` guarded and
+`Unchecked` bare. `true` (⇒ `Checked()`) and `false` (⇒ `Owned()`) are accepted
+as shorthand.
 """
 function declare_subscription!(e::Entity, msgtype::Type, handler;
                                view::Union{Bool, ViewMode}=Owned(),

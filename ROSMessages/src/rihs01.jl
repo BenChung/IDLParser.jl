@@ -72,10 +72,8 @@ end
 
 # ---- JSON serialization ----------------------------------------------------
 #
-# We write JSON manually rather than depending on a JSON library — the shape
-# is fixed, and we need exact control over key order and `: ` / `, ` spacing
-# to match the reference output byte-for-byte. Diverging by one space changes
-# the hash.
+# Hand-written so key order and `: ` / `, ` spacing match the reference output
+# byte-for-byte — a one-space divergence changes the hash.
 
 function _json_string(io::IO, s::AbstractString)
     write(io, '"')
@@ -159,8 +157,8 @@ end
     calculate_rihs01_hash(msg::TypeDescriptionMsg) -> String
 
 Return the RIHS01 hash string (`"RIHS01_<64 hex>"`) for the given message.
-The caller is responsible for sorting `referenced_type_descriptions` if
-cross-implementation compatibility matters — the hash function does not sort.
+The hash covers `referenced_type_descriptions` in the order given; sort them
+first (by `type_name`) to match other ROS 2 implementations.
 """
 function calculate_rihs01_hash(msg::TypeDescriptionMsg)
     return "RIHS01_" * bytes2hex(sha256(to_ros2_json(msg)))
@@ -265,9 +263,8 @@ function _to_field_type(ts::Parse.TypeSpec.Type,
     prim_id, string_cap, nested = _leaf_type_info(inner_ts, package, qualifier)
 
     if seq_offset != 0 && static_capacity != 0
-        # ROS2's flat type-id encoding can't represent "static array of
-        # sequence-of-T" — that requires a nested wrapper type. Reject
-        # rather than emit a wrong hash silently.
+        # The flat type-id encoding has no "static array of sequence-of-T";
+        # that shape needs a nested wrapper type.
         error("RIHS01 cannot encode a static array of a sequence")
     end
 
@@ -425,13 +422,12 @@ service_rihs01(service_name::AbstractString, request::TypeDescriptionMsg,
 # ---- action-protocol service hashes (rmw_zenoh / hiroz) ---------------------
 #
 # A ROS2 action is three services on `<topic>/_action/{send_goal,get_result,
-# cancel_goal}`. rmw_zenoh keys each off a SERVICE type hash, and — matching the
-# reference rmw_zenoh/hiroz codegen — these are computed from FIXED, hardcoded
-# request/response shapes (NOT the generated wrapper structs) under the `action`
-# qualifier (the `is_action` path). The closures are intentionally the reference
-# impl's: SendGoal/GetResult carry the action Goal/Result *main* TD only (no
-# transitive deps), and CancelGoal omits the `goals_canceling` field and the UUID
-# dep entirely. Replicated bug-for-bug so our keyexpr matches a real ROS2 peer.
+# cancel_goal}`. rmw_zenoh keys each off a SERVICE type hash computed from fixed,
+# hardcoded request/response shapes under the `action` qualifier (the `is_action`
+# path), matching the reference rmw_zenoh/hiroz codegen. The closures replicate
+# that codegen exactly so our keyexpr matches a real ROS2 peer: SendGoal/GetResult
+# carry the action Goal/Result main TD only (no transitive deps), and CancelGoal
+# omits the `goals_canceling` field and the UUID dep entirely.
 #
 # The keyexpr *type name* differs from the hashed name for cancel_goal: it's
 # published as `action_msgs/srv/CancelGoal` but the hash is computed over the
@@ -459,7 +455,7 @@ _ap_nested(name) = FieldTypeDescription(TYPE_ID_NESTED_TYPE, UInt64(0), UInt64(0
     send_goal_service_rihs01(package, action_name, goal_td::TypeDescription) -> String
 
 The action `send_goal` service RIHS01. `goal_td` is the action's `<Name>_Goal`
-type description (main only, as the reference impl includes it).
+type description (main only — its transitive deps are excluded from the closure).
 """
 function send_goal_service_rihs01(package::AbstractString, action_name::AbstractString,
                                   goal_td::TypeDescription)
@@ -607,10 +603,9 @@ end
 Reconstruct the interface IL from a RIHS01 `TypeDescription` — the inverse of
 [`type_description_from_struct`](@ref). The `RMessage` name is the final
 segment of the fully-qualified `type_name` (`std_msgs/msg/String` → `String`).
-Constants and field defaults are not present (RIHS01 excludes them), so the
-result carries no constants and no field defaults. For a `TypeDescriptionMsg`
-the referenced descriptions are ignored: nested types already survive as refs
-inside the main type's fields.
+RIHS01 excludes constants and field defaults, so the result carries neither.
+For a `TypeDescriptionMsg` the referenced descriptions are dropped: nested
+types already survive as refs inside the main type's fields.
 """
 function lift(td::TypeDescription)
     name = Symbol(split(td.type_name, '/')[end])

@@ -1,13 +1,16 @@
-# Intermediate language for ROS2 interfaces. Sits between the textual
-# `.msg`/`.srv`/`.action` form and IDLParser's `Parse.Decl` IDL AST, so the
-# two translations (text↔IL and IL↔IDL) stay independent and round-trippable.
-#
-# The IL deliberately models ROS concepts directly (a message is constants +
-# fields, a field is a typed name with an optional default) rather than IDL
-# ones (modules, structs, annotations). `ros2.jl` owns the IL↔IDL lowering and
-# lifting; this file owns the IL data types and IL→text unparsing.
-
 module IL
+
+"""
+Intermediate language for ROS 2 interfaces, sitting between the textual
+`.msg`/`.srv`/`.action` form and IDLParser's `Parse.Decl` IDL AST. Splitting the
+two translations (text↔IL and IL↔IDL) keeps each independent and round-trippable.
+
+The IL models ROS concepts directly: a message is constants plus fields, a field
+is a typed name with an optional default. `ros2.jl` owns the IL↔IDL lowering and
+lifting; this file owns the IL data types and IL→text unparsing.
+
+ROS 2 interface definitions: https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html
+"""
 
 using Moshi.Data: @data
 using Moshi.Derive: @derive
@@ -99,9 +102,9 @@ end
 """
     referenced_refs(x) -> Vector{Tuple{Union{Nothing, String}, String}}
 
-The nested-type references an IL interface (`RMessage`/`RService`/`RAction`) makes:
-`(package, name)` pairs, with `package === nothing` for a same-package (relative)
-reference. Primitive and string fields contribute nothing. A field's *element* base
+Reports the nested-type references an IL interface (`RMessage`/`RService`/`RAction`)
+makes, as `(package, name)` pairs with `package === nothing` for a same-package
+(relative) reference. Primitive and string fields contribute nothing. A field's *element* base
 carries the ref (arrays/sequences flatten to `RType{base, ArraySpec}`), so walking
 `RField`s covers `T`, `T[]`, and `T[N]` alike. ROSNode's `@ros_import` uses this to
 resolve a type's transitive definition closure to generate.
@@ -118,12 +121,11 @@ function referenced_refs(fields::Vector{RField})
 end
 referenced_refs(m::RMessage) = referenced_refs(m.fields)
 referenced_refs(s::RService) = vcat(referenced_refs(s.request), referenced_refs(s.response))
-# Beyond the three sections' own field refs, an action's implicit protocol types
-# (SendGoal/GetResult/FeedbackMessage — see `action_protocol_decls`) reference
-# `unique_identifier_msgs/UUID` (every goal id) and `builtin_interfaces/Time` (the
-# accept stamp). Reporting them keeps a consumer's generation closure (e.g.
-# `@ros_import`) closed when it emits those protocol types. The protocol types'
-# refs to the same-package sections are intrinsic to the action, not external.
+# An action's implicit protocol types (SendGoal/GetResult/FeedbackMessage — see
+# `action_protocol_decls`) reference `unique_identifier_msgs/UUID` (goal id) and
+# `builtin_interfaces/Time` (accept stamp). Reporting them alongside the three
+# sections' field refs keeps a consumer's generation closure (e.g. `@ros_import`)
+# complete. Protocol refs to the same-package sections are intrinsic to the action.
 referenced_refs(a::RAction)  =
     vcat(referenced_refs(a.goal), referenced_refs(a.result), referenced_refs(a.feedback),
          Tuple{Union{Nothing, String}, String}[

@@ -52,7 +52,7 @@ end
 # Run a handler purely to warm it: under the `_WARMUP` scope (so `is_warming()` is
 # true on this task and any child task it spawns) and swallowing throws — a warm-up
 # failure must never be fatal, and a handler written for live data may not tolerate
-# a synthesized sample. Logged at `warn` (not `error`): it's expected-ish. `thunk`
+# a synthesized sample. Logged at `warn` because a synthesizer mismatch is expected. `thunk`
 # is first so the `_run_warm(topic) do … end` call sites bind the do-block to it.
 function _run_warm(thunk, topic)
     try
@@ -74,24 +74,28 @@ _sample_msg(::Type{T}, sample) where {T} =
 # ── default message construction ───────────────────────────────────────────────
 # Generated message structs (both the `@cdr_fixed` and `@kwdef` forms) keep a
 # positional inner constructor, so a value is built field-by-field from each
-# field's *exact* type (`fieldtypes`). Used for the :execute fallback and the
+# field's declared type (`fieldtypes`). Used for the :execute fallback and the
 # package `@compile_workload`. Recurses into nested message structs.
 
 """
     _default_msg(::Type{T}) -> T
 
-A zero/empty instance of generated message type `T` for warm-up (§D8): every field
-defaulted by its type — `0`/`false` for numbers, `""` for strings, a fixed array
-(`SArray`) of its defaulted element, an empty `Vector` for sequences, recursively
-for nested messages. Built positionally so it works regardless of whether the struct
-has keyword defaults. `warmup_sample` overrides it when the caller supplies realism.
+Build a zero/empty instance of generated message type `T` for warm-up: each field
+gets its type's default — `0`/`false` for numbers, `""` for strings, a fixed array
+(`SArray`) of defaulted elements, an empty `Vector` for sequences, recursing into
+nested messages. The positional constructor handles both the `@cdr_fixed` and
+`@kwdef` struct forms. `warmup_sample` overrides this when the caller supplies a
+representative message.
+
+Generated from a ROS 2 interface (`.msg`) definition; see
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html
 """
 _default_msg(::Type{T}) where {T} = T(map(_default_field, fieldtypes(T))...)
 
-# A fixed array `T[N]` generates as `SArray{Tuple{N},T,1,N}` for *any* element
-# `T` — string/struct included — so we default per-element and rebuild the SArray
-# (`length(S)` is the flattened `prod(dims)` count, `eltype(S)` the element type).
-# `zero` only covers numeric elements; on strings/structs it MethodErrors.
+# A fixed array `T[N]` generates as `SArray{Tuple{N},T,1,N}` for any element `T`,
+# string/struct included, so default per-element and rebuild the SArray (`length(S)`
+# is the flattened `prod(dims)` count, `eltype(S)` the element type). `zero` covers
+# only numeric elements and MethodErrors on strings/structs.
 _default_field(::Type{S}) where {S} =
     S <: Number         ? zero(S) :
     S <: AbstractString ? convert(S, "") :
@@ -193,7 +197,7 @@ end
 # `GoalHandle`, and result/feedback encode. Always precompile-only — a goal body is
 # a long-running mission wrapped in cancellation/settlement machinery over a live
 # `GoalHandle`; executing a fabricated one at warm-up is neither safe nor
-# meaningful, so :execute is a no-op here (documented in the D8 status). `exec` is
+# meaningful, so :execute is a no-op here. `exec` is
 # the do-block body (high-level) or the `on_accepted` callback (low-level).
 function _warm_action(::Type{G}, ::Type{R}, ::Type{F}, exec::E,
                       ::Type{GH}) where {G, R, F, E, GH}

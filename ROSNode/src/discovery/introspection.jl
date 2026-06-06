@@ -1,12 +1,12 @@
-# §13 Introspection — the dual of discovery: we *serve* the interfaces others use
+# §13 Introspection — the dual of discovery: we serve the interfaces others use
 # to inspect us. Two facilities live here:
 #
 #   • `~/get_type_description` — a Service answering from the Context type registry
 #     (§11). Every registered type carries its `TypeDescription`; the served
-#     closure is *canonicalized* so its RIHS01 matches the hash we advertise, and
+#     closure is canonicalized so its RIHS01 matches the hash we advertise, and
 #     a request for an unknown (name, hash) is a clean `successful=false` reply.
 #   • the `/rosout` bridge — an `AbstractLogger` teeing Julia logging to the parent
-#     logger *and* to a node-owned `rcl_interfaces/msg/Log` publisher, so a Julia
+#     logger and to a node-owned `rcl_interfaces/msg/Log` publisher, so a Julia
 #     `@info`/`@warn` on a node surfaces on the ROS `/rosout` topic.
 #
 # Both are wired against the vendored `type_description_interfaces` / `rcl_interfaces`
@@ -45,7 +45,7 @@ Look up the registry entry (§11) for `(type_name, type_hash)` and return the
 canonical internal `TypeDescriptionMsg` (main + referenced closure) to serve over
 `~/get_type_description`, or `nothing` if the exact name+version isn't registered.
 `type_hash` is the REP-2011 RIHS string (e.g. `"RIHS01_<64-hex>"`); an empty hash
-matches *any* registered version of `type_name` (the rmw_zenoh "I have the name,
+matches any registered version of `type_name` (the rmw_zenoh "I have the name,
 send me whatever you advertise" form).
 
 The result is canonicalized (referenced closure sorted by `type_name`) so its
@@ -72,9 +72,8 @@ function describe_type(ctx_or_node, type_name::AbstractString,
 end
 
 # Registry is keyed on `(name, hash)`; a name-only lookup scans for the first
-# entry whose name matches. The registry owns the lock — reach the table through
-# it. Kept here (not in context.jl) because it's a §13-specific convenience over
-# the generic `(name, hash)` key, not part of the registry's core contract.
+# entry whose name matches, under the registry's own lock. Lives here as a
+# §13-specific convenience over the generic `(name, hash)` key.
 function _lookup_any_version(reg, name::String)
     @lock reg.lock begin
         for ((n, _h), entry) in reg.entries
@@ -334,9 +333,9 @@ request for an unknown `(name, hash)` is a clean `successful=false` reply. Every
 node serves this so peers can fetch the descriptions it advertises. The handle is
 tracked on `node` (closed with it) like any other entity.
 
-When `include_type_sources` is set, `type_sources` is populated from the served
-closure's registry entries via [`_type_sources`](@ref) (one per type, the
-`IL.unparse` text); otherwise it is empty (the description alone suffices for decode).
+When `include_type_sources` is requested, `type_sources` carries one regenerated
+`IL.unparse` text per served type (via [`_type_sources`](@ref)); the default reply
+leaves it empty, since the description alone suffices for decode.
 """
 function wire_get_type_description!(node)
     return Service(node, "~/get_type_description", GetTypeDescription_Request) do req
@@ -353,8 +352,8 @@ function wire_get_type_description!(node)
 end
 
 # ── /rosout: the Julia-logging → rcl_interfaces/msg/Log bridge (§13, D7) ──────
-# D7: Julia's `@info`/`@warn`/`@error`/`@logmsg` *are* the ROS logging API — no
-# `RCLCPP_INFO`-style macros. `RosoutLogger <: AbstractLogger` is node-scoped and,
+# D7: Julia's `@info`/`@warn`/`@error`/`@logmsg` are the ROS logging API; there are
+# no `RCLCPP_INFO`-style macros. `RosoutLogger <: AbstractLogger` is node-scoped and,
 # per record, (a) writes the ROS console line `[LEVEL] [stamp] [name]: msg` to
 # stderr, (b) publishes an `rcl_interfaces/msg/Log` on the node's shared `/rosout`
 # publisher, and (c) optionally forwards to a `parent` logger (a file/Julia console
@@ -419,8 +418,8 @@ makes a `.`-separated child). `min_level` is the logger's own floor; per-name
 overrides come from the node's level table ([`set_logger_level!`](@ref)).
 
 Default ([`logger`](@ref)) is `console=true, parent=nothing` — a bare node logs in
-ROS format. Pass a `parent` (e.g. a `ConsoleLogger`) to *also* get Julia's native
-output. If `node` has no live session the `/rosout` publisher can't be declared and
+ROS format. Pass a `parent` (e.g. a `ConsoleLogger`) to add Julia's native output
+alongside. If `node` has no live session the `/rosout` publisher can't be declared and
 that sink is skipped (console/parent still work), so installing the logger is always
 safe.
 """
@@ -561,7 +560,7 @@ end
 
 # Write the ROS-format console line: `[LEVEL] [secs.nanosec] [logger_name]: msg`.
 # Built as one string and printed in a single `print` so concurrent records don't
-# interleave mid-line. Uses the logger's *own* `name`, so a child logger's records
+# interleave mid-line. Uses the logger's own `name`, so a child logger's records
 # show the child name even sharing the parent's stderr.
 function _print_ros_console(lg::RosoutLogger, level, message; kwargs...)
     sec, nanosec = _stamp_sec_nanosec(lg.node)
@@ -678,8 +677,8 @@ Logging.global_logger(node::Node) = Logging.global_logger(logger(node))
 
 Run `f()` with a fresh [`RosoutLogger`](@ref) (built with `kwargs`) installed as the
 active logger (§13). `with_logger(node) do … end` is the usual form (it reuses the
-node's cached logger); `with_rosout` is kept for explicitly overriding logger
-options (`parent=`, `console=`, `min_level=`) for a scope.
+node's cached logger); `with_rosout` lets you override logger options
+(`parent=`, `console=`, `min_level=`) for a scope.
 
 ```julia
 with_rosout(node; parent = ConsoleLogger()) do

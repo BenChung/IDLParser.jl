@@ -31,10 +31,10 @@ export Context, Node, # `Node` forward-declared here; the §6 layer specializes 
 """
     EndpointInfo
 
-A single discovered (or locally-injected) endpoint, the atom of the graph (§12).
-`type === nothing` for an `EMPTY_TOPIC_TYPE` token; `is_local` distinguishes our
-own injected entities (authoritative) from liveliness-discovered remotes
-(eventually consistent).
+A single discovered (or locally-injected) endpoint, the atom of the [discovery graph](https://docs.ros.org/en/rolling/Concepts/Basic/About-Discovery.html)
+(§12). `type === nothing` for an `EMPTY_TOPIC_TYPE` token; `is_local`
+distinguishes our own injected entities (authoritative) from
+liveliness-discovered remotes (eventually consistent).
 """
 struct EndpointInfo
     node_name::String
@@ -147,12 +147,13 @@ lookup_type(reg::TypeRegistry, info::TypeInfo) =
     Context(; domain_id, namespace, enclave, config, format, drain_timeout, …)
     Context(f; kwargs...)  do ctx … end
 
-The process-level container (§5). Opens one Zenoh `Session` and holds everything
-nodes share: the session and its `z_id`, the atomic entity-id counter, the
-`domain_id`, default `namespace`/`enclave`, the keyexpr formatter, the type
-registry (§11), the discovery index + its `@ros2_lv/**` liveliness subscriber
-(§12), a clock (§7), the `on_shutdown` hooks, and the shutdown state machine
-(§14). `Context` is the RAII/shutdown root: `close(ctx)` runs the drain.
+The process-level container (§5), the [ROS 2 node](https://docs.ros.org/en/rolling/Concepts/Basic/About-Nodes.html)
+group root. Opens one Zenoh `Session` and holds everything nodes share: the
+session and its `z_id`, the atomic entity-id counter, the `domain_id`, default
+`namespace`/`enclave`, the keyexpr formatter, the type registry (§11), the
+discovery index + its `@ros2_lv/**` liveliness subscriber (§12), a clock (§7),
+the `on_shutdown` hooks, and the shutdown state machine (§14). `Context` is the
+RAII/shutdown root: `close(ctx)` runs the drain.
 
 The do-block form opens, runs `f(ctx)`, and `close`s on exit (the
 `rclcpp::init`/`shutdown` bracket).
@@ -192,16 +193,15 @@ mutable struct Context
     @atomic _state::ShutdownState
     const _on_shutdown::Vector{Any}      # user cleanup hooks, run during the drain
     const _shutdown_done::Threads.Condition  # `spin`/`wait` park here until drained
-    # Woken `all=true` as the *first* drain step so blocked clock-waits
-    # (`_interruptible_sleep`, Rate, sleep_until) unwind with a ShutdownException
-    # instead of sleeping out their full span. Distinct from `_shutdown_done`
-    # (the terminal condition): this fires at drain start, that at drain end.
+    # Notified `all=true` at drain start so blocked clock-waits
+    # (`_interruptible_sleep`, Rate, sleep_until) re-check `is_shutdown` and raise
+    # ShutdownException. The terminal counterpart is `_shutdown_done`, fired at drain end.
     const _shutdown_wake::Threads.Condition
     const drain_timeout::Float64         # seconds to await in-flight work
     # Registered close-able handles (nodes, entities, timers) undeclared on drain
     # (step 4). The entity layer pushes here; `close(ctx)` walks it in reverse.
     const _resources::Vector{Any}
-    # D10B S2: dynamic-resolution lens — the module whose baked `__ros_resolve__` table this
+    # Dynamic-resolution lens: the module whose baked `__ros_resolve__` table this
     # Context looks through, so every node/sub on it sees one consistent, deterministic
     # picture. `nothing` ⇒ content-canonical resolution only.
     const home::Union{Module, Nothing}
@@ -276,7 +276,7 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
     # wellknown (included after this file).
     _register_canonical_types!(ctx)
     _register_static_types!(ctx)
-    home === nothing && _maybe_hint_no_home()    # D10B S2: nudge if a resolvable home exists
+    home === nothing && _maybe_hint_no_home()    # nudge if a resolvable home exists
 
     _start_discovery!(ctx)
     return ctx
@@ -295,8 +295,8 @@ end
     @context([kwargs...]) do ctx … end
 
 Create a [`Context`](@ref) whose dynamic-resolution `home` is the calling module — sugar
-for `Context(f; home=@__MODULE__, kwargs...)` (D10B S2). Every keyexpr-only subscription
-on the Context then resolves wire types to *this* module's `@ros_import` structs, giving
+for `Context(f; home=@__MODULE__, kwargs...)`. Every keyexpr-only subscription
+on the Context then resolves wire types to this module's `@ros_import` structs, giving
 one consistent picture across the session. Use `Context(...; home=Mod)` for a different
 lens, or a plain `Context()` for content-canonical resolution only.
 """
@@ -918,11 +918,11 @@ end
     spin(ctx; handle_signals=false)
 
 Park the main task until the Context shuts down (§14). The scheduler runs the
-callbacks — `spin` does *not* pump an executor; it only keeps the process alive
-and gives signals a home. `handle_signals=true` installs SIGINT/SIGTERM handlers
-for the duration of the spin (opt-in so a library embedding us doesn't steal the
-host's handlers): first signal = graceful drain, a second SIGINT = hard
-`exit(130)`.
+callbacks; `spin` keeps the process alive and gives signals a home (the [executor](https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Executors.html)
+role lives in the scheduler, not here). `handle_signals=true` installs
+SIGINT/SIGTERM handlers for the duration of the spin — opt-in, so the host keeps
+its own handlers when a library embeds us: first signal = graceful drain, a
+second SIGINT = hard `exit(130)`.
 """
 function spin(ctx::Context; handle_signals::Bool=false)
     if handle_signals
@@ -938,8 +938,8 @@ end
 # Park on the drain, turning SIGINT into a graceful shutdown. With
 # `exit_on_sigint(false)` set (see `_install_signal_handlers!`), Julia delivers a
 # Ctrl-C as an `InterruptException` thrown into this task at its `wait` yield-point
-# rather than exiting the process. The first one requests the drain (idempotent) and
-# re-parks until it completes; a second — the impatient "I said stop" — hard-exits.
+# rather than exiting the process. The first requests the drain (idempotent) and
+# re-parks until it completes; a second hard-exits.
 function _park_until_drained(ctx::Context)
     interrupted = false
     while true

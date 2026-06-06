@@ -116,9 +116,9 @@ function resolve_type(typ::CR.TypeSpec.Type; enclosing::Union{Symbol, Nothing}=n
         CR.TypeSpec.TWChar() => Cwchar_t
         CR.TypeSpec.TBool() => Bool
         CR.TypeSpec.TOctet() => UInt8
-        # Bounded and unbounded strings share a wire format. Moshi @match
-        # treats `nothing` in a pattern as a variable binding, so the only
-        # safe way to "match any inner" is the `_` wildcard.
+        # Bounded and unbounded strings share a wire format. Moshi @match binds
+        # `nothing` in a pattern as a variable, so match any inner bound with the
+        # `_` wildcard.
         CR.TypeSpec.TString(_) => String
         CR.TypeSpec.TWString(_) => String
         CR.TypeSpec.TSeq(elt, _) => :(Vector{$(resolve_type(elt; enclosing=enclosing))})
@@ -385,18 +385,17 @@ function _struct_fields(decls, enclosing::Union{Symbol, Nothing}, registry::Type
 end
 
 # An all-fixed struct (every field a primitive or an SArray of primitives) is
-# emitted via `@cdr_fixed`: a single plain concrete struct whose wire format is
-# standard CDR1 — exactly what a ROS2 publisher emits, trailing pad omitted. It
-# is one concrete type (no variant wrapper), so `fieldnames`/`fieldtype` reflect
-# the real fields and the value nests cleanly. `@cdr_fixed` supplies
-# `propertynames`, `==`, and `show`; serialization flows through the library's
-# generic `write`/`read`.
+# emitted via `@cdr_fixed`: one plain concrete struct whose wire format is
+# standard CDR1, matching what a ROS2 publisher emits. As a single concrete type
+# (no variant wrapper), `fieldnames`/`fieldtype` reflect the real fields and the
+# value nests cleanly. `@cdr_fixed` supplies `propertynames`/`==`/`show`;
+# serialization flows through the library's generic `write`/`read`.
 #
 # A struct with a string/sequence/non-flat-nested field is a plain `@kwdef`
 # struct. Serialization is entirely the library's: generic `read` (owned),
 # `read_view` (zero-copy `CDRView{T}` with `CDRString`/`CDRArray` fields), and
-# generic `write` (a field-by-field inverse of `read`). The generator emits no
-# read/write — only the struct, a value `==`, and `@kwdef`'s keyword ctor.
+# generic `write`. The generator emits only the struct, a value `==`, and the
+# keyword ctor.
 function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
                         registry::TypeRegistry, scope::Vector{Symbol}, tier::Symbol=:any)
     fields = _struct_fields(decls, enclosing, registry, scope, Set{Vector{Symbol}}(([scope; name],)))
@@ -425,16 +424,15 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
             Expr(:., CDRSerialization, QuoteNode(Symbol("@cdr_fixed"))),
             LineNumberNode(@__LINE__, Symbol(@__FILE__)),
             structdef)
-        # Keyword constructor preserving the old `@kwdef` ergonomics: convert
-        # each field so callers can pass plain `Int`/`Float64` literals, then
-        # forward to the positional constructor the plain struct provides.
+        # Keyword constructor matching `@kwdef` ergonomics: convert each field so
+        # callers can pass plain `Int`/`Float64` literals, then forward to the
+        # struct's positional constructor.
         conv_args = [:(convert($t, $n)) for (n, t, _) in fields]
         kw_ctor = Expr(:(=),
             Expr(:call, name, Expr(:parameters, field_names...)),
             Expr(:call, name, conv_args...))
-        # `@cdr_fixed` emits `propertynames`/`==`/`show`; the library's generic
-        # `write`/`read` handle serialization. We only add the keyword
-        # constructor (the macro's own constructor is positional).
+        # `@cdr_fixed` supplies a positional constructor; the keyword one above
+        # is the generator's addition.
         body = Any[cdr_fixed, kw_ctor]
         # `:fixed` is already guaranteed by `@cdr_fixed` (it rejects any
         # non-flat field at macro-expansion). `:compact` additionally requires a
@@ -453,9 +451,8 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
         return Expr(:block, body...)
     end
 
-    # Julia's default `==` only field-compares bits types; with `String`/
-    # `Vector` fields it falls back to `===`. Generated messages are pure data,
-    # so force value equality.
+    # Generated messages are pure data, so compare by value field-by-field;
+    # Julia's default `==` would compare `String`/`Vector` fields by `===`.
     eq_body = isempty(field_names) ? true :
         foldl((acc, n) -> :($acc && a.$n == b.$n),
               field_names[2:end];
@@ -668,6 +665,19 @@ function build_modules(name, mod_dict; depth::Int=1,
     return :(module $name $(body...) end)
 end
 
+"""
+    generate_code(definitions; require=Dict(), emit_imports=false)
+
+Lower const-resolved ROS 2 IDL `definitions` into Julia module/struct/typedef/const
+`Expr`s, one outer module per package. Each struct lands in a CDR layout tier:
+all-fixed structs become a single `@cdr_fixed` value whose in-memory bytes match the
+CDR1 wire, and the rest become `@kwdef` structs decoded field-by-field. `require`
+pins a struct to a tier by scoped path (`"pkg/Name" => :compact`); `emit_imports`
+adds the per-module `import StaticArrays, CDRSerialization` that the textual export
+needs.
+
+ROS 2 IDL interface definition: https://design.ros2.org/articles/idl_interface_definition.html
+"""
 function generate_code(definitions::Vector{<:CR.CanAnnotate{CR.Decl}};
                        require::AbstractDict = Dict{String, Symbol}(),
                        emit_imports::Bool=false)

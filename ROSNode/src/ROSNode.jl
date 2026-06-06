@@ -1,16 +1,16 @@
 """
     ROSNode
 
-A Julian ROS2 client built on Zenoh. See `ARCHITECTURE.md` for the design.
+A Julian ROS 2 client built on Zenoh, implementing the node-centric concepts of
+the ROS 2 graph: https://docs.ros.org/en/rolling/Concepts/Basic.html
 
-This file wires the component modules together in bottom-up dependency order.
-Components are included as they are implemented.
+The module body includes the component files in bottom-up dependency order. See
+`ARCHITECTURE.md` for the design.
 """
 module ROSNode
 
 # ── component includes (bottom-up) ───────────────────────────────────────
-# Populated by the implementation as each component lands. Order matters:
-# primitives → data plane → object model → patterns → graph/lifecycle.
+# Order matters: primitives → data plane → object model → patterns → graph/lifecycle.
 
 include("interfaces/interfaces.jl")     # @ros_msgs over the vendored tree → Interfaces.<pkg>… (first: every file references it)
 include("base/core.jl")                 # shared seams: re-exports, exceptions, status tokens (§6/§8/§9)

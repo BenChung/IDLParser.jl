@@ -24,6 +24,8 @@ set — `Bool`, `Int64`, `Float64`, `String`, `Symbol` (string-with-choices suga
 and `Vector` of those (plus `Vector{UInt8}` byte arrays). Anything else errors at
 expansion.
 
+See the ROS 2 parameters concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
+
 Per-field annotations: a leading string literal is the description; `∈ lo..hi` is
 a numeric range; `∈ (a, b, …)` is a choice set; `|> readonly` blocks runtime sets.
 A user `validate(::P)` method (default no-op) adds cross-field rules — exactly
@@ -74,18 +76,18 @@ macro parameters(structdef)
     ctor_kw = Expr(:parameters, kwparams...)
     typ = esc(name)
 
-    # The struct + keyword constructor. Built with leaves already escaped, so the
-    # whole block is *not* re-escaped. The inner constructor name matches the
-    # (escaped) type so `new` resolves to it; `ctorassign` carries spliced helpers.
+    # The struct + keyword constructor. Leaves are already escaped, so the whole
+    # block stays unescaped. The inner constructor name matches the (escaped) type
+    # so `new` resolves to it; `ctorassign` carries spliced helpers.
     structblock = Expr(:struct, false, typ,
         Expr(:block, fieldexprs...,
              Expr(:function, Expr(:call, typ, ctor_kw),
                   Expr(:block, Expr(:call, :new, ctorassign...)))))
 
-    # The `descriptors` reflection method — the reflection root the parameter
-    # services read. `descriptors` is referenced through a `GlobalRef` to this
-    # (the macro's) module so it *extends* ROSNode.descriptors rather than getting
-    # hygiene-gensym'd into a fresh local; it dispatches on the escaped user type.
+    # The `descriptors` reflection method the parameter services read. Referenced
+    # through a `GlobalRef` to this (the macro's) module so it extends
+    # ROSNode.descriptors instead of being hygiene-gensym'd into a fresh local;
+    # it dispatches on the escaped user type.
     descriptors_ref = GlobalRef(@__MODULE__, :descriptors)
     descmethod = Expr(:(=),
         Expr(:call, descriptors_ref, :(::Type{$(typ)})),
@@ -168,7 +170,7 @@ descriptors(p) = descriptors(typeof(p))
     validate(candidate::P)
 
 User hook for cross-field rules — ROS2's `add_on_set_parameters_callback`,
-expressed as a method on the *whole* candidate (§10). The default is a no-op.
+expressed as a method on the whole candidate (§10). The default is a no-op.
 Throw [`ParameterRejection`](@ref) (or any exception) to reject a transaction; an
 internal caller sees the throw, an external client sees a rejected
 `SetParametersResult`. Define `ROSNode.validate(p::PlannerParams) = …` to override.
@@ -178,9 +180,9 @@ validate(_) = nothing
 """
     ParameterRejection(reason)
 
-A parameter set was rejected — by a per-field constraint, a `read_only` runtime
-set, or a user `validate`. Carries the human `reason` string that becomes the
-wire `SetParametersResult.reason`. Internal callers see it raised; the service
+Signals a rejected parameter set, raised by a per-field constraint, a `read_only`
+runtime set, or a user `validate`. Carries the human `reason` string that becomes
+the wire `SetParametersResult.reason`. Internal callers see it raised; the service
 layer catches it into a `successful=false` reply (§10).
 """
 struct ParameterRejection <: Exception
@@ -190,9 +192,6 @@ Base.showerror(io::IO, e::ParameterRejection) =
     print(io, "ParameterRejection: ", e.reason)
 
 # ── structural setproperties (no ConstructionBase dep) ──────────────────────────
-# Reconstruct an immutable schema value with a subset of fields overridden, via
-# the keyword constructor `@parameters` generates. A NamedTuple is a partial
-# overlay; the field order is the struct's own.
 
 """
     setproperties(base::P, overrides::NamedTuple) -> P

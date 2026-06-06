@@ -1,9 +1,9 @@
-# The message ↔ ZBytes bridge (§2.1/§3): the one place ROSNode turns a generated
-# message struct into a Zenoh payload and back. Both directions avoid an
-# intermediate full-payload `Vector` — encode sizes exactly then writes once,
-# decode reads straight out of the (copied or borrowed) payload memory. The wire
-# body is the 4-byte CDR encapsulation header (`CDR_LE`) + CDR payload; rmw_zenoh
-# per-message metadata rides separately in the Zenoh attachment (below).
+# The message ↔ ZBytes bridge: the one place ROSNode turns a generated message
+# struct into a Zenoh payload and back. Encode sizes the buffer exactly then writes
+# once; decode reads straight out of the (copied or borrowed) payload memory, so
+# neither direction allocates an intermediate full-payload `Vector`. The wire body
+# is the 4-byte CDR encapsulation header (`CDR_LE`) followed by the CDR payload;
+# rmw_zenoh per-message metadata rides separately in the Zenoh attachment (below).
 
 using CDRSerialization: CDRReader, CDRWriter, CDRSizeCalculator, read_view,
                         iscompact, materialize, CDRView, CDR_LE
@@ -24,14 +24,14 @@ import CDRSerialization
 Serialize a generated ROS message `msg` to a Zenoh payload. One exact-size
 allocation (the `CDRSizeCalculator` pass gives the precise byte count, preamble
 included), one serialization pass with `CDRWriter`, then the buffer is wrapped
-as a `ZBytes` that `put`/`reply` *borrows* (no copy into the transport — Zenoh
-pins the buffer until its deleter fires, §3.3). Compact (`@cdr1_compat`) messages
-take `write`'s single-store fast path internally.
+as a `ZBytes` that `put`/`reply` borrows: Zenoh pins the buffer until its deleter
+fires, so the transport reuses our heap allocation directly. Compact
+(`@cdr1_compat`) messages take `write`'s single-store fast path internally.
 
-`write` (not `write_all!`) is the exact-buffer entry point: it `ensureroom`s the
-*precise* per-field size, whereas `write_all!`'s upfront conservative budget
-over-estimates padding and overruns a tightly-sized buffer (it targets growable
-`IOBuffer`s, not the exact `Memory` we size here).
+`write` is the exact-buffer entry point: it `ensureroom`s the precise per-field
+size, matching the tightly-sized buffer this path allocates. (`write_all!` budgets
+padding conservatively upfront for growable `IOBuffer`s and would overrun the
+exact `Memory` sized here.)
 
 The SHM-move publish path (`zref(session, WireOf{T})`, §3.3) is a transport-layer
 choice made by the publisher, not here; this is the heap-borrow form.
@@ -56,16 +56,17 @@ end
     as(x, ::Type{T}) -> T
 
 Boundary cast: re-materialize `x` as the layout-compatible ROS type `T`. For two
-distinct Julia structs of the *same* wire type (equal RIHS01 ⇒ identical CDR form and
-field layout — e.g. two modules' aliases of `sensor_msgs/msg/Image`), this hands `x`'s
-value across the nominal-type boundary via the exact wire codec, correct by the same
-round-trip invariant the wire relies on. Identity when `typeof(x) === T`; a genuine
-layout mismatch surfaces as a decode error, never a silent reinterpretation.
+distinct Julia structs that share one wire type (equal RIHS01 ⇒ identical CDR form
+and field layout — e.g. two modules' aliases of `sensor_msgs/msg/Image`), this hands
+`x`'s value across the nominal-type boundary via the exact wire codec, correct by the
+same round-trip invariant the wire relies on. Returns `x` unchanged when
+`typeof(x) === T`. A genuine layout mismatch surfaces as a decode error rather than a
+silent reinterpretation.
 
-The explicit recovery when a value built as one alias reaches code expecting another —
-e.g. a handler on a Context whose `home` resolves the wire type to a different struct
-than the handler's body dispatches on: `f(as(msg, ThatType))`. (A `CDRView` re-tags
-zero-copy through `CDRSerialization.retag` — added with the intra-process work.)
+Use it when a value built as one alias reaches code expecting another — e.g. a handler
+on a Context whose `home` resolves the wire type to a different struct than the
+handler's body dispatches on: `f(as(msg, ThatType))`. A `CDRView` re-tags zero-copy
+through `CDRSerialization.retag`.
 """
 as(x, ::Type{T}) where {T} = typeof(x) === T ? x : decode(_encode_to_vector(x), T)
 export as
@@ -107,10 +108,9 @@ the single-load fast path (`iscompact`), and the value is plain bits with no
 aliasing, so a "view" of one is already escapable.
 """
 function decode(mem::DenseVector{UInt8}, ::Type{T}; view::Bool=false) where {T}
-    # Back-compat keyword entry. Prefer the type-stable `decode_view`/`decode_owned`
-    # on hot paths: a runtime `view::Bool` widens this method's return to
-    # `Union{T, CDRView{T}}` ⇒ inferred `Any` ⇒ every result is boxed and the decode
-    # is reached by dynamic dispatch. Each arm below is itself stable.
+    # Runtime `view::Bool` widens the return to `Union{T, CDRView{T}}`, forcing a
+    # boxed result and dynamic dispatch. Prefer `decode_view`/`decode_owned` on hot
+    # paths; each is type-stable.
     return view ? decode_view(mem, T) : decode_owned(mem, T)
 end
 
@@ -142,13 +142,11 @@ escapable. `iscompact` is `@generated` and constant-folds per concrete `T`, so t
     return iscompact(r, T) ? read(r, T) : read_view(r, T)
 end
 
-# ROS2/rmw_zenoh serializes with `CDR_LE` (CDR v1, little-endian). Declaring the
-# encapsulation up front gives a *concrete* `CDRReader{B,false,true}` — its
-# `IsCDR2`/`LE` params (and the type of every `CDRString`/`CDRView` derived from
-# it) are then known at compile time, so `decode_view`/`decode_owned` infer to a
-# concrete return with no `Any`-box / dynamic dispatch (the data-derived
-# `CDRReader(mem)` widened them to `Any`; see §3.2). The preamble is still consumed
-# and validated — a non-`CDR_LE` payload throws noisily rather than mis-decoding.
+# ROS2/rmw_zenoh serializes with `CDR_LE` (CDR v1, little-endian). Passing the
+# encapsulation as a `Val` gives a concrete `CDRReader{B,false,true}` whose
+# `IsCDR2`/`LE` params are known at compile time, so `decode_view`/`decode_owned`
+# infer a concrete return with no dynamic dispatch. The preamble is still consumed
+# and validated; a non-`CDR_LE` payload throws rather than mis-decoding.
 @inline _ros_reader(mem::DenseVector{UInt8}) = CDRReader(mem, Val(CDR_LE))
 
 """
@@ -163,10 +161,10 @@ decode_owned(view::CDRView) = materialize(view)
 # ── per-message attachment (§3.4) ────────────────────────────────────────
 # The `(sequence_number::Int64, source_timestamp::Int64, source_gid::NTuple{16,
 # UInt8})` triple that rides every `put`/request/reply, byte-for-byte with hiroz.
-# The encode/decode and the fixed `[u8;16]` gid form live in ROSZenoh
-# (`attachment.jl`); we thread them through so ROSNode callers spell the wire
-# metadata in one vocabulary. `gid` derivation (`entity_gid`) is also ROSZenoh's —
-# the publisher/service layer supplies the gid from its `EndpointEntity`.
+# Encode/decode, the fixed `[u8;16]` gid form, and `gid` derivation (`entity_gid`)
+# live in ROSZenoh (`attachment.jl`); these wrappers thread them through so ROSNode
+# callers spell the wire metadata in one vocabulary. The publisher/service layer
+# supplies the gid from its `EndpointEntity`.
 
 """
     encode_attachment(seq, ts, gid::NTuple{16,UInt8}) -> ZBytes
@@ -193,20 +191,21 @@ decode_attachment(sample) = ROSZenoh.decode_attachment(sample)
     type_info(::Type{T}) -> TypeInfo
 
 The `TypeInfo` (qualified ROS2 name + RIHS01 hash) for a generated message type,
-used to build the data-route and liveliness key expressions (§2.2). The name is
+used to build the data-route and liveliness key expressions. The name and hash
+identify the .msg interface on the wire — see
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html. The name is
 recovered reflectively from the type's module path: a generated type lives at
 `<package>.<qualifier>.<Name>` (e.g. `std_msgs.msg.String`), which maps to the
 ROS2 name `"<package>/<qualifier>/<Name>"`.
 
-TODO(typesupport §11): the RIHS01 hash is a per-type *fact computed from the
-struct AST*, which the generated Julia type does not carry — it belongs to the
-type registry, which `eval`s codegen from the IL and can stash the
-`type_info_from_struct` result keyed by `(name, hash)`. Until that registry
-lands, the hash is the zero placeholder (`TypeHash()`, the Humble sentinel),
-which is correct enough for keyexpr *structure* but not for cross-version hash
-matching. The registry specializes this method per registered type with the real
-hash; static types so specialized are fast, dynamic ones reached via
-`invokelatest`.
+The RIHS01 hash is a per-type value computed from the struct AST, which the
+generated Julia type does not carry — it belongs to the type registry, which
+`eval`s codegen from the IL and can stash the `type_info_from_struct` result keyed
+by `(name, hash)`. Until that registry lands, the hash is the zero placeholder
+(`TypeHash()`, the Humble sentinel): correct for keyexpr structure, but not for
+cross-version hash matching. The registry specializes this method per registered
+type with the real hash, so static specialized types are fast and dynamic ones go
+through `invokelatest`.
 """
 function type_info(::Type{T}) where {T}
     return TypeInfo(ros_type_name(T), TypeHash())

@@ -1,18 +1,17 @@
-# §7 Time & clocks. rclcpp's three-clock model expressed Julian-ly: the clock
-# source is a singleton-type discriminator that doubles as the `RTime` tag, so
-# mixing clocks is a *compile-time* MethodError rather than a runtime throw.
+# Time & clocks, mirroring rclcpp's three-clock model. The clock source is a
+# singleton-type discriminator that doubles as the `RTime` tag, so combining two
+# clocks is a compile-time MethodError.
 #
-# Depends only on `Dates` + Base; the Node type lands later, so node accessors
-# are duck-typed (`::Any`) against the node's clock surface (see `_node_clock`).
-# Sim time (`/clock`, `use_sim_time`) is a Context-level concern not yet wired —
-# the ROS-clock paths fall back to system time with TODO(graph) markers so this
-# file precompiles and the wall/steady paths work today.
+# Depends only on `Dates` + Base. The Node type is included later, so node
+# accessors are duck-typed (`::Any`) against the node's clock surface (see
+# `_node_clock`). Sim time (`/clock`, `use_sim_time`) is a Context-level concern;
+# the ROS-clock paths read system time and carry TODO(graph) markers for the
+# eventual `/clock` wiring.
 
 using Dates: Dates, Period, Nanosecond
 
 # ── clock sources ─────────────────────────────────────────────────────────
-# Singleton types, not Symbols: type-stable selection and the discriminator is
-# reused as the `RTime{C}` tag below.
+# Singleton types give type-stable selection, and the same type tags `RTime{C}`.
 
 """
     ClockSource
@@ -27,8 +26,8 @@ struct System <: ClockSource end
 "Monotonic clock (`CLOCK_MONOTONIC`); never goes backward. For durations/timeouts."
 struct Steady <: ClockSource end
 """
-The ROS abstraction: system time normally, or simulated time driven by `/clock`
-when a node sets `use_sim_time`. What `now(node)` returns and what stamps use.
+The ROS clock: system time by default, or simulated time driven by `/clock`
+when a node sets `use_sim_time`. Backs `now(node)` and message stamps.
 """
 struct ROS <: ClockSource end
 
@@ -38,16 +37,17 @@ struct ROS <: ClockSource end
     RTime{C<:ClockSource}
 
 A clock-tagged instant: an `Int64` nanosecond count (rclcpp's
-`rcl_time_point_value_t`), *not* the wire `builtin_interfaces/Time` struct.
-Named `RTime`, not `Time`, to avoid the `Dates.Time` clash. The tag `C` makes
-cross-clock arithmetic a `MethodError` (`RTime{Steady} - RTime{System}` has no
-method), turning rclcpp's runtime "clock types differ" throw into a dispatch
-guarantee.
+`rcl_time_point_value_t`). The tag `C` makes cross-clock arithmetic a
+`MethodError` (`RTime{Steady} - RTime{System}` has no method), enforcing rclcpp's
+"clock types differ" rule at dispatch time. This is the in-process value type,
+distinct from the wire `builtin_interfaces/Time` struct; convert with
+`to_msg`/`rtime`. The name avoids the `Dates.Time` clash.
+
+See https://design.ros2.org/articles/clock_and_time.html
 """
 struct RTime{C<:ClockSource}
     ns::Int64
 end
-# (the default inner ctor `RTime{C}(::Int64)` already converts any `Integer`.)
 
 "The `ClockSource` instance tagging this instant."
 source(::RTime{C}) where {C} = C()
@@ -58,14 +58,13 @@ nanoseconds(t::RTime) = t.ns
     Duration(ns)
 
 A clock-agnostic span in nanoseconds (signed `Int64`; differencing two instants
-may be negative). Distinct from `ROSZenoh.Duration` (the unsigned QoS-policy
-type) — this is rclcpp's `rcl_duration_value_t`, deliberately untagged so a span
-measured on one clock can be applied to another (rclcpp parity).
+may be negative). rclcpp's `rcl_duration_value_t`, untagged so a span measured on
+one clock can be applied to another. Distinct from `ROSZenoh.Duration`, the
+unsigned QoS-policy type.
 """
 struct Duration
     ns::Int64
 end
-# (the default inner ctor `Duration(::Int64)` already converts any `Integer`.)
 "Construct from a `Dates.Period` (`Duration(Dates.Millisecond(20))`)."
 Duration(p::Period) = Duration(Dates.tons(p))
 
@@ -80,8 +79,8 @@ _to_ns(p::Period)   = Dates.tons(p)
 _to_ns(n::Integer)  = Int64(n)
 
 # ── arithmetic (within a clock only) ────────────────────────────────────────
-# The whole point: only same-tag instants combine. No `RTime{A} ⊕ RTime{B}`
-# method exists, so mixing clocks fails to compile-dispatch.
+# Only same-tag instants combine; there is no `RTime{A} ⊕ RTime{B}` method, so
+# mixing clocks is a dispatch error.
 
 # instant − instant → span
 Base.:-(a::RTime{C}, b::RTime{C}) where {C} = Duration(a.ns - b.ns)
@@ -169,23 +168,20 @@ rtime(::Type{C}, msg) where {C<:ClockSource} = RTime{C}(_join_ns(msg.sec, msg.na
 rtime(::C, msg) where {C<:ClockSource}       = rtime(C, msg)
 duration(msg) = Duration(_join_ns(msg.sec, msg.nanosec))
 
-# `header.stamp = now(node)` should convert at the boundary via the generated
-# kw-ctor's `convert(FieldType, value)` (§7). We deliberately do **not** define
-# `Base.convert(::Type{T}, ::RTime) where T` here: an unconstrained `T` claims
-# every `convert` target and collides with dozens of Base methods (`Any`,
-# `Nothing`, `Missing`, `Ref`, …). The conversion is keyed on the *concrete*
-# generated `builtin_interfaces` `Time`/`Duration` structs, which are owned by
-# the message-integration layer and not in scope here.
+# `header.stamp = now(node)` converts at the boundary via the generated kw-ctor's
+# `convert(FieldType, value)`. The `Base.convert` methods belong with the
+# concrete generated `builtin_interfaces` `Time`/`Duration` structs (owned by the
+# message-integration layer): an unconstrained `convert(::Type{T}, ::RTime)`
+# would claim every target and collide with Base methods for `Any`/`Nothing`/etc.
 #
-# TODO(messages): when that layer lands, register the narrow methods against the
-# concrete types, e.g.
-#   Base.convert(::Type{builtin_interfaces.msg.Time}, t::RTime)     = to_msg(builtin_interfaces.msg.Time, t)
+# TODO(messages): register the narrow methods against the concrete types, e.g.
+#   Base.convert(::Type{builtin_interfaces.msg.Time}, t::RTime)        = to_msg(builtin_interfaces.msg.Time, t)
 #   Base.convert(::Type{builtin_interfaces.msg.Duration}, d::Duration) = to_msg(builtin_interfaces.msg.Duration, d)
-# Until then, callers use `to_msg(T, …)` / `rtime` / `duration` explicitly.
+# Meanwhile callers use `to_msg(T, …)` / `rtime` / `duration` explicitly.
 
 # ── jump callbacks ──────────────────────────────────────────────────────────
-# Registered so timers can recompute their next fire across a discontinuity
-# (sim activate/deactivate, NTP step, runtime `use_sim_time` toggle, §7).
+# Let timers recompute their next fire across a clock discontinuity (sim
+# activate/deactivate, NTP step, runtime `use_sim_time` toggle).
 
 "Why a clock jumped — handed to a `JumpCallback`."
 @enum JumpKind sim_activated sim_deactivated time_forward time_backward
@@ -262,11 +258,10 @@ Base.show(io::IO, ::Clock{C}) where {C} = print(io, "Clock{", nameof(C), "}")
 # TODO(graph): route through `node.clock(C())` once Node exists, so the ROS
 # clock can pick up the node's `use_sim_time` + Context `/clock` source.
 function _node_clock(node, src::C) where {C<:ClockSource}
-    # Cache the handle in `node.clocks` (a node has one). A *stable* handle per (node,
-    # source) is essential: `register!(clock(node, ROS()), cb)` and `now(node, ROS())`
-    # and the sim-time jump dispatch (`_fire_jumps_to!`) all reach the SAME `Clock{ROS}`
-    # only if it is shared, not re-synthesized each call. A context-less mock (tests) has
-    # no `clocks` table — synthesize a fresh handle (the caller holds it directly).
+    # One stable handle per (node, source), cached in `node.clocks`, so that
+    # `register!(clock(node, ROS()), cb)`, `now(node, ROS())`, and the sim-time jump
+    # dispatch all reach the same `Clock{C}`. A context-less mock (tests) has no
+    # `clocks` table, so synthesize a fresh handle for the caller to hold.
     if hasproperty(node, :clocks)
         return get!(() -> Clock(node, src), node.clocks, C)::Clock{C}
     end
@@ -341,9 +336,8 @@ Dates.now(node, src::ClockSource) = Dates.now(clock(node, src))
 Dates.now(node::Any) = Dates.now(node, ROS())
 
 # ── sleep / sleep_until ─────────────────────────────────────────────────────
-# Clock-aware, and **interruptible on context shutdown** (§14). Steady/System
-# sleep the wall remainder; ROS is system today, sim later. Interruption hook is
-# stubbed until the Context shutdown plumbing lands.
+# Clock-aware and interruptible on context shutdown. Steady/System sleep the wall
+# remainder; ROS sleeps wall time today and tracks sim later.
 
 # How long (wall ns) to actually block to realize a span on this clock. For
 # Steady/System that's just the span; for ROS-under-sim it differs (TODO).
@@ -422,10 +416,9 @@ function _interruptible_sleep(c::Clock, ns::Integer)
 end
 
 # ── Timer ───────────────────────────────────────────────────────────────────
-# `Timer(node, period; clock=ROS()) do … end` — fires every period on the chosen
-# clock. Follows the `Timer(f, …)` precedent (DESIGN §"type-constructors"):
-# constructor takes the function, returns a `close`-able handle, doesn't
-# auto-close, and dies with the node.
+# `Timer(node, period; clock=ROS()) do … end` fires every period on the chosen
+# clock. The constructor takes the function first, returns a `close`-able handle
+# that stays open until closed, and dies with the node.
 
 """
     Timer(f, node, period; clock=ROS())
@@ -467,7 +460,7 @@ function _start!(t::Timer{C}) where {C<:Union{Steady,System}}
     secs = t.period.ns / 1e9
     t.impl = Base.Timer(secs; interval=secs) do _
         (@atomic t.open) || return
-        _timer_active(t.clk.node) || return       # §14.2: gated (inactive) node ⇒ skip tick
+        _timer_active(t.clk.node) || return
         try
             t.f()
         catch err
@@ -486,7 +479,7 @@ function _start!(t::Timer{ROS})
     secs = t.period.ns / 1e9
     t.impl = Base.Timer(secs; interval=secs) do _
         (@atomic t.open) || return
-        _timer_active(t.clk.node) || return       # §14.2: gated (inactive) node ⇒ skip tick
+        _timer_active(t.clk.node) || return
         try
             t.f()
         catch err
@@ -515,9 +508,9 @@ Base.show(io::IO, t::Timer{C}) where {C} =
     Rate(node, hz; clock=ROS())
 
 A loop-frequency governor. Call `sleep(rate)` at the bottom of a loop to sleep
-the remainder of each `1/hz` period on the node's clock. Drifts are absorbed by
-anchoring to the last wake (rclcpp `WallRate` semantics) rather than `sleep`'s
-fixed delay.
+the remainder of each `1/hz` period on the node's clock. Anchoring to the last
+wake absorbs per-iteration drift, holding the target frequency (rclcpp `WallRate`
+semantics).
 """
 mutable struct Rate{C<:ClockSource}
     const clk::Clock{C}

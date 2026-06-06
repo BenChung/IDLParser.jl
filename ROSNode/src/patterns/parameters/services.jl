@@ -5,7 +5,11 @@
 # binding (a `Service(node, …)` per service + the `/parameter_events` publisher)
 # is the §8 Service-layer's job and is staged behind a precompile-safe stub.
 
-"The six standard parameter service base names (§10), under the node's private namespace."
+"""
+The six standard ROS 2 parameter service base names, under the node's private
+namespace (§10). Every node exposes these so any parameter client can introspect
+and mutate its parameters: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
+"""
 const PARAMETER_SERVICE_NAMES = (
     "describe_parameters",
     "get_parameter_types",
@@ -15,8 +19,8 @@ const PARAMETER_SERVICE_NAMES = (
     "set_parameters_atomically",
 )
 
-# describe: name → its ParameterDescriptor (declared) or a synthesized one for a
-# live dynamic param. The reflection the `describe_parameters` service replies with.
+# name → its declared `ParameterDescriptor`, a synthesized one for a live dynamic
+# param, or a NOT_SET descriptor for an unknown name.
 function describe_parameters(s::ParameterServer{P}, names) where {P}
     out = ParameterDescriptor[]
     for name in names
@@ -64,17 +68,17 @@ function get_parameters(s::ParameterServer{P}, names) where {P}
     end
 end
 
-# list: the flat union of names, optionally prefix-filtered. (`depth`/separator
-# semantics of `ListParameters` are a TODO until the wire request type lands.)
+# list: the flat union of names, optionally prefix-filtered. `depth`/separator
+# semantics of `ListParameters` are unimplemented.
 function list_parameters(s::ParameterServer; prefixes=())
     names = parameter_names(s)
     isempty(prefixes) && return names
     filter(n -> any(p -> startswith(String(n), String(p)), prefixes), names)
 end
 
-# set (atomic): apply `name => value` pairs as one transaction. Returns
-# `(successful, reason)` — the `SetParametersResult` shape. A rejection is caught
-# into `successful=false` (the external-client asymmetry, §10), never re-raised.
+# set (atomic): apply `name => value` pairs as one transaction. Returns the
+# `(successful, reason)` `SetParametersResult` shape, mapping a rejection to
+# `successful=false` so callers over the wire see a result rather than an exception.
 function set_parameters_atomically(s::ParameterServer{P}, pairs) where {P}
     try
         transaction(s) do p
@@ -90,8 +94,8 @@ function set_parameters_atomically(s::ParameterServer{P}, pairs) where {P}
     end
 end
 
-# set (per-item): each pair its own transaction → one `SetParametersResult` each,
-# independent success/failure (ROS2's `SetParameters`, vs the atomic variant).
+# set (per-item): each pair is its own transaction, yielding one `SetParametersResult`
+# with independent success/failure (ROS2's `SetParameters`).
 function set_parameters(s::ParameterServer{P}, pairs) where {P}
     map(pairs) do (name, value)
         set_parameters_atomically(s, ((name, value),))
@@ -100,9 +104,8 @@ end
 
 # ── wire types (§10) ──────────────────────────────────────────────────────────
 # The `rcl_interfaces` generated structs the parameter services marshal over.
-# Vendored under `Interfaces`; aliased here for readability. Keyword constructors
-# require *every* field (the generator emits no defaults), so each build below is
-# exhaustive.
+# Vendored under `Interfaces`; aliased here for readability. The generated keyword
+# constructors require every field (no defaults), so each build below is exhaustive.
 
 const _RCL_MSG = Interfaces.rcl_interfaces.msg
 const _RCL_SRV = Interfaces.rcl_interfaces.srv
@@ -116,8 +119,8 @@ const _Time                 = Interfaces.builtin_interfaces.msg.Time
 
 # ── value marshalling (§10) ─────────────────────────────────────────────────────
 # A Julia parameter value ⇄ the `ParameterValue` tagged union. The `type` byte
-# selects the live arm; the other ten fields carry zeroed placeholders (the union
-# is flat on the wire, so every field is present — the kw ctor needs all of them).
+# selects the live arm; because the union is flat on the wire, every field is
+# present, so the other ten carry zeroed placeholders.
 
 # A `ParameterValue` with `type=tag` and one arm filled; the rest are zero/empty.
 _param_value(tag::ParameterType; bool=false, int=Int64(0), dbl=0.0, str="",
@@ -127,9 +130,9 @@ _param_value(tag::ParameterType; bool=false, int=Int64(0), dbl=0.0, str="",
         bool_array_value = bools, integer_array_value = ints,
         double_array_value = dbls, string_array_value = strs)
 
-# A Julia value → its `ParameterValue`. `Symbol` is string-with-choices sugar, so
-# it marshals as STRING. `nothing` (an unset/unknown param) is NOT_SET. `Bool` is
-# matched before `Integer` (it `<: Integer`).
+# A Julia value → its `ParameterValue`. `Symbol` marshals as STRING. `nothing` (an
+# unset/unknown param) is NOT_SET. `Bool` must be matched ahead of `Integer`,
+# since `Bool <: Integer`.
 function _to_param_value(x)
     x === nothing                      && return _param_value(PARAMETER_NOT_SET)
     x isa Bool                         && return _param_value(PARAMETER_BOOL;          bool = x)
@@ -146,8 +149,7 @@ function _to_param_value(x)
 end
 
 # A `ParameterValue` → its Julia value, dispatched on the `type` tag. NOT_SET (and
-# any unknown tag) reads back as `nothing` — the unset-parameter sentinel `set`
-# rejects upstream.
+# any unknown tag) reads back as `nothing`, the unset-parameter sentinel.
 function _from_param_value(pv)
     t = _ptype(pv.type)
     t === PARAMETER_BOOL          && return pv.bool_value
@@ -234,9 +236,9 @@ function wire_parameter_services!(s::ParameterServer)
 end
 
 # Assemble `rcl_interfaces/msg/ParameterEvent` from the post-commit batch and
-# publish it on `/parameter_events`. A declared field that *moved* is a change; a
-# name absent from `previous` (a fresh dynamic param) is new. Deletions aren't
-# modeled by the transaction path yet, so `deleted_parameters` stays empty.
+# publish it on `/parameter_events`. A name present in `previous` is a change; a
+# fresh dynamic param (absent from `previous`) is new. The transaction path does
+# not model deletions, so `deleted_parameters` stays empty.
 function _publish_parameter_event(s::ParameterServer, batch::ParameterEventBatch)
     s._events_pub === nothing && return nothing
     node = s.node

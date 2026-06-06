@@ -11,15 +11,17 @@
 
 A single accepted action goal (§9). Carries the 16-byte goal id, the decoded
 goal request (`G`), the live [`GoalState`](@ref), and the write-once
-[`ResultCell`](@ref) the handler settles. Cancellation is *structured*:
+[`ResultCell`](@ref) the handler settles. Cancellation is structured:
 [`feedback!`](@ref)/[`checkpoint`](@ref) throw [`Cancelled`](@ref) once the goal
-is `CANCELING`, so the classic "stuck in CANCELING" bug can't happen on the
-default path.
+is `CANCELING`, so a goal in `CANCELING` always unwinds to a `CANCELED` result on
+the default path.
 
 Settle it with [`succeed`](@ref)/[`abort`](@ref)/`canceled` via
 [`respond!`](@ref), or just `return`/throw from the handler (fail-safe
 settlement, §8/§9). The server owns the result cache and status publication; the
 handle is the user-facing verb surface.
+
+See the ROS 2 action concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
 mutable struct GoalHandle{A, G, R, F}
     const server::Any                    # back-ref to the ActionServer (duck-typed)
@@ -29,12 +31,12 @@ mutable struct GoalHandle{A, G, R, F}
     const accepted_at::Int64             # acceptance stamp (wall ns, §3.4/§7)
     const lock::ReentrantLock
     @atomic status::GoalState
-    # The settled result, cached for `get_result` replay (a late or repeated
-    # fetch is answered without re-running the goal). The cell delivers the
-    # payload through `deliver` and does *not* retain it, so we capture it here on
-    # the first terminal fill. `nothing` until settled; written under `g.lock`
-    # before the cell flips `filled` (single-writer, in `_deliver_result!`), so a
-    # waiter waking on `wait_settled` always sees the result by the time it reads it.
+    # The settled result, cached for `get_result` replay so a late or repeated
+    # fetch is answered without re-running the goal. The cell delivers the payload
+    # through `deliver` without retaining it, so the first terminal fill captures
+    # it here. `nothing` until settled; written under `g.lock` before the cell
+    # flips `filled` (single-writer, in `_deliver_result!`), so a waiter waking on
+    # `wait_settled` always sees the result by the time it reads it.
     result::Union{R, Nothing}
     # Terminal stamp (wall ns) — when the goal settled; `0` while live. Drives
     # TTL eviction of the result cache (the goal table holds settled goals only
@@ -64,11 +66,10 @@ state(g::GoalHandle) = _state_symbol(@atomic g.status)
 Base.show(io::IO, g::GoalHandle{A}) where {A} =
     print(io, "GoalHandle(", nameof(A), " ", _state_symbol(@atomic g.status), ")")
 
-# Transition guard: only advance from a non-terminal state, atomically. The
-# terminal latch is owned by settlement (`_deliver_result!`), which writes under
-# the *same* `g.lock`; so a transition can never clobber a settled status — it
-# either observes the terminal state here and bails, or runs first and is then
-# overwritten by the terminal latch. Either way terminal wins.
+# Transition guard: advance the status only from a non-terminal state, under
+# `g.lock`. Settlement's terminal latch (`_deliver_result!`) takes the same lock,
+# so terminal always wins — a transition either sees the terminal state and bails
+# or is overwritten by the latch.
 function _transition!(g::GoalHandle, to::GoalState)
     @lock g.lock begin
         cur = @atomic g.status
@@ -103,8 +104,8 @@ result. After a goal is already settled (e.g. detached post-cancel cleanup ran
 `respond!`), `checkpoint` is a no-op so the cleanup runs to completion.
 """
 function checkpoint(g::GoalHandle)
-    # Once settled, the cancel signal is spent — detached cleanup must not keep
-    # throwing (DESIGN: "checkpoint() now a no-op" after the cleanup respond!).
+    # Once settled, the cancel signal is spent: a no-op here lets detached
+    # post-cancel cleanup run to completion instead of re-throwing Cancelled.
     isfilled(g.cell) && return nothing
     iscancelled(g) && throw(Cancelled())
     nothing
@@ -116,10 +117,9 @@ end
     feedback!(goal, fb)
 
 Publish one feedback message `fb` (a `Feedback` struct for the action) on the
-action's feedback topic, *and* checkpoint cancellation (§9): if the goal is
-`CANCELING` this throws [`Cancelled`](@ref) before publishing, so a feedback loop
-doubles as a cancellation-observation loop. Sugar for
-`respond!(goal, feedback, fb)`.
+action's feedback topic, then checkpoint cancellation (§9): a `CANCELING` goal
+throws [`Cancelled`](@ref) before publishing, so a feedback loop doubles as a
+cancellation-observation loop. Sugar for `respond!(goal, feedback, fb)`.
 
 A feedback publish after the goal is settled is dropped (the client has the
 result; the stream is closed).

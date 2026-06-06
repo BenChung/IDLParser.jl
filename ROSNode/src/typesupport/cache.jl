@@ -1,13 +1,13 @@
 # ── content-addressed cache (project-local, opt-in) ─────────────────────────
 # A store keyed by RIHS01, holding the wire `TypeDescription` JSON (the form
 # `calculate_rihs01_hash` hashes over, so self-validating on load). Discovery
-# checks it before the network; a fetch writes it back. Codegen is cheap, so we
-# cache the *definition*, not generated code, and regenerate on load.
+# checks it before the network; a fetch writes it back. Because codegen is cheap, the
+# cache holds the definition and regenerates the code on load.
 #
-# Location & opt-in (D5, revised): the cache is a **project-local** folder (in the
-# active project's dir), `.json` blobs keyed by RIHS01 hash. It is **off by default**
-# — persistence is enabled by the user adding the [`@ros_cache`](@ref) macro to their
-# module (which calls [`enable_project_cache!`](@ref) from its `__init__`), or by the
+# Location & opt-in: the cache is a project-local folder (in the active project's
+# dir) of `.json` blobs keyed by RIHS01 hash, off by default. The user enables
+# persistence by adding the [`@ros_cache`](@ref) macro to their module (which calls
+# [`enable_project_cache!`](@ref) from its `__init__`), or by the
 # `$ROS_TYPESUPPORT_CACHE` env override (ops/tests, force-enables with that dir).
 # ROSNode is a library; discovered types are deployment-specific, so they belong in
 # the importing project, owned by the user — not a package-global scratchspace.
@@ -16,7 +16,7 @@
 
 # Cache opt-in state. `dir === nothing` ⇒ use the project-local default when enabled.
 # `dirs` is the ordered read search-list (a project may register several `@ros_cache`
-# dirs); `dir` is the single primary *write* dir (the deterministic min of `dirs`, or
+# dirs); `dir` is the single primary write dir (the deterministic min of `dirs`, or
 # the last explicit `enable_project_cache!`). Reads consult every entry in `dirs`.
 mutable struct _CacheState
     enabled::Bool
@@ -36,11 +36,13 @@ end
 """
     enable_project_cache!(dir = <project>/ros_typesupport) -> String
 
-Turn on project-local persistence of dynamically-discovered type descriptions
-(D5): discovery then writes `.json` `TypeDescription` blobs (keyed by RIHS01) under
-`dir`, and resolution reads them before going to the wire. Off by default — the
-[`@ros_cache`](@ref) macro calls this from its `__init__` so a project opts in by
-adding the macro. Returns the (created) directory.
+Turn on project-local persistence of dynamically-discovered [type descriptions][1].
+Discovery writes `.json` `TypeDescription` blobs (keyed by RIHS01) under `dir`, and
+resolution reads a cached blob first, falling back to the wire on a miss. Off by
+default: the [`@ros_cache`](@ref) macro calls this from its `__init__`, so a project
+opts in by adding the macro. Returns the (created) directory.
+
+[1]: https://design.ros2.org/articles/idl_interface_definition.html
 """
 function enable_project_cache!(dir::AbstractString=_default_project_cache_dir())
     d = String(dir)
@@ -51,10 +53,9 @@ function enable_project_cache!(dir::AbstractString=_default_project_cache_dir())
     return d
 end
 
-# Register a set of `@ros_cache` opt-in dirs deterministically (D5). Multiple dirs no
-# longer collapse to whichever the unordered set yielded last: all become the read
-# search-list and the lexicographically smallest is the single (stable) write dir. A
-# `>1`-dir project is warned — discovery still persists, but only to one of them.
+# Register a set of `@ros_cache` opt-in dirs deterministically. All become the read
+# search-list; the lexicographically smallest is the single stable write dir. A
+# `>1`-dir project is warned: discovery persists, but only to that one dir.
 function _register_cache_dirs!(dirs)
     ds = sort!(unique(String[String(d) for d in dirs]))
     isempty(ds) && return _CACHE.dir
@@ -120,8 +121,8 @@ end
 
 # Load + self-validate a cached `TypeDescriptionMsg` for `info`, searching every
 # registered cache dir in order (first hit wins). Recomputes the RIHS01 over the parsed
-# blob and discards on mismatch (a stale/corrupt entry can never decode wrong, DESIGN
-# §cache). Returns `nothing` on miss, parse failure, or hash mismatch across all dirs.
+# blob and discards on mismatch (a stale/corrupt entry can never decode wrong).
+# Returns `nothing` on miss, parse failure, or hash mismatch across all dirs.
 function _cache_load(info::TypeInfo)
     _cache_enabled() || return nothing
     leaf = _cache_leaf(info)
@@ -159,9 +160,9 @@ end
 # ── TypeDescription JSON (de)serialization ──────────────────────────────────
 # The cache and the `:typedesc` export round-trip the wire blob through the exact
 # JSON `to_ros2_json` emits. Serialization is ROSMessages' (`to_ros2_json`, the
-# hashing form); the inverse parser lives here because it's a cache/persistence
-# concern, not a hashing one. We parse the fixed, hand-written shape directly
-# rather than add a JSON dep — same posture ROSMessages takes writing it.
+# hashing form); the inverse parser lives here as a cache/persistence concern. It
+# parses the fixed, hand-written shape directly to avoid a JSON dependency, matching
+# the posture ROSMessages takes when writing it.
 
 # Minimal recursive-descent parser for the exact JSON shape `to_ros2_json` emits:
 # `{"type_description": <td>, "referenced_type_descriptions": [<td>...]}` where a

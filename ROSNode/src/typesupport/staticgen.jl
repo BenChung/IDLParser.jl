@@ -1,11 +1,11 @@
-# §11/D5 — static type generation macros: `@ros_import` and `@ros_cache`.
+# Static type generation macros: `@ros_import` and `@ros_cache`.
 #
 # Both turn a *source* of type definitions into statically-compiled Julia types in
 # the caller module (reusing ROSMessages' existing generation — the same pipeline
 # `@ros_msg`/`@ros_msgs` run) and record `(type, TypeDescription-JSON)` pairs in the
 # module-local `__ros_static_types__` global, which Context creation registers (real
-# RIHS01, bound to the precompiled type) so keyexpr-only resolution and the §13
-# server use them directly — no runtime codegen.
+# RIHS01, bound to the precompiled type) so keyexpr-only resolution and the
+# type-description server use them directly — no runtime codegen.
 #
 #   • `@ros_import "pkg" | "pkg/qual/Name" …` — resolve ament/vendored types *by
 #     name* (with their transitive reference closure) and generate them. The static
@@ -14,7 +14,7 @@
 #   • `@ros_cache [dir]` — bake the project-local discovered-type cache (`.json`
 #     blobs) into static types, `include_dependency` the blobs (so a grown cache
 #     re-precompiles), and turn on runtime persistence (so this run's new discoveries
-#     are written for next time). The D5/D9 "converge to fast" opt-in.
+#     are written for next time). Opt in to converge a deployment toward fast warm-up.
 #
 # `flush_type_cache` graduates the cache out to a folder (default `.msg`).
 
@@ -128,7 +128,7 @@ function _resolve_import_closure(names::Vector{String}, roots::Vector{String}=St
         end
         il = _parse_interface(path, qual, bare)
         push!(specs, (; package=pkg, qualifier=qual, bare=bare, path=path, il=il))
-        for (rpkg, rname) in IL.referenced_refs(il)         # transitive deps (always msg)
+        for (rpkg, rname) in IL.referenced_refs(il)         # referenced types are always msg
             push!(work, (rpkg === nothing ? pkg : String(rpkg), "msg", String(rname)))
         end
     end
@@ -203,20 +203,19 @@ function _static_register_stmts(jsons, cache_dir)
     return stmts
 end
 
-# D10B S1 — emit the per-module resolution-table population. `jsons` are the module's
+# Emit the per-module resolution-table population. `jsons` are the module's
 # *own* (newly-generated) types `(pkg, qual, bare, json)`; aliased/transitive types arrive
 # via the dependency-closure fold inside `_merge_resolve!`, so a pure-alias import still
 # emits this (with no own entries) to inherit its deps' tables. Emitted at module top level
-# (NOT in `__init__`) so it runs and bakes at precompile — where the loaded-module set is
-# exactly this module's dependency closure, making the table deterministic and load-order
-# independent. (For a script/REPL module it runs at eval over the ambient set — the
-# documented degradation.)
+# so it runs and bakes at precompile, where the loaded-module set is exactly this module's
+# dependency closure, making the table deterministic and load-order independent. (For a
+# script/REPL module it runs at eval over the ambient set — the documented degradation.)
 function _resolve_stmts(jsons)
     own = Any[]
     for (pkg, qual, bare, json) in jsons
         tdmsg = _parse_type_description_json(json)
         tdmsg === nothing && continue
-        rihs = calculate_rihs01_hash(tdmsg)        # RIHS01 string
+        rihs = calculate_rihs01_hash(tdmsg)
         push!(own, :(($(QuoteNode(Symbol(rihs))), $(Meta.parse("$pkg.$qual.$bare")))))
     end
     return Any[
@@ -244,7 +243,7 @@ end
 
 # Emit, per provided hit, `module <pkg> module <qual> const <Name> = <T> end end`
 # so the caller's `<pkg>.<qual>.<Name>` path *aliases* an already-compiled struct `T`
-# (one wire type ⇒ one Julia struct, §11/D5) instead of minting a duplicate. `T` is
+# (one wire type ⇒ one Julia struct), reusing it rather than minting a duplicate. `T` is
 # the resolved type spliced in literally — ROSNode's vendored canonical copy, or a
 # type a dependency already `@ros_import`ed — so it's an external reference (single
 # copy, even across a precompile boundary). One module pair per (pkg, qual).
@@ -279,8 +278,8 @@ end
 function _import_plan(names::Vector{String}, roots::Vector{String}=String[])
     specs = _resolve_import_closure(names, roots)
     isempty(specs) &&
-        error("@ros_import: no sources resolved for $(names) — vendored, in a sourced \
-               ROS2 env (AMENT_PREFIX_PATH), or under a `from=` root")
+        error("@ros_import: no sources resolved for $(names); searched `from=` roots, the \
+               vendored dir, and AMENT_PREFIX_PATH (source a ROS 2 env or add a `from=` root)")
     tds = _static_type_descriptions([(s.package, s.il) for s in specs])
     hashof = Dict{String, Any}()
     jsonof = Dict{String, String}()
@@ -376,7 +375,7 @@ function _plan_block!(block, plan)
         append!(block.args, gen.args)
         append!(block.args, _static_register_stmts(gen_jsons, nothing))
     end
-    # D10B S1: per-module resolution table — always (even pure-alias, which inherits its
+    # Per-module resolution table — always emitted (even pure-alias, which inherits its
     # deps' tables via the closure fold). `gen_jsons` are this module's own mints.
     append!(block.args, _resolve_stmts(gen_jsons))
     # Track BYO sources so edits/additions invalidate precompile (generated paths get
@@ -392,8 +391,9 @@ end
     @ros_import "pkg/qual/Name" as Alias
     @ros_import from="dir" "pkg/qual/Name" ...
 
-Statically generate ament/vendored ROS interface types *resolved by name* into the
-calling module (the static counterpart to dynamic discovery). Each name is a package
+Statically generate ROS 2 interface types ([`.msg`/`.srv`/`.action`](https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html))
+resolved by name from ament/vendored sources into the calling module, the static
+counterpart to dynamic discovery. Each name is a package
 (`"sensor_msgs"` — all its interfaces) or a fully-qualified type
 (`"sensor_msgs/msg/Imu"`); the transitive reference closure (e.g. `std_msgs/Header`)
 is pulled automatically. Sources are found in ROSNode's vendored dir and, when inside
@@ -415,15 +415,16 @@ Generation reuses the same pipeline as [`@ros_msg`](@ref) (structs +
 `include_dependency`); types land at `<pkg>.<qual>.<Name>`. They are additionally
 **auto-registered** (real RIHS01) on Context creation, so a keyexpr-only
 `Subscription(node, "/t")` uses the precompiled type with no runtime codegen, and the
-§13 server can serve their descriptions. No JSON caching — ament/vendored is the
-durable source.
+type-description server can serve their descriptions. Resolution always reads
+ament/vendored directly, the durable source, so there is no JSON cache to keep in sync.
 
 **Binding (Julia-`import`-like).** A fully-qualified *message* type binds its bare
 leaf, like `import Mod: Name` — `@ros_import "sensor_msgs/msg/Image"` gives `Image`
 directly (and `sensor_msgs.msg.Image` too, since `sensor_msgs` is in scope). A bare
 package binds the module, like `import Mod` — `@ros_import "sensor_msgs"` gives
-`sensor_msgs` (use `sensor_msgs.msg.X`). Transitively-pulled deps are *not* leaf-bound
-(no namespace flood). Two imports binding the same leaf error, pointing at `as`.
+`sensor_msgs` (use `sensor_msgs.msg.X`). Transitively-pulled deps stay reachable only
+by path (`pkg.qual.Name`), keeping the leaf namespace to the types you named. Two
+imports binding the same leaf error, pointing at `as`.
 
 **Single-copy:** any type whose `(name, RIHS01)` is already provided by a loaded
 module — the vendored canonical copy, or one a dependency `@ros_import`ed (see
@@ -587,7 +588,7 @@ macro ros_cache(args...)
     # Bake registration for the cached types + the cache opt-in marker (`""` ⇒ the
     # project default dir, recomputed at load so it stays relocatable).
     append!(block.args, _static_register_stmts(type_jsons, isempty(args) ? "" : dir))
-    # D10B S1: cached types also join the per-module resolution table (content-canonical,
+    # Cached types also join the per-module resolution table (content-canonical,
     # in the home closure).
     append!(block.args, _resolve_stmts(type_jsons))
     return esc(block)
@@ -612,8 +613,8 @@ end
 Graduate the project-local discovered-type cache out to folder `to` (D5): write each
 cached type in `format` (`:msg` default — a colcon-buildable interface package;
 `:julia` for precompilable source; `:typedesc` for the raw wire blob). Returns the
-paths written. The durable, user-owned export of what was learned by running against
-the live graph (vs. the ephemeral cache).
+paths written. Produces a durable, user-owned export of the types learned by running
+against the live graph, suitable for checking into a project.
 """
 function flush_type_cache(to::AbstractString; dir::AbstractString=_cache_dir(),
                           format::Symbol=:msg)

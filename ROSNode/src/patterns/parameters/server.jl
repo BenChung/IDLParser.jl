@@ -1,10 +1,10 @@
 # ── the parameter server (§10) ──────────────────────────────────────────────────
-# Holds the live schema value behind an atomic `Ref{P}` (whole-struct swap, so a
-# racing reader sees old-or-new, never half-applied), the descriptors (cached
+# Holds the live schema value behind an atomic field (whole-struct swap, so a
+# racing reader sees a complete old-or-new value), the descriptors (cached
 # once), the dynamic side dict + `allow_undeclared` gate, the mutation lock, the
-# on-change listeners, and a slot for the `/parameter_events` publisher the §8
-# service wiring attaches. `node` is held loosely (`Any`) so this file does not
-# depend on a particular Node shape — the node attaches its server and routes
+# on-change listeners, and a slot for the `/parameter_events` publisher the
+# service wiring attaches. `node` is held loosely (`Any`) to keep this file
+# independent of the Node type — the node attaches its server and routes
 # `node.parameters` to it.
 
 """
@@ -17,12 +17,14 @@ complete value, rollback is free); undeclared params live in `dynamic_parameters
 the sugar (`server.field = v`, [`setproperties!`](@ref)); read declared fields
 with `server.field`.
 
+Implements the ROS 2 parameter model: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
+
 Typically reached as `node.parameters`; the six standard parameter services and
 `/parameter_events` are wired generically over `P` (see [`wire_parameter_services!`](@ref)).
 """
 mutable struct ParameterServer{P}
     const node::Any                                  # the owning Node (loosely held)
-    @atomic value::P                                 # live schema value (atomic swap)
+    @atomic value::P                                 # live schema value
     const descriptors::Vector{ParameterDescriptor}
     const by_name::Dict{Symbol, ParameterDescriptor}
     const dynamic::Dict{Symbol, Any}                 # undeclared params (Any-typed)
@@ -63,7 +65,7 @@ current(s::ParameterServer) = @atomic s.value
 "The declared schema type `P` of this server."
 schema_type(::ParameterServer{P}) where {P} = P
 
-"The declared field names (§10)."
+"The declared parameter names, in schema order (§10)."
 declared_names(s::ParameterServer{P}) where {P} = fieldnames(P)
 
 "The dynamic (undeclared) parameter dict (§10) — errors if `allow_undeclared` is off."
@@ -74,9 +76,9 @@ function dynamic_parameters(s::ParameterServer)
 end
 
 # ── reads (§10) ──────────────────────────────────────────────────────────────────
-# `server.field` derefs the live struct (type-stable for a declared field). The
-# reserved members (`node`/`value`/…) read through normally; everything else is a
-# parameter name. Declared names always win over the dynamic dict.
+# `server.field` derefs the live struct (type-stable for a declared field).
+# Reserved struct members read through; any other name is a parameter, with
+# declared names taking priority over the dynamic dict.
 
 const _SERVER_FIELDS = fieldnames(ParameterServer)
 
@@ -99,8 +101,9 @@ Base.propertynames(s::ParameterServer{P}) where {P} = fieldnames(P)
     parameter(server, name::Symbol)
 
 Read a parameter by `name` across both tiers (§10): a declared field reads from
-the live struct, a dynamic one from the side dict (when `allow_undeclared`).
-Throws if undeclared and the gate is off — the flat-namespace read the services use.
+the live struct, a dynamic one from the side dict (when `allow_undeclared`). The
+flat-namespace read the services use; throws for an undeclared name when the gate
+is off.
 """
 function parameter(s::ParameterServer{P}, name::Symbol) where {P}
     name in fieldnames(P) && return getfield(@atomic(s.value), name)
@@ -123,12 +126,13 @@ function parameter_names(s::ParameterServer{P}) where {P}
 end
 
 # ── transactions: the mutation primitive (§10) ──────────────────────────────────
-# A `Draft` is a mutable overlay over the live base: `p.field = v` records an
-# override (reads see pending values), assignments touch nothing live and publish
-# nothing. On clean block exit we build the candidate via `setproperties`, validate
-# the *whole* thing (per-field descriptors + user `validate`), swap once, and fire
-# one batched event. Any throw aborts — the candidate is dropped, the cell never
-# held a partial state (free rollback).
+# A `Draft` is a mutable overlay over the live base: `p.field = v` records a
+# pending override that later reads in the block observe, while the live value
+# stays untouched until commit. On clean block exit we build the candidate via
+# `setproperties`, validate the whole candidate (per-field descriptors + user
+# `validate`), swap once, and fire one batched event. A throw aborts: the
+# candidate is dropped and the live cell keeps its last committed value (free
+# rollback).
 
 mutable struct Draft{P}
     const server::ParameterServer{P}
@@ -196,11 +200,12 @@ end
 
 # Validate a candidate against the descriptors + the user `validate` hook, throwing
 # `ParameterRejection` on the first violation. Per-field checks run only for fields
-# whose value actually *moved* (`moved` = the override names) — an idempotent set
-# (incl. a replace-all re-setting a read-only field to its current value) is a no-op,
-# not a rejection; for a moved field the read-only gate (runtime sets only — startup
-# overrides go through the ctor) precedes the constraint. Shared by the server commit
-# and the client-side transaction pre-check (so both raise the same rejection).
+# whose value actually changed; `moved` lists the override names, and an idempotent
+# set (e.g. a replace-all re-setting a read-only field to its current value) commits
+# as a no-op. For a changed field the read-only gate runs first, then the
+# constraint; the gate blocks runtime sets only, since startup overrides go through
+# the ctor. Shared by the server commit and the client-side transaction pre-check,
+# so both raise the same rejection.
 function _validate_candidate(by_name::AbstractDict, base::P, candidate::P, moved) where {P}
     for name in moved
         d = get(by_name, name, nothing)

@@ -1,19 +1,18 @@
-# ── per-module resolution tables (D10B S1) ──────────────────────────────────────
+# ── per-module resolution tables ───────────────────────────────────────────────
 # Each module that `@ros_import`s/`@ros_cache`s a type bakes a `__ros_resolve__ ::
 # Dict{Symbol, ResolveEntry}` (key = RIHS01 string) into its image, mapping a wire type
-# to the Julia struct *this module* resolves it to. It is built at the module's
-# **precompile** by `_merge_resolve!` — where the loaded-module set is exactly the
-# module's dependency closure — so the table is a pure function of the declared deps,
-# deterministic and immune to ambient runtime load order. A Context looks through one
-# module's table (its `home`, D10B S2); decode identity is per-module, not global.
+# to the Julia struct this module resolves it to. `_merge_resolve!` builds it at the
+# module's precompile, where the loaded-module set is exactly the module's dependency
+# closure, so the table is a pure function of the declared deps and immune to runtime
+# load order. A Context resolves through one module's table (its `home`).
 
 """
     ResolveEntry(type, origin, tied)
 
 One `(wire-RIHS01 → Julia struct)` resolution in a module's `__ros_resolve__`.
-`origin` is the *minting* module (the package that generated `type`, for the tie
-warning); `tied` is set when this entry settled a cross-module tie (a fork) so a
-closer dependent adopts it rather than re-deriving/re-warning.
+`origin` is the minting module (the package that generated `type`), named in the tie
+warning. `tied` marks an entry that settled a cross-module fork, so a closer dependent
+adopts it and skips re-deriving the pick.
 """
 struct ResolveEntry
     type::Type
@@ -36,10 +35,9 @@ function _warn_tie(rihs::Symbol, keep::ResolveEntry, drop::ResolveEntry)
            shared message package so they alias a single struct." rihs=String(rihs) maxlog=1
 end
 
-# Fold source table `src` into `dst` (this module's), applying the D10B assembly rule.
-# Agreement (diamond) is a no-op; a fresh fork is picked deterministically by the
-# fully-qualified type string and marked `tied` (+ warned once); an already-`tied`
-# settlement is sticky (suppresses re-derivation/re-warn from a closer dependent).
+# Fold source table `src` into `dst` (this module's). Agreement (diamond) is a no-op;
+# a fresh fork is picked deterministically by the fully-qualified type string, marked
+# `tied`, and warned once; an already-`tied` settlement is sticky.
 function _fold_resolve!(dst::Dict{Symbol, ResolveEntry}, src::Dict{Symbol, ResolveEntry})
     for (sym, e) in src
         prev = get(dst, sym, nothing)
@@ -62,11 +60,9 @@ end
 
 # Reduce all candidate entries for one wire RIHS01 (gathered across the whole closure)
 # to the single winner. Agreement is a no-op (carry the `tied` flag forward if any arm
-# was already settled). A fork — two or more distinct structs — is settled by a true
-# *global* `argmin` over the fully-qualified type string, so the survivor is the
-# globally smallest FQN regardless of the order candidates were gathered in (a pairwise
-# sticky fold would instead let the first-settled pair win and drop a later, smaller
-# arm). Warns once, naming the global winner against a representative loser.
+# was already settled). A fork — two or more distinct structs — is settled by a global
+# `argmin` over the fully-qualified type string, so the survivor is the globally smallest
+# FQN regardless of gather order. Warns once, naming the winner against a representative loser.
 function _reduce_candidates(sym::Symbol, cands::Vector{ResolveEntry})
     keep = cands[1]                      # global argmin(string(type))
     drop = cands[1]                      # global argmax — a deterministic representative loser
@@ -85,16 +81,16 @@ end
 """
     _merge_resolve!(mod::Module, own::Vector{<:Tuple{Symbol, Type}}) -> Dict
 
-Populate `mod.__ros_resolve__` (D10B S1): globally reduce every loaded module's table
-into it (at precompile that is exactly `mod`'s dependency closure — diamond/fork resolved
+Populate `mod.__ros_resolve__`: globally reduce every loaded module's table into it (at
+precompile that set is exactly `mod`'s dependency closure, so diamonds and forks settle
 here), then add `mod`'s own freshly-minted `(rihs, T)` entries (own wins for `mod`).
-Idempotent across multiple `@ros_import`/`@ros_cache` calls in one module. Emitted by the
-macros at module top level so it runs — and bakes — at precompile.
+Idempotent across multiple `@ros_import`/`@ros_cache` calls in one module. The macros
+emit it at module top level so it runs, and bakes, at precompile.
 
-The closure pick is a *global* `argmin(string(type))` over all candidates for a wire
-type, not a pairwise sticky fold: with three or more forks the survivor is the globally
-smallest FQN regardless of `loaded_modules` iteration order (a `Dict`, unordered), so the
-documented "deterministic pick by fully-qualified type string" holds beyond two sources.
+The closure pick is a global `argmin(string(type))` over all candidates for a wire type:
+with three or more forks the survivor is the globally smallest FQN regardless of
+`loaded_modules` iteration order (a `Dict`, unordered), so the deterministic pick by
+fully-qualified type string holds beyond two sources.
 """
 function _merge_resolve!(mod::Module, own)
     tbl = getglobal(mod, _RESOLVE_GLOBAL)::Dict{Symbol, ResolveEntry}
@@ -133,7 +129,7 @@ end
     resolve_in_home(home::Module, rihs::Symbol) -> Union{Type, Nothing}
 
 The Julia struct `home`'s baked `__ros_resolve__` resolves wire type `rihs` (RIHS01
-string) to, or `nothing` if `home` (and its closure) never imported it — the D10B S2
+string) to, or `nothing` when `home` and its closure never imported it. This is the
 per-Context resolution step, keyed by the Context's `home` module.
 """
 function resolve_in_home(home::Module, rihs::Symbol)
@@ -144,9 +140,9 @@ function resolve_in_home(home::Module, rihs::Symbol)
     e === nothing ? nothing : e.type
 end
 
-# D10B S2: at Context construction with no `home`, hint once if some loaded module has a
-# non-empty resolution table — the user almost certainly meant to bind a home (forgetting
-# it silently disables resolving their `@ros_import` types on the dynamic path).
+# At Context construction with no `home`, hint once if some loaded module has a non-empty
+# resolution table: the user almost certainly meant to bind one, since without it the
+# dynamic path cannot resolve their `@ros_import` types.
 function _maybe_hint_no_home()
     for D in values(Base.loaded_modules)
         isdefined(D, _RESOLVE_GLOBAL) || continue

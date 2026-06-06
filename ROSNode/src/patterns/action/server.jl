@@ -8,12 +8,15 @@
 """
     ActionServer{A, G, R, F}
 
-A ROS2 action server for action type `A` (§9). Owns the three protocol services
+A ROS 2 action server for action type `A` (§9). Owns the three protocol services
 (`send_goal`/`cancel_goal`/`get_result`), the `feedback` + `status` topics, the
 goal table (live goals + the result cache), and the user callbacks
 (`on_goal`/`on_cancel`/`on_accepted`). `close`-able; dies with its node, joining
 outstanding goal tasks (incl. detached post-cancel cleanup) up to the Context
 drain timeout (§14).
+
+The goal/feedback/result lifecycle and cancellation model follow the upstream ROS 2
+action concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 
 Construct via [`ActionServer`](@ref)'s constructor — the low-level three-callback
 form or the high-level `do`-block sugar.
@@ -41,8 +44,8 @@ mutable struct ActionServer{A, G, R, F}
     const goals::Dict{GoalId, GoalHandle{A, G, R, F}}
     const lock::ReentrantLock
     # Serializes goal-body execution under `concurrency = Serial()` (one goal at a
-    # time, §4) — a *dedicated* lock, not the node-wide one (which guards cross-
-    # entity state and must stay free while a long mission runs).
+    # time, §4). Dedicated to goal bodies so the node-wide lock (guarding cross-
+    # entity state) stays free while a long mission runs.
     const serial_lock::ReentrantLock
     @atomic open::Bool
 end
@@ -122,10 +125,10 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
 
     _wire_action_server!(server)
 
-    # §D8: precompile goal-decode → per-goal execution callable → result/feedback
-    # encode. Precompile-only (no :execute — a fabricated long-running goal body
-    # over a live GoalHandle isn't safe to run at warm-up). `exec` is the do-block
-    # body (high-level) or the `on_accepted` callback (low-level).
+    # Precompile goal-decode → per-goal execution callable → result/feedback encode.
+    # Precompile-only: a fabricated long-running goal body over a live GoalHandle
+    # isn't safe to run at warm-up. `exec` is the do-block body (high-level) or the
+    # `on_accepted` callback (low-level).
     pol = _resolve_warmup(node, warmup, warmup_sync)
     exec = body !== nothing ? body : accepted
     _warmup!(pol, () -> _warm_action(G, R, F, exec, GoalHandle{A, G, R, F}))
@@ -239,7 +242,7 @@ function _handle_send_goal(server::ActionServer{A, G, R, F}, q::Query) where {A,
         return nothing
     end
 
-    decision = _with_node_logger(() -> server.on_goal(goal_req), server.node)  # D7
+    decision = _with_node_logger(() -> server.on_goal(goal_req), server.node)
     accepted = !(decision isa Reject)
 
     if accepted
@@ -259,14 +262,13 @@ end
 # enough that the table can't grow without limit under a high goal rate.
 const _RESULT_CACHE_TTL_NS = Int64(15 * 60) * 1_000_000_000   # 15 minutes
 
-# Evict terminal goals once their result is no longer recoverable: settled longer ago
-# than the cache TTL (a late OR repeated `get_result` past the window). NOT on
-# `fetched` — a repeated fetch must still replay the cached result; that flag only
-# prunes the status array. Live goals (settled_at == 0) are never touched, nor is
-# a goal whose task is still running (a detached post-cancel cleanup), so the drain
-# join (`_await_goals`) can still reach it. Caller holds `server.lock`. Bounds both
-# the table size and `_publish_status`'s cost, which scales with the table (rclcpp
-# prunes terminal goals the same way).
+# Evict terminal goals whose result is no longer recoverable: settled longer ago
+# than the cache TTL. Eviction keys on the TTL alone — a repeated fetch must still
+# replay the cached result — so the `fetched` flag only prunes the status array.
+# Live goals (settled_at == 0) stay, as does a goal whose task is still running (a
+# detached post-cancel cleanup) so the drain join (`_await_goals`) can still reach it.
+# Caller holds `server.lock`. Bounds the table size and `_publish_status`'s
+# table-scaled cost, matching rclcpp.
 function _evict_terminal_goals!(server::ActionServer)
     now = _now_ns(server.node)
     for (id, g) in server.goals
@@ -274,9 +276,6 @@ function _evict_terminal_goals!(server::ActionServer)
         settled == 0 && continue                       # still live
         t = g._task
         (t === nothing || istaskdone(t)) || continue   # cleanup still in flight
-        # Evict purely by the cache TTL — a late OR repeated `get_result` must still
-        # replay a cached result within the window, so do NOT evict on `fetched` (that
-        # flag only prunes the status array). rclcpp's result_timeout behaves the same.
         now - settled > _RESULT_CACHE_TTL_NS && delete!(server.goals, id)
     end
     nothing
@@ -297,9 +296,9 @@ function _register_goal!(server::ActionServer{A, G, R, F}, id::GoalId, req::G) w
                                _now_ns(server.node), ReentrantLock(),
                                GOAL_ACCEPTED, nothing, 0, false, nothing)
     # Idempotent insert: a client retries `send_goal` when its reply is lost or lags
-    # discovery, so the same id can arrive more than once. Re-registering would orphan
-    # the original goal's result cell — the one a held `get_result` blocks on — and spawn
-    # a duplicate body, deadlocking `fetch`. A known id reuses the existing goal. Returns
+    # discovery, so the same id can arrive more than once. A known id reuses the
+    # existing goal; re-registering would orphan its result cell (the one a held
+    # `get_result` blocks on) and spawn a duplicate body, deadlocking `fetch`. Returns
     # `(goal, fresh)`; `fresh=false` ⇒ a duplicate/racing request already registered it.
     g_out, fresh = @lock server.lock begin
         existing = get(server.goals, id, nothing)
@@ -339,9 +338,9 @@ end
 
 # ── cancel_goal service (§9) ───────────────────────────────────────────────────
 # Decode the cancel request (a goal_info: goal_id + stamp; zero id ⇒ cancel-all),
-# run `on_cancel` per matched goal, and on accept move it to CANCELING (arming the
-# `checkpoint`/`feedback!` cancellation throw — it does *not* stop execution; the
-# handler observes the token, §9).
+# run `on_cancel` per matched goal, and on accept move it to CANCELING. This arms
+# the `checkpoint`/`feedback!` cancellation throw; execution keeps running until the
+# handler observes the token (§9).
 
 function _handle_cancel_goal(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
     isopen(server) || return _reply_inactive(q)
@@ -359,7 +358,7 @@ function _handle_cancel_goal(server::ActionServer{A, G, R, F}, q::Query) where {
     for g in canceling
         # Only a live (accepted/executing) goal can be canceled.
         (@atomic g.status) in (GOAL_ACCEPTED, GOAL_EXECUTING) || continue
-        _with_node_logger(() -> server.on_cancel(g), server.node) isa Reject && continue  # D7
+        _with_node_logger(() -> server.on_cancel(g), server.node) isa Reject && continue
         if _transition!(g, GOAL_CANCELING)
             push!(accepted, g)
         end
@@ -370,8 +369,8 @@ function _handle_cancel_goal(server::ActionServer{A, G, R, F}, q::Query) where {
 end
 
 # ── get_result service (§9) ────────────────────────────────────────────────────
-# The client's `fetch` blocks on a `get_result` request. We must reply only once
-# the goal is terminal — so the queryable handler *waits* on the result cell
+# The client's `fetch` blocks on a `get_result` request. The reply lands only once
+# the goal is terminal, so the queryable handler waits on the result cell
 # (a task per request, the Zenoh trampoline gives us that, §2.3) then replies with
 # the cached status + result. An unknown goal id is an error reply.
 
@@ -407,9 +406,8 @@ function _high_level_on_accepted(body::Function, concurrency::Concurrency)
         run = () -> _run_goal_body(g, body, concurrency)
         # The body is always its own task so `on_accepted` (which runs on the
         # send_goal request task) returns promptly to reply accepted. Under
-        # `Serial()` the task is sticky — it stays on the node's cooperative thread
-        # (D3), consistent with the single-threaded default; `Parallel` bodies run
-        # on spawned threads.
+        # `Serial()` the task is sticky, staying on the node's cooperative thread
+        # like the single-threaded default; `Parallel` bodies run on spawned threads.
         g._task = _spawn_body(concurrency, run)
         nothing
     end
@@ -426,14 +424,14 @@ function _spawn_body(c::Concurrency, run)
 end
 
 # Execute one goal body under the settlement wrapper. `Serial()` serializes bodies
-# on the server's dedicated `serial_lock` (§4 one-at-a-time — *not* the node-wide
-# lock, which must stay free during a long mission); `Parallel` runs free.
+# on the server's dedicated `serial_lock` (§4 one-at-a-time), leaving the node-wide
+# lock free during a long mission; `Parallel` runs free.
 function _run_goal_body(g::GoalHandle{A, G, R, F}, body::Function, concurrency::Concurrency) where {A, G, R, F}
     _transition!(g, GOAL_EXECUTING)
     server = g.server
     _publish_status(server)
-    # D7: run the goal body under the node logger so a plain `@info` inside it
-    # routes to the server node's /rosout.
+    # Run the goal body under the node logger so a plain `@info` inside it routes
+    # to the server node's /rosout.
     runner = () -> settle_handler!(g.cell, () -> _with_node_logger(() -> body(g), server.node);
                                    success_status = succeeded,
                                    default_result = () -> _zero_result(R),
@@ -574,8 +572,8 @@ const _CancelGoal_Request  = Interfaces.action_msgs.srv.CancelGoal_Request
 const _CancelGoal_Response = Interfaces.action_msgs.srv.CancelGoal_Response
 
 # Decode the request payload as `T` (owned copy; the query buffer is borrowed).
-# A request always carries a CDR body, even an empty one — a missing payload is a
-# protocol error from the peer.
+# A request always carries a CDR body, even an empty one, so a missing payload is
+# a peer protocol error.
 function _decode_query(q::Query, ::Type{T}) where {T}
     pay = payload(q)
     pay === nothing && throw(ArgumentError("action request carried no payload"))

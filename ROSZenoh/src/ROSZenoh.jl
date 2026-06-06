@@ -1,12 +1,13 @@
 """
     ROSZenoh
 
-ROS2-to-Zenoh key expression and entity modelling. The primary target is
-`rmw_zenoh_cpp` (the native ROS2 Zenoh RMW) via the `RmwZenoh` formatter —
-this is the path that should match the `hiroz-protocol` Rust reference
-byte-for-byte and stay so. The `Ros2DDS` formatter is a secondary path for
-interop with the older `zenoh-plugin-ros2dds` DDS bridge; it exists for
-compatibility, but the primary code paths and defaults assume RmwZenoh.
+Maps ROS 2 entities and topics to Zenoh key expressions and QoS. Two RMW
+formatters share this model: `RmwZenoh` targets `rmw_zenoh_cpp` (the native
+ROS 2 Zenoh RMW) and matches the `hiroz-protocol` Rust reference byte-for-byte,
+so it drives the default code paths; `Ros2DDS` bridges to the
+`zenoh-plugin-ros2dds` DDS plugin for cross-vendor interop.
+
+See https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Different-Middleware-Vendors.html
 """
 module ROSZenoh
 

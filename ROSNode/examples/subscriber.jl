@@ -10,8 +10,8 @@ using ROSNode
 @ros_import "std_msgs/msg/String" from="interfaces"
 
 # `@context` binds this module as the Context's resolution home (sugar for
-# `Context(; home=@__MODULE__, …)`), so the type-less `Subscription` below lands this
-# module's `@ros_import`ed `String` rather than a content-canonical type.
+# `Context(; home=@__MODULE__, …)`), so the type-less `Subscription` below resolves to
+# this module's `@ros_import`ed `String`.
 @context(peers = ["tcp/localhost:7447"]) do ctx
     node = Node(ctx, "listener")
 

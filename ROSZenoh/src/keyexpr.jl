@@ -1,7 +1,13 @@
-# Formatter dispatch. Each formatter is a zero-sized singleton; the API is a
-# set of generic functions specialized on the formatter type. This mirrors the
-# Rust `KeyExprFormatter` trait but is more natural in Julia.
+"""
+Key-expression and liveliness-token formatting for the two Zenoh-based ROS 2
+middleware conventions: `RmwZenoh` (the native `rmw_zenoh_cpp` RMW) and
+`Ros2DDS` (the `zenoh-plugin-ros2dds` DDS bridge). Each formatter is a
+zero-sized singleton; the API is a set of generic functions specialized on the
+formatter type.
 
+See the ROS 2 middleware-vendor concept:
+https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Different-Middleware-Vendors.html
+"""
 abstract type KeyExprFormat end
 
 """
@@ -23,7 +29,7 @@ field and is only emitted on pub/sub.
 """
 struct Ros2DDS <: KeyExprFormat end
 
-# Per-formatter escape character. Specialised below in each formatter module.
+# Per-formatter escape character substituted for '/' when mangling liveliness tokens.
 escape_char(::RmwZenoh) = '%'
 escape_char(::Ros2DDS)  = '§'
 
@@ -43,10 +49,7 @@ Inverse of `mangle`.
 """
 demangle(f::KeyExprFormat, s::AbstractString) = replace(String(s), escape_char(f) => '/')
 
-# Strip exactly one leading and one trailing '/' if present. Mirrors the
-# `strip_prefix('/').strip_suffix('/')` chain used in the Rust impl, which is
-# subtly different from `strip(s, '/')` — only one slash is removed at each
-# end, even if there are multiple.
+# Strip at most one leading and one trailing '/'; runs of slashes survive (unlike strip(s, '/')).
 function _strip_one_slash(s::AbstractString)
     s = startswith(s, '/') ? SubString(s, nextind(s, 1)) : SubString(s, 1)
     s = endswith(s, '/')   ? SubString(s, 1, prevind(s, lastindex(s)))  : s

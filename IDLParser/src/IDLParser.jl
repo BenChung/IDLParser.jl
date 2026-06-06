@@ -1,3 +1,16 @@
+"""
+    IDLParser
+
+Parse ROS 2 interface definitions (`.idl`/`.msg`) into Julia struct definitions.
+
+The pipeline runs in three stages, each a submodule: [`Parse`](@ref) builds the
+specification AST, [`ConstResolution`](@ref) resolves constant expressions and
+scopes, and [`Generation`](@ref) emits the Julia types.
+
+See the ROS 2 interface model at
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html and the IDL
+type mapping at https://design.ros2.org/articles/idl_interface_definition.html.
+"""
 module IDLParser
 
 module Parse
@@ -15,13 +28,10 @@ module Generation
     include("generation/gen.jl")
 end
 
-# NB: no precompile workload here on purpose. ROSNode's `@ros_msgs` path uses only
-# `ConstResolution.resolve_constants` + `Generation.generate_code` — never the IDL
-# *text* parser (`Parse.specification`). Baking the full IDL grammar here cost ~14s
-# of cold-build time compiling combinators no ROSNode consumer calls. Coverage for
-# the resolve+generate methods ROSNode *does* hit is baked by ROSMessages' workload
-# (it runs the real parse_msg → resolve → generate chain, caching those external
-# CodeInstances into ROSMessages' pkgimage). A standalone `.idl` consumer that wants
-# the parser baked should add its own workload exercising `open_idl`/`parse_whole`.
+# No precompile workload by design. ROSNode's `@ros_msgs` path uses only
+# `ConstResolution.resolve_constants` and `Generation.generate_code`, so ROSMessages
+# bakes their coverage via its own parse_msg → resolve → generate workload. The IDL
+# text parser (`Parse.specification`) goes unbaked; a standalone `.idl` consumer that
+# wants it should add a workload exercising `open_idl`/`parse_whole`.
 
 end

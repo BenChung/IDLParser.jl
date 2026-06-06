@@ -2,7 +2,7 @@
 # `@parameters` macro generates an immutable struct (type-stable reads) plus a
 # `descriptors(::Type)` method, and the live value sits behind an atomic `Ref{P}`
 # inside a `ParameterServer{P}`. Mutation is transactional — `transaction(server)
-# do p … end` builds a mutable draft, validates the *whole* candidate, swaps once,
+# do p … end` builds a mutable draft, validates the whole candidate, swaps once,
 # and fires one `/parameter_events` batch. Single-statement sugar (`server.x = v`,
 # `setproperties!(server, …)`) routes through the same commit path. Undeclared
 # params live in a separate `dynamic_parameters` dict, gated by `allow_undeclared`.
@@ -40,6 +40,8 @@ marshals straight onto the wire `type` byte. `PARAMETER_NOT_SET` (0) is the
 unset/unknown sentinel (never stored for a declared field); the other arms mirror
 ROS2's `ParameterValue` union. `get_parameter_types` returns these, and a
 [`ParameterDescriptor`](@ref) carries one as its `ptype`.
+
+See the ROS 2 parameter concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
 """
 @enum ParameterType::UInt8 begin
     PARAMETER_NOT_SET       = 0
@@ -79,7 +81,7 @@ end
     parameter_type(::Type) -> ParameterType
 
 The `rcl_interfaces/msg/ParameterType` tag for a declared field type. `Symbol`
-maps to STRING (it is string-with-choices sugar). Throws for anything outside the
+maps to STRING (string-with-choices sugar). Throws for anything outside the
 legal value set — the same check the macro applies at expansion time.
 """
 function parameter_type(::Type{T}) where {T}
@@ -147,9 +149,9 @@ end
 
 # ── readonly marker (§10) ───────────────────────────────────────────────────────
 # `field = default |> readonly` tags a field read-only. The macro detects the pipe
-# *syntactically* at parse time (`_parse_param_field`) and strips it — the default
-# is never wrapped at runtime. `readonly`/`_ReadOnly` exist only as a harmless
-# runtime identity so a stray `readonly(x)` outside the DSL doesn't error.
+# syntactically at parse time (`_parse_param_field`) and strips it, so the stored
+# default is the bare value. `readonly`/`_ReadOnly` exist only as a harmless
+# runtime identity so a stray `readonly(x)` outside the DSL still evaluates.
 
 struct _ReadOnly
     value::Any
@@ -159,8 +161,8 @@ end
     readonly(default)
 
 Mark a `@parameters` field read-only: `field::T = default |> readonly`. Read-only
-blocks *runtime* sets (an exception internally; a rejected `SetParametersResult`
-on the wire), but a startup override (CLI/launch/YAML) is still allowed (§10).
+blocks runtime sets (an exception internally; a rejected `SetParametersResult`
+on the wire) while still permitting a startup override (CLI/launch/YAML) (§10).
 The marker is consumed at macro expansion, so the stored default is the bare value.
 """
 readonly(x) = _ReadOnly(x)
