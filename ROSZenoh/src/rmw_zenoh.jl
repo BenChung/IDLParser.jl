@@ -25,8 +25,7 @@
 # - liveliness:  "<kind>,<lease_sec>,<lease_nsec>"; kind "" (Automatic, default)
 #                / "3" (ManualByTopic) [RMW: 1/3]; lease components empty when 0.
 #
-# The all-default profile therefore encodes the trailing fields as `,:,:,,`,
-# identical to the previous placeholder form.
+# The all-default profile therefore encodes the trailing fields as `,:,:,,`.
 
 # A Duration component renders as its integer, or "" when 0 (the ∞/default).
 _dur_sec_nsec(::Nothing) = ("", "")
@@ -37,9 +36,6 @@ function encode_qos(::RmwZenoh, qos::QosProfile; keyless::Bool=false)
     rel = qos.reliability == :reliable     ? "" :
           qos.reliability == :best_effort  ? "2" :
           error("invalid reliability $(qos.reliability)")
-    # Only "Reliable" matches default; explicit non-default reliable still
-    # ends up "" here — the Rust does the same (it compares against the
-    # Default impl).
     dur = qos.durability  == :volatile         ? "" :
           qos.durability  == :transient_local  ? "1" :
           error("invalid durability $(qos.durability)")
@@ -139,7 +135,7 @@ function _ros_to_dds_type(name::AbstractString)
 end
 function _dds_to_ros_type(name::AbstractString)
     occursin("::dds_::", name) || return String(name)   # already ROS form / non-standard
-    pre, post = split(String(name), "::dds_::"; limit=2) # ("std_msgs::msg", "String_")
+    pre, post = split(String(name), "::dds_::"; limit=2)
     typ = endswith(post, '_') ? chop(post) : post
     string(replace(pre, "::" => "/"), '/', typ)
 end
