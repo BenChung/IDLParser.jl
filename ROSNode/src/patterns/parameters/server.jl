@@ -194,6 +194,28 @@ function transaction(f, s::ParameterServer{P}) where {P}
     end
 end
 
+# Validate a candidate against the descriptors + the user `validate` hook, throwing
+# `ParameterRejection` on the first violation. Per-field checks run only for fields
+# whose value actually *moved* (`moved` = the override names) — an idempotent set
+# (incl. a replace-all re-setting a read-only field to its current value) is a no-op,
+# not a rejection; for a moved field the read-only gate (runtime sets only — startup
+# overrides go through the ctor) precedes the constraint. Shared by the server commit
+# and the client-side transaction pre-check (so both raise the same rejection).
+function _validate_candidate(by_name::AbstractDict, base::P, candidate::P, moved) where {P}
+    for name in moved
+        d = get(by_name, name, nothing)
+        d === nothing && continue
+        isequal(getfield(candidate, name), getfield(base, name)) && continue
+        d.read_only &&
+            throw(ParameterRejection("parameter $(name) is read-only"))
+        reason = _check_constraint(d, getfield(candidate, name))
+        reason === nothing ||
+            throw(ParameterRejection("parameter $(name): $(reason)"))
+    end
+    validate(candidate)            # cross-field rules over the whole candidate
+    return candidate
+end
+
 # Build + validate the candidate, swap once, publish one event batch. Caller holds
 # `s.lock`. Returns the committed value. Validation throws `ParameterRejection`
 # (constraint / read-only / user `validate`) → the lock unwinds, nothing committed.
@@ -204,24 +226,7 @@ function _commit!(s::ParameterServer{P}, base::P,
     candidate = isempty(overrides) ? base :
                 setproperties(base, NamedTuple(overrides))
 
-    # Per-field validation, but only for fields whose value actually *moved* — an
-    # idempotent set (incl. a replace-all that re-sets a read-only field to its
-    # current value) is a no-op, not a rejection. For a moved field: read-only gate
-    # first (runtime sets only — startup overrides go through the ctor, not here),
-    # then the constraint.
-    for (name, _) in overrides
-        d = get(s.by_name, name, nothing)
-        d === nothing && continue
-        isequal(getfield(candidate, name), getfield(base, name)) && continue
-        d.read_only &&
-            throw(ParameterRejection("parameter $(name) is read-only"))
-        reason = _check_constraint(d, getfield(candidate, name))
-        reason === nothing ||
-            throw(ParameterRejection("parameter $(name): $(reason)"))
-    end
-
-    # Cross-field rules over the whole candidate (ROS2's on-set callback).
-    validate(candidate)
+    _validate_candidate(s.by_name, base, candidate, keys(overrides))
 
     # Atomic whole-struct swap — readers see old-or-new, never partial.
     @atomic s.value = candidate

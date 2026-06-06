@@ -120,9 +120,9 @@ const _Time                 = Interfaces.builtin_interfaces.msg.Time
 # is flat on the wire, so every field is present — the kw ctor needs all of them).
 
 # A `ParameterValue` with `type=tag` and one arm filled; the rest are zero/empty.
-_param_value(tag::UInt8; bool=false, int=Int64(0), dbl=0.0, str="",
+_param_value(tag::ParameterType; bool=false, int=Int64(0), dbl=0.0, str="",
              bytes=UInt8[], bools=Bool[], ints=Int64[], dbls=Float64[], strs=String[]) =
-    _ParameterValue(; type = tag, bool_value = bool, integer_value = int,
+    _ParameterValue(; type = UInt8(tag), bool_value = bool, integer_value = int,
         double_value = dbl, string_value = str, byte_array_value = bytes,
         bool_array_value = bools, integer_array_value = ints,
         double_array_value = dbls, string_array_value = strs)
@@ -149,16 +149,16 @@ end
 # any unknown tag) reads back as `nothing` — the unset-parameter sentinel `set`
 # rejects upstream.
 function _from_param_value(pv)
-    t = pv.type
-    t == PARAMETER_BOOL          && return pv.bool_value
-    t == PARAMETER_INTEGER       && return pv.integer_value
-    t == PARAMETER_DOUBLE        && return pv.double_value
-    t == PARAMETER_STRING        && return pv.string_value
-    t == PARAMETER_BYTE_ARRAY    && return pv.byte_array_value
-    t == PARAMETER_BOOL_ARRAY    && return pv.bool_array_value
-    t == PARAMETER_INTEGER_ARRAY && return pv.integer_array_value
-    t == PARAMETER_DOUBLE_ARRAY  && return pv.double_array_value
-    t == PARAMETER_STRING_ARRAY  && return pv.string_array_value
+    t = _ptype(pv.type)
+    t === PARAMETER_BOOL          && return pv.bool_value
+    t === PARAMETER_INTEGER       && return pv.integer_value
+    t === PARAMETER_DOUBLE        && return pv.double_value
+    t === PARAMETER_STRING        && return pv.string_value
+    t === PARAMETER_BYTE_ARRAY    && return pv.byte_array_value
+    t === PARAMETER_BOOL_ARRAY    && return pv.bool_array_value
+    t === PARAMETER_INTEGER_ARRAY && return pv.integer_array_value
+    t === PARAMETER_DOUBLE_ARRAY  && return pv.double_array_value
+    t === PARAMETER_STRING_ARRAY  && return pv.string_array_value
     return nothing
 end
 
@@ -170,7 +170,7 @@ end
 # descriptor (no fixed declared type).
 function _to_descriptor(d::ParameterDescriptor)
     constraints = d.constraint === nothing ? "" : string("∈ ", d.constraint)
-    return _WireDescriptor(; name = String(d.name), type = d.ptype,
+    return _WireDescriptor(; name = String(d.name), type = UInt8(d.ptype),
         description = d.description, additional_constraints = constraints,
         read_only = d.read_only, dynamic_typing = (d.type === Nothing),
         floating_point_range = _RCL_MSG.FloatingPointRange[],
@@ -200,7 +200,7 @@ function wire_parameter_services!(s::ParameterServer)
 
     push!(s.services, Service(node, "~/get_parameter_types", _RCL_SRV.GetParameterTypes_Request) do req
         return _RCL_SRV.GetParameterTypes_Response(;
-            types = collect(UInt8, get_parameter_types(s, req.names)))
+            types = UInt8[UInt8(t) for t in get_parameter_types(s, req.names)])
     end)
 
     push!(s.services, Service(node, "~/get_parameters", _RCL_SRV.GetParameters_Request) do req
@@ -255,3 +255,32 @@ function _publish_parameter_event(s::ParameterServer, batch::ParameterEventBatch
     publish(s._events_pub, ev)
     return nothing
 end
+
+# ── node integration (§10) ──────────────────────────────────────────────────────
+# `Node(ctx, name, P)` bakes a `@parameters` schema `P` into the node: build the
+# base node, attach a `ParameterServer{P}` (reached as `node.parameters`), and wire
+# the six standard services + `/parameter_events` so the node is driveable by any
+# ROS2 parameter client (rclcpp/rclpy/hiroz) — and by our own `ParameterClient`.
+
+"""
+    Node(ctx, name, ::Type{P}; overrides=(;), allow_undeclared=false, kwargs...) -> Node
+
+Construct a node with a declared parameter schema `P` (a [`@parameters`](@ref)
+struct), §10. Equivalent to `Node(ctx, name; kwargs...)` plus a `ParameterServer{P}`
+attached at `node.parameters`, with the six standard parameter services and
+`/parameter_events` wired ([`wire_parameter_services!`](@ref)). `overrides` overlays
+startup values (CLI/launch/YAML) onto the schema defaults; `allow_undeclared` opens
+the dynamic tier. Remaining `kwargs` forward to the base [`Node`](@ref) constructor.
+"""
+function Node(ctx::Context, name::AbstractString, ::Type{P};
+              overrides::NamedTuple=(;), allow_undeclared::Bool=false,
+              kwargs...) where {P}
+    node = Node(ctx, name; kwargs...)
+    server = ParameterServer{P}(node; overrides = overrides, allow_undeclared = allow_undeclared)
+    wire_parameter_services!(server)
+    node.parameters = server
+    return node
+end
+
+"The undeclared/dynamic parameter dict of a node's parameter server (§10)."
+dynamic_parameters(node::Node) = dynamic_parameters(node.parameters)

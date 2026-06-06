@@ -35,6 +35,7 @@ include("patterns/parameters/macro.jl")      # §10 @parameters macro + validate
 include("patterns/parameters/server.jl")     # §10 ParameterServer, reads, transactions
 include("patterns/parameters/events.jl")     # §10 on-change events
 include("patterns/parameters/services.jl")   # §10 standard parameter services + wire marshalling
+include("patterns/parameters/client.jl")      # §10 remote ParameterClient (the §12 async/fallible dual)
 include("discovery/graph.jl")           # §13 graph introspection
 include("typesupport/registry.jl")      # §11 registry entry shape + codegen pipeline + realize
 include("typesupport/acquire.jl")       # §11 dynamic (TypeDescription) + ament/colcon acquisition + resolve_type

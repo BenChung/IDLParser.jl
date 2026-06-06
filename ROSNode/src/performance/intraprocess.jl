@@ -1,7 +1,9 @@
 # §15.1 Intra-process short-circuit. When a publisher and a subscriber share a
 # Context, the publisher hands the message object to the subscriber's handler
-# directly — skipping the CDR serialize, the Zenoh hop, and the decode. On by
-# default. The realization that keeps it API-minimal (DESIGN §Intra-process):
+# directly — skipping the CDR serialize, the Zenoh hop, and the decode. Designed to
+# be on by default, but **not yet wired** into publish/declare/close (see the Wiring
+# note below) and not yet tested: today same-Context delivery rides Zenoh's loopback.
+# The realization that keeps it API-minimal (DESIGN §Intra-process):
 # *intra-process is the same receive model with an in-heap Julia object as the
 # buffer instead of a Zenoh payload*, so the existing knobs carry it:
 #

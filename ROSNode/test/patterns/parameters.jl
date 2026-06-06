@@ -8,7 +8,7 @@ using ROSNode: @parameters, ParameterServer, ParameterDescriptor, descriptors,
                parameter, parameter_names, declared_names, dynamic_parameters,
                on_parameter_event, ParameterRejection, ParameterEventBatch,
                readonly, validate,
-               PARAMETER_DOUBLE, PARAMETER_STRING, PARAMETER_BOOL,
+               PARAMETER_DOUBLE, PARAMETER_STRING, PARAMETER_BOOL, PARAMETER_NOT_SET,
                parameter_type, get_parameters, set_parameters_atomically,
                describe_parameters
 
@@ -166,6 +166,37 @@ ROSNode.validate(p::PlannerParams) =
         @test s.max_speed == 2.0          # atomic: rejected set didn't apply
         ds = describe_parameters(s, (:frame, :unknown))
         @test ds[1].read_only === true
-        @test ds[2].ptype == 0x00         # NOT_SET for an unknown name
+        @test ds[2].ptype == PARAMETER_NOT_SET   # NOT_SET for an unknown name
+    end
+
+    # Client-side pure logic (the wire path is exercised by examples/parameters.jl).
+    @testset "client: pure helpers" begin
+        # set-input normalization → name => value pairs.
+        @test ROSNode._param_pairs((a = 1, b = 2)) == [:a => 1, :b => 2]
+        @test ROSNode._param_pairs([:a => 1, :b => 2]) == [:a => 1, :b => 2]
+        @test ROSNode._param_pairs(Dict(:a => 1)) == [:a => 1]
+
+        # ParameterType ↔ Julia type round-trip + the wire-byte guard.
+        for T in (Bool, Int64, Float64, String, Vector{UInt8}, Vector{Bool},
+                  Vector{Int64}, Vector{Float64}, Vector{String})
+            @test ROSNode._param_julia_type(parameter_type(T)) === T
+        end
+        @test ROSNode._param_julia_type(PARAMETER_NOT_SET) === Nothing
+        @test ROSNode._ptype(2) === ROSNode.PARAMETER_INTEGER
+        @test ROSNode._ptype(99) === PARAMETER_NOT_SET          # out of range → NOT_SET
+
+        # Wire-descriptor decode preserves name/type/ptype/read_only/description.
+        d0 = ParameterDescriptor(:speed, Float64, PARAMETER_DOUBLE, "spd", nothing, true, 1.0)
+        d1 = ROSNode._from_wire_descriptor(ROSNode._to_descriptor(d0))
+        @test (d1.name, d1.type, d1.ptype, d1.read_only, d1.description) ==
+              (:speed, Float64, PARAMETER_DOUBLE, true, "spd")
+
+        # _ClientDraft: pending overrides coerce to the field type, read through to base.
+        d = ROSNode._ClientDraft{PlannerParams}(PlannerParams(), Dict{Symbol, Any}())
+        d.max_speed = 9                       # Int → Float64
+        @test d.max_speed === 9.0             # reads the pending override
+        @test d.mode == "auto"                # reads through to the base
+        @test_throws ArgumentError (d.nonexistent = 1)
+        @test setproperties(PlannerParams(), NamedTuple(d.overrides)).max_speed == 9.0
     end
 end

@@ -16,9 +16,11 @@
 
 import Dates
 
-export @parameters, ParameterServer, ParameterDescriptor,
+export @parameters, ParameterServer, ParameterClient, ParameterDescriptor, ParameterType,
        descriptors, validate, transaction, setproperties, setproperties!,
        dynamic_parameters, declared_names, parameter_names, parameter, set_parameter!,
+       get_parameters, get_parameter_types, set_parameters, set_parameters_atomically,
+       list_parameters, describe_parameters,
        on_parameter_event, readonly, ParameterRejection
 
 # ── legal value types (§10) ───────────────────────────────────────────────────
@@ -30,21 +32,51 @@ export @parameters, ParameterServer, ParameterDescriptor,
 const _SCALAR_PARAM_TYPES = (Bool, Int64, Float64, String, Symbol)
 const _ARRAY_ELT_TYPES    = (Bool, Int64, Float64, String, UInt8)
 
-# Map a Julia field type to the ROS2 `ParameterType` tag (rcl_interfaces values).
-# 0 = NOT_SET; we never store NOT_SET for a declared field.
-const PARAMETER_NOT_SET        = UInt8(0)
-const PARAMETER_BOOL           = UInt8(1)
-const PARAMETER_INTEGER        = UInt8(2)
-const PARAMETER_DOUBLE         = UInt8(3)
-const PARAMETER_STRING         = UInt8(4)
-const PARAMETER_BYTE_ARRAY     = UInt8(5)
-const PARAMETER_BOOL_ARRAY     = UInt8(6)
-const PARAMETER_INTEGER_ARRAY  = UInt8(7)
-const PARAMETER_DOUBLE_ARRAY   = UInt8(8)
-const PARAMETER_STRING_ARRAY   = UInt8(9)
+"""
+    ParameterType
+
+The `rcl_interfaces/msg/ParameterType` tag enum (§10), `UInt8`-backed so it
+marshals straight onto the wire `type` byte. `PARAMETER_NOT_SET` (0) is the
+unset/unknown sentinel (never stored for a declared field); the other arms mirror
+ROS2's `ParameterValue` union. `get_parameter_types` returns these, and a
+[`ParameterDescriptor`](@ref) carries one as its `ptype`.
+"""
+@enum ParameterType::UInt8 begin
+    PARAMETER_NOT_SET       = 0
+    PARAMETER_BOOL          = 1
+    PARAMETER_INTEGER       = 2
+    PARAMETER_DOUBLE        = 3
+    PARAMETER_STRING        = 4
+    PARAMETER_BYTE_ARRAY    = 5
+    PARAMETER_BOOL_ARRAY    = 6
+    PARAMETER_INTEGER_ARRAY = 7
+    PARAMETER_DOUBLE_ARRAY  = 8
+    PARAMETER_STRING_ARRAY  = 9
+end
+
+# A wire `type` byte → `ParameterType`, guarding an out-of-range tag back to
+# NOT_SET (a peer sending an unknown arm reads as unset, never throws).
+_ptype(t::Integer) = (0 <= t <= 9) ? ParameterType(t) : PARAMETER_NOT_SET
+_ptype(t::ParameterType) = t
+
+# The Julia value type behind a `ParameterType` arm — the inverse of
+# `parameter_type`, used to fill in a client-side `ParameterDescriptor.type` and to
+# coerce a dynamically-typed remote value.
+function _param_julia_type(t::ParameterType)
+    t === PARAMETER_BOOL          && return Bool
+    t === PARAMETER_INTEGER       && return Int64
+    t === PARAMETER_DOUBLE        && return Float64
+    t === PARAMETER_STRING        && return String
+    t === PARAMETER_BYTE_ARRAY    && return Vector{UInt8}
+    t === PARAMETER_BOOL_ARRAY    && return Vector{Bool}
+    t === PARAMETER_INTEGER_ARRAY && return Vector{Int64}
+    t === PARAMETER_DOUBLE_ARRAY  && return Vector{Float64}
+    t === PARAMETER_STRING_ARRAY  && return Vector{String}
+    return Nothing
+end
 
 """
-    parameter_type(::Type) -> UInt8
+    parameter_type(::Type) -> ParameterType
 
 The `rcl_interfaces/msg/ParameterType` tag for a declared field type. `Symbol`
 maps to STRING (it is string-with-choices sugar). Throws for anything outside the
@@ -86,7 +118,7 @@ numeric `(lo, hi)` range, or a tuple of allowed values (`∈ choices`).
 struct ParameterDescriptor
     name::Symbol
     type::Type
-    ptype::UInt8
+    ptype::ParameterType
     description::String
     constraint::Any        # nothing | (lo, hi)::Tuple | choices::Tuple
     read_only::Bool

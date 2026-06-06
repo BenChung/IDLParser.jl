@@ -74,6 +74,10 @@ mutable struct Node
     _rosout_pub::Any                     # node-owned /rosout publisher, shared by every node logger
     _logger::Any                         # the default node `RosoutLogger`
     const _log_levels::Dict{String, Int32}  # §7 per-logger-name min levels (LogLevel.level)
+    # §10 parameters: a `ParameterServer{P}` when the node is built via the schema
+    # form `Node(ctx, name, P)`, else `nothing`. Reached as `node.parameters` (a
+    # plain field — no custom `getproperty`, so atomic `open` reads stay direct).
+    parameters::Any
     # Default warm-up policy (§D8) for entities on this node; an entity ctor's own
     # `warmup`/`warmup_sync` kwargs override per-endpoint.
     const warmup::WarmupPolicy
@@ -98,7 +102,7 @@ function Node(ctx::Context, name::AbstractString;
     node = Node(ctx, nm, ns, fqn, ent, lv_key, nothing,
                 Any[], Dict{DataType, Any}(), ReentrantLock(),
                 Pair{String, String}[], nothing, nothing,
-                Dict{String, Int32}(), WarmupPolicy(warmup, warmup_sync), true)
+                Dict{String, Int32}(), nothing, WarmupPolicy(warmup, warmup_sync), true)
 
     # Declare the node's liveliness token (peers discover the node), then inject
     # it into our own index so self-queries see it immediately (§12 authoritative).

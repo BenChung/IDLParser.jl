@@ -72,6 +72,8 @@ try
         # §8 services + §9 actions — live request/reply + full goal lifecycle.
         _section("services", "patterns/services.jl")
         _section("actions", "patterns/actions.jl")
+        # §10 parameters — live remote ParameterClient round-trips (the §12 dual).
+        _section("parameters_live", "patterns/parameters_live.jl")
         # D7: unified logging — pure level/format/maxlog + live /rosout dispatcher wrap.
         _section("rosout", "discovery/rosout.jl")
         # D8: precompilation / warm-up — detector/@effectful/policy/_default_msg + live
