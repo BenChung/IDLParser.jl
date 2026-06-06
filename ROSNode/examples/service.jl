@@ -23,7 +23,7 @@ ROLE in ("both", "server", "client") ||
 const RUN_SERVER = ROLE in ("both", "server")
 const RUN_CLIENT = ROLE in ("both", "client")
 
-Context(; peers = ["tcp/localhost:7447"], home = @__MODULE__) do ctx
+@context(peers = ["tcp/localhost:7447"]) do ctx
     node = Node(ctx, "add_two_ints")
 
     # ── Server ──────────────────────────────────────────────────────────────

@@ -15,9 +15,10 @@ using ROSNode
 # source root: `@ros_import from="interfaces" "my_pkg/msg/MyType"`.)
 @ros_import "std_msgs/msg/String"
 
-# The Context owns the Zenoh session, discovery, and shutdown. The do-block form
-# drains and closes everything on exit. `peers` points at the router.
-Context(; peers = ["tcp/localhost:7447"]) do ctx
+# `@context` opens the Context — owner of the Zenoh session, discovery, and shutdown —
+# binding this module as its type-resolution home (sugar for `Context(; home=@__MODULE__, …)`).
+# The do-block form drains and closes everything on exit; `peers` points at the router.
+@context(peers = ["tcp/localhost:7447"]) do ctx
     node = Node(ctx, "talker")
     pub  = Publisher(node, "/chatter", std_msgs.msg.String)
 

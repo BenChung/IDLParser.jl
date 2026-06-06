@@ -28,7 +28,7 @@ const RUN_CLIENT = ROLE in ("both", "client")
 
 # `localhost_only` keeps discovery on the configured router (no multicast); drop it
 # to reach peers on other hosts.
-Context(; peers = ["tcp/localhost:7447"], home = @__MODULE__, localhost_only = true) do ctx
+@context(peers = ["tcp/localhost:7447"], localhost_only = true) do ctx
     node = Node(ctx, "fibonacci")
 
     # ── Server (high-level do-block) ──────────────────────────────────────────

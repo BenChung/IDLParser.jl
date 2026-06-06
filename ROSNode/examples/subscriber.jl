@@ -9,7 +9,10 @@ using ROSNode
 
 @ros_import "std_msgs/msg/String" from="interfaces"
 
-Context(; peers = ["tcp/localhost:7447"], home=@__MODULE__) do ctx
+# `@context` binds this module as the Context's resolution home (sugar for
+# `Context(; home=@__MODULE__, …)`), so the type-less `Subscription` below lands this
+# module's `@ros_import`ed `String` rather than a content-canonical type.
+@context(peers = ["tcp/localhost:7447"]) do ctx
     node = Node(ctx, "listener")
 
     # The do-block handler runs once per message. `msg` is an owned, decoded
