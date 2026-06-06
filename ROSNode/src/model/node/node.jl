@@ -157,6 +157,15 @@ are logged so one can't abort the rest of the teardown.
 """
 function Base.close(node::Node)
     (@atomicswap node.open = false) || return nothing
+    # §7: leave the Context's sim-time set (idempotent — a no-op if this node never opted
+    # in; tears down the `/clock` source if it was the last user). Done *after* marking the
+    # node closed so the deactivation jump is skipped for it (`_fire_jumps_to!` guards on
+    # `isopen`) — close shouldn't deliver callbacks.
+    try
+        set_use_sim_time!(node.context, node, false)
+    catch err
+        @error "close(node): sim-time deopt failed" exception=(err, catch_backtrace())
+    end
     # Entities first (a sub/service may reference the node), reverse order. Snapshot
     # under the lock so a concurrent `make_entity`/`dispose` can't mutate mid-walk.
     ents = @lock node.lock (es = copy(node.entities); empty!(node.entities); es)

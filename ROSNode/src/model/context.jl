@@ -178,6 +178,15 @@ mutable struct Context
     # Sim-time source (§7): the Context-hosted `/clock` value, atomically held.
     # `nothing` until any node sets `use_sim_time` and the sub lands.
     @atomic sim_time_ns::Union{Int64, Nothing}
+    # §7 sim-time wiring. `_sim_users` is the set of nodes that opted into
+    # `use_sim_time` (sim active iff non-empty — ONE process-level `/clock` source,
+    # per-node opt-in). `_clock_node`/`_clock_sub` are the hidden internal node + its
+    # `/clock` Subscription carrying that source. All guarded by `_sim_lock` (a
+    # distinct lock — NOT `_state_lock`).
+    _clock_node::Any
+    _clock_sub::Any
+    const _sim_users::Set{Any}
+    const _sim_lock::ReentrantLock
     # Shutdown state + drain machinery (§14).
     const _state_lock::ReentrantLock
     @atomic _state::ShutdownState
@@ -256,6 +265,7 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
     ctx = Context(sess, ZenohId(_zid_hex(sess)), dom, ns, enc, format,
                   0, TypeRegistry(), GraphIndex(), nothing,
                   Dict{DataType, Any}(), nothing,
+                  nothing, nothing, Set{Any}(), ReentrantLock(),
                   ReentrantLock(), running, Any[], Threads.Condition(),
                   Threads.Condition(), Float64(drain_timeout), Any[], home)
 
@@ -333,6 +343,151 @@ function clock(ctx::Context, src::ClockSource)
     end::Clock{C}
 end
 clock(ctx::Context) = clock(ctx, ROS())
+
+# ── §7 sim-time: use_sim_time → /clock routing ──────────────────────────────────
+# ONE process-level `/clock` data source (a Subscription on a hidden internal node),
+# per-node opt-in: `_sim_users` holds the nodes whose ROS clock follows sim time, so
+# `now(node, ROS())` reads `sim_time_ns` only for an opted-in node (time.jl). Jump
+# callbacks fire on the clock each node actually holds (`node.clocks[ROS]`): a per-node
+# `sim_activated`/`sim_deactivated` on opt-in/opt-out, and a `time_forward`/`time_backward`
+# to every active node on a `/clock` discontinuity. Follow-only (no interpolation): `now`
+# holds between samples (rclcpp TimeSource); ROS `Timer`/`Rate` are NOT sim-driven here.
+#
+# Activation declares a real `/clock` Subscription, which needs a `NodeEntity`
+# (`topic_keyexpr` requires one) — hence a hidden internal node, not a bare Context. It
+# runs synchronously (under the param-commit `s.lock` via the event hook): toggling is
+# rare/one-time, and nothing takes a param lock while holding `_sim_lock`/node locks, so
+# there is no cycle. (A jump callback that re-enters parameter mutation is safe only
+# because `s.lock` is a `ReentrantLock` — same-thread re-entry succeeds; a non-reentrant
+# lock here would reintroduce a self-deadlock.)
+
+_is_sim_user(ctx::Context, node) = @lock ctx._sim_lock (node in ctx._sim_users)
+
+"""
+    set_use_sim_time!(ctx, node, on::Bool) -> nothing
+
+(De)activate sim-time routing for `node` (§7). The first opt-in declares the Context's
+`/clock` Subscription; the last opt-out tears it down. Fires a per-node
+`sim_activated`/`sim_deactivated` jump on the node's ROS clock.
+"""
+function set_use_sim_time!(ctx::Context, node, on::Bool)
+    transition = :none
+    @lock ctx._sim_lock begin
+        if on
+            if !(node in ctx._sim_users)
+                was_empty = isempty(ctx._sim_users)
+                push!(ctx._sim_users, node)
+                transition = was_empty ? :activate_first : :join
+            end
+        elseif node in ctx._sim_users
+            delete!(ctx._sim_users, node)
+            transition = isempty(ctx._sim_users) ? :deactivate_last : :leave
+        end
+    end
+    if transition === :activate_first
+        _activate_sim!(ctx)
+        _fire_jumps_to!(node, TimeJump(sim_activated, _activate_delta(ctx)))
+    elseif transition === :join
+        _fire_jumps_to!(node, TimeJump(sim_activated, _activate_delta(ctx)))
+    elseif transition === :leave
+        _fire_jumps_to!(node, TimeJump(sim_deactivated, Duration(0)))
+    elseif transition === :deactivate_last
+        _fire_jumps_to!(node, TimeJump(sim_deactivated, Duration(0)))
+        _deactivate_sim!(ctx)
+    end
+    nothing
+end
+
+# Activation delta for a node joining an already-running sim: the actual sim−system
+# offset (so threshold callbacks fire too); 0 for the first opt-in (no `/clock` sample
+# yet — `on_clock_change` still triggers it).
+_activate_delta(ctx::Context) =
+    (s = @atomic ctx.sim_time_ns; s === nothing ? Duration(0) : Duration(s - _read_ns(System())))
+
+# Declare the `/clock` Subscription on the hidden internal node (created once, reused
+# across reactivations). Each sample's `builtin_interfaces/Time` is ingested as ns.
+function _activate_sim!(ctx::Context)
+    # Build into locals; commit BOTH to the Context only after the Subscription
+    # succeeds — so a throwing `Subscription` ctor can't strand `_clock_node` without a
+    # `/clock` sub (which would make every later reactivation a no-op).
+    node = ctx._clock_node === nothing ?
+        Node(ctx, "_ros_clock"; serve_type_description = false) : ctx._clock_node
+    ClockMsg = Interfaces.rosgraph_msgs.msg.Clock
+    sub = Subscription(node, "/clock", ClockMsg) do msg
+        _ingest_clock!(ctx, _join_ns(msg.clock.sec, msg.clock.nanosec))
+    end
+    @lock ctx._sim_lock begin
+        ctx._clock_node = node
+        ctx._clock_sub = sub
+    end
+    nothing
+end
+
+# Tear down the `/clock` source: close the sub and clear sim time. A late in-flight
+# sample is ignored by `_ingest_clock!` (it re-checks `_sim_users` under the lock).
+function _deactivate_sim!(ctx::Context)
+    sub = @lock ctx._sim_lock begin
+        s = ctx._clock_sub
+        ctx._clock_sub = nothing
+        @atomic ctx.sim_time_ns = nothing
+        s
+    end
+    sub === nothing && return nothing
+    try
+        close(sub)
+    catch err
+        @error "sim-time: closing /clock subscription failed" exception=(err, catch_backtrace())
+    end
+    nothing
+end
+
+# Ingest one `/clock` sample. Resurrection-safe: a sample arriving after deactivation
+# (empty `_sim_users`) is ignored. The first post-activation sample only sets the
+# baseline (the per-node `sim_activated` already fired at opt-in); a later change fires a
+# `time_forward`/`time_backward` to every active node.
+function _ingest_clock!(ctx::Context, ns::Int64)
+    local jump
+    @lock ctx._sim_lock begin
+        if isempty(ctx._sim_users)
+            jump = nothing
+        else
+            old = @atomic ctx.sim_time_ns
+            @atomic ctx.sim_time_ns = ns
+            jump = (old === nothing || ns == old) ? nothing :
+                   TimeJump(ns > old ? time_forward : time_backward, Duration(ns - old))
+        end
+    end
+    jump === nothing || _fire_clock_jumps!(ctx, jump)
+    nothing
+end
+
+# Fire a jump to the callbacks on one node's ROS clock (the handle the user holds,
+# `node.clocks[ROS]`), gated by `_triggers`. A snapshot copy decouples firing from a
+# concurrent `register!`.
+function _fire_jumps_to!(node, j::TimeJump)
+    node === nothing && return nothing
+    node isa Node && !isopen(node) && return nothing   # skip a closed/closing node (no fire on a torn-down clock)
+    (hasproperty(node, :clocks) && haskey(node.clocks, ROS)) || return nothing
+    c = node.clocks[ROS]::Clock{ROS}
+    for cb in copy(c.jumps)
+        _triggers(cb, j) || continue
+        try
+            cb.f(j)
+        catch err
+            @error "sim-time jump callback threw" exception=(err, catch_backtrace())
+        end
+    end
+    nothing
+end
+
+# A `/clock` discontinuity affects every opted-in node — fan the jump to all of them.
+function _fire_clock_jumps!(ctx::Context, j::TimeJump)
+    nodes = @lock ctx._sim_lock collect(ctx._sim_users)
+    for n in nodes
+        _fire_jumps_to!(n, j)
+    end
+    nothing
+end
 
 # ── name resolution (§5) ────────────────────────────────────────────────────
 # Turn a user name into a fully-qualified name *before* it reaches ROSZenoh:
@@ -691,6 +846,15 @@ function _drain!(ctx::Context)
                     @error "drain: closing discovery subscriber failed" exception=(err, catch_backtrace())
                 end
                 ctx._lv_sub = nothing
+            end
+            # §7 sim-time: the `/clock` sub rides `_clock_node` (a registered resource,
+            # already closed in the reverse walk above). Just clear the references + the
+            # opt-in set so nothing dangles.
+            @lock ctx._sim_lock begin
+                ctx._clock_sub = nothing
+                ctx._clock_node = nothing
+                empty!(ctx._sim_users)
+                @atomic ctx.sim_time_ns = nothing
             end
             try
                 isopen(ctx.session) && close(ctx.session)

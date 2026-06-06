@@ -133,6 +133,23 @@ ROSNode.validate(p::PlannerParams) =
         @test length(batches) == 1
     end
 
+    # §7: the trigger condition the `use_sim_time → /clock` hook keys on. A committed
+    # change to `use_sim_time` lands in the event batch — `_emit_parameter_event!` fires
+    # the hook off exactly this. The hook itself early-returns here (`node === nothing`);
+    # the live Context wiring is exercised in parameters_live.jl.
+    @testset "use_sim_time change reaches the event batch (hook trigger)" begin
+        s = ParameterServer(nothing, PlannerParams())
+        batches = ParameterEventBatch[]
+        on_parameter_event(s) do b; push!(batches, b); end
+        transaction(s) do p; p.use_sim_time = true; end
+        @test length(batches) == 1
+        @test haskey(batches[1].changed, :use_sim_time)
+        @test batches[1].changed[:use_sim_time] === true
+        @test batches[1].previous[:use_sim_time] === false
+        transaction(s) do p; p.use_sim_time = true; end   # no-op: no batch, hook wouldn't re-fire
+        @test length(batches) == 1
+    end
+
     @testset "dynamic (undeclared) params gated by allow_undeclared" begin
         off = ParameterServer(nothing, PlannerParams())
         @test_throws ArgumentError dynamic_parameters(off)

@@ -262,8 +262,13 @@ Base.show(io::IO, ::Clock{C}) where {C} = print(io, "Clock{", nameof(C), "}")
 # TODO(graph): route through `node.clock(C())` once Node exists, so the ROS
 # clock can pick up the node's `use_sim_time` + Context `/clock` source.
 function _node_clock(node, src::C) where {C<:ClockSource}
-    if hasproperty(node, :clocks) && haskey(node.clocks, C)
-        return node.clocks[C]::Clock{C}
+    # Cache the handle in `node.clocks` (a node has one). A *stable* handle per (node,
+    # source) is essential: `register!(clock(node, ROS()), cb)` and `now(node, ROS())`
+    # and the sim-time jump dispatch (`_fire_jumps_to!`) all reach the SAME `Clock{ROS}`
+    # only if it is shared, not re-synthesized each call. A context-less mock (tests) has
+    # no `clocks` table — synthesize a fresh handle (the caller holds it directly).
+    if hasproperty(node, :clocks)
+        return get!(() -> Clock(node, src), node.clocks, C)::Clock{C}
     end
     Clock(node, src)
 end
@@ -296,12 +301,19 @@ register!(f::Function, c::Clock; kwargs...) = register!(c, JumpCallback(f; kwarg
 _read_ns(::Steady) = Int64(Base.time_ns() & typemax(Int64))   # monotonic, ns
 _read_ns(::System) = round(Int64, time() * 1e9)               # wall, ns since unix epoch
 
-# ROS clock: system time today. TODO(graph): when the owning node's
-# `use_sim_time` is set, read the Context-hosted `/clock` sim time instead.
+# ROS clock (§7): sim time from the owning Context's `/clock` source when this clock's
+# node opted into `use_sim_time`, else system time. The common (non-sim) path is
+# lock-free: `sim_time_ns === nothing` short-circuits before the per-node opt-in check
+# (which takes `_sim_lock`). The Context's own ROS clock (`c.node === ctx`) is never a
+# sim user, so it reads system time.
 function _read_ns(c::Clock{ROS})
-    # placeholder for the sim-time branch; system time is the non-sim answer.
-    _read_ns(System())
+    ctx = _clock_ctx(c.node)
+    ctx === nothing && return _read_ns(System())
+    s = @atomic ctx.sim_time_ns
+    s === nothing && return _read_ns(System())          # sim inactive (common) — lock-free
+    (c.node !== ctx && _is_sim_user(ctx, c.node)) ? s : _read_ns(System())
 end
+# A bare `ROS()` source (no node/Context to reach) is system time.
 _read_ns(::ROS) = _read_ns(System())
 
 """

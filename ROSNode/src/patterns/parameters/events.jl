@@ -94,14 +94,13 @@ function _server_stamp_ns(s::ParameterServer)
 end
 
 # `use_sim_time` toggle hook (§7). The Context hosts the single `/clock` sub and
-# per-node opt-in; this notifies it. TODO(time §7): call the Context's sim-time
-# (de)activation once that surface lands — today the value is already committed in
-# the struct, so `now(node)` will read it through when the §7 routing is wired.
+# per-node opt-in; this routes the committed value to it so `now(node, ROS())` follows
+# `/clock` and registered jump callbacks fire. Runs under the commit `s.lock` (see
+# `set_use_sim_time!` for why synchronous activation is safe).
 function _on_use_sim_time_changed(s::ParameterServer, enabled)
     node = s.node
     node === nothing && return nothing
-    # TODO(time §7): `set_use_sim_time!(node.context, node, enabled)` to (de)activate
-    # the Context `/clock` subscription and fire the ROS-clock jump callbacks.
+    set_use_sim_time!(_ctx(node), node, Bool(enabled))
     return nothing
 end
 

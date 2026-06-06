@@ -211,3 +211,59 @@ end
         end
     end
 end
+
+# ── §7 sim-time: use_sim_time reroutes the node's ROS clock to /clock ─────────────
+import Dates
+using ROSNode: Publisher, publish, clock, register!, JumpCallback, ROS, System, nanoseconds
+
+@parameters struct SimParams
+    use_sim_time::Bool = false
+end
+
+const _ClockMsg = ROSNode.Interfaces.rosgraph_msgs.msg.Clock
+const _TimeMsg  = ROSNode.Interfaces.builtin_interfaces.msg.Time
+function _clockmsg(ns::Integer)
+    s, n = divrem(Int64(ns), 1_000_000_000)
+    _ClockMsg(clock = _TimeMsg(sec = Int32(s), nanosec = UInt32(n)))
+end
+
+@testset "sim-time: use_sim_time reroutes now(node, ROS) to /clock (§7)" begin
+    _pctx() do ctx
+        node = Node(ctx, "simnode", SimParams)
+        clk  = clock(node, ROS())                  # stable handle; register a jump callback on it
+        jumps = Channel{Any}(32)
+        register!(clk, JumpCallback(j -> put!(jumps, j);
+                                    on_clock_change = true, min_forward = Dates.Millisecond(1)))
+
+        # Before activation the ROS clock is system time.
+        @test abs(nanoseconds(Dates.now(node, ROS())) - nanoseconds(Dates.now(node, System()))) < 1_000_000_000
+
+        _pstep("sim: activate use_sim_time, publish two /clock values")
+        node.parameters.use_sim_time = true        # single-statement transaction → hook → set_use_sim_time!
+        cpub = Publisher(node, "/clock", _ClockMsg)
+        sleep(0.5)                                  # let the Context /clock sub + this route match
+
+        t1 = 1_000_000_000                          # 1.0 s sim — baseline (no jump)
+        publish(cpub, _clockmsg(t1))
+        @test timedwait(() -> nanoseconds(Dates.now(node, ROS())) == t1, 5.0; pollint = 0.02) === :ok
+
+        t2 = 5_000_000_000                          # 5.0 s sim — a forward discontinuity
+        publish(cpub, _clockmsg(t2))
+        @test timedwait(() -> nanoseconds(Dates.now(node, ROS())) == t2, 5.0; pollint = 0.02) === :ok
+
+        # Jump callbacks fired on the node's clock: sim_activated (opt-in) + time_forward (t1→t2).
+        @test timedwait(() -> isready(jumps), 5.0; pollint = 0.02) === :ok
+        sleep(0.2)
+        kinds = Symbol[]
+        while isready(jumps); push!(kinds, Symbol(take!(jumps).kind)); end
+        @test :sim_activated in kinds
+        @test :time_forward in kinds
+
+        _pstep("sim: deactivate → ROS reverts to system, sim_deactivated fires")
+        node.parameters.use_sim_time = false        # synchronous: tears down + fires the jump
+        @test abs(nanoseconds(Dates.now(node, ROS())) - nanoseconds(Dates.now(node, System()))) < 1_000_000_000
+        sawdeact = false
+        while isready(jumps); Symbol(take!(jumps).kind) === :sim_deactivated && (sawdeact = true); end
+        @test sawdeact
+    end
+end

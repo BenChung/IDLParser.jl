@@ -279,6 +279,12 @@ function Node(ctx::Context, name::AbstractString, ::Type{P};
     server = ParameterServer{P}(node; overrides = overrides, allow_undeclared = allow_undeclared)
     wire_parameter_services!(server)
     node.parameters = server
+    # Startup overrides commit through the ctor, NOT a transaction, so the `use_sim_time`
+    # event hook never fires for them (§7). Activate sim explicitly if the committed value
+    # is true, so a node started with `use_sim_time=true` follows `/clock` from the start.
+    if hasfield(P, :use_sim_time) && getfield((@atomic server.value), :use_sim_time) === true
+        set_use_sim_time!(ctx, node, true)
+    end
     return node
 end
 

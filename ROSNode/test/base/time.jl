@@ -4,7 +4,7 @@
 
 using ROSNode: RTime, Duration, System, Steady, ROS, ClockSource,
                nanoseconds, seconds, source, to_msg, rtime, duration,
-               Clock, Rate, JumpCallback, TimeJump, sim_activated, time_forward,
+               Clock, Rate, JumpCallback, TimeJump, register!, sim_activated, time_forward,
                time_backward
 using Dates: Dates, Nanosecond, Millisecond, Second
 
@@ -142,5 +142,22 @@ ClockMockNode() = ClockMockNode(Dict{DataType, Any}())
         @test ROSNode._triggers(cb, TimeJump(time_backward, Duration(-5_000_000)))
         # backward below threshold: no
         @test !ROSNode._triggers(cb, TimeJump(time_backward, Duration(-1_000_000)))
+    end
+
+    # The firing contract (the audit gap): a registered callback's `f` actually runs
+    # when the jump dispatch driver fans to the clock the user holds, gated by
+    # `_triggers`. Pure: drive `_fire_jumps_to!` directly on a mock node (no Context).
+    @testset "JumpCallback fires through the dispatch driver" begin
+        node = ClockMockNode()
+        c = ROSNode.clock(node, ROS())            # cached in node.clocks[ROS] (stable handle)
+        fired = Ref(0)
+        register!(c, JumpCallback(_ -> (fired[] += 1);
+                                  min_forward = Millisecond(10), on_clock_change = true))
+        ROSNode._fire_jumps_to!(node, TimeJump(sim_activated, Duration(0)))
+        @test fired[] == 1                        # source switch fires (on_clock_change)
+        ROSNode._fire_jumps_to!(node, TimeJump(time_forward, Duration(1_000_000)))   # 1ms < 10ms
+        @test fired[] == 1                        # below threshold: no fire
+        ROSNode._fire_jumps_to!(node, TimeJump(time_forward, Duration(10_000_000)))  # 10ms
+        @test fired[] == 2                        # at/above threshold: fires
     end
 end
