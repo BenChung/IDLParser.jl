@@ -127,6 +127,23 @@ _dt("@ros_import from= modules ready")
         @test all(e -> e.type !== nothing && e.mod !== nothing, values(es))
     end
 
+    @testset "dynamic codegen resolves a nested message ref (closure)" begin
+        _dt("dynamic codegen with nested ref")
+        # The wire shape a type-less subscriber gets: Chatter{header: demo_msgs/msg/Header, …}
+        # plus the referenced Header. realize! must generate Header into the SAME gensym module,
+        # else `header::demo_msgs.msg.Header` is an UndefVarError and codegen leaves type=nothing.
+        htd   = _internal_td("float64 stamp\nstring frame\n", "Header", "demo_msgs").type_description
+        cmain = _internal_td("demo_msgs/Header header\nstring data\nint32 seq\n",
+                             "Chatter", "demo_msgs").type_description
+        tdm   = TypeDescriptionMsg(cmain, [htd])
+        info  = TypeInfo("demo_msgs/msg/Chatter", type_hash_from_rihs_string(calculate_rihs01_hash(tdm)))
+        entry = ROSNode.realize!(ROSNode.entry_from_type_description(tdm, info; verify = false))
+        @test entry.mod !== nothing && entry.type !== nothing        # codegen succeeded (was nothing)
+        @test fieldnames(entry.type) === (:header, :data, :seq)
+        htype = fieldtype(entry.type, :header)                       # nested type, generated alongside
+        @test nameof(htype) === :Header && fieldnames(htype) === (:stamp, :frame)
+    end
+
     @testset "type_sources regenerate from registry IL (include_type_sources)" begin
         _dt("type_sources from registry IL")
         # Session-free: build a real TypeRegistry from the well-known entries (a bare

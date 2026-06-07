@@ -20,7 +20,7 @@ using ROSNode
 # NamedTuple settles SUCCEEDED; throwing settles ABORTED.
 module Act
     using ROSNode
-    @ros_package "example_interfaces"
+    @ros_package "action_tutorials_interfaces"
     @ros_action function Fibonacci(order::Int32,
             fb::FeedbackSink{@NamedTuple{sequence::Vector{Int32}}})::@NamedTuple{sequence::Vector{Int32}}
         seq = Int32[0, 1]

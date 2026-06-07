@@ -17,7 +17,7 @@ using ROSNode
 # the sections by short name: `Fibonacci.Goal`, `Fibonacci.Feedback`, `Fibonacci.Result`
 # (plus the protocol wrappers the runtime uses internally). Wire names are unchanged
 # (`Fibonacci_Goal`, …).
-@ros_import "example_interfaces/action/Fibonacci" from="interfaces"
+@ros_import "action_tutorials_interfaces/action/Fibonacci" from="interfaces"
 
 # Which half(s) to run: the `ROLE` env var or the first CLI arg, defaulting to `both`.
 const ROLE = lowercase(get(ENV, "ROLE", isempty(ARGS) ? "both" : ARGS[1]))

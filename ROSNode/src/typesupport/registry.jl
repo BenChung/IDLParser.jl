@@ -121,6 +121,23 @@ function _generate_exprs(il, package::AbstractString; emit_imports::Bool=false)
     return IDLParser.Generation.generate_code(resolved; emit_imports=emit_imports)
 end
 
+# The full generation closure for a dynamic entry: every nested type it references
+# (lifted from the `td`'s referenced descriptions, each under its own package) followed
+# by the main IL. `generate_code` topo-sorts, so a nested-message field resolves to a
+# sibling generated into the SAME module — without the closure a `pkg/msg/Nested` field
+# is an UndefVarError in the gensym module. Mirrors @ros_import's multi-type closure.
+function _closure_ils(entry::RegistryEntry, package::AbstractString)
+    ils = Tuple{String, Any}[]
+    if entry.td !== nothing
+        for rtd in entry.td.referenced_type_descriptions
+            rpkg, _, _ = split_ros_name(rtd.type_name)
+            push!(ils, (rpkg, lift(rtd)))
+        end
+    end
+    push!(ils, (package, entry.il))
+    return ils
+end
+
 # Eval an interface's generated code into a fresh module and return it. Generated
 # code splices the `StaticArrays`/`CDRSerialization` module objects directly, so it
 # resolves them regardless of the eval target's deps. The gensym'd target is rooted
@@ -129,11 +146,10 @@ end
 #
 # TODO: dynamic types accumulate as hidden submodules of CDRSerialization rather
 # than ROSNode. A dedicated runtime-codegen root module would localize them.
-function _eval_module(il, package::AbstractString)
+function _eval_module(entry::RegistryEntry, package::AbstractString)
     name = gensym(isempty(package) ? :ros_dynamic : Symbol(package))
     target = Core.eval(CDRSerialization, :(module $name end))
-    exprs = _generate_exprs(il, package)
-    for ex in exprs
+    for ex in _generate_exprs_multi(_closure_ils(entry, package))
         Core.eval(target, ex)
     end
     return target
@@ -192,7 +208,7 @@ end
 
 function _realize_locked!(entry::RegistryEntry, package::AbstractString)
     try
-        mod = _eval_module(entry.il, package)
+        mod = _eval_module(entry, package)
         entry.mod = mod
         # A message has one umbrella struct to bind as `entry.type`; a service /
         # action has sections (`Foo_Request`/`Foo_Goal`/…) and no umbrella type,

@@ -19,6 +19,12 @@ mutable struct ActionClient{A, G, R, F}
     const name::String                   # resolved action FQN
     const support::ActionTypeSupport{A, G, R, F}
     const qos::QosProfile
+    # rmw_zenoh request attachment (§3.4): the three action services are `get`s, and a
+    # real rmw_zenoh queryable reads the request's `(sequence_number, source_timestamp,
+    # source_gid)` attachment to stamp its reply — hiroz `.unwrap()`s it, so a request
+    # without one panics the peer. Stable per-client gid + a per-request seq.
+    const _gid::NTuple{16, UInt8}
+    @atomic _seq::Int64
     @atomic open::Bool
     # Lazy routing-match probes (`_ClientWire`s, service.jl) for `send_goal` and
     # `get_result`, declared on first `wait_for_action_server`/`action_server_matched`
@@ -38,8 +44,15 @@ function ActionClient(node::Node, name::AbstractString, ::Type{A};
     support = ActionTypeSupport(A)
     G = goal_type(support); R = result_type(support); F = feedback_type(support)
     fqn = resolve_name(node, name; kind=:service)
-    ActionClient{A, G, R, F}(node, fqn, support, qos, true, nothing, ReentrantLock())
+    gid = ROSZenoh.entity_gid(node.entity.z_id, next_entity_id!(node.context))
+    ActionClient{A, G, R, F}(node, fqn, support, qos, gid, 0, true, nothing, ReentrantLock())
 end
+
+# The rmw_zenoh per-request attachment for an action service `get`. Mirrors the
+# `ServiceClient` path so a request reaching a C++/Rust peer carries the metadata it
+# echoes back into the reply (without it, hiroz's `query.attachment().unwrap()` panics).
+_request_attachment(client::ActionClient) =
+    encode_attachment((@atomic client._seq += 1), _now_ns(client.node), client._gid)
 
 # The action sub-service `TypeInfo` for a client call (`:send_goal` / `:get_result`
 # / `:cancel_goal`), or the action-typed info as a fallback — the client side of
@@ -157,7 +170,8 @@ function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     accepted = false
     got_reply = false
     for _ in 1:40                                          # up to ~2s of 50ms backoffs
-        for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req), timeout_ms=5000)
+        for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req),
+                          attachment=_request_attachment(client), timeout_ms=5000)
             got_reply = true
             if Zenoh.is_ok(r)
                 resp = decode_owned(Zenoh.sample(r), _send_goal_response_type(A))
@@ -254,7 +268,8 @@ function _get_result_once(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     got_reply = false
     for _ in 1:40                                          # ~2s of 50ms backoffs to match
         for r in Base.get(ctx.session, Keyexpr(tk), "";
-                          payload=encode(req), timeout_ms=_GET_RESULT_TIMEOUT_MS)
+                          payload=encode(req), attachment=_request_attachment(client),
+                          timeout_ms=_GET_RESULT_TIMEOUT_MS)
             got_reply = true
             if Zenoh.is_ok(r)
                 resp = decode_owned(Zenoh.sample(r), _get_result_response_type(A))
@@ -318,7 +333,8 @@ function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     # this goal (a zeroed goal_id would be the server's cancel-all sentinel).
     req = _CancelGoal_Request(; goal_info = _GoalInfo(; goal_id = _to_uuid(g.id),
                                                       stamp = to_msg(_Time, Dates.now(client.node))))
-    for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req), timeout_ms=5000)
+    for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req),
+                      attachment=_request_attachment(client), timeout_ms=5000)
         break
     end
     @atomic g._state = :canceling

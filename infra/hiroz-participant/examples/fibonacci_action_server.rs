@@ -105,9 +105,6 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // Initialize logging
-    zenoh::init_log_from_env_or("error");
-
     // Create the hiroz context with optional configuration
     let mut builder = ZContextBuilder::default();
     if let Some(e) = args.get(1) {

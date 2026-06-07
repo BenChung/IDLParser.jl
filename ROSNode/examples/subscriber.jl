@@ -23,12 +23,13 @@ using ROSNode
         @info "heard" typeof(msg.data) msg.data
     end
 
-    # Julia's scheduler is the executor — no explicit spin() needed. Just keep the
-    # process alive while the subscription's task delivers messages.
+    # Messages are delivered on the scheduler's own tasks — `spin` is not an
+    # rclcpp-style executor pump, it just parks the main task to keep the process
+    # alive. `handle_signals=true` turns Ctrl-C into a graceful drain (clean liveliness
+    # departure + session close); without it, Julia's default SIGINT path force-exits
+    # and dumps a native backtrace of every thread (including libzenohc's tokio pool).
     @info "listening on /chatter — Ctrl-C to stop"
-    while true
-        sleep(1.0)
-    end
+    spin(ctx; handle_signals = true)
 end
 
 # A type-less subscription is also available: `Subscription(node, "/chatter") do msg … end`

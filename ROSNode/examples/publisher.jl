@@ -13,7 +13,7 @@ using ROSNode
 # vendored tree or, inside a sourced ROS2 env, from AMENT_PREFIX_PATH — and lands
 # it at `std_msgs.msg.String` in this module. (For your own interfaces, add a local
 # source root: `@ros_import from="interfaces" "my_pkg/msg/MyType"`.)
-@ros_import "std_msgs/msg/String"
+@ros_import "std_msgs/msg/String" from="interfaces"
 
 # `@context` opens the Context — owner of the Zenoh session, discovery, and shutdown —
 # binding this module as its type-resolution home (sugar for `Context(; home=@__MODULE__, …)`).
@@ -22,10 +22,17 @@ using ROSNode
     node = Node(ctx, "talker")
     pub  = Publisher(node, "/chatter", std_msgs.msg.String)
 
-    for i in 0:typemax(Int)
+    # `spin` parks the main task; the publish loop runs on a background task so the two
+    # coexist. `handle_signals=true` makes Ctrl-C a graceful drain — the loop sees
+    # `isopen(ctx)` flip and stops — instead of Julia's default SIGINT force-exit that
+    # dumps a native backtrace of every thread (including libzenohc's tokio pool).
+    @info "publishing on /chatter — Ctrl-C to stop"
+    Threads.@spawn for i in 0:typemax(Int)
+        isopen(ctx) || break
         msg = std_msgs.msg.String(data = "hello world $i")
         publish(pub, msg)
         @info "published" msg.data
         sleep(1.0)
     end
+    spin(ctx; handle_signals = true)
 end

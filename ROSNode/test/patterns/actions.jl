@@ -68,6 +68,22 @@ function _wait_action(c::ActionClient)
     sleep(0.5)   # liveliness (the graph) leads Zenoh queryable route-matching; let it settle
 end
 
+# Regression (real-peer interop): every action service `get` (send_goal/get_result/cancel)
+# must carry an rmw_zenoh request attachment. A C++/Rust rmw_zenoh peer reads it from
+# `query.attachment()` to stamp its reply and PANICS if absent (observed: hiroz's accept()
+# `.unwrap()` on `None`). Julia↔Julia tolerates a missing one — the server mints its own reply
+# attachment — so the live lifecycle tests below don't catch it; this guards the client side.
+@testset "action client request attachment" begin
+    _actx() do ctx
+        client = ActionClient(Node(ctx, "att_probe"), "/att_probe", Process)
+        @test client._gid != ntuple(_ -> 0x00, 16)        # ctor derived a real source gid
+        s0 = @atomic client._seq
+        @test ROSNode._request_attachment(client) !== nothing
+        @test (@atomic client._seq) == s0 + 1             # per-request seq advanced
+        close(client)
+    end
+end
+
 @testset "actions (Zenoh session)" begin
 
     # on_goal accept / reject / defer: the three acceptance decisions surface on the
