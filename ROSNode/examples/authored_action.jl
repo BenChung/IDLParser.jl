@@ -1,32 +1,36 @@
-# Authored-type action for example_interfaces/action/Fibonacci.
+# Authored-type action for action_tutorials_interfaces/action/Fibonacci.
 #
 #     zenohd -l tcp/localhost:7447 &
 #     julia --project=. ROSNode/examples/authored_action.jl           # both, one process (default)
 #     julia --project=. ROSNode/examples/authored_action.jl server    # serve only (Ctrl-C to stop)
 #     julia --project=. ROSNode/examples/authored_action.jl client    # send a goal (needs a server)
 #
-# The authored counterpart to action.jl. The action IS a Julia function: goal fields are
-# parameters, a `FeedbackSink{@NamedTuple{…}}` parameter is the feedback channel, and the
-# `@NamedTuple` return type is the result. `@ros_package "example_interfaces"` gives it the
-# wire identity `example_interfaces/action/Fibonacci` (matching the published RIHS, sections
-# and endpoints alike) — so it interoperates with action.jl, a C++/Python server, or
-# `ros2 action send_goal /fibonacci example_interfaces/action/Fibonacci "{order: 8}"`.
+# The authored counterpart to action.jl, targeting the `action_tutorials_interfaces` Fibonacci
+# (what the ROS2 action_tutorials demos and hiroz use). The action IS a Julia function: goal
+# fields are parameters, a `FeedbackSink{@NamedTuple{…}}` parameter is the feedback channel, and
+# the `@NamedTuple` return type is the result. `@ros_package "action_tutorials_interfaces"` gives
+# it the wire identity `action_tutorials_interfaces/action/Fibonacci` (matching the published RIHS,
+# sections and endpoints alike) — so it interoperates with a C++/Rust/Python Fibonacci server, or
+# `ros2 action send_goal /fibonacci action_tutorials_interfaces/action/Fibonacci "{order: 8}"`.
+#
+# Schema: Goal `int32 order`, Result `int32[] sequence`, Feedback `int32[] partial_sequence` — note
+# the feedback field is `partial_sequence`, not `sequence` (that's the example_interfaces variant).
 
 using ROSNode
 
 # The function body IS the handler, running once per accepted goal. Calling the feedback
-# sink `fb((sequence = …,))` publishes a Feedback message AND checkpoints cancellation: if a
+# sink `fb((partial_sequence = …,))` publishes a Feedback message AND checkpoints cancellation: if a
 # client cancels, it throws here and the goal settles CANCELED. Returning the result
 # NamedTuple settles SUCCEEDED; throwing settles ABORTED.
 module Act
     using ROSNode
     @ros_package "action_tutorials_interfaces"
     @ros_action function Fibonacci(order::Int32,
-            fb::FeedbackSink{@NamedTuple{sequence::Vector{Int32}}})::@NamedTuple{sequence::Vector{Int32}}
+            fb::FeedbackSink{@NamedTuple{partial_sequence::Vector{Int32}}})::@NamedTuple{sequence::Vector{Int32}}
         seq = Int32[0, 1]
         for _ in 1:order
             push!(seq, seq[end] + seq[end-1])
-            fb((sequence = copy(seq),))   # publish feedback + cancellation yield point
+            fb((partial_sequence = copy(seq),))   # publish feedback + cancellation yield point
             sleep(0.3)                    # pretend the step is expensive
         end
         @info "goal complete" seq
@@ -62,7 +66,7 @@ const RUN_CLIENT = ROLE in ("both", "client")
             # Stream feedback as NamedTuples; the loop ends when the goal settles (the
             # framework drives the result behind the scenes).
             for fb in feedback(gh)
-                @info "feedback" fb.sequence
+                @info "feedback" fb.partial_sequence
             end
 
             result = fetch(gh)                        # settled — result is a NamedTuple
