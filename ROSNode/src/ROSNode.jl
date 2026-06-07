@@ -48,6 +48,7 @@ include("interfaces/wellknown.jl")      # §11/§13 statically-compiled bootstra
 include("performance/warmup.jl")        # §D8 precompilation / warm-up (after wellknown: needs Interfaces types)
 include("discovery/introspection.jl")   # message introspection
 include("typesupport/staticgen.jl")     # §11/D5 @ros_import / @ros_cache static-gen + flush
+include("typesupport/authored.jl")      # authored Julia types → ROS (@ros_package / @ros_message)
 include("lifecycle.jl")                 # managed lifecycle nodes
 include("performance/intraprocess.jl")  # intra-process transport
 

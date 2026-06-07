@@ -19,7 +19,7 @@ const _STATIC_ENTRY_LOCK = ReentrantLock()
 # entry's `mod`/`type` to the compiled `T` so `realize!` is a no-op. Records the
 # reverse mapping so `type_info_of(T)` reports the hash. Returns `nothing` when the
 # JSON fails to parse.
-function _intern_static_entry!(@nospecialize(T), json::AbstractString)
+function _intern_static_entry!(@nospecialize(T), json::AbstractString; provenance::Symbol=:static)
     @lock _STATIC_ENTRY_LOCK begin
         haskey(_STATIC_ENTRY_CACHE, T) && return _STATIC_ENTRY_CACHE[T]
         tdmsg = _parse_type_description_json(json)
@@ -27,7 +27,7 @@ function _intern_static_entry!(@nospecialize(T), json::AbstractString)
         hash = type_hash_from_rihs_string(calculate_rihs01_hash(tdmsg))
         hash === nothing && return nothing
         e = RegistryEntry(TypeInfo(tdmsg.type_description.type_name, hash),
-                          lift(tdmsg); td=tdmsg, provenance=:static)
+                          lift(tdmsg); td=tdmsg, provenance=provenance)
         e.mod = parentmodule(T)
         e.type = T
         _record_type_entry!(e)                 # type_info_of(T) → the real hash
@@ -65,6 +65,31 @@ function absorb_static_types!(mod::Module)
         d = try; getglobal(mod, _CACHE_MARKER); catch; nothing; end
         dir = (d isa AbstractString && !isempty(d)) ? String(d) : _default_project_cache_dir()
         @lock _STATIC_TYPES.lock push!(_STATIC_TYPES.cache_dirs, dir)
+    end
+    # Authored types (@ros_message/…): drained in push order (nested-first), interned by
+    # *reflection* (their IL isn't known until load time), and folded into the module's
+    # resolve table so dynamic subscribers map the wire RIHS to the user's struct.
+    # `_intern_authored_entry!` lives in authored.jl (included later; late-bound here).
+    if isdefined(mod, _AUTHORED_GLOBAL)
+        authored = try; getglobal(mod, _AUTHORED_GLOBAL); catch; nothing; end
+        if authored isa AbstractVector
+            for d in authored
+                try
+                    T, fqn = d
+                    T isa Type || continue
+                    @lock _STATIC_TYPES.lock (T in _STATIC_TYPES.seen) && continue
+                    e = _intern_authored_entry!(T, String(fqn))
+                    e === nothing && continue
+                    @lock _STATIC_TYPES.lock begin
+                        push!(_STATIC_TYPES.seen, T)
+                        push!(_STATIC_TYPES.entries, e)
+                    end
+                    _merge_resolve!(mod, Tuple{Symbol, Type}[(Symbol(to_rihs_string(e.info.hash)), T)])
+                catch err
+                    @error "typesupport: absorbing authored type failed" mod exception=(err, catch_backtrace())
+                end
+            end
+        end
     end
     if isdefined(mod, _STATIC_GLOBAL)
         descriptors = try; getglobal(mod, _STATIC_GLOBAL); catch; return nothing; end

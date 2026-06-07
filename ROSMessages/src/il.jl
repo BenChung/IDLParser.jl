@@ -28,9 +28,11 @@ using Moshi.Match: @match
     RFloat(Int)  # 32/64
     RStr(Union{Nothing, Int})   # nothing = unbounded; Int = upper bound
     RWStr(Union{Nothing, Int})
-    # package = nothing for a same-package (relative) reference, else the
-    # owning package name. `time`/`duration`/`Header` aliases lift to refs.
-    RRef(Union{Nothing, String}, String)
+    # package = nothing for a same-package (relative) reference, else the owning
+    # package name; the third field is the ROS qualifier ("msg"/"srv"/"action") so a
+    # ref to a non-`msg` type (e.g. an action wrapper → its `_Goal` section) lowers to
+    # the correct `pkg/<qual>/Name`. `time`/`duration`/`Header` aliases lift to msg refs.
+    RRef(Union{Nothing, String}, String, String)
 end
 @derive RBase[Eq, Hash, Show]
 
@@ -113,7 +115,7 @@ function referenced_refs(fields::Vector{RField})
     out = Tuple{Union{Nothing, String}, String}[]
     for f in fields
         @match f.type.base begin
-            RBase.RRef(pkg, name) => push!(out, (pkg, name))
+            RBase.RRef(pkg, name, _) => push!(out, (pkg, name))
             _ => nothing
         end
     end
@@ -172,7 +174,7 @@ unparse(io::IO, b::RBase.Type) = @match b begin
         print(io, "wstring")
         b === nothing || print(io, "<=", b)
     end
-    RBase.RRef(pkg, name) => begin
+    RBase.RRef(pkg, name, _) => begin
         pkg === nothing || print(io, pkg, "/")
         print(io, name)
     end

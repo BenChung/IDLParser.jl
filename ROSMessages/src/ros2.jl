@@ -47,16 +47,16 @@ using Moshi.Match: @match
 @rule _wstring_unbounded = r"wstring\b"p  |> _ -> IL.RBase.RWStr(nothing)
 
 @rule _absolute_ref = _ident & r"/"p & _ident > (pkg, _, name) ->
-    IL.RBase.RRef(String(pkg), String(name))
+    IL.RBase.RRef(String(pkg), String(name), "msg")
 
 # Legacy ROS1 aliases. `rosidl_adapter` rewrites these unconditionally even
 # in the presence of a same-package type with the same name, so we do too;
 # a user wanting their own `Header` must spell it `<pkg>/Header`.
-@rule _builtin_time     = r"time\b"p     |> _ -> IL.RBase.RRef("builtin_interfaces", "Time")
-@rule _builtin_duration = r"duration\b"p |> _ -> IL.RBase.RRef("builtin_interfaces", "Duration")
-@rule _builtin_header   = r"Header\b"p   |> _ -> IL.RBase.RRef("std_msgs", "Header")
+@rule _builtin_time     = r"time\b"p     |> _ -> IL.RBase.RRef("builtin_interfaces", "Time", "msg")
+@rule _builtin_duration = r"duration\b"p |> _ -> IL.RBase.RRef("builtin_interfaces", "Duration", "msg")
+@rule _builtin_header   = r"Header\b"p   |> _ -> IL.RBase.RRef("std_msgs", "Header", "msg")
 
-@rule _relative_ref = _ident |> s -> IL.RBase.RRef(nothing, String(s))
+@rule _relative_ref = _ident |> s -> IL.RBase.RRef(nothing, String(s), "msg")
 
 # Order matters: PEG alternation is first-match. Bounded forms must precede
 # unbounded, absolute_ref must precede relative_ref, and the legacy builtin
@@ -331,10 +331,10 @@ _base_to_ts(base::IL.RBase.Type) = @match base begin
         b === nothing ? nothing : Parse.ConstExpr.Lit(Parse.Literal.Intg(b)))
     IL.RBase.RWStr(b) => Parse.TypeSpec.TWString(
         b === nothing ? nothing : Parse.ConstExpr.Lit(Parse.Literal.Intg(b)))
-    IL.RBase.RRef(pkg, name) => Parse.TypeSpec.TRef(
+    IL.RBase.RRef(pkg, name, qual) => Parse.TypeSpec.TRef(
         pkg === nothing ?
             Parse.ScopedName.Name(Symbol[], Symbol(name), true) :
-            Parse.ScopedName.Name([Symbol(pkg), :msg], Symbol(name), true))
+            Parse.ScopedName.Name([Symbol(pkg), Symbol(qual)], Symbol(name), true))
 end
 
 # Lower an IL value to a `ConstExpr`. Float-typed targets narrow the value's
@@ -473,12 +473,13 @@ parse_action(source::AbstractString; name::AbstractString, package::AbstractStri
 # accept reply stamps a `builtin_interfaces/Time`. Field names match
 # rosidl_adapter so the generated structs (and their RIHS01) are wire-compatible.
 function _action_protocol_messages(name::AbstractString)
-    uuid    = IL.RType(IL.RBase.RRef("unique_identifier_msgs", "UUID"), IL.ArraySpec.AScalar())
-    time    = IL.RType(IL.RBase.RRef("builtin_interfaces", "Time"), IL.ArraySpec.AScalar())
+    uuid    = IL.RType(IL.RBase.RRef("unique_identifier_msgs", "UUID", "msg"), IL.ArraySpec.AScalar())
+    time    = IL.RType(IL.RBase.RRef("builtin_interfaces", "Time", "msg"), IL.ArraySpec.AScalar())
     boolean = IL.RType(IL.RBase.RBool(), IL.ArraySpec.AScalar())
     int8    = IL.RType(IL.RBase.RInt(8), IL.ArraySpec.AScalar())
-    # A same-package (relative) ref to one of the three sections.
-    section(sec) = IL.RType(IL.RBase.RRef(nothing, string(name, sec)), IL.ArraySpec.AScalar())
+    # A same-package (relative) ref to one of the three sections (action-qualified; the relative
+    # form lowers to a bare name resolved within the surrounding `action` package).
+    section(sec) = IL.RType(IL.RBase.RRef(nothing, string(name, sec), "action"), IL.ArraySpec.AScalar())
     fld(t, n) = IL.RField(t, n, nothing)
     msg(suffix, fields) = IL.RMessage(Symbol(name, suffix), IL.RConstant[], fields)
     return IL.RMessage[
@@ -650,11 +651,13 @@ end)
 function _ref_to_base(scoped)
     path, n = _scoped_name(scoped)
     if isempty(path)
-        return IL.RBase.RRef(nothing, string(n))
-    elseif length(path) >= 2 && path[end] === :msg
-        return IL.RBase.RRef(string(path[end-1]), string(n))
+        return IL.RBase.RRef(nothing, string(n), "msg")
+    elseif length(path) >= 2
+        # `pkg/<qual>/Name`: the qualifier is the last path segment, the owning
+        # package the one before it — preserved so action-section refs survive.
+        return IL.RBase.RRef(string(path[end-1]), string(n), string(path[end]))
     else
-        return IL.RBase.RRef(string(path[1]), string(n))
+        return IL.RBase.RRef(string(path[1]), string(n), "msg")
     end
 end
 

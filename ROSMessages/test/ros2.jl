@@ -529,9 +529,9 @@ end
 
     @testset "nested refs" begin
         # fully-qualified `.../msg/Name` keeps the owning package
-        @test rtype("geometry_msgs/Pose p").base == IL.RBase.RRef("geometry_msgs", "Pose")
+        @test rtype("geometry_msgs/Pose p").base == IL.RBase.RRef("geometry_msgs", "Pose", "msg")
         # a bare relative ref comes back relative
-        @test rtype("Pose p").base == IL.RBase.RRef(nothing, "Pose")
+        @test rtype("Pose p").base == IL.RBase.RRef(nothing, "Pose", "msg")
     end
 
     @testset "message shape" begin

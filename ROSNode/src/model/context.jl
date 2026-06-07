@@ -301,9 +301,12 @@ one consistent picture across the session. Use `Context(...; home=Mod)` for a di
 lens, or a plain `Context()` for content-canonical resolution only.
 """
 macro context(args...)
-    isempty(args) && error("@context needs a trailing do-block: `@context(kwargs…) do ctx … end`")
-    body = esc(args[end])
-    kws  = map(esc, args[1:end-1])
+    # Julia hands a trailing do-block to a macro as its FIRST argument (an `->` lambda);
+    # any `kwargs` written inside the parens follow it. So the body is `args[1]`, not `args[end]`.
+    (!isempty(args) && args[1] isa Expr && args[1].head === :->) ||
+        error("@context needs a trailing do-block: `@context(kwargs…) do ctx … end`")
+    body = esc(args[1])
+    kws  = map(esc, args[2:end])
     m = __module__
     return :(Context($body; home=$m, $(kws...)))
 end

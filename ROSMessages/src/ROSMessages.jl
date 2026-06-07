@@ -16,16 +16,21 @@ import IDLParser: Parse, ConstResolution, Generation
 include("il.jl")
 include("ros2.jl")
 include("rihs01.jl")
+include("reflect.jl")
 include("macros.jl")
 
 export @ros_msg, @ros_msgs
 export to_ros, lift, lower, IL
+export il_from_type, il_from_fields, il_field_diff
 
 # Exercise the full `@ros_msgs` pipeline so its CodeInstances — including IDLParser's
 # `resolve_constants`/`generate_code`, which are external to this package — bake into
 # this pkgimage, sparing downstream consumers (e.g. ROSNode's vendored `Interfaces`)
 # the JIT cost.
 using PrecompileTools: @setup_workload, @compile_workload
+using StaticArrays: SVector
+# A small struct to bake the reflection path (primitive + static-array + sequence fields).
+struct _ReflectWL; a::Int32; v::SVector{3, Float64}; n::Vector{Int32}; end
 @setup_workload begin
     msg = """
     int32 FOO=7
@@ -54,6 +59,11 @@ using PrecompileTools: @setup_workload, @compile_workload
         tdmsg = TypeDescriptionMsg(td, TypeDescription[])
         calculate_rihs01_hash(tdmsg)
         lift(tdmsg)
+        # Reflection path (reflect.jl): Julia struct → IL → TD → hash.
+        ril = il_from_type(_ReflectWL; name_of = _ -> "p/msg/X")
+        rd  = lower(ril; package="")
+        rtd = type_description_from_struct(rd[end], "p/msg/X"; package="p", qualifier="msg")
+        calculate_rihs01_hash(TypeDescriptionMsg(rtd, TypeDescription[]))
     end
 end
 

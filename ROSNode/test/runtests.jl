@@ -65,6 +65,8 @@ try
         _section("resolution_d10b", "typesupport/resolution_d10b.jl") # D10B per-module resolution tables + cross-materialize
         # Live D5 round-trips against the private router (§11/§13/D5 S2/S3/S5/S7).
         _section("dynamic_live", "typesupport/dynamic_live.jl")
+        # Authored Julia types → ROS (@ros_package/@ros_message): registration + live round-trip.
+        _section("authored", "typesupport/authored.jl")
         # §4 concurrency: persistent worker-pool consumer (Parallel view/owned + Inf).
         _section("parallel_dispatch", "model/parallel_dispatch.jl")
         # Live D4: transient_local latched delivery + durability-aware lifecycle re-latch.

@@ -525,18 +525,18 @@ end
 
 # Parse a fully-qualified nested type name (`geometry_msgs/msg/Point`, or a
 # bare `Point` relative ref) into an `RRef`, mirroring `_ref_to_base` in
-# `ros2.jl`: a trailing `.../msg/Name` keeps the owning package, anything else
-# keeps the leading segment.
+# `ros2.jl`: a `pkg/<qual>/Name` keeps both the owning package and the qualifier
+# (so `.../action/Name_Goal` survives), a bare name is a relative ref.
 function _nested_name_to_ref(qualified::AbstractString)
     parts = split(qualified, '/')
     name = String(parts[end])
     path = parts[1:end-1]
     if isempty(path)
-        return IL.RBase.RRef(nothing, name)
-    elseif length(path) >= 2 && path[end] == "msg"
-        return IL.RBase.RRef(String(path[end-1]), name)
+        return IL.RBase.RRef(nothing, name, "msg")
+    elseif length(path) >= 2
+        return IL.RBase.RRef(String(path[end-1]), name, String(path[end]))
     else
-        return IL.RBase.RRef(String(path[1]), name)
+        return IL.RBase.RRef(String(path[1]), name, "msg")
     end
 end
 
