@@ -1,0 +1,21 @@
+name = "ROSReach"
+uuid = "00fce365-27c4-4628-b7b6-1864d312181b"
+version = "0.1.0"
+authors = ["Benjamin Chung <ckfinite@gmail.com> and contributors"]
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+ROSZenoh = "02c87683-9d8e-4267-bbb6-13e61ef8b9a5"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+Zenoh = "b742139f-8771-480b-a9b2-33222b45d29b"
+
+[compat]
+julia = "1.11"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Zenohd_jll = "60fe4315-4d9d-51d2-90b3-f4c2062225d6"
+
+[targets]
+test = ["Test", "Zenohd_jll"]
