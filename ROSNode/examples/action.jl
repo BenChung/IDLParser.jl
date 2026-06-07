@@ -1,4 +1,4 @@
-# Action server + client for example_interfaces/action/Fibonacci.
+# Action server + client for action_tutorials_interfaces/action/Fibonacci.
 #
 #     zenohd -l tcp/localhost:7447 &
 #     julia --project=. ROSNode/examples/action.jl           # both, one process (default)
@@ -6,8 +6,8 @@
 #     julia --project=. ROSNode/examples/action.jl client    # send a goal (needs a server)
 #
 # Fibonacci is the canonical demo action: a Goal `order`, streamed Feedback
-# `sequence`, and a final Result `sequence`. The `client` role interoperates
-# with `ros2 action send_goal /fibonacci example_interfaces/action/Fibonacci "{order: 10}"`
+# `partial_sequence`, and a final Result `sequence`. The `client` role interoperates
+# with `ros2 action send_goal /fibonacci action_tutorials_interfaces/action/Fibonacci "{order: 10}"`
 # (or a C++/Python server) given a matching router and domain.
 
 using ROSNode
@@ -42,7 +42,7 @@ const RUN_CLIENT = ROLE in ("both", "client")
             seq = Int32[0, 1]
             for i in 1:goal.request.order
                 push!(seq, seq[end] + seq[end-1])
-                feedback!(goal, Fibonacci.Feedback(sequence = copy(seq)))
+                feedback!(goal, Fibonacci.Feedback(partial_sequence = copy(seq)))
                 sleep(0.3)  # pretend the step is expensive; also a cancellation yield point
             end
             @info "goal complete" seq
@@ -63,7 +63,7 @@ const RUN_CLIENT = ROLE in ("both", "client")
             # Stream feedback as it arrives; the loop ends when the goal settles — the
             # framework drives the result behind the scenes, so there's no task to juggle.
             for fb in feedback(gh)
-                @info "feedback" fb.sequence
+                @info "feedback" fb.partial_sequence
             end
 
             # The goal has settled; `fetch` returns its (now cached) result.

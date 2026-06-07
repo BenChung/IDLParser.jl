@@ -29,7 +29,8 @@ using ROSZenoh: ROSZenoh, TypeInfo, TypeHash, to_rihs_string,
 
 export TypeRegistry, RegistryEntry, register_type!, lookup_type,
        resolve_type, export_typesupport,
-       ament_prefix_paths, discover_ament_packages, load_ament_type,
+       ament_prefix_paths, search_prefixes, add_search_path!,
+       discover_ament_packages, load_ament_type,
        enable_project_cache!, disable_project_cache!, absorb_static_types!
 
 # ── registry entry shape (§11) ────────────────────────────────────────────

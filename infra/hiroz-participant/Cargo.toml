@@ -8,3 +8,8 @@ clap = "4.6.1"
 hiroz = { git = "https://github.com/ZettaScaleLabs/hiroz.git" }
 hiroz-msgs = { git = "https://github.com/ZettaScaleLabs/hiroz.git" }  # Standard ROS 2 message types
 tokio = { version = "1", features = ["full"] }  # Async runtime
+
+[[example]]
+name = "z_parameter_client"
+path = "examples/parameters/client.rs"
+required-features = []

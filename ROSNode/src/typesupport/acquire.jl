@@ -66,10 +66,42 @@ function register_type_description!(reg::TypeRegistry, td::TypeDescriptionMsg,
 end
 
 # ── ament / colcon acquisition (static, no wire) ────────────────────────────
-# The "I'm in a sourced workspace" path: scan `AMENT_PREFIX_PATH` for installed
-# interface packages and parse their `share/<pkg>/{msg,srv,action}/*` files
-# straight to IL — same as feeding them to `@ros_msgs`, but resolved by
+# The "I'm in a sourced workspace" path: scan the install-prefix search paths for
+# installed interface packages and parse their `share/<pkg>/{msg,srv,action}/*`
+# files straight to IL — same as feeding them to `@ros_msgs`, but resolved by
 # package/type name at runtime with no codegen until first use.
+
+# Standard system install roots, searched after the env-var prefixes so a sourced
+# workspace overlay still wins. One `/opt/ros/<distro>` per distro we expect on a
+# vanilla install; nonexistent ones are dropped by the `isdir` filter.
+const _ROS_SYSTEM_DISTROS = ("rolling", "jazzy", "kilted", "lyrical", "humble")
+
+# User-added prefixes (highest precedence), populated via `add_search_path!`. A
+# plain global vector: search-path config is process-global and set at startup.
+const _USER_SEARCH_PATHS = String[]
+
+"""
+    add_search_path!(path) -> Vector{String}
+
+Register `path` as an install-prefix search root (highest precedence) for ament
+type acquisition, process-wide. `path` is expected to be an install prefix whose
+interface files live under `<path>/share/<pkg>/{msg,srv,action}/`, the same shape
+as an `AMENT_PREFIX_PATH` entry. The path is normalized and de-duplicated; returns
+the current user search-path list.
+"""
+function add_search_path!(path::AbstractString)
+    p = abspath(expanduser(String(path)))
+    p in _USER_SEARCH_PATHS || push!(_USER_SEARCH_PATHS, p)
+    return _USER_SEARCH_PATHS
+end
+
+# Colon-separated entries of env var `var`, empties dropped (no `isdir` filter —
+# `search_prefixes` does that once over the merged set).
+function _env_prefix_paths(var::AbstractString)
+    raw = get(ENV, var, "")
+    isempty(raw) && return String[]
+    return String[p for p in split(raw, ':') if !isempty(p)]
+end
 
 """
     ament_prefix_paths() -> Vector{String}
@@ -77,10 +109,32 @@ end
 The `AMENT_PREFIX_PATH` entries (colon-separated, ROS's install-prefix search
 path), filtered to existing directories. Empty when not in a sourced workspace.
 """
-function ament_prefix_paths()
-    raw = get(ENV, "AMENT_PREFIX_PATH", "")
-    isempty(raw) && return String[]
-    return String[p for p in split(raw, ':') if !isempty(p) && isdir(p)]
+ament_prefix_paths() = String[p for p in _env_prefix_paths("AMENT_PREFIX_PATH") if isdir(p)]
+
+"""
+    search_prefixes() -> Vector{String}
+
+The ordered, de-duplicated install-prefix roots scanned for ament interface files,
+filtered to existing directories. Precedence (first wins under the overlay rule):
+
+1. `add_search_path!` roots (user-registered),
+2. `AMENT_PREFIX_PATH` (a sourced workspace),
+3. `CMAKE_PREFIX_PATH`,
+4. `/opt/ros/<distro>` system installs ($(join(_ROS_SYSTEM_DISTROS, ", "))).
+"""
+function search_prefixes()
+    prefixes = String[]
+    seen = Set{String}()
+    sources = Iterators.flatten((_USER_SEARCH_PATHS,
+                                 _env_prefix_paths("AMENT_PREFIX_PATH"),
+                                 _env_prefix_paths("CMAKE_PREFIX_PATH"),
+                                 (joinpath("/opt/ros", d) for d in _ROS_SYSTEM_DISTROS)))
+    for p in sources
+        (isempty(p) || p in seen || !isdir(p)) && continue
+        push!(seen, p)
+        push!(prefixes, p)
+    end
+    return prefixes
 end
 
 # An interface file under a prefix: `<prefix>/share/<pkg>/{msg,srv,action}/<X>.ext`.
@@ -89,15 +143,15 @@ const _IFACE_EXTS = (".msg", ".srv", ".action")
 """
     discover_ament_packages() -> Dict{String, Vector{String}}
 
-Scan `AMENT_PREFIX_PATH` for installed interface packages, mapping each package
-name to the absolute paths of its `.msg`/`.srv`/`.action` files (§11 ament
-acquisition). A package is "interface" iff its `share/<pkg>` dir has at least one
-of those files. Later prefixes don't override earlier ones — first-seen wins, the
-ament overlay convention.
+Scan the [`search_prefixes`](@ref) install roots for installed interface packages,
+mapping each package name to the absolute paths of its `.msg`/`.srv`/`.action`
+files (§11 ament acquisition). A package is "interface" iff its `share/<pkg>` dir
+has at least one of those files. Later prefixes don't override earlier ones —
+first-seen wins, the ament overlay convention.
 """
 function discover_ament_packages()
     out = Dict{String, Vector{String}}()
-    for prefix in ament_prefix_paths()
+    for prefix in search_prefixes()
         share = joinpath(prefix, "share")
         isdir(share) || continue
         for pkg in readdir(share)
@@ -119,14 +173,14 @@ function discover_ament_packages()
     return out
 end
 
-# Locate the interface file for a fully-qualified ROS2 name across the ament
+# Locate the interface file for a fully-qualified ROS2 name across the search
 # prefixes: `<prefix>/share/<pkg>/<qual>/<Name>.<ext>`. Returns the first match
 # (overlay order) or `nothing`.
 function _find_ament_file(name::AbstractString)
     package, qualifier, bare = split_ros_name(name)
     isempty(package) && return nothing
     ext = qualifier == "srv" ? ".srv" : qualifier == "action" ? ".action" : ".msg"
-    for prefix in ament_prefix_paths()
+    for prefix in search_prefixes()
         path = joinpath(prefix, "share", package, qualifier, bare * ext)
         isfile(path) && return path
     end
