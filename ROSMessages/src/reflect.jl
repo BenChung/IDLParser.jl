@@ -88,7 +88,9 @@ function il_from_type(::Type{T}; name_of=_default_name_of) where {T}
         error("il_from_type expects a concrete struct type, got $(T)")
     fields = IL.RField[IL.RField(_rtype(ty; name_of=name_of), nm, nothing)
                        for (nm, ty) in zip(fieldnames(T), fieldtypes(T))]
-    return IL.RMessage(Symbol(nameof(T)), IL.RConstant[], fields)
+    # An empty authored struct gets the rosidl synthetic member (shared convention),
+    # so its RIHS + wire form match the parse path and a real ROS2 peer.
+    return IL.RMessage(Symbol(nameof(T)), IL.RConstant[], IL.nonempty_fields(fields))
 end
 
 """
@@ -102,7 +104,9 @@ themselves. `name` must already be the suffixed section name (`"SetMode_Request"
 function il_from_fields(name::AbstractString, pairs; name_of=_default_name_of)
     fields = IL.RField[IL.RField(_rtype(ty; name_of=name_of), Symbol(nm), nothing)
                        for (nm, ty) in pairs]
-    return IL.RMessage(Symbol(name), IL.RConstant[], fields)
+    # An empty section (e.g. an empty `@NamedTuple{}` service response) gets the rosidl
+    # synthetic member (shared convention), matching the parse path and a real peer.
+    return IL.RMessage(Symbol(name), IL.RConstant[], IL.nonempty_fields(fields))
 end
 
 """

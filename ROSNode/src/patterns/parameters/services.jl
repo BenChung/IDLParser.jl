@@ -190,8 +190,13 @@ the server's node (§10/§13), each bound to the reflection handlers above. Gene
 over `P` — one implementation serves every schema. The services are node-private
 (`~/…`); `/parameter_events` is absolute (every node publishes the same topic).
 Service handles are tracked on the node (closed with it) and held on the server.
+
+Generic over any [`AbstractParameterServer`](@ref): both `ParameterServer{P}` and
+the multi-schema [`CompositeParameterServer`](@ref) (§4.4) supply the six reflection
+handlers + `parameter_names`, so one wiring serves a plain node and a composed
+(member-prefixed) one alike.
 """
-function wire_parameter_services!(s::ParameterServer)
+function wire_parameter_services!(s::AbstractParameterServer)
     node = s.node
 
     push!(s.services, Service(node, "~/describe_parameters", _RCL_SRV.DescribeParameters_Request) do req

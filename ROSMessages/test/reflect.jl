@@ -21,6 +21,7 @@ struct Pose;        position::Point; orientation::Quaternion;    end
 struct TimeMsg;     sec::Int32; nanosec::UInt32;                 end
 struct Header;      stamp::TimeMsg; frame_id::String;            end
 struct PoseStamped; header::Header; pose::Pose;                  end
+struct EmptyAuthored;                                            end   # a fieldless authored type
 
 const _NAMES = IdDict{Any,String}(
     Point       => "geometry_msgs/msg/Point",
@@ -118,6 +119,20 @@ _td(S, fqn) = type_description_from_struct(_ast(S), fqn; package=String(split(fq
     @testset "il_from_type rejects @NamedTuple; il_from_fields takes it via nt_pairs" begin
         @test_throws ErrorException il_from_type(@NamedTuple{a::Int64})
         @test nt_pairs(@NamedTuple{a::Int64, b::Float64}) == Tuple{Symbol,Type}[(:a, Int64), (:b, Float64)]
+    end
+
+    # An empty authored type (a fieldless struct via il_from_type, or an empty section
+    # via il_from_fields — e.g. an empty `@NamedTuple{}` service response) must get the
+    # rosidl synthetic member, so its RIHS01 matches the parse path + a real ROS2 peer
+    # (not the degenerate zero-field hash).
+    @testset "empty authored type gets the synthetic member (== parse path)" begin
+        from_type   = il_from_type(EmptyAuthored; name_of=NAMEOF)
+        from_fields = il_from_fields("EmptyAuthored", Tuple{Symbol,Type}[])
+        @test ROSMessages.IL.unparse(from_type)   == "uint8 structure_needs_at_least_one_member"
+        @test ROSMessages.IL.unparse(from_fields) == "uint8 structure_needs_at_least_one_member"
+        h_type  = rihs01_hash(_first_struct(lower(from_type; package="")), "pkg/msg/EmptyAuthored")
+        h_parse = rihs01_hash(parse_msg(""; name="EmptyAuthored")[1], "pkg/msg/EmptyAuthored")
+        @test h_type == h_parse
     end
 
     @testset "_default_name_of throws off-shape (no silent bare-name fallback)" begin

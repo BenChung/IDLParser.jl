@@ -396,6 +396,19 @@ end
 # `read_view` (zero-copy `CDRView{T}` with `CDRString`/`CDRArray` fields), and
 # generic `write`. The generator emits only the struct, a value `==`, and the
 # keyword ctor.
+# rosidl's reserved member for an otherwise-empty message (added by the ROS frontend
+# so a fieldless message still has a wire form). It defaults to 0 so an empty message
+# constructs with no arguments — matching rclcpp/rclpy — even though generated ctors
+# otherwise require every field. It only ever appears alone in an all-primitive struct.
+const _EMPTY_STRUCT_MEMBER = :structure_needs_at_least_one_member
+
+# A keyword-parameter form for one field name: the empty-struct member carries a `= 0`
+# default in the generated keyword ctor (so an empty message constructs with no args);
+# every other field stays a required keyword. The struct field declarations stay plain
+# (`@cdr_fixed`/`@kwdef` take the declarations, the default lives in the ctor) — and an
+# empty message is always all-primitive, so the member only meets this ctor path.
+_kw_param(n::Symbol) = n === _EMPTY_STRUCT_MEMBER ? Expr(:kw, n, 0) : n
+
 function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
                         registry::TypeRegistry, scope::Vector{Symbol}, tier::Symbol=:any)
     fields = _struct_fields(decls, enclosing, registry, scope, Set{Vector{Symbol}}(([scope; name],)))
@@ -429,7 +442,7 @@ function _render_struct(name::Symbol, decls, enclosing::Union{Symbol, Nothing},
         # struct's positional constructor.
         conv_args = [:(convert($t, $n)) for (n, t, _) in fields]
         kw_ctor = Expr(:(=),
-            Expr(:call, name, Expr(:parameters, field_names...)),
+            Expr(:call, name, Expr(:parameters, [_kw_param(n) for n in field_names]...)),
             Expr(:call, name, conv_args...))
         # `@cdr_fixed` supplies a positional constructor; the keyword one above
         # is the generator's addition.

@@ -257,8 +257,11 @@ end
 
 # ---- Building IL interfaces from source ------------------------------------
 
+# An empty (fieldless) message gets the rosidl synthetic member via
+# `IL.nonempty_fields` (the shared convention; see il.jl), so the parse path matches
+# the reflection path and rosidl.
 build_message(name, constants, fields) =
-    IL.RMessage(Symbol(name), constants, fields)
+    IL.RMessage(Symbol(name), constants, IL.nonempty_fields(fields))
 
 """
     message_il(source; name) -> IL.RMessage

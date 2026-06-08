@@ -32,6 +32,13 @@ export @parameters, ParameterServer, ParameterClient, ParameterDescriptor, Param
 const _SCALAR_PARAM_TYPES = (Bool, Int64, Float64, String, Symbol)
 const _ARRAY_ELT_TYPES    = (Bool, Int64, Float64, String, UInt8)
 
+# Supertype of every node-level parameter surface: the single-schema
+# `ParameterServer{P}` (server.jl) and the multi-schema `CompositeParameterServer`
+# façade (composite.jl, §4.4). `wire_parameter_services!` and `node.parameters`
+# are written against this so a composed node exposes one member-prefixed `ros2
+# param` namespace over its members' servers.
+abstract type AbstractParameterServer end
+
 """
     ParameterType
 

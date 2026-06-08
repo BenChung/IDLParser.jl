@@ -31,7 +31,7 @@ using ROSNode
 end
 ```
 
-This powers generic tooling — recorders, bridges, introspection — over types it never imported. `@ros_cache` persists each discovered type to warm it at startup on the next run. See [Interface Types](interfaces.md).
+This powers generic tooling — recorders, bridges, introspection — over types it never imported.
 
 ## What it provides
 
@@ -41,36 +41,32 @@ This powers generic tooling — recorders, bridges, introspection — over types
 - **Actions** run long-running goals that stream feedback and return a result.
 - **Parameters** expose named, typed values that peers read and set.
 
-## Defining interface types
+## The guide
 
-Two paths produce the same wire types:
+Start with [Getting Started](getting-started.md): start a router, open a context, run an example. From there the guide builds from concepts to practice.
 
-1. Import an existing ROS interface by name with `@ros_import`.
-2. Author one in Julia with `@ros_message`, `@ros_service`, or `@ros_action`.
+**Foundations**
 
-Both carry the same RIHS01 identity, so an imported type and its authored twin are wire-compatible. See [Interface Types](interfaces.md).
+- [The Runtime Model](foundations/runtime-model.md) — how a context, node, and `spin` keep a process alive while the scheduler delivers messages.
+- [Interface Types](foundations/interface-types.md) — the typed messages every topic, service, and action carries, and the RIHS01 identity that makes them wire-compatible.
 
-## Runtime model
+**Communication**
 
-A `Context` owns the Zenoh session, discovery, and shutdown; a `Node` groups the entities you create against it; `spin(ctx; handle_signals = true)` parks the main task and runs until shutdown, turning Ctrl-C into a graceful drain. Julia's scheduler is the executor, so handlers run on tasks. See [Getting Started](getting-started.md) for the full setup.
+- [Topics](communication/topics.md) — publish and subscribe on a named channel.
+- [Services](communication/services.md) — answer a request with a response.
+- [Actions](communication/actions.md) — run a long-running goal that streams feedback and returns a result.
+- [Parameters](communication/parameters.md) — expose named, typed values that peers read and set.
 
-Typed subscriptions select a view mode — `Owned` copies the payload into Julia memory, `Checked` exposes a zero-copy view guarded against escape, `Unchecked` exposes the view directly for maximum throughput. Callbacks run with `Serial()` concurrency by default; `Parallel(n)` fans delivery across `n` tasks.
+**Going Further**
 
-## Tutorials
+- [Authoring Interfaces in Julia](advanced/authoring.md) — define message, service, and action types in Julia source with `@ros_message`, `@ros_service`, and `@ros_action`.
+- [Runtime Type Discovery](advanced/discovery.md) — resolve message types off the wire and persist them with `@ros_cache`.
+- [Message Delivery](advanced/delivery.md) — choose a view mode and concurrency for how samples reach a handler.
 
-- [Getting Started](getting-started.md) — start a router, open a context, run an example.
-- [Interface Types](interfaces.md) — import or author message, service, and action types.
-- [Publisher and Subscriber](tutorials/pubsub.md) — publish and subscribe on a topic.
-- [Service and Client](tutorials/service.md) — serve and call a request/response service.
-- [Action Server and Client](tutorials/action.md) — run an action server and client with feedback.
+**Composition**
 
-## Mapping to the ROS 2 tutorials
+- [Components](composition/components.md) — author a node as a collection of mixins, and compose nodes into a process.
 
-| ROSNode page | ROS 2 rolling beginner tutorial |
-| --- | --- |
-| `tutorials/pubsub.md` | Writing a simple publisher and subscriber (C++/Python) |
-| `tutorials/service.md` | Writing a simple service and client (C++/Python) |
-| `tutorials/action.md` | Writing an action server and client |
-| `interfaces.md` | Creating custom msg and srv files + Implementing custom interfaces |
-| `getting-started.md` | Configuring environment / Creating a workspace / Creating a package / Using colcon |
-| `index.md` | (overview of the client library) |
+**Interop**
+
+- [Interoperating with ROS 2](interop/ros2.md) — exchange topics, services, actions, and parameters with C++ and Python ROS 2 nodes.

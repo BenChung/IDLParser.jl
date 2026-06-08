@@ -83,6 +83,23 @@ struct RMessage
     fields::Vector{RField}
 end
 
+# rosidl synthesizes a `uint8 structure_needs_at_least_one_member` member for a
+# fieldless message (an empty `.msg`, an empty `.srv`/`.action` section, or an empty
+# authored `@NamedTuple`), so an empty message still has a CDR wire form and a RIHS01
+# hash matching rosidl. This is the one place the convention lives: every `RMessage`
+# builder (the text parser's `build_message` and the reflection path's
+# `il_from_type`/`il_from_fields`) routes its field list through here. Idempotent — a
+# non-empty list (a re-parse or a peer's TypeDescription already carrying the member)
+# is returned unchanged.
+const EMPTY_STRUCT_MEMBER = :structure_needs_at_least_one_member
+# No explicit default — matching rosidl's canonical `.msg` form (the member is value 0
+# by construction). The generated keyword constructor defaults it to 0 by name in
+# IDLParser gen.jl (`_kw_param`), and RIHS01 excludes defaults, so this stays canonical.
+nonempty_fields(fields::Vector{RField}) =
+    isempty(fields) ?
+        RField[RField(RType(RBase.RUInt(8), ArraySpec.AScalar()), EMPTY_STRUCT_MEMBER, nothing)] :
+        fields
+
 # Services and actions hold their sections as `RMessage`s whose `name`s are the
 # fully-suffixed struct names (`Foo_Request`, `Foo_Goal`, …) so the IL→IDL
 # lowering can treat each section uniformly.

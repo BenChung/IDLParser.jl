@@ -22,7 +22,7 @@ Implements the ROS 2 parameter model: https://docs.ros.org/en/rolling/Concepts/B
 Typically reached as `node.parameters`; the six standard parameter services and
 `/parameter_events` are wired generically over `P` (see [`wire_parameter_services!`](@ref)).
 """
-mutable struct ParameterServer{P}
+mutable struct ParameterServer{P} <: AbstractParameterServer
     const node::Any                                  # the owning Node (loosely held)
     @atomic value::P                                 # live schema value
     const descriptors::Vector{ParameterDescriptor}

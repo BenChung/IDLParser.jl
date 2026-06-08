@@ -294,7 +294,13 @@ end
     @test length(decls) == 3
     s_result = _find_struct(decls, :Do_Result)
     @test s_result !== nothing
-    @test isempty(_struct_members(s_result))
+    # An empty action section gets the rosidl synthetic member, like any empty
+    # message — never a zero-field struct (so it has a real wire form + RIHS hash).
+    ms = _struct_members(s_result)
+    @test length(ms) == 1
+    m = _unwrap(ms[1])
+    @test m.first == TypeSpec.TUInt(8)
+    @test m.second == [Declarator.DIdent(:structure_needs_at_least_one_member)]
 end
 
 @testset "File dispatch with comments and blank lines" begin
@@ -418,10 +424,16 @@ end
         @test h_no_default == h_with_default
     end
 
-    # Empty message — no fields. Just needs to produce a well-formed hash.
+    # Empty message — rosidl synthesizes a `uint8 structure_needs_at_least_one_member`,
+    # so the struct is never fieldless and the hash is over that one member (matching
+    # rosidl), not a degenerate empty-field hash.
     @testset "empty message" begin
-        # parse_msg with an empty body — the parser should produce a struct with zero members.
         decls = parse_msg(""; name="Empty")
+        ms = _struct_members(decls[1])
+        @test length(ms) == 1
+        m = _unwrap(ms[1])
+        @test m.first == TypeSpec.TUInt(8)
+        @test m.second == [Declarator.DIdent(:structure_needs_at_least_one_member)]
         h = rihs01_hash(decls[1], "test_msgs/msg/Empty")
         @test startswith(h, "RIHS01_")
         @test length(h) == 7 + 64

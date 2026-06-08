@@ -35,6 +35,7 @@ include("patterns/parameters/macro.jl")      # §10 @parameters macro + validate
 include("patterns/parameters/server.jl")     # §10 ParameterServer, reads, transactions
 include("patterns/parameters/events.jl")     # §10 on-change events
 include("patterns/parameters/services.jl")   # §10 standard parameter services + wire marshalling
+include("patterns/parameters/composite.jl")   # §4.4 multi-schema façade (member-prefixed node-level params)
 include("patterns/parameters/client.jl")      # §10 remote ParameterClient (the §12 async/fallible dual)
 include("discovery/graph.jl")           # §13 graph introspection
 include("typesupport/registry.jl")      # §11 registry entry shape + codegen pipeline + realize
@@ -51,5 +52,8 @@ include("typesupport/staticgen.jl")     # §11/D5 @ros_import / @ros_cache stati
 include("typesupport/authored.jl")      # authored Julia types → ROS (@ros_package / @ros_message)
 include("lifecycle.jl")                 # managed lifecycle nodes
 include("performance/intraprocess.jl")  # intra-process transport
+include("model/component/component.jl") # mixins/components: @mixin, HAS/DOES ports, lifecycle (DESIGN-COMPONENTS.md)
+include("model/component/run.jl")       # node assembly: @node, run, port materialization
+include("model/component/composition.jl") # §7 node-kind registry + container LoadNode/ros2 component services
 
 end # module ROSNode
