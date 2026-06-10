@@ -9,7 +9,7 @@
 # Always run Zenoh tests under a hard force-kill: `timeout -k 5 120 julia …`.
 
 using ROSNode
-using ROSNode: Context, Node, ServiceClient, call, wait_for_service,
+using ROSNode: Context, Node, Subscription, ServiceClient, call, wait_for_service,
                CompositeParameterServer, ParameterServer,
                parameters, entities, get_parameters, set_parameters_atomically,
                describe_parameters, parameter_names, node_kind, node_kinds,
@@ -40,6 +40,28 @@ using ._CompTypes
 
 @node Rig = ["camera" => _CompTypes.Cam, "lidar" => _CompTypes.Lid]
 @node Box = ["camera" => _CompTypes.Cam]
+
+# Port-bearing mixins for the §4.4 wire-topic remap + clobber tests (a vendored msg
+# type fills the ports — content is irrelevant, only the wire names matter here).
+module _CompPorts
+    using ROSNode
+    const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+    @mixin struct CamP; end
+    @publishes CamP image :: _T
+    @mixin struct LidP; end
+    @publishes LidP image :: _T
+    @mixin struct Fuse; end
+    @hears function left(m::Fuse, msg::_T) end
+    @hears function right(m::Fuse, msg::_T) end
+end
+using ._CompPorts
+
+@node TwoCam  = ["front" => _CompPorts.CamP{image => "front/image"},      # isolate the two outputs
+                 "rear"  => _CompPorts.CamP{image => "rear/image"}]
+@node Fused   = ["front" => _CompPorts.CamP{image => "front/image"},      # cross-member wiring:
+                 "fuse"  => _CompPorts.Fuse{left => front.image}]         #   fuse.left ⇐ front.image
+@node Collide = ["a" => _CompPorts.CamP, "b" => _CompPorts.LidP]          # both publish "image" ⇒ clobber
+@node Shared  = ["a" => _CompPorts.CamP, "b" => _CompPorts.LidP{image => "a/image"}]  # remap ⇒ no clobber
 
 @testset "component namespacing + composition (Zenoh session)" begin
 
@@ -181,6 +203,52 @@ using ._CompTypes
             @test !call(loadc, bad; timeout_ms = 5000).success
 
             close(loadc); close(listc); close(unloadc)
+        end
+    end
+
+    @testset "wire-topic remap + clobber (§4.4)" begin
+        # own-port string remap
+        w, remapped = ROSNode._resolve_wires(TwoCam)
+        @test w[:front][:image] == "front/image"
+        @test w[:rear][:image]  == "rear/image"
+        @test (:front, :image) in remapped
+        # cross-member ref resolves to the target's (remapped) wire
+        wf, _ = ROSNode._resolve_wires(Fused)
+        @test wf[:fuse][:left]   == "front/image"
+        @test wf[:front][:image] == "front/image"
+        # a remap naming a port the mixin doesn't declare is an error
+        @test_throws ErrorException ROSNode._resolve_wires(
+            ROSNode.NodeKind(:Bad, [ROSNode.NodeMember(:a, _CompPorts.CamP, Pair{Symbol, Any}[:nope => "x"])]))
+
+        _cctx() do ctx
+            # two publishers on one resolved name, no remap ⇒ hard clobber error at assembly
+            @test_throws ErrorException run(Collide; ctx = ctx, name = "collide", block = false)
+            # remapping one side resolves the clobber
+            @test run(Shared; ctx = ctx, name = "shared", block = false) isa ROSNode.ComponentNode
+            # both remapped ⇒ assembles, and the resolved map the materialiser uses carries them
+            tc = run(TwoCam; ctx = ctx, name = "twocam", block = false)
+            @test tc.wires[:front][:image] == "front/image"
+            @test tc.wires[:rear][:image]  == "rear/image"
+        end
+    end
+
+    @testset "one /parameter_events per atomic multi-member set (§4.4)" begin
+        _cctx() do ctx
+            rig = run(Rig; ctx = ctx, name = "evrig", block = false)
+            events = Channel{Any}(16)
+            watcher = Node(ctx, "evwatch")
+            Subscription(watcher, "/parameter_events", _RMSG.ParameterEvent) do ev
+                ev.node == rig.node.fqn && put!(events, ev)
+            end
+            sleep(0.6)                                          # let the sub match
+            ok, _ = ROSNode.set_parameters_atomically(rig.node.parameters,
+                        [("camera.fps", 42), ("lidar.fps", 7)])
+            @test ok
+            sleep(0.6)                                          # let the event arrive
+            evs = Any[]
+            while isready(events); push!(evs, take!(events)); end
+            @test length(evs) == 1                              # one combined event, not two
+            @test sort([p.name for p in evs[1].changed_parameters]) == ["camera.fps", "lidar.fps"]
         end
     end
 end

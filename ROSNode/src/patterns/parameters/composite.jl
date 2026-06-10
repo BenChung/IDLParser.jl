@@ -173,26 +173,37 @@ function set_parameters_atomically(s::CompositeParameterServer, pairs)
         end
     end
 
-    # phase 2 — commit; each member's commit fires its forwarding listener, which
-    # republishes the change on the node's one `/parameter_events` with prefixed names.
-    # `transaction` re-validates under the member's lock, so a concurrent set that moved
-    # the base between phase 1 and here can still reject — map it to `(false, reason)`
-    # (the `SetParametersResult` contract) rather than letting it escape the handler.
-    for member in order
-        srv = _member_server(s, member)
-        try
-            transaction(srv) do p
-                for (f, v) in bymember[member]
-                    setproperty!(p, f, v)
+    # phase 2 — commit. Each member's commit fires its forwarding listener; a node-level
+    # atomic set must surface as ONE `/parameter_events` (rclcpp parity), not one per
+    # member. We collect the member batches into a task-local buffer (the member
+    # transactions + their synchronous listeners run on *this* task, so a concurrent
+    # direct `parameters(m)` set on another task is unaffected and still publishes its
+    # own event), then publish a single combined event. `transaction` re-validates under
+    # the member's lock, so a concurrent set that moved the base between phase 1 and here
+    # can still reject — mapped to `(false, reason)` (the `SetParametersResult` contract).
+    entries = Tuple{String, ParameterEventBatch}[]
+    failure = nothing
+    task_local_storage(_PARAM_COLLECTOR_KEY, entries) do
+        for member in order
+            srv = _member_server(s, member)
+            try
+                transaction(srv) do p
+                    for (f, v) in bymember[member]
+                        setproperty!(p, f, v)
+                    end
                 end
+            catch err
+                err isa ParameterRejection ? (failure = (false, "$(member).$(err.reason)")) :
+                err isa ArgumentError       ? (failure = (false, "$(member): " * sprint(showerror, err))) :
+                                              rethrow()
+                break
             end
-        catch err
-            err isa ParameterRejection && return (false, "$(member).$(err.reason)")
-            err isa ArgumentError && return (false, "$(member): " * sprint(showerror, err))
-            rethrow()
         end
     end
-    return (true, "")
+    # Publish one event for whatever did commit (all, in the common case; the already-
+    # committed prefix on a rare phase-2 race), then report the verdict.
+    isempty(entries) || _publish_event!(s, entries)
+    return failure === nothing ? (true, "") : failure
 end
 
 # ── node-level /parameter_events (§4.4) ──────────────────────────────────────────
@@ -200,30 +211,52 @@ end
 # member servers have none. A forwarding listener on each member republishes that
 # member's post-commit batch on the node's publisher with prefixed names — so a
 # change driven through the node-level `~/set_parameters` AND one made directly via
-# `parameters(m)`/`@on_parameter` both surface a node-level event.
+# `parameters(m)`/`@on_parameter` both surface a node-level event. When a node-level
+# atomic set is in progress on this task, the listener instead *collects* its batch
+# into the task-local buffer so the whole set publishes as one event (above).
+
+# Task-local key under which `set_parameters_atomically` parks its batch collector.
+const _PARAM_COLLECTOR_KEY = :__rosnode_param_event_collector__
 
 function _wire_composite_events!(s::CompositeParameterServer)
     for (nm, srv) in s.members
         prefix = String(nm)
         on_parameter_event(srv) do batch
-            _publish_member_event!(s, prefix, batch)
+            _on_member_event!(s, prefix, batch)
         end
     end
     return s
 end
 
-# Assemble + publish the node-level `ParameterEvent` for one member's commit batch,
-# prefixing each moved name with `<member>.`. Mirrors `_publish_parameter_event`
-# (services.jl) but over the façade's publisher and the member prefix.
-function _publish_member_event!(s::CompositeParameterServer, prefix::String, batch::ParameterEventBatch)
+# The forwarding listener: append to the current task's collector when a node-level
+# atomic set is running (coalesced into one event by the caller), else publish this one
+# member's change immediately. Task-local, so a concurrent direct mutation on another
+# task always takes the immediate path.
+function _on_member_event!(s::CompositeParameterServer, prefix::String, batch::ParameterEventBatch)
+    collector = get(task_local_storage(), _PARAM_COLLECTOR_KEY, nothing)
+    if collector === nothing
+        _publish_event!(s, Tuple{String, ParameterEventBatch}[(prefix, batch)])
+    else
+        push!(collector::Vector{Tuple{String, ParameterEventBatch}}, (prefix, batch))
+    end
+    return nothing
+end
+
+# Assemble + publish ONE node-level `ParameterEvent` from a set of `(member-prefix,
+# batch)` entries, prefixing each moved name with `<member>.`. Mirrors
+# `_publish_parameter_event` (services.jl) but over the façade's publisher.
+function _publish_event!(s::CompositeParameterServer, entries::Vector{Tuple{String, ParameterEventBatch}})
     s._events_pub === nothing && return nothing
     node = s.node
     new_params     = _Parameter[]
     changed_params = _Parameter[]
-    for (name, value) in batch.changed
-        p = _Parameter(; name = string(prefix, ".", name), value = _to_param_value(value))
-        push!(haskey(batch.previous, name) ? changed_params : new_params, p)
+    for (prefix, batch) in entries
+        for (name, value) in batch.changed
+            p = _Parameter(; name = string(prefix, ".", name), value = _to_param_value(value))
+            push!(haskey(batch.previous, name) ? changed_params : new_params, p)
+        end
     end
+    (isempty(new_params) && isempty(changed_params)) && return nothing
     ev = _ParameterEvent(; stamp = to_msg(_Time, Dates.now(node)),
         node = node === nothing ? "" : String(node.fqn),
         new_parameters = new_params, changed_parameters = changed_params,

@@ -33,6 +33,7 @@ mutable struct ComponentNode
     const members::Dict{Symbol, Any}
     const order::Vector{Symbol}     # member names in DI construction (toposort) order — drives
                                     # lifecycle fan-out + reverse-order teardown (§4.2/§5)
+    const wires::Dict{Symbol, Dict{Symbol, String}}  # member => (port => resolved wire name), §4.4 remaps
     lifecycle::Any                  # the LifecycleNode (managed) or nothing
 end
 
@@ -82,11 +83,19 @@ end
 
 # ── @node ─────────────────────────────────────────────────────────────────────
 
-"A member of a `@node`: a name within the node and the mixin type filling it (§4.4)."
+"""
+A member of a `@node`: a name within the node, the mixin type filling it, and its
+per-member wire-topic **remaps** (§4.4). Each remap is `port => target`, where `target`
+is a `String` (an explicit wire name, ROS `-r`-style) or a `(member, port)` pair
+pointing at another member's resolved wire name. Topics resolve in the node namespace
+as authored unless remapped here.
+"""
 struct NodeMember
     name::Symbol
     mixin::Type
+    remaps::Vector{Pair{Symbol, Any}}   # port => String | (member::Symbol, port::Symbol)
 end
+NodeMember(name::Symbol, mixin::Type) = NodeMember(name, mixin, Pair{Symbol, Any}[])
 
 """
     NodeKind
@@ -116,7 +125,9 @@ macro node(assign)
         error("@node expects `N = [\"name\" => Mixin, …]`")
     N, rhs = assign.args[1], assign.args[2]
     members = _parse_members(rhs)
-    memexprs = [:( $(NodeMember)($(QuoteNode(nm)), $(esc(mx))) ) for (nm, mx) in members]
+    memexprs = [:( $(NodeMember)($(QuoteNode(nm)), $(esc(mx)),
+                                 $(Pair{Symbol, Any})[$(rms...)]) )
+                for (nm, mx, rms) in members]
     # Also register the kind by name (the `rclcpp_components_register_nodes` analog, §7)
     # so a container's `load_node` can instantiate it from a `ros2 component load` request.
     return quote
@@ -126,13 +137,16 @@ macro node(assign)
     end
 end
 
-# Each member is `"name" => Mixin` (string name — the namespace, §4.4). A bare identifier
-# name (`name => Mixin`) is accepted too, but the type is never auto-named: an explicit
-# name is required, so a member's namespace is always written, not derived.
+# Each member is `"name" => Mixin` (string name — the namespace, §4.4), optionally with
+# wire-topic remaps `"name" => Mixin{port => "wire", port2 => other.port, …}` (§4.4). A
+# bare identifier name (`name => Mixin`) is accepted too, but the type is never
+# auto-named: an explicit name is required, so a member's namespace is always written.
+# Returns `(name, mixin_expr, remap_exprs)` per member, where each remap_expr is a
+# `port => target` Pair-expr (target a String literal, or a `(member, port)` tuple-expr).
 function _parse_members(rhs)
     (rhs isa Expr && rhs.head in (:vect, :vcat)) ||
         error("@node: the right-hand side must be a list, `[\"name\" => Mixin, …]`")
-    out = Tuple{Symbol, Any}[]
+    out = Tuple{Symbol, Any, Vector{Any}}[]
     seen = Set{Symbol}()
     for el in rhs.args
         (el isa Expr && el.head === :call && el.args[1] === :(=>)) ||
@@ -149,9 +163,36 @@ function _parse_members(rhs)
         name in seen &&
             error("@node: duplicate member name `$(name)` — member names must be unique within a node (§4.4)")
         push!(seen, name)
-        push!(out, (name, el.args[3]))
+        mixin, remaps = _parse_member_rhs(name, el.args[3])
+        push!(out, (name, mixin, remaps))
     end
     return out
+end
+
+# A member's right-hand side: a bare mixin `K`, or `K{port => target, …}` (the §4.4
+# remap form — Julia parses the braces as a `:curly`). Returns `(mixin_expr, remap_exprs)`.
+function _parse_member_rhs(name::Symbol, rhs)
+    (rhs isa Expr && rhs.head === :curly) || return (rhs, Any[])
+    mixin = rhs.args[1]
+    remaps = Any[]
+    for spec in rhs.args[2:end]
+        (spec isa Expr && spec.head === :call && spec.args[1] === :(=>)) ||
+            error("@node: member `$(name)` remap must be `port => \"wire\"` or `port => other.port` (got `$(spec)`)")
+        port = spec.args[2]
+        port isa Symbol ||
+            error("@node: member `$(name)` remap key must be a port name (got `$(port)`)")
+        target = spec.args[3]
+        tgt = if target isa AbstractString
+            String(target)
+        elseif target isa Expr && target.head === :. && target.args[1] isa Symbol &&
+               target.args[2] isa QuoteNode
+            :( ($(QuoteNode(target.args[1])), $(QuoteNode(target.args[2].value))) )  # (member, port)
+        else
+            error("@node: member `$(name)` remap target must be a \"wire\" string or `member.port` (got `$(target)`)")
+        end
+        push!(remaps, :( $(QuoteNode(port)) => $tgt ))
+    end
+    return (mixin, remaps)
 end
 
 function _snake(s::AbstractString)
@@ -168,21 +209,24 @@ _default_name(::Type{M}) where {M} = _snake(String(nameof(M)))
 
 # Create each declared port's runtime handle against the node-core. Returns the
 # handle NamedTuple (`entities(m)`) and the paused timers to start at activate.
-function _materialize_ports!(node::Node, m, specs::Vector{PortSpec}, pvalue)
+# `wiremap` is the member's resolved §4.4 remap (port => wire name); a port not in it
+# uses its authored `_wire(p)`.
+function _materialize_ports!(node::Node, m, specs::Vector{PortSpec}, pvalue,
+                             wiremap::Dict{Symbol, String} = Dict{Symbol, String}())
     handles = Pair{Symbol, Any}[]
     timers = Any[]
     for p in specs
         if p.kind === :publisher
-            push!(handles, p.name => Publisher(node, _wire(p), p.msgtype))
+            push!(handles, p.name => Publisher(node, _wire(p, wiremap), p.msgtype))
         elseif p.kind === :subscription
             react = p.reaction
-            sub = Subscription(node, _wire(p), p.msgtype) do msg
+            sub = Subscription(node, _wire(p, wiremap), p.msgtype) do msg
                 react(m, msg)
             end
             push!(handles, p.name => sub)
         elseif p.kind === :service
             react = p.reaction
-            srv = Service(node, _wire(p), p.msgtype) do req
+            srv = Service(node, _wire(p, wiremap), p.msgtype) do req
                 react(m, req)
             end
             push!(handles, p.name => srv)
@@ -190,7 +234,7 @@ function _materialize_ports!(node::Node, m, specs::Vector{PortSpec}, pvalue)
             f = p.reaction
             support = ActionTypeSupport(typeof(f))
             body = _component_action_adapter(f, support, p.extra.fb_pos, m)
-            push!(handles, p.name => _make_action_server(node, _wire(p), typeof(f); body = body))
+            push!(handles, p.name => _make_action_server(node, _wire(p, wiremap), typeof(f); body = body))
         elseif p.kind === :timer
             hz = p.extra.rate isa Symbol ? getproperty(pvalue, p.extra.rate) : p.extra.rate
             react = p.reaction
@@ -206,6 +250,100 @@ end
 
 # A port's wire name: its explicit `on \"…\"` override, else the identifier (§3).
 _wire(p::PortSpec) = p.wire === nothing ? String(p.name) : p.wire
+
+# A port's wire name under a member's resolved remap map (§4.4): the remapped name if
+# present, else the authored `_wire(p)`.
+_wire(p::PortSpec, wiremap::Dict{Symbol, String}) = get(wiremap, p.name, _wire(p))
+
+# ── wire-topic remap resolution + clobber detection (§4.4) ───────────────────────
+
+# Resolve every member port's wire name: the remap target if any, else the authored
+# `_wire(p)`. A cross-member remap (`port => (member, port)`) resolves to the referenced
+# port's wire, by fixpoint (so a ref to a remapped port follows it). Returns
+# `member => (port => wire-string)` for ALL ports, plus the set of explicitly-remapped
+# `(member, port)`. Errors on a remap of an unknown port, a ref to an unknown
+# member/port, or an unresolvable/cyclic ref chain.
+function _resolve_wires(k::NodeKind)
+    wires    = Dict{Symbol, Dict{Symbol, String}}()
+    portset  = Dict{Symbol, Set{Symbol}}()
+    refs     = Dict{Tuple{Symbol, Symbol}, Tuple{Symbol, Symbol}}()  # (m,port) => (refm, refport)
+    remapped = Set{Tuple{Symbol, Symbol}}()
+    for mem in k.members
+        ports = mixin_spec(mem.mixin).ports
+        portset[mem.name] = Set(p.name for p in ports)
+        rmap = Dict{Symbol, Any}(mem.remaps)
+        for (port, _) in rmap
+            port in portset[mem.name] ||
+                error("@node `$(k.name)`: member `$(mem.name)` remaps unknown port `$(port)`")
+        end
+        w = Dict{Symbol, String}()
+        for p in ports
+            t = get(rmap, p.name, nothing)
+            if t === nothing
+                w[p.name] = _wire(p)
+            elseif t isa AbstractString
+                w[p.name] = String(t); push!(remapped, (mem.name, p.name))
+            else
+                refs[(mem.name, p.name)] = t; push!(remapped, (mem.name, p.name))
+            end
+        end
+        wires[mem.name] = w
+    end
+    remaining = Set(keys(refs))
+    while !isempty(remaining)
+        progressed = false
+        for mp in collect(remaining)
+            refm, refport = refs[mp]
+            haskey(portset, refm) ||
+                error("@node `$(k.name)`: member `$(mp[1])` remaps `$(mp[2])` to unknown member `$(refm)`")
+            refport in portset[refm] ||
+                error("@node `$(k.name)`: member `$(mp[1])` remaps `$(mp[2])` to `$(refm).$(refport)`, not a port of `$(refm)`")
+            if haskey(wires[refm], refport)
+                wires[mp[1]][mp[2]] = wires[refm][refport]
+                delete!(remaining, mp); progressed = true
+            end
+        end
+        progressed ||
+            error("@node `$(k.name)`: unresolvable or cyclic wire remap among $(collect(remaining))")
+    end
+    return wires, remapped
+end
+
+# A port kind's clobber **channel**: a `(bucket, resolve_name-kind)` for an output/server
+# port, or `nothing` for kinds that may share a name (subscriptions/clients) or have no
+# wire name (timers). Pub↔sub sharing is intra-node wiring, so only same-bucket outputs
+# collide. Services and actions bucket apart (an action's name nests its own services).
+_clobber_channel(kind::Symbol) =
+    kind === :publisher ? (:topic,   :topic)   :
+    kind === :service   ? (:service, :service) :
+    kind === :action    ? (:action,  :service) : nothing
+
+# Error on an unintended clobber (§4.4): two members' same-channel output ports
+# resolving to one wire name, unless at least one was explicitly remapped (a deliberate
+# share). Resolves against the node namespace (so `~/x` vs `/ns/node/x` compare equal).
+function _check_clobbers(k::NodeKind, node::Node, wires, remapped)
+    seen = Dict{Tuple{Symbol, String}, Tuple{Symbol, Symbol, Bool}}()
+    for mem in k.members
+        for p in mixin_spec(mem.mixin).ports
+            ch = _clobber_channel(p.kind)
+            ch === nothing && continue
+            full = resolve_name(node, wires[mem.name][p.name]; kind = ch[2])
+            key  = (ch[1], full)
+            here = (mem.name, p.name, (mem.name, p.name) in remapped)
+            if haskey(seen, key)
+                prev = seen[key]
+                (prev[3] || here[3]) ||
+                    error("@node `$(k.name)`: members `$(prev[1]).$(prev[2])` and " *
+                          "`$(here[1]).$(here[2])` both resolve to $(p.kind) name `$(full)` — an " *
+                          "unintended clobber. Remap one (e.g. `$(here[1]) => $(nameof(mem.mixin))" *
+                          "{$(here[2]) => \"…\"}`) or rename.")
+            else
+                seen[key] = here
+            end
+        end
+    end
+    return nothing
+end
 
 # A ROS-clock timer built but NOT started (its `Base.Timer` is created at activate, so
 # a tick can't fire before configure / while a managed node is gated).
@@ -304,7 +442,8 @@ function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
     rt = getfield(m, :__rt__)::MixinRuntime
     ports, timers = _materialize_ports!(cnode.node, m, mixin_spec(typeof(m)).ports,
-                                        current(rt.pserver))
+                                        current(rt.pserver),
+                                        get(cnode.wires, nm, Dict{Symbol, String}()))
     rt.ports = ports
     rt.timers = timers
     _ensure_entities_accessor!(typeof(m), ports)   # type-stable `entities(m)::PortsNT` (§3.5)
@@ -356,6 +495,9 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
     order, bytype, edges = _members_plan(K)
     composed = K isa NodeKind            # the construction path drives prefixing (§4.3), not member count
     declared = composed ? Symbol[m.name for m in K.members] : copy(order)  # listing/view order
+    # §4.4 wire-topic remaps: resolve every member port's wire name (mixin-as-node has none).
+    wires, remapped = composed ? _resolve_wires(K) :
+                      (Dict{Symbol, Dict{Symbol, String}}(), Set{Tuple{Symbol, Symbol}}())
     cnref = Ref{Any}(nothing)            # the managed callbacks reach the cnode through this
 
     if managed
@@ -372,14 +514,18 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
         node = Node(ctx, name; namespace = namespace)
     end
 
-    cnode = ComponentNode(node, Dict{Symbol, Any}(), order, ln)
+    cnode = ComponentNode(node, Dict{Symbol, Any}(), order, wires, ln)
     cnref[] = cnode
 
-    # A failure mid-assembly (construct/DI/param-wiring/configure) must not leave a
-    # half-built node — and its already-declared entities — orphaned on the (possibly
+    # A failure mid-assembly (clobber/construct/DI/param-wiring/configure) must not leave
+    # a half-built node — and its already-declared entities — orphaned on the (possibly
     # shared) Context. Tear it down before rethrowing; `close` is a no-op on the parts
     # not yet built.
     try
+        # §4.4 assembly-time clobber check: two members' same-channel outputs landing on
+        # one wire name (without an explicit remap) is a hard error you fix by remapping.
+        composed && _check_clobbers(K, node, wires, remapped)
+
         # construct members in dependency order, injecting resolved siblings (§4.2); attach
         # each member's typed ParameterServer{P_M}. No materialise/configure here — that
         # happens at the configure step (immediately for unmanaged, at the transition for managed).
@@ -417,18 +563,19 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
             foreach(nm -> _member_activate!(cnode, nm), order)
         end
 
-        # §5: a mixin's `cleanup` runs on the node-core's teardown. The dominant teardown
-        # is a Context drain (a `container`/`run` shutdown closes the Context, not each
-        # ComponentNode), so register a drain hook that fans out member cleanup in reverse
-        # DI order. Idempotent with an explicit `close(cn)`/`unload_node` (the
-        # materialised-ports guard in `_member_cleanup!` makes cleanup run once per
-        # configure), and it covers a managed node too (drain closes the inner Node, not
-        # the LifecycleNode, so its transition hooks don't otherwise fire at drain).
+        # §5: the node tears down on the node-core's close. The dominant teardown is a
+        # Context drain (a `container`/`run` shutdown closes the Context, not each
+        # ComponentNode), so register a drain hook that fully closes the node — running
+        # member `cleanup` in reverse DI order and, for a managed node, driving
+        # `close(LifecycleNode)` so its dispatch-gate registration is dropped (the drain
+        # otherwise closes the inner Node but not the wrapper). Idempotent with an explicit
+        # `close(cn)`/`unload_node`: `close` no-ops on an already-closed node, and the
+        # materialised-ports guard in `_member_cleanup!` runs cleanup once per configure.
         on_shutdown(ctx) do
             try
-                foreach(nm -> _member_cleanup!(cnode, nm), reverse(order))
+                close(cnode)
             catch err
-                @error "component: teardown cleanup hook threw" node = name exception = (err, catch_backtrace())
+                @error "component: teardown hook threw" node = name exception = (err, catch_backtrace())
             end
         end
     catch
