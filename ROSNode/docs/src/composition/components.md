@@ -82,7 +82,7 @@ construct(::Type{Guard}, node, src) = Guard(battery_src = src)
 
 `requires`, `construct`, and the lifecycle hooks extend framework generics. A component module writes `import ROSNode: configure, requires, construct` so its method definitions extend ROSNode's. A bare definition under plain `using` defines a fresh local function the framework never calls. Reactions authored by `@hears`/`@serves`/`@every`, and `@param`/`@provides`, are macro-emitted and need no import.
 
-`configure` is a lifecycle hook — a plain method run at startup:
+`configure` is a lifecycle hook — a plain method run at startup; the lifecycle section below covers the full set:
 
 ```julia
 configure(s::Sensor) = @info "Sensor up" rate = parameters(s).rate
@@ -123,6 +123,59 @@ end
 ```
 
 The ground station is a plain node subscribing to `/vehicle/telemetry`. The vehicle publishes telemetry at 5 Hz, and the guard answers the `~/safe_to_fly` query its `@serves` authored.
+
+## Lifecycle — acquiring and releasing state
+
+A mixin whose state wraps an external resource — a device, a file, a connection — authors the setup and the matching release as lifecycle hooks. The five hooks are plain methods on the mixin type, each defaulting to a no-op:
+
+- `configure(m)` acquires resources into the mixin's state.
+- `activate(m)` / `deactivate(m)` mark the working edge. A managed node gates dispatch automatically (below), so most mixins leave both as no-ops.
+- `cleanup(m)` releases what `configure` acquired.
+- `on_error(m)` recovers after a hook throws on a managed transition.
+
+The framework brackets the hooks with its own bookkeeping: a member's entities materialise immediately before its `configure` runs, its timers (created paused) start at `activate`, and its entities close immediately after `cleanup`. The hooks cover only the state the framework can't see:
+
+```julia
+import ROSNode: configure, cleanup
+
+@mixin struct Recorder
+    io::Any = nothing                       # configure opens it, cleanup closes it
+end
+@param Recorder path::String = "flight.log"
+
+configure(r::Recorder) = r.io = open(parameters(r).path, "a")
+cleanup(r::Recorder)   = r.io === nothing || close(r.io)
+
+@hears "/vehicle/telemetry" function record(r::Recorder, msg::Telemetry)
+    println(r.io, msg.battery)
+end
+```
+
+A managed node's dispatch gate (below) holds `record` until `Active`: `configure` has already opened `r.io` when the first message lands. An unmanaged node delivers from the moment the subscription materialises, and a message can reach `record` before `configure` assigns `r.io`. Guard the field in the handler, or run the node managed, when that window matters.
+
+Every node shares this vocabulary; `managed` chooses who drives it:
+
+- **Unmanaged (default).** `run` / `add!` brings the node straight up: construction runs every member's `configure`, then every member's `activate`. `cleanup` runs at teardown — an explicit `close(node)`, a container's `unload_node` (containers are the second scale of composition, below), or the Context drain when the node's Context closes.
+- **Managed (`managed = true`).** The node declares the lifecycle control surface (the five `lifecycle_msgs` services plus the `~/transition_event` topic) and starts `Unconfigured`. The hooks run at the real transitions — `autostart = true` runs `configure!` then `activate!` during construction — and an external orchestrator (`ros2 lifecycle set …`) or in-process calls drive them:
+
+```julia
+vehicle = run(Vehicle; ctx = ctx, name = "vehicle", managed = true, block = false)
+ln = ROSNode.lifecycle(vehicle)
+configure!(ln)      # → Inactive: entities materialise, each member's configure runs
+activate!(ln)       # → Active: timers start, dispatch gating lifts
+deactivate!(ln)     # → Inactive: members deactivate in reverse order, gating drops back
+cleanup!(ln)        # → Unconfigured: each cleanup runs, entities close — a configure! starts fresh
+```
+
+While a managed node is in any state other than `Active`, its publishers, subscriptions, timers, and services are gated at dispatch: publishers drop, subscriptions and timers don't fire, services error-reply. An action server stays live in every state: it accepts goals, runs them, and publishes feedback. The control surface stays live throughout, as do the parameter services and `~/get_type_description` — an orchestrator drives transitions and tunes parameters on an inactive node. `activate`/`deactivate` therefore carry only work beyond that automatic gating — pre-rolling a device, flushing a buffer.
+
+Avoid cycling `deactivate!`/`activate!` on a node with `@every` timers: a repeat `activate!` arms a fresh timer while the previously armed one keeps firing, so each cycle adds one extra fire per period. `cleanup!` closes the timer handles, and the next `configure!` starts clean.
+
+In a multi-mixin node the hooks fan out in dependency order: `configure`, `activate`, and `on_error` run providers first, `deactivate` and `cleanup` in reverse. In `Vehicle`, the `Sensor` configures before the `Guard` it was injected into, and cleans up after it.
+
+A hook signals failure by throwing. The fan-out discards hook return values, so a hook that returns the lifecycle `failure` token completes the transition as a success. On a managed transition the throw enters error processing: each member's `on_error` runs in dependency order, and the node recovers to `Unconfigured` when every one returns cleanly; an `on_error` that throws halts the fan-out and lands the node in `Finalized`. Error processing runs the hooks alone — entities stay materialised — so `on_error` releases what the member's hooks acquired. During unmanaged construction `run` / `add!` tears the partial node down, then the throw propagates — every member that reached `configure` cleans up (the thrower included, against its partial state), declared entities close, and nothing is left on the Context.
+
+`cleanup` runs at most once per `configure`. Teardown has several triggers — explicit `close`, `unload_node`, the shutdown transition, the Context drain — and a node can see more than one; the member's materialised entities are the guard, so the first trigger runs `cleanup` and later ones are no-ops. The framework logs a throwing `cleanup` and teardown continues: the member's entities still close and the remaining members still clean up. After `cleanup` the entities drop; the managed `cleanup!` transition runs the same guarded step, so a re-`configure!` rematerialises them.
 
 ## Two scales of composition
 
