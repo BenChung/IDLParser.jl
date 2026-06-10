@@ -67,18 +67,18 @@ battery(s::Sensor) = s.level                # satisfy the BatterySource contract
 @provides Sensor BatterySource
 ```
 
-`Guard` declares the need with `requires`, and receives the resolved provider in its `construct` method. The injected provider lands in a state field:
+`Guard` declares the need with `requires`, and receives the resolved provider in its `construct` method. The injected provider lands in a type-parameter field — its concrete type is fixed per composition (a real `Sensor` here, a mock in a test rig), so reactions read it type-stably:
 
 ```julia
-@mixin struct Guard
-    battery_src::Any = nothing              # the injected sibling provider
+@mixin struct Guard{B}
+    battery_src::B                          # the injected sibling provider
 end
 requires(::Type{Guard}) = (BatterySource,)
-construct(::Type{Guard}, node, src) = Guard(battery_src = src)
+construct(::Type{Guard}, node, src) = Guard(battery_src = src)   # injected ⇒ Guard{Sensor}
 @param Guard min_battery::Float64 = 20.0
 ```
 
-`construct` dispatches on the mixin being built. The dependency arrives untyped and is used through its interface method — `battery(g.battery_src)` in the service handler above.
+`construct` dispatches on the mixin being built — the bare base `Guard`, which covers every `Guard{B}`; reactions annotate the base the same way (`safe(g::Guard, …)`). The dependency is used through its interface method — `battery(g.battery_src)` in the service handler above. Omitting a zero-dep `construct` makes the dependency required: the mixin loads only composed in a `@node`. Providing one makes it optional — `construct(::Type{Guard}, node) = Guard(battery_src = NullBattery())` picks a null-object default so `run(Guard)` works standalone.
 
 `requires`, `construct`, and the lifecycle hooks extend framework generics. A component module writes `import ROSNode: configure, requires, construct` so its method definitions extend ROSNode's. A bare definition under plain `using` defines a fresh local function the framework never calls. Reactions authored by `@hears`/`@serves`/`@every`, and `@param`/`@provides`, are macro-emitted and need no import.
 

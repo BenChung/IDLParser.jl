@@ -58,11 +58,16 @@ module Drone
     end
 
     # ── Guard: depends on a BatterySource; serves "safe to fly?" ───────────────────
-    @mixin struct Guard
-        battery_src::Any = nothing                          # the injected sibling provider
+    # The provider's concrete type is fixed per composition (a real Sensor here, a mock
+    # in a test rig), so it lands in a type parameter — reactions read it type-stably.
+    struct NullBattery end                                  # null-object provider for standalone loads
+    battery(::NullBattery) = 0.0
+    @mixin struct Guard{B}
+        battery_src::B                                      # the injected sibling provider
     end
     requires(::Type{Guard}) = (BatterySource,)              # need a BatterySource …
-    construct(::Type{Guard}, node, src) = Guard(battery_src = src)   # … delivered here at build
+    construct(::Type{Guard}, node, src) = Guard(battery_src = src)        # … injected ⇒ Guard{Sensor}
+    construct(::Type{Guard}, node) = Guard(battery_src = NullBattery())   # standalone ⇒ Guard{NullBattery}
     @param Guard min_battery::Float64 = 20.0
     # Inline-authoring `@serves`: the args after `g` are the request fields, the
     # `@NamedTuple` return is the response — the macro generates the `srv` type.

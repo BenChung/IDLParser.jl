@@ -61,10 +61,19 @@ mixin_spec(::Type{M}) where {M} = @lock _MIXINS_LOCK _MIXINS[M]
 ismixin(::Type{M}) where {M} = @lock _MIXINS_LOCK haskey(_MIXINS, M)
 ismixin(@nospecialize(_)) = false
 
+# Declarations attach to the registered base; a concrete instantiation reaching here is
+# a value-level spelling (type alias, `typeof`) the syntactic macro guards can't see —
+# it would `get!` a shadow registry entry invisible to materialisation.
+function _check_decl_key(::Type{M}) where {M}
+    M isa DataType && Base.typename(M).wrapper !== M && error(
+        "component declarations attach to the mixin base — use `$(Base.typename(M).wrapper)`, not the instantiation `$(M)`")
+    return nothing
+end
+
 _add_param!(::Type{M}, p::ParamSpec) where {M} =
-    @lock _MIXINS_LOCK (push!(get!(MixinSpec, _MIXINS, M).params, p); nothing)
+    (_check_decl_key(M); @lock _MIXINS_LOCK (push!(get!(MixinSpec, _MIXINS, M).params, p); nothing))
 _add_port!(::Type{M}, p::PortSpec) where {M} =
-    @lock _MIXINS_LOCK (push!(get!(MixinSpec, _MIXINS, M).ports, p); nothing)
+    (_check_decl_key(M); @lock _MIXINS_LOCK (push!(get!(MixinSpec, _MIXINS, M).ports, p); nothing))
 
 # ── the per-instance runtime binding (the hidden `__rt__`, §3.5/§5) ─────────────
 # Each constructed mixin carries a back-ref to its node-core + its materialised
@@ -92,22 +101,32 @@ Declare a mixin (DESIGN §2): a **mutable, state-only** struct subtyping
 framework fills at construction. Entities and parameters are *not* fields — they
 attach to the type with `@param`/`@publishes`/`@every`/`@hears` and are reached
 reflectively via [`parameters`](@ref) / [`entities`](@ref). Every field needs a
-default (the mixin is built with `construct`, default `M()`).
+default unless `construct` is overridden to supply it (the mixin is built with
+`construct`, default `M()`).
+
+A mixin may be parametric (`struct Guard{B}`) for type-stable dependency injection: a
+free-type-parameter field (`battery_src::B`, no default) is supplied by `construct` —
+the DI form `construct(::Type{Guard}, node, deps…)` for composed injection, plus an
+explicit zero-dep `construct(::Type{Guard}, node)` choosing a default instantiation if
+the mixin should also load standalone (a parametric mixin without one raises a clear
+error). Reactions annotate the bare base (`m::Guard`, never `m::Guard{…}`) — the base
+covers every instantiation.
 """
 macro mixin(structexpr)
     (structexpr isa Expr && structexpr.head === :struct) ||
         error("@mixin expects `struct Name … end`, got $(structexpr)")
-    name = _mixin_name(structexpr.args[2])
+    name = _mixin_name(structexpr.args[2])              # full name-expr: `M` or `M{T…}`
+    base = name isa Symbol ? name : name.args[1]        # registration/value key: the base
     body = structexpr.args[3]
     # Inject the hidden runtime slot, force mutable + a kwdef ctor, subtype Component.
-    newbody = Expr(:block, body.args..., :(__rt__::Any = nothing))
+    newbody = Expr(:block, body.args..., :(__rt__::$(Union{Nothing, MixinRuntime}) = nothing))
     newstruct = Expr(:struct, true, Expr(:(<:), name, :Component), newbody)
     return esc(quote
         Base.@kwdef $newstruct
-        $(GlobalRef(@__MODULE__, :_register_mixin!))($name)
+        $(GlobalRef(@__MODULE__, :_register_mixin!))($base)
         # Register the mixin as a loadable kind too (mixin-as-node, §4.3/§7), so a
         # container's `load_node` can instantiate it by name.
-        $(GlobalRef(@__MODULE__, :register_node_kind!))(string(nameof($name)), $name)
+        $(GlobalRef(@__MODULE__, :register_node_kind!))(string(nameof($base)), $base)
         # Generate the parameter schemas at module load (so `P_M`'s ctor exists before
         # any frame uses it — the authored-types deferred pattern). The first `@mixin`
         # in a module installs the hook; later ones see it defined and skip.
@@ -116,14 +135,14 @@ macro mixin(structexpr)
                 $(GlobalRef(@__MODULE__, :_finalize_mixins!))(@__MODULE__)
             end
         end
-        $name
+        $base
     end)
 end
 
 _mixin_name(n::Symbol) = n
 function _mixin_name(n::Expr)
     n.head === :(<:) && return _mixin_name(n.args[1])
-    n.head === :curly && error("@mixin: parametric mixins are unsupported")
+    n.head === :curly && return n
     error("@mixin: could not read the struct name from $(n)")
 end
 
@@ -250,6 +269,9 @@ macro serves(a, b=nothing)
     fname, allargs, rettype = _parse_handler_sig(f)
     isempty(allargs) && error("@serves: the handler needs a first `m::M` argument")
     M = allargs[1][2]
+    M isa Expr && M.head === :curly && error(string(
+        "@serves: reactions must cover the mixin base — got `m::$(M)`",
+        M.args[1] === :Union ? "" : "; annotate `m::$(M.args[1])`"))
     if rettype === nothing
         length(allargs) >= 2 ||
             error("@serves: the existing-type form needs `req::SrvReqType`; the inline form needs a `::@NamedTuple{…}` return")
@@ -309,6 +331,9 @@ macro runs(a, b=nothing)
     rettype === nothing && error("@runs: the handler needs a `::@NamedTuple{…}` result return")
     length(allargs) >= 2 || error("@runs: the handler needs `m::M` plus goal fields and a `fb::FeedbackSink{…}`")
     M = allargs[1][2]
+    M isa Expr && M.head === :curly && error(string(
+        "@runs: reactions must cover the mixin base — got `m::$(M)`",
+        M.args[1] === :Union ? "" : "; annotate `m::$(M.args[1])`"))
     pkg = isdefined(__module__, :__ros_package__) ?
           String(getfield(__module__, :__ros_package__)) : _snake(String(nameof(__module__)))
     return esc(_emit_runs_inline(__module__, pkg, fname, M, allargs, rettype, wire, f))
@@ -391,6 +416,9 @@ function _parse_reaction_sig(f, nargs::Int)
     (args[1] isa Expr && args[1].head === :(::)) ||
         error("@every/@hears: the first argument must be `m::MixinType`")
     M = args[1].args[2]
+    M isa Expr && M.head === :curly && error(string(
+        "@every/@hears: reactions must cover the mixin base — got `m::$(M)`",
+        M.args[1] === :Union ? "" : "; annotate `m::$(M.args[1])`"))
     argtypes = Any[a isa Expr && a.head === :(::) ? a.args[2] : :Any for a in args]
     return (sig.args[1]::Symbol, M, argtypes)
 end
@@ -453,8 +481,9 @@ set is transactional. (For a single-mixin node the node schema *is* `P_M`; multi
 slicing/namespacing, §4.4, is a later increment.)
 """
 # The live parameter snapshot for `m` — dynamically typed. `_ensure_schema!` generates
-# a per-mixin `parameters(::M) = _param_value(m)::P_M` that adds the concrete-type
-# assert for a type-stable read; this generic is the pre-generation fallback.
+# a per-mixin `parameters(m::M)` that branches on the unset slot (reusing this error)
+# then asserts `::ParameterServer{P_M}` for a statically-dispatched `current`; this
+# generic is the pre-generation fallback.
 function _param_value(m::Component)
     rt = getfield(m, :__rt__)
     rt === nothing && error("parameters($(typeof(m))): not materialised yet (no node-core)")
@@ -463,16 +492,28 @@ end
 parameters(m::Component) = _param_value(m)
 
 # ── construction hook (§4.2) ────────────────────────────────────────────────────
-# A mixin with no dependencies default-constructs; the DI form (`construct(::Type{M},
-# node, deps…)`) lands with the §4 protocol in a later increment.
+# A plain mixin with no dependencies default-constructs (`M()`); a parametric mixin
+# needs an explicit zero-dep `construct` (else a clear error). The DI form
+# (`construct(::Type{M}, node, deps…)`) is resolved/toposorted in run.jl.
 
 """
     construct(::Type{M}, node) -> M
 
 Build a mixin instance (§4.2). Defaults to `M()` (every field defaulted). Override to
-inject dependencies once the DI protocol (§4) lands.
+inject dependencies (`construct(::Type{M}, node, deps…)`); a parametric mixin defines
+the zero-dep form explicitly to choose its default instantiation for standalone loads.
 """
-construct(::Type{M}, node) where {M <: Component} = M()
+construct(::Type{M}, node) where {M <: Component} = _zero_dep_construct(M)
+
+# Kind-dispatched fallback body: method existence can't detect an author override (the
+# generic above matches every `M <: Component`, UnionAlls included), and a sibling
+# `construct(::UnionAll, node)` loses specificity to it — dead code. `DataType` vs
+# `UnionAll` on the type *value* splits cleanly.
+_zero_dep_construct(M::DataType) = M()
+_zero_dep_construct(M::UnionAll) = error(
+    "$(M) has a free type parameter: define `construct(::Type{$(nameof(M))}, node)` to " *
+    "choose its concrete instantiation, or — for a DI consumer — declare `requires` and " *
+    "compose it in a `@node` so `construct(::Type{$(nameof(M))}, node, deps...)` receives them.")
 
 # ── DI: interfaces, provision, requirements (§4.1/§4.2) ─────────────────────────
 # An interface is a NAME (a marker type) for a set of generic functions; provision is
@@ -529,8 +570,8 @@ end
 # ── parameter-schema codegen (§3.5) ─────────────────────────────────────────────
 # A mixin's `@param`s accumulate across separate statements, so the typed schema `P_M`
 # can't be generated at `@mixin` expansion. It's generated lazily at first `run`
-# (cached): a `@parameters`-style coercing struct + its `descriptors` + the dispatched
-# `pschema(::Type{M}) = P_M` accessor, evaluated into the mixin's home module — the
+# (cached): a `@parameters`-style coercing struct + its `descriptors` + the covariant
+# `pschema(::Type{<:M}) = P_M` accessor, evaluated into the mixin's home module — the
 # authored-types deferred-codegen pattern (typesupport/authored.jl). `run` reaches the
 # new-world type through `invokelatest`; reactions compiled afterward see it statically,
 # so `parameters(m).fps` is a type-stable field load.
@@ -598,10 +639,18 @@ function _gen_schema(mod::Module, psym::Symbol, params::Vector{ParamSpec}, ::Typ
         $structdef
         $(GlobalRef(@__MODULE__, :descriptors))(::Type{$psym}) =
             $(ParameterDescriptor)[$(descs...)]
-        $(GlobalRef(@__MODULE__, :pschema))(::Type{$M}) = $psym
-        # the type-stable per-mixin accessor: `parameters(m::M)::P_M`
-        $(GlobalRef(@__MODULE__, :parameters))(m::$M) =
-            $(GlobalRef(@__MODULE__, :_param_value))(m)::$psym
+        $(GlobalRef(@__MODULE__, :pschema))(::Type{<:$M}) = $psym
+        # The type-stable per-mixin accessor. The `=== nothing` branch keeps the friendly
+        # pre-materialisation error (`_param_value` raises it); the server assert makes
+        # `current(::ParameterServer{P_M})` dispatch statically and return `P_M`. Emission
+        # rules are load-bearing: this block is eval'd into the mixin's home module, so
+        # functions interpolate as GlobalRefs and types as values — a bare name would
+        # silently define a fresh local function there.
+        $(GlobalRef(@__MODULE__, :parameters))(m::$M) = begin
+            rt = getfield(m, :__rt__)
+            rt === nothing && $(GlobalRef(@__MODULE__, :_param_value))(m)
+            $(GlobalRef(@__MODULE__, :current))(getfield(rt, :pserver)::$(ParameterServer){$psym})
+        end
         $psym
     end
     return Core.eval(mod, block)

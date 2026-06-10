@@ -174,6 +174,10 @@ end
 function _parse_member_rhs(name::Symbol, rhs)
     (rhs isa Expr && rhs.head === :curly) || return (rhs, Any[])
     mixin = rhs.args[1]
+    # `K{Sensor}` (no `=>` pairs) is a mixin instantiation, not the remap form — members
+    # always name the base; DI picks the provider, and hence the instantiation.
+    any(s -> s isa Expr && s.head === :call && s.args[1] === :(=>), rhs.args[2:end]) ||
+        error("@node: member `$(name)` names a mixin instantiation `$(rhs)` — name the base mixin `$(mixin)`; the provider is chosen by DI")
     remaps = Any[]
     for spec in rhs.args[2:end]
         (spec isa Expr && spec.head === :call && spec.args[1] === :(=>)) ||
@@ -438,15 +442,33 @@ _build_pserver(node::Node, ::Type{P}, overrides::NamedTuple) where {P} =
 
 # ── per-member lifecycle steps (run at the matching transition, §5) ─────────────
 
+# The base for instance-keyed lookups: `Guard{Sensor} → Guard`, identity for plain
+# types. Registries and generated accessors are keyed on the registered base, so
+# `typeof(m)` (a concrete instantiation for a parametric mixin) must normalize first.
+_base(::Type{T}) where {T} = Base.typename(T).wrapper
+
+# Friendly run-entry gate: a concrete instantiation spelled at the value level (type
+# alias, `typeof`) bypasses the macro guards — point at the base instead of the bare
+# "not a @mixin" / downstream KeyError.
+function _check_runnable(M, what::AbstractString)
+    ismixin(M) && return nothing
+    M isa DataType && ismixin(_base(M)) && error(
+        "$(what): name the base mixin `$(_base(M))` — the instantiation is chosen by `construct`/DI (got `$(M)`)")
+    error("$(what): $(M) is not a @mixin")
+end
+
 function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
     rt = getfield(m, :__rt__)::MixinRuntime
-    ports, timers = _materialize_ports!(cnode.node, m, mixin_spec(typeof(m)).ports,
+    ports, timers = _materialize_ports!(cnode.node, m, mixin_spec(_base(typeof(m))).ports,
                                         current(rt.pserver),
                                         get(cnode.wires, nm, Dict{Symbol, String}()))
     rt.ports = ports
     rt.timers = timers
-    _ensure_entities_accessor!(typeof(m), ports)   # type-stable `entities(m)::PortsNT` (§3.5)
+    # type-stable `entities(m)::PortsNT` (§3.5) — the base goes in as BOTH the generated
+    # signature and the dedup key, so one method covers every instantiation (a concrete
+    # signature here would silently strand other instantiations on the untyped generic).
+    _ensure_entities_accessor!(_base(typeof(m)), ports)
     return nothing
 end
 
@@ -610,7 +632,7 @@ function Base.run(::Type{M}; name::AbstractString = _default_name(M),
                   localhost_only::Bool = false,
                   managed::Bool = false, autostart::Bool = !managed,
                   block::Bool = true) where {M <: Component}
-    ismixin(M) || error("run: $(M) is not a @mixin")
+    _check_runnable(M, "run")
     _ensure_schema!(M)
     return _run(ctx, M, name, namespace, overrides, peers, localhost_only, managed, autostart, block)
 end
@@ -624,6 +646,7 @@ function Base.run(k::NodeKind; name::AbstractString = String(k.name),
                   managed::Bool = false, autostart::Bool = !managed,
                   block::Bool = true)
     for mem in k.members
+        _check_runnable(mem.mixin, "@node member `$(mem.name)`")
         _ensure_schema!(mem.mixin)
     end
     return _run(ctx, k, name, namespace, overrides, peers, localhost_only, managed, autostart, block)

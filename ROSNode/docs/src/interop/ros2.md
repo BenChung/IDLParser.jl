@@ -38,6 +38,13 @@ ros2 param get /client_demo_server max_speed
 ros2 param set /client_demo_server max_speed 80
 ```
 
+Lifecycle — drive a managed component's transitions ([Components](../composition/components.md)):
+
+```sh
+ros2 lifecycle set /vehicle configure
+ros2 lifecycle get /vehicle
+```
+
 ## Where imported types come from
 
 `@ros_import` statically generates an interface by name from ROSNode's vendored tree or, inside a sourced ROS 2 environment, from `AMENT_PREFIX_PATH`. The `from=` argument adds local source roots, so your own packages resolve alongside the vendored tree:

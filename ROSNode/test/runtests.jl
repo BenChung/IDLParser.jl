@@ -94,6 +94,10 @@ try
         # §4.4/§7 component layer — multi-mixin node-level parameter namespacing
         # (member-prefixed ros2 param) + dynamic LoadNode/ros2 component composition.
         _section("component_namespacing", "model/component_namespacing.jl")
+        # Parametric mixins — type-stable DI (PLAN-PARAMETRIC-MIXINS.md): base-keyed
+        # registration/accessors, zero-dep vs injected construct, guard errors, live
+        # standalone/composed/parametric-provider injection.
+        _section("component_parametric_di", "model/component_parametric_di.jl")
     end
 finally
     _kill_router!()
