@@ -1,6 +1,16 @@
 [deps]
+CDRSerialization = "cbcadc0d-0faf-4c71-82b5-fceb8cc36223"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+IDLParser = "817e8c30-d1ad-4896-85b5-1c4c82b7999b"
+ROSMessages = "745bd5ac-df70-4edb-8655-498bbbb894cf"
 ROSNode = "bb9e268e-7981-4227-9ebf-b0919ec29e7a"
+ROSZenoh = "02c87683-9d8e-4267-bbb6-13e61ef8b9a5"
+Zenoh = "b742139f-8771-480b-a9b2-33222b45d29b"
 
 [sources]
+CDRSerialization = { url = "https://github.com/BenChung/CDRSerialization.jl.git", rev = "master" }
+IDLParser = { path = "../../IDLParser" }
+ROSMessages = { path = "../../ROSMessages" }
 ROSNode = { path = ".." }
+ROSZenoh = { path = "../../ROSZenoh" }
+Zenoh = { url = "https://github.com/BenChung/Zenoh.jl.git", rev = "master" }
