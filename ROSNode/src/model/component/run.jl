@@ -12,9 +12,7 @@
 #     materialise at the configure transition, so an inactive node's entities are
 #     gated/silent until `activate`.
 #
-# Deferred: member-name namespacing for node-level `ros2 param` on multi-member nodes
-# (§4.4 — per-member servers work; `parameters(m)` is correct), `LoadNode`/`ros2
-# component` dynamic composition (§7), and a §D8 warm-up hook (first-run JIT latency).
+# Deferred: a §D8 warm-up hook (first-run JIT latency).
 
 export @node
 
@@ -26,7 +24,7 @@ export @node
 A live component node (DESIGN §4/§5): the node-core (a `Node`, or the inner `Node` of
 a `LifecycleNode` when managed) shared by the node's member mixins, the constructed
 member instances by name, and the `LifecycleNode` handle (`lifecycle`) when managed.
-Returned by [`run`](@ref) / held by a [`Container`](@ref).
+Returned by `run` / held by a [`Container`](@ref).
 """
 mutable struct ComponentNode
     const node::Node
@@ -113,12 +111,47 @@ Base.show(io::IO, k::NodeKind) =
 
 """
     @node N = ["name" => Mixin, …]
+    @node N = ["name" => Mixin{port => "wire", port2 => other.port, …}, …]
 
-Assemble a node from member mixins (DESIGN §4/§4.4). Each member is given an **explicit
-name** — a string — which is its namespace within the node (the prefix for its
-parameters and its `entities(node)` slice, §4.3/§4.4). The name is written out rather
-than derived, so the namespace is never a surprise. `run(N)` / `add!(container, N)`
-instantiate it.
+Assemble a node kind from member mixins (DESIGN-COMPONENTS §4). A node is one node in
+the ROS graph whose entities are contributed by several mixin members sharing one
+node-core. Each member is `"name" => Mixin`, where the string `name` is that member's
+namespace within the node — the prefix for its parameters (`name.field`) and its slice
+of the node-level entity view (`entities(node).name`, §4.3/§4.4). The name is always
+written out, so the namespace is explicit and two members of the same mixin type stay
+distinct instances.
+
+Binds `N` to a `NodeKind` and registers it by name in the process-global
+node-kind registry (the `rclcpp_components_register_nodes` analog), so a container's
+`load_node` / `ros2 component load` can instantiate it from its name. Registration
+runs when the defining module's body is evaluated — scripts, the REPL, and `include`d
+modules; a precompiled package's kinds are absent from the registry at load
+(registering those is a known follow-up). Evaluates to the `NodeKind`. Bring the node
+up with `run(N; …)` or `add!(container, N; …)`.
+
+A member may remap its ports with brace syntax, `Mixin{port => target}` — the ROS
+`-r`-style remap. `target` is a wire-name string, or another member's port written
+`other_member.port`, which resolves to that port's resolved wire name. Topics resolve
+in the node namespace as authored unless remapped. Assembly errors on an unintended
+clobber — two members' same-channel output ports (publishers, service servers, action
+servers) landing on one resolved name with neither explicitly remapped; fix it by
+remapping one onto a distinct name, or express a deliberate share by explicitly
+remapping at least one onto the shared name.
+
+Expansion errors (raised when the macro runs) on: a right-hand side that is not a
+list; a member without an explicit `"name" => Mixin` form; a member name containing a
+dot or duplicated within the node; or a member spelled as a mixin instantiation
+(`Mixin{Provider}` with no `=>` pairs) — name the base mixin and let dependency
+injection choose the instantiation. A remap of a port the mixin does not declare, a
+remap to an unknown member/port, or a cyclic cross-member remap chain errors at
+assembly (`run`/`add!`).
+
+```julia
+@node Rig = ["front" => Camera{image => "front/image"},
+             "rear"  => Camera{image => "rear/image"},
+             "fuse"  => Stitcher{left => front.image, right => rear.image}]
+run(Rig; name = "rig")
+```
 """
 macro node(assign)
     (assign isa Expr && assign.head === :(=)) ||
@@ -681,12 +714,22 @@ end
 """
     Container
 
-A set of nodes sharing one process / `Context` (DESIGN §7) — the deploy-time
-composition of [`run`](@ref)'s standalone form. Built by [`container`](@ref); `add!`
-instantiates nodes on its shared Context. It is itself a ROS node (`node`, named
-after the container) hosting the `~/_container/{load_node,unload_node,list_nodes}`
-services, so `ros2 component load/unload/list` drives it (§7); every loaded node
-gets a container-unique id (`loaded`) for `ros2 component list`/`unload`.
+A set of nodes sharing one process and one `Context` (DESIGN-COMPONENTS §7) — the
+deploy-time composition of `run`'s standalone form. Built by
+[`container`](@ref); [`add!`](@ref) instantiates each node on the shared Context, so
+the nodes share one session, discovery, type registry, and Julia scheduler, plus —
+when intra-process delivery is enabled (`container`'s default) — the §15.1 direct
+in-process path between same-Context publisher/subscriber pairs.
+
+The container is itself a ROS node (`inner_node(c)`, named after the container)
+hosting the `~/_container/{load_node,unload_node,list_nodes}` services over the
+vendored `composition_interfaces` types, so `ros2 component load/unload/list` and the
+`ComposableNodeContainer` launch action drive it. Every loaded node is tracked under
+a container-unique id (1-based, monotonic), reported by `list_nodes` / `ros2
+component list` and addressable by `unload_node` / `ros2 component unload`.
+
+Construct one through [`container`](@ref). `close(c)` closes the shared Context,
+which drains every loaded node.
 """
 mutable struct Container
     const ctx::Context
@@ -705,22 +748,41 @@ inner_node(c::Container) = c.node
 Base.close(c::Container) = close(c.ctx)
 
 """
-    container([name]) do c
+    container([name="container"]; namespace=nothing, peers=String[],
+              localhost_only=false, intra_process=true, block=true) do c
         add!(c, K; name=…, overrides=…, managed=…)
         …
     end -> Container
 
-Compose nodes into one process (DESIGN §7): open a single `Context` — shared session,
-discovery, type registry, thread pool — run the block to populate it via [`add!`](@ref),
-then `spin` until shutdown (unless `block=false`, which returns the live `Container`).
-With `intra_process=true` (default) same-Context publisher↔subscriber pairs take the
-§15.1 direct in-process path (process-global today). Same node code as standalone
-`run` — only the deploy-time wiring differs.
+Compose nodes into one process (DESIGN-COMPONENTS §7). Opens a single `Context` — one
+shared Zenoh session, discovery, type registry, and Julia scheduler — runs `f(c)` to
+populate it via [`add!`](@ref), then parks on `spin` until the Context drains. The
+same node code runs standalone under `run` or composed here; only the
+deploy-time wiring differs.
 
-The container is itself a node (named `name`, optionally under `namespace`) exposing
+Returns the live [`Container`](@ref). With `block=true` (default) `spin` installs a
+SIGINT handler for the duration — the first Ctrl-C drains gracefully, a second forces
+exit — and the call returns once the Context has drained, closing it. SIGTERM is not
+yet wired and terminates the process without draining. With `block=false` the call
+returns the running `Container` immediately, leaving you to drive it and `close(c)`
+it; the Context stays open until then. An exception during `f(c)` closes the Context
+and propagates.
+
+The container is itself a node named `name` (optionally under `namespace`) exposing
 the `~/_container/{load_node,unload_node,list_nodes}` services (§7), so a running
 container accepts `ros2 component load/unload/list` and the `ComposableNodeContainer`
 launch action.
+
+`intra_process=true` (default) enables the §15.1 direct in-process path for
+same-Context publisher/subscriber pairs through `set_intra_process!` — a
+process-global switch today.
+
+```julia
+container("vision") do c
+    add!(c, Perception; name = "perception", overrides = (fps = 60,))
+    add!(c, Recorder;   name = "recorder")
+end
+```
 """
 function container(f::Function, name::AbstractString = "container";
                    namespace::Union{AbstractString, Nothing} = nothing,
@@ -751,11 +813,37 @@ function container(f::Function, name::AbstractString = "container";
 end
 
 """
-    add!(c::Container, K; name, namespace, overrides, managed) -> ComponentNode
+    add!(c::Container, K; name=…, namespace=nothing, overrides=(;), managed=false,
+         autostart=!managed) -> ComponentNode
 
-Instantiate node kind `K` (a `@mixin` used as a node, or a `@node`) on the container's
-shared Context (§7) and track it with a container-unique id (so it shows up in
-`ros2 component list` and can be `unload`ed). Returns the live [`ComponentNode`](@ref).
+Instantiate node kind `K` — a `@mixin` type promoted to a node (un-prefixed
+parameters, §4.3) or a `@node` composition (member-prefixed parameters) — on
+container `c`'s shared Context (§7), and track it under a container-unique id so it
+appears in `list_nodes` / `ros2 component list` and can be `unload_node`-ed. Returns
+the live `ComponentNode`. `name` defaults to the kind's name (a mixin's
+snake-cased type name).
+
+Forwards to `run(K; ctx = c.ctx, block = false, kwargs...)`: it constructs the mixins
+in dependency order, wires the parameter services, and brings the node up. Unmanaged
+(the default), the node autostarts (configure → activate) during this call;
+`managed=true` declares the lifecycle control surface and the node starts
+`Unconfigured` unless `autostart=true`, leaving an external orchestrator
+(`ros2 lifecycle`) to drive it. `overrides` is a NamedTuple of parameter values keyed
+by mixin-local name (`fps`), or by prefixed `var"member.field"` to target one member
+when two members share a field name.
+
+Do not pass `ctx` or `block`: a caller-supplied value silently overrides the
+container's own — `ctx` builds the node on a foreign Context while the container
+still tracks it, and `block=true` parks `add!` (and the `container` block) on `spin`.
+Transport is fixed when `container` opens the Context, so `run`'s
+`peers`/`localhost_only` are ignored here.
+
+```julia
+container("fleet") do c
+    vehicle = add!(c, Vehicle; name = "vehicle", overrides = (min_battery = 90.0,))
+    add!(c, GroundStation; name = "ground", managed = true)
+end
+```
 """
 function add!(c::Container, @nospecialize(K); kwargs...)
     cn = run(K; ctx = c.ctx, block = false, kwargs...)

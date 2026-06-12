@@ -9,19 +9,25 @@
 """
     GoalHandle{A, G, R, F}
 
-A single accepted action goal (§9). Carries the 16-byte goal id, the decoded
-goal request (`G`), the live [`GoalState`](@ref), and the write-once
-[`ResultCell`](@ref) the handler settles. Cancellation is structured:
-[`feedback!`](@ref)/[`checkpoint`](@ref) throw [`Cancelled`](@ref) once the goal
-is `CANCELING`, so a goal in `CANCELING` always unwinds to a `CANCELED` result on
-the default path.
+A single accepted action goal, server-side. Carries the 16-byte
+`unique_identifier_msgs/UUID` goal id, the decoded goal request (a `Goal` struct,
+reachable as `goal.request`), the live goal state ([`state`](@ref)), and the
+write-once result cell the handler settles. This is the user-facing verb surface
+for one goal; the server owns the result cache and `status` publication.
 
-Settle it with [`succeed`](@ref)/[`abort`](@ref)/`canceled` via
-[`respond!`](@ref), or just `return`/throw from the handler (fail-safe
-settlement, §8/§9). The server owns the result cache and status publication; the
-handle is the user-facing verb surface.
+Cancellation is structured. Once an accepted cancel moves the goal to
+`CANCELING`, [`feedback!`](@ref) and [`checkpoint`](@ref) throw
+[`Cancelled`](@ref) at the next yield point, so a goal in `CANCELING` unwinds to
+a `CANCELED` result on the default path with no manual polling. Settle explicitly
+with [`succeed`](@ref)/[`abort`](@ref) (or `respond!(goal, canceled, result)`),
+or just `return` a `Result` (settles `SUCCEEDED`) or throw (settles `ABORTED`) —
+the fail-safe wrapper guarantees the cell is filled exactly once.
 
-See the ROS 2 action concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
+Constructed by the framework on goal acceptance, never directly. A handle lives
+from acceptance until the result-cache TTL evicts it after settlement.
+
+Follows the ROS 2 action goal lifecycle:
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
 mutable struct GoalHandle{A, G, R, F}
     const server::Any                    # back-ref to the ActionServer (duck-typed)
@@ -42,9 +48,9 @@ mutable struct GoalHandle{A, G, R, F}
     # TTL eviction of the result cache (the goal table holds settled goals only
     # long enough for a late `get_result`, §9).
     @atomic settled_at::Int64
-    # Set once a `get_result` has replayed this goal's result; lets `_publish_status`
-    # drop it from the status array (rclcpp prunes fetched terminal goals) and lets
-    # eviction reclaim it eagerly rather than waiting out the full TTL.
+    # Set once a `get_result` has replayed this goal's result; `_publish_status`
+    # then drops it from the status array (rclcpp prunes fetched terminal goals).
+    # Eviction keys on the TTL alone — a repeated fetch must still replay.
     @atomic fetched::Bool
     # The execution task (set when scheduled); tracked so `close(server)` joins
     # outstanding goals incl. detached post-cancel cleanup (§14 / DESIGN §drain).
@@ -57,9 +63,16 @@ goal_id(g::GoalHandle) = g.id
 """
     state(goal) -> Symbol
 
-The goal's lifecycle state (§9): `:accepted`, `:executing`, `:canceling`,
-`:succeeded`, `:canceled`, `:aborted`, or `:unknown`. The same accessor serves
-the server `GoalHandle` and the client-side goal handle.
+The goal's current lifecycle state as a `Symbol`: `:accepted`, `:executing`,
+`:canceling`, `:succeeded`, `:canceled`, `:aborted`, or `:unknown`
+(`action_msgs/msg/GoalStatus`). The same accessor reads a server-side
+[`GoalHandle`](@ref) and a client-side dispatched-goal handle; the client side
+adds `:rejected` (the handle [`send`](@ref) returns when the server declines), a
+local symbol the server-side handle never reports — a rejected goal is never
+registered.
+
+The Symbol surface keeps the wire `GoalStatus` enum internal and reads naturally
+at a call site (`state(goal) === :executing`).
 """
 state(g::GoalHandle) = _state_symbol(@atomic g.status)
 
@@ -88,24 +101,33 @@ end
 """
     iscancelled(goal) -> Bool
 
-True once the goal has been moved to `CANCELING` by an accepted cancel request
-(§9). Cheap atomic read — the non-throwing form of [`checkpoint`](@ref) for code
-that wants to branch rather than unwind.
+True once an accepted cancel request has moved the goal to `CANCELING`. A cheap,
+lock-free atomic read — the non-throwing counterpart of [`checkpoint`](@ref), for
+a handler that branches on cancellation.
+
+Reads the live status only: a goal that has already settled as `CANCELED` reads
+`false` here (it is no longer in `CANCELING`).
 """
 iscancelled(g::GoalHandle) = (@atomic g.status) === GOAL_CANCELING
 
 """
     checkpoint(goal)
 
-A cancellation yield point (§9): throws [`Cancelled`](@ref) if the goal is
-`CANCELING`, otherwise returns. Place it in long loops so cancellation unwinds
-structurally — the fail-safe settlement then maps the `Cancelled` to a `CANCELED`
-result. After a goal is already settled (e.g. detached post-cancel cleanup ran
-`respond!`), `checkpoint` is a no-op so the cleanup runs to completion.
+A cancellation yield point: throw [`Cancelled`](@ref) when the goal is
+`CANCELING`, otherwise return `nothing`. Place it inside long-running loops so an
+accepted cancel request unwinds the handler structurally — the fail-safe
+settlement then maps the `Cancelled` to a `CANCELED` result.
+
+Once the goal has already settled (for example, detached post-cancel cleanup has
+run `respond!`), `checkpoint` is a no-op so that cleanup runs to completion. The
+non-throwing form is [`iscancelled`](@ref), a Bool read for handlers that branch
+on cancellation.
+
+Returns `nothing`.
 """
 function checkpoint(g::GoalHandle)
     # Once settled, the cancel signal is spent: a no-op here lets detached
-    # post-cancel cleanup run to completion instead of re-throwing Cancelled.
+    # post-cancel cleanup run to completion.
     isfilled(g.cell) && return nothing
     iscancelled(g) && throw(Cancelled())
     nothing
@@ -117,12 +139,17 @@ end
     feedback!(goal, fb)
 
 Publish one feedback message `fb` (a `Feedback` struct for the action) on the
-action's feedback topic, then checkpoint cancellation (§9): a `CANCELING` goal
-throws [`Cancelled`](@ref) before publishing, so a feedback loop doubles as a
-cancellation-observation loop. Sugar for `respond!(goal, feedback, fb)`.
+action's `feedback` topic, after checkpointing cancellation. A `CANCELING` goal
+throws [`Cancelled`](@ref) before anything is published, so a progress-report
+loop doubles as a cancellation-observation loop with no extra code. Equivalent to
+`respond!(goal, feedback, fb)`.
 
-A feedback publish after the goal is settled is dropped (the client has the
-result; the stream is closed).
+A feedback publish after the goal has settled is dropped (the client already
+holds the result and the feedback stream is closed). The message rides the
+`feedback` topic as a `<A>_FeedbackMessage` (goal_id + feedback) so a client
+filters it to the matching goal.
+
+Returns `nothing`.
 """
 function feedback!(g::GoalHandle{A, G, R, F}, fb::F) where {A, G, R, F}
     checkpoint(g)
@@ -163,18 +190,27 @@ end
 """
     succeed(goal, result)
 
-Settle the goal as `SUCCEEDED` with `result` — `respond!(goal, succeeded, result)`
-(§9). The common explicit terminal verb when the handler computes its result
-before its final expression.
+Settle the goal as `SUCCEEDED` with `result` (a `Result` struct for the action) —
+shorthand for `respond!(goal, succeeded, result)`. Use it when the handler
+computes its result before its final expression; a plain `return result` from a
+`do`-block body reaches the same outcome.
+
+The first terminal settle wins, runs the result-cache delivery and `status`
+publication, and releases the client's blocked `get_result`. Returns `true`; a
+second explicit terminal settle raises `ArgumentError` (the double-settle guard).
 """
 succeed(g::GoalHandle{A, G, R, F}, result::R) where {A, G, R, F} = respond!(g, succeeded, result)
 
 """
     abort(goal, result)
 
-Settle the goal as `ABORTED` with `result` — `respond!(goal, aborted, result)`
-(§9). The explicit failure verb; a thrown (non-`Cancelled`) exception reaches the
-same outcome via fail-safe settlement.
+Settle the goal as `ABORTED` with `result` (a `Result` struct for the action) —
+shorthand for `respond!(goal, aborted, result)`. The explicit failure verb; a
+thrown non-`Cancelled` exception from the handler reaches the same `ABORTED`
+outcome through fail-safe settlement.
+
+The first terminal settle wins. Returns `true`; a second explicit terminal settle
+raises `ArgumentError` (the double-settle guard).
 """
 abort(g::GoalHandle{A, G, R, F}, result::R) where {A, G, R, F} = respond!(g, aborted, result)
 

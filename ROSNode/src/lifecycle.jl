@@ -27,23 +27,78 @@ export LifecycleNode, LifecycleState, Unconfigured, Inactive, Active, Finalized,
        configure!, activate!, deactivate!, cleanup!, shutdown!
 
 # ── state machine (§14.2) ─────────────────────────────────────────────────────
-# The four primary states as singletons of a sealed abstract type — same shape as
-# `ClockSource`/`SettlementStatus`, so `state(node)` dispatches and an unknown state
-# is a `MethodError`, not a silent wrong branch. The transition states
-# (Configuring/Activating/…) are internal: a node is "in" one only for the duration
-# of a callback, so they need no reified value here — the callback scope is the
-# transition.
+# Same singleton shape as `ClockSource`/`SettlementStatus`.
 
-"Sealed tag for the four ROS2 lifecycle primary states (§14.2)."
+"""
+    LifecycleState
+
+Sealed abstract supertype of the four ROS 2 managed-node primary states:
+[`Unconfigured`](@ref), [`Inactive`](@ref), [`Active`](@ref), and
+[`Finalized`](@ref). Each is a zero-field singleton, so dispatching on
+[`state`](@ref) turns an unhandled state into a `MethodError` at the call site.
+
+Maps to the primary states of the ROS 2 [managed-node
+lifecycle](https://design.ros2.org/articles/node_lifecycle.html)
+(`lifecycle_msgs/msg/State` ids `PRIMARY_STATE_UNCONFIGURED`/`_INACTIVE`/`_ACTIVE`/
+`_FINALIZED`). The four primary states are the only reified ones: a node occupies a
+transition state (Configuring, Activating, …) exactly for the duration of its
+callback, so the callback scope is the transition.
+"""
 abstract type LifecycleState end
 
-"Immediately after construction; no configuration loaded (rclcpp `PRIMARY_STATE_UNCONFIGURED`)."
+"""
+    Unconfigured() :: LifecycleState
+
+The state immediately after [`LifecycleNode`](@ref) construction: no configuration
+loaded, no resources acquired. The ROS 2 `PRIMARY_STATE_UNCONFIGURED`.
+
+Reachable as the initial state, after [`cleanup!`](@ref) (`Inactive → Unconfigured`),
+and as the recovery target when an error-processing callback succeeds. The valid
+transitions out are [`configure!`](@ref) (to [`Inactive`](@ref)) and
+[`shutdown!`](@ref) (to [`Finalized`](@ref)).
+"""
 struct Unconfigured <: LifecycleState end
-"Configured and idle — entities exist but stay gated, so dispatch is silenced (`PRIMARY_STATE_INACTIVE`)."
+
+"""
+    Inactive() :: LifecycleState
+
+Configured and idle: the node's entities exist and stay visible in the graph, and
+the dispatch gate holds them shut — publishers drop, subscriptions and timers stay
+quiet, application services error-reply. The ROS 2 `PRIMARY_STATE_INACTIVE`.
+
+Reached by [`configure!`](@ref) (from [`Unconfigured`](@ref)) or
+[`deactivate!`](@ref) (from [`Active`](@ref)). Valid transitions out:
+[`activate!`](@ref), [`cleanup!`](@ref), and [`shutdown!`](@ref).
+"""
 struct Inactive     <: LifecycleState end
-"The live state — application entities fire (`PRIMARY_STATE_ACTIVE`)."
+
+"""
+    Active() :: LifecycleState
+
+The live state: the gate is open and application entities dispatch normally —
+publishers send, subscriptions and timers fire, services serve. The ROS 2
+`PRIMARY_STATE_ACTIVE`, and the only state for which [`isactive`](@ref) is `true`.
+
+Reached by [`activate!`](@ref) from [`Inactive`](@ref). Valid transitions out:
+[`deactivate!`](@ref) and [`shutdown!`](@ref). On entry, [`activate!`](@ref)
+re-runs each transient_local subscription's latched-history fetch so the node picks
+up state published while it was inactive.
+"""
 struct Active       <: LifecycleState end
-"Terminal — `shutdown!` ran, the node is finalized (`PRIMARY_STATE_FINALIZED`)."
+
+"""
+    Finalized() :: LifecycleState
+
+The terminal state, reached once [`shutdown!`](@ref) has run from any non-terminal
+state. The ROS 2 `PRIMARY_STATE_FINALIZED`. No transitions lead out; the node is
+spent and is typically closed.
+
+Also the landing when error processing fails to recover: a callback that throws
+runs `on_error`, and any `on_error` outcome other than success drops the node here.
+`close` runs [`shutdown!`](@ref) first, which normally lands here; a
+recovering `on_error` during shutdown leaves the latched state
+[`Unconfigured`](@ref) even as the node closes.
+"""
 struct Finalized    <: LifecycleState end
 
 Base.show(io::IO, ::Unconfigured) = print(io, "Unconfigured")
@@ -85,34 +140,55 @@ const TRANSITION_ACTIVE_SHUTDOWN      = 0x07
 # `change_state` requests can't interleave callback execution.
 
 """
-    LifecycleNode(ctx, name; namespace=nothing, enclave=nothing, autostart=false,
-                  on_configure=…, on_activate=…, on_deactivate=…, on_cleanup=…,
-                  on_shutdown=…, on_error=…, msgs=nothing) -> LifecycleNode
+    LifecycleNode(ctx::Context, name::AbstractString; namespace=nothing, enclave=nothing,
+                  autostart=false, on_configure=…, on_activate=…, on_deactivate=…,
+                  on_cleanup=…, on_shutdown=…, on_error=…, msgs=nothing) -> LifecycleNode
 
-A ROS2 managed node: a distinct node type wrapping a plain [`Node`] with a state
-machine an external orchestrator drives (`~/change_state`) and observes
-(`~/get_state`, `~/transition_event`). Starts in [`Unconfigured`](@ref). See the
-ROS 2 [managed-node design](https://design.ros2.org/articles/node_lifecycle.html)
-for the state machine and §14.2 for this implementation.
+A ROS 2 managed node: a distinct node type that wraps a plain [`Node`] and adds the
+managed-node state machine an external orchestrator drives (`~/change_state`) and
+observes (`~/get_state`, `~/transition_event`). Construction starts the node in
+[`Unconfigured`](@ref). See the ROS 2 [managed-node
+design](https://design.ros2.org/articles/node_lifecycle.html) for the state machine
+and §14.2 for this implementation.
 
-Transitions run user callbacks under the **action three-way** (§9): a callback
-returns normally ⇒ SUCCESS (land in the target state); returns the
-[`failure`](@ref) token ⇒ FAILURE (a clean "can't right now" — revert to the
-origin state); throws ⇒ ERROR (`on_error` runs; its SUCCESS recovers to
-`Unconfigured`, otherwise the node goes `Finalized`). Each callback takes the
-`LifecycleNode` and defaults to a no-op.
+The six transition callbacks each take the `LifecycleNode` and run under the action
+three-way settlement (§9): returning normally is SUCCESS (land in the target state);
+returning the [`failure`](@ref) token is FAILURE (a clean "can't right now" that
+reverts to the origin state); throwing is ERROR (`on_error` runs — its SUCCESS
+recovers to [`Unconfigured`](@ref), any other outcome drops the node to
+[`Finalized`](@ref)). Each callback defaults to a no-op, so a node with no behavior
+still transitions cleanly. A thrown `ShutdownException` propagates unchanged — it
+signals context shutdown, not a callback error.
 
-While the node is not [`Active`](@ref), every *application* entity created on it is
-gated **at dispatch** ([`isactive`](@ref)): publishers drop, subscriptions/timers
-don't fire, services error-reply. The control surface is exempt (always live).
+While the node is not [`Active`](@ref), every application entity created on it is
+gated at dispatch ([`isactive`](@ref)): publishers drop, subscriptions and timers
+stay quiet, application services error-reply with "node inactive". The control
+surface — the five `lifecycle_msgs` services plus the `~/transition_event` topic —
+stays live in every state, since an external manager must reach it precisely while
+the node is inactive. Create application entities against [`inner_node`](@ref)`(ln)`
+so they register on the node the gate is keyed by.
 
-`autostart=true` runs `configure!` then `activate!` on construction (the simple
-single-owner case). The wire control surface (the five `lifecycle_msgs` services +
-the `~/transition_event` topic) always declares from the vendored `lifecycle_msgs`
-types; `msgs` is accepted for source-compat and ignored.
+`autostart=true` runs [`configure!`](@ref) then [`activate!`](@ref) on construction
+for the simple single-owner case; a failed or erroring transition leaves the node in
+whatever state the three-way reached. The `~/transition_event` topic is published
+transient_local + reliable with depth 1, so a late-joining manager sees the latest
+transition (matching rclcpp's latched event topic). `msgs` is accepted for
+source-compatibility and ignored: the control surface always declares from the
+vendored `lifecycle_msgs` types.
 
-Entities and the node die with `close` / the Context drain (§14), which runs
-`shutdown!` → `Finalized` first.
+The per-node lock serializes transitions, so two racing `~/change_state` requests —
+or a wire request racing an in-process [`configure!`](@ref) — cannot interleave
+their callbacks. `close` (or the Context drain, §14) runs
+[`shutdown!`](@ref) before tearing down the node's entities.
+
+```julia
+node = LifecycleNode(ctx, "camera";
+    on_configure = ln -> (open_device!(); nothing),
+    on_cleanup   = ln -> (close_device!(); nothing))
+img = Publisher(inner_node(node), "image", sensor_msgs.msg.Image)  # gated until Active
+configure!(node)   # Unconfigured → Inactive, opens the device
+activate!(node)    # Inactive → Active, image publishes start flowing
+```
 """
 mutable struct LifecycleNode
     const node::Node
@@ -185,11 +261,17 @@ _lc_noop(::LifecycleNode) = nothing
 """
     inner_node(ln::LifecycleNode) -> Node
 
-The wrapped plain [`Node`] (§14.2). Application entities are created against it —
-`Publisher(inner_node(ln), "image", T)`, `Timer(inner_node(ln), …) do … end` — so
-they register on the node the gate is keyed by and are silenced automatically while
-the managed node is not [`Active`](@ref). (The pattern constructors are typed on
-`Node`; unwrap here rather than passing the `LifecycleNode`.)
+The plain [`Node`] wrapped by a managed node (§14.2). Create application entities
+against it — `Publisher(inner_node(ln), "image", T)`,
+`Timer(inner_node(ln), period) do … end`,
+`Subscription(inner_node(ln), "cmd", T) do msg … end` — so they register on the node
+the dispatch gate is keyed by and are silenced automatically while the managed node
+is not [`Active`](@ref).
+
+The pattern constructors are typed on `Node`; unwrap with `inner_node` at each
+construction site. The returned node carries the context, fully-qualified name,
+namespace, and clocks; naming and clock helpers reached through the `LifecycleNode`
+forward to it.
 """
 inner_node(ln::LifecycleNode) = ln.node
 
@@ -213,22 +295,35 @@ resolve_name(ln::LifecycleNode, name::AbstractString; kwargs...) =
 """
     state(ln::LifecycleNode) -> LifecycleState
 
-The node's current primary lifecycle state ([`Unconfigured`](@ref)/[`Inactive`](@ref)/
-[`Active`](@ref)/[`Finalized`](@ref)). Read lock-free (atomic); the value an
-external `get_state` query reports.
+The managed node's current primary lifecycle state — one of [`Unconfigured`](@ref),
+[`Inactive`](@ref), [`Active`](@ref), or [`Finalized`](@ref), and the value an
+external `~/get_state` query reports.
+
+Read lock-free via an atomic load, so any dispatch task can consult it cheaply;
+transitions latch it under the node lock. Compare or dispatch on the singleton to
+branch: `state(ln) === Active()`.
 """
 state(ln::LifecycleNode) = @atomic ln._state
 
 """
-    isactive(node) -> Bool
     isactive(ln::LifecycleNode) -> Bool
+    isactive(node::Node) -> Bool
+    isactive(entity::Entity) -> Bool
 
-The dispatch gate predicate (§14.2). A [`LifecycleNode`] is active only in the
-[`Active`](@ref) state. A plain [`Node`] is active unless it is the wrapped node of
-some `LifecycleNode` (the gate registry); an unmanaged node is always active, the
-no-branch fast path. Hooked into the data-plane dispatch paths so that while a
-managed node is not Active, its application entities are silenced automatically:
-publishers drop, subscriptions/timers don't fire, services error-reply.
+The dispatch gate predicate (§14.2): whether an entity fires right now. A
+[`LifecycleNode`](@ref) is active only in the [`Active`](@ref) state. A plain
+[`Node`] is active unless it is the wrapped node of some `LifecycleNode`, found
+through an identity-keyed registry (one lock-guarded lookup; an unmanaged node is
+absent and always active). An [`Entity`] follows its node's state, with one
+exception: the control surface of a managed node (the `lifecycle_msgs` services and
+the `~/transition_event` publisher) is always active, so an external manager can
+drive and observe an inactive node.
+
+This single predicate is threaded into each data-plane dispatch site — publish,
+subscription delivery, timer tick, service handling — so while a managed node is
+not Active its application entities are silenced automatically: publishers drop,
+subscriptions and timers skip the handler, and services error-reply. Each call
+recomputes from the node's current atomic state.
 """
 isactive(ln::LifecycleNode) = state(ln) === Active()
 
@@ -240,15 +335,6 @@ function isactive(node::Node)
     g === nothing ? true : isactive(g::LifecycleNode)
 end
 
-"""
-    isactive(entity::Entity) -> Bool
-
-Whether `entity` should dispatch right now (§14.2). The *control surface* of a
-LifecycleNode is exempt (always live, so an external manager can drive/observe an
-inactive node); every other entity follows its node's [`isactive`](@ref). This is
-the single predicate the dispatch hooks (publish / subscription / timer / service)
-consult.
-"""
 function isactive(e::Entity)
     g = _gate_for(e.node)
     g === nothing && return true                  # plain Node ⇒ always
@@ -258,22 +344,16 @@ end
 
 # Dispatch hooks (§14.2 "gate everything, at dispatch"). The gate is a single
 # `isactive(e::Entity)` guard threaded into each data-plane dispatch site. This
-# file is included last and `isactive` is a normal late-bound method, so the four
-# sites each add a one-line check beside their existing `isopen(e)` short-circuit:
+# file is included last and `isactive` is a normal late-bound method; the sites:
 #
-#   • pubsub.jl `publish`       — after `isopen(e) || return nothing`:
-#         isactive(e) || return nothing                       # Publisher ⇒ drop
-#   • node.jl  `_run_handler`   — at entry (before decode):
-#         isactive(e) || return nothing                       # Subscription ⇒ no fire
-#   • service.jl `_serve_query` — before running the handler:
-#         isactive(e) || (reply_err(query, "node inactive"); finalize(query.q); return)
-#   • time.jl  Timer `_start!`  — the timer's entity isn't in scope; the gate rides
-#         on the user `f` closure instead (the Timer is created on the node, so the
-#         body's `publish`/state access is already gated transitively). A direct
-#         timer gate would need the owning node on the `Timer` — deferred.
+#   • pubsub.jl   `publish`        — after `isopen(e)`: drop while inactive
+#   • dispatch.jl `_predispatch`   — before decode/novelty: skip delivery
+#   • service.jl  `_serve_query`   — before the handler: error-reply "node inactive"
+#                                    (infra services exempt via `_is_infra_service`)
+#   • time.jl     `_timer_active`  — each tick, keyed on the timer's owning node
 #
-# A plain `Node` makes every `isactive` call return `true` with one IdDict lookup,
-# so the guard is free for the common (unmanaged) case.
+# A plain `Node` answers every `isactive` with one registry lookup, so the guard is
+# cheap for the common (unmanaged) case.
 
 # ── transitions: the action three-way, reused (§14.2/§9) ───────────────────────
 # Each public transition validates the origin state, runs the user callback under
@@ -290,30 +370,58 @@ end
 """
     TransitionResult
 
-The outcome of a lifecycle transition: `:success` (landed in the target state),
-`:failure` (callback declined — reverted to origin), or `:error` (callback threw —
-`on_error` ran, recovered to `Unconfigured` or fell to `Finalized`). Returned by
-[`configure!`](@ref)/[`activate!`](@ref)/… for in-process callers; the wire
-`change_state` reply reports `success = (result === :success)`.
+Alias for `Symbol`: the outcome of a lifecycle transition, returned by
+[`configure!`](@ref), [`activate!`](@ref), [`deactivate!`](@ref),
+[`cleanup!`](@ref), and [`shutdown!`](@ref). One of:
+
+  - `:success` — the callback returned normally; the node landed in the target state.
+  - `:failure` — the callback returned the [`failure`](@ref) token; the node stayed
+    in its origin state (a clean decline, nothing published).
+  - `:error` — the callback threw; `on_error` ran, recovering to [`Unconfigured`](@ref)
+    on its success or dropping to [`Finalized`](@ref) otherwise.
+
+The wire `~/change_state` reply reports `success = (result === :success)`.
 """
-const TransitionResult = Symbol   # one of :success / :failure / :error
+const TransitionResult = Symbol
 
 """
-    configure!(ln) -> TransitionResult
+    configure!(ln::LifecycleNode) -> TransitionResult
 
-`Unconfigured → Inactive`, running `on_configure` (§14.2). The conventional place
-to create the node's (gated-until-Active) entities and acquire resources.
+Drive the `Unconfigured → Inactive` transition, running the `on_configure` callback
+(§14.2). The conventional place to create the node's entities (gated until
+[`Active`](@ref)) and acquire resources such as devices or files. Matches the ROS 2
+managed-node `configure` transition.
+
+Returns `:success` when the callback lands the node in [`Inactive`](@ref),
+`:failure` if the callback returns the [`failure`](@ref) token (the node stays
+[`Unconfigured`](@ref)), or `:error` if it throws (`on_error` runs). Holds the
+node's transition lock so it cannot interleave with a concurrent transition. Throws
+`ArgumentError` if the node is closed, or if it is not currently `Unconfigured`.
 """
 configure!(ln::LifecycleNode) =
     _drive!(ln, Unconfigured(), Inactive(), ln.on_configure,
             TRANSITION_CONFIGURE, "configure")
 
 """
-    activate!(ln) -> TransitionResult
+    activate!(ln::LifecycleNode) -> TransitionResult
 
-`Inactive → Active`, running `on_activate` (§14.2). Usually empty — gating is
-automatic, so activation is just the state flip that un-silences the node's
-entities.
+Drive the `Inactive → Active` transition, running the `on_activate` callback
+(§14.2). The callback is usually empty: gating is automatic, so activation is the
+state flip that opens the dispatch gate. Matches the ROS 2 managed-node `activate`
+transition.
+
+Returns `:success` when the node lands in [`Active`](@ref), `:failure` if the
+callback returns [`failure`](@ref) (the node stays [`Inactive`](@ref)), or `:error`
+if it throws. Throws `ArgumentError` if the node is closed or not currently
+`Inactive`.
+
+On success, after the gate opens, each transient_local subscription on the node
+re-runs its latched-history query (the ROS 2 transient_local durability replay), so
+the node picks up the latest state it dropped while inactive. The replay is
+novelty-gated — a sample already seen is skipped across deactivate/reactivate
+cycles — and runs per-entity best-effort after the transition lock is released: a
+re-latch failure is logged without unwinding the transition, and the replay can
+overlap a subsequent transition.
 """
 function activate!(ln::LifecycleNode)
     r = _drive!(ln, Inactive(), Active(), ln.on_activate,
@@ -340,31 +448,54 @@ end
 _node_entities_snapshot(node::Node) = @lock node.lock copy(node.entities)
 
 """
-    deactivate!(ln) -> TransitionResult
+    deactivate!(ln::LifecycleNode) -> TransitionResult
 
-`Active → Inactive`, running `on_deactivate` (§14.2). Usually empty (gating is
-automatic); the state flip re-silences the node.
+Drive the `Active → Inactive` transition, running the `on_deactivate` callback
+(§14.2). Usually empty, since gating is automatic; the state flip re-silences the
+node's application entities. Matches the ROS 2 managed-node `deactivate` transition.
+
+Returns `:success` when the node lands in [`Inactive`](@ref), `:failure` if the
+callback returns [`failure`](@ref) (the node stays [`Active`](@ref)), or `:error` if
+it throws. Throws `ArgumentError` if the node is closed or not currently `Active`.
 """
 deactivate!(ln::LifecycleNode) =
     _drive!(ln, Active(), Inactive(), ln.on_deactivate,
             TRANSITION_DEACTIVATE, "deactivate")
 
 """
-    cleanup!(ln) -> TransitionResult
+    cleanup!(ln::LifecycleNode) -> TransitionResult
 
-`Inactive → Unconfigured`, running `on_cleanup` (§14.2). Releases what
-`on_configure` acquired (close entities, free devices).
+Drive the `Inactive → Unconfigured` transition, running the `on_cleanup` callback
+(§14.2). The place to release what `on_configure` acquired — close entities, free
+devices — returning the node to a fresh [`Unconfigured`](@ref) state it can be
+reconfigured from. Matches the ROS 2 managed-node `cleanup` transition.
+
+Returns `:success` when the node lands in [`Unconfigured`](@ref), `:failure` if the
+callback returns [`failure`](@ref) (the node stays [`Inactive`](@ref)), or `:error`
+if it throws. Throws `ArgumentError` if the node is closed or not currently
+`Inactive`.
 """
 cleanup!(ln::LifecycleNode) =
     _drive!(ln, Inactive(), Unconfigured(), ln.on_cleanup,
             TRANSITION_CLEANUP, "cleanup")
 
 """
-    shutdown!(ln) -> TransitionResult
+    shutdown!(ln::LifecycleNode) -> TransitionResult
 
-`{Unconfigured,Inactive,Active} → Finalized`, running `on_shutdown` (§14.2). The
-terminal transition; valid from any non-terminal state (this is the lifecycle drain
-`close(ctx)` reaches, §14). Idempotent — already `Finalized` is a `:success` no-op.
+Drive the terminal `{Unconfigured, Inactive, Active} → Finalized` transition,
+running the `on_shutdown` callback (§14.2). Valid from any non-terminal state, and
+the transition `close` / the Context drain (§14) reaches when closing a
+managed node. Matches the ROS 2 managed-node `shutdown` transition; the
+`~/transition_event` carries the origin-specific transition id
+(`TRANSITION_UNCONFIGURED_SHUTDOWN` / `TRANSITION_INACTIVE_SHUTDOWN` /
+`TRANSITION_ACTIVE_SHUTDOWN`).
+
+Returns `:success` once the node lands in [`Finalized`](@ref); a node already
+`Finalized` is a `:success` no-op (idempotent), even when closed. Returns `:error`
+if `on_shutdown` throws: `on_error` runs, and the node lands in
+[`Unconfigured`](@ref) on its success or [`Finalized`](@ref) otherwise — the shared
+error-recovery rule, which for shutdown means a recovering `on_error` leaves the
+node non-terminal. Throws `ArgumentError` if a non-`Finalized` node is closed.
 """
 function shutdown!(ln::LifecycleNode)
     origin = state(ln)
@@ -443,7 +574,7 @@ end
 function _handle_error!(ln::LifecycleNode, origin::LifecycleState, label::AbstractString)
     recovered = _run_transition(ln, ln.on_error, "$(label):on_error")
     target = recovered === :success ? Unconfigured() : Finalized()
-    _land!(ln, origin, target, TRANSITION_ACTIVATE)  # lifecycle_msgs has no id for error-recovery edges; reuse ACTIVATE for the event
+    _land!(ln, origin, target, TRANSITION_ACTIVATE)  # error-recovery edge reported as ACTIVATE on the wire (see BUGS-COMPONENT-LIFECYCLE.md)
     return :error
 end
 
@@ -637,10 +768,10 @@ end
 """
     close(ln::LifecycleNode)
 
-Finalize and tear down the managed node (§14.2/§14). Runs `shutdown!` → `Finalized`
-(the lifecycle drain) if not already terminal, drops the gate registration, then
-closes the wrapped [`Node`] — which undeclares every entity (control surface +
-application) and the node token. Idempotent.
+Finalize and tear down the managed node (§14.2/§14). Runs [`shutdown!`](@ref) (the
+lifecycle drain, normally landing in [`Finalized`](@ref)) if not already terminal,
+drops the gate registration, then closes the wrapped [`Node`] — which undeclares
+every entity (control surface + application) and the node token. Idempotent.
 """
 function Base.close(ln::LifecycleNode)
     isopen(ln) || return nothing

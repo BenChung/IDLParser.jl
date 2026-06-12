@@ -60,7 +60,7 @@ Type-level handle on an action type `A` and its three sub-message structs:
 data-route key expressions and the handler signatures. Built from the action
 type argument to `ActionServer`/`ActionClient`. The protocol wrappers
 (`SendGoal`/`GetResult` request/response, `FeedbackMessage`) are generated
-siblings of `A`, resolved off `A` on demand via [`_action_wrapper`](@ref).
+siblings of `A`, resolved off `A` on demand via `_action_wrapper`.
 
 See the ROS 2 actions concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
@@ -226,11 +226,37 @@ struct Accept <: GoalResponse end
 struct Reject <: GoalResponse end
 struct Defer  <: GoalResponse end
 
-"Accept a goal and begin executing it now (fires `on_accepted`)."
+"""
+    accept() -> Accept
+
+The `on_goal` decision that accepts a goal and fires the server's `on_accepted`:
+the high-level `do`-block body runs immediately, while a low-level callback
+decides when. Return it from an `on_goal(request)` callback. One of the three
+goal-acceptance tokens with [`reject`](@ref) and [`defer`](@ref); the default
+`on_goal` returns `accept()`.
+"""
 accept() = Accept()
-"Reject a goal — the client's `send` returns a rejected handle."
+
+"""
+    reject() -> Reject
+
+The `on_goal` decision that declines a goal: the server replies not-accepted and
+the client's [`send`](@ref) returns a handle in state `:rejected`. Return it from
+an `on_goal(request)` callback. One of the three goal-acceptance tokens with
+[`accept`](@ref) and [`defer`](@ref).
+"""
 reject() = Reject()
-"Accept a goal but defer execution — stays `ACCEPTED` until `execute(goal)` (the queue path, §9)."
+
+"""
+    defer() -> Defer
+
+The `on_goal` decision that accepts a goal but leaves it in the `ACCEPTED` state
+for the owner to run later with [`execute`](@ref) — the queue/orchestrator path.
+The server replies accepted but does not fire `on_accepted` for a deferred goal.
+Return it from an `on_goal(request)` callback, typically paired with
+[`SingleFlight`](@ref) wiring. One of the three goal-acceptance tokens with
+[`accept`](@ref) and [`reject`](@ref).
+"""
 defer()  = Defer()
 
 # `on_cancel` returns accept/reject — reuse the same tokens (accept arms the

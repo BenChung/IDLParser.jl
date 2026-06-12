@@ -29,7 +29,7 @@ discovered type must hash-match the name it travels under. `lift` reconstructs t
 main IL; nested types survive as `RRef`s in its fields, and codegen resolves them
 from the referenced closure carried in `td`.
 
-Codegen is deferred to [`realize!`](@ref) / first use, keeping registration cheap
+Codegen is deferred to `realize!` / first use, keeping registration cheap
 and letting discovery succeed even when a type later fails to generate.
 """
 function entry_from_type_description(td::TypeDescriptionMsg, info::TypeInfo;
@@ -83,11 +83,17 @@ const _USER_SEARCH_PATHS = String[]
 """
     add_search_path!(path) -> Vector{String}
 
-Register `path` as an install-prefix search root (highest precedence) for ament
-type acquisition, process-wide. `path` is expected to be an install prefix whose
-interface files live under `<path>/share/<pkg>/{msg,srv,action}/`, the same shape
-as an `AMENT_PREFIX_PATH` entry. The path is normalized and de-duplicated; returns
-the current user search-path list.
+Register `path` as an install-prefix search root for ament type acquisition,
+process-wide and at the highest precedence (ahead of `AMENT_PREFIX_PATH`).
+`path` should be an install prefix whose interface files live under
+`<path>/share/<pkg>/{msg,srv,action}/`, the same shape as an
+`AMENT_PREFIX_PATH` entry. The path is expanded (`~`), normalized to an
+absolute path, and de-duplicated against prior registrations. Returns the
+current user-registered search-path list.
+
+The registration is global mutable process state, intended to be set once at
+startup; it is not synchronized, so configure it before concurrent type
+resolution begins.
 """
 function add_search_path!(path::AbstractString)
     p = abspath(expanduser(String(path)))
@@ -106,21 +112,28 @@ end
 """
     ament_prefix_paths() -> Vector{String}
 
-The `AMENT_PREFIX_PATH` entries (colon-separated, ROS's install-prefix search
-path), filtered to existing directories. Empty when not in a sourced workspace.
+The `AMENT_PREFIX_PATH` environment entries (colon-separated, ROS's
+install-prefix search path), filtered to existing directories. Returns an empty
+vector outside a sourced workspace. This is one component of the merged ament
+search order; [`search_prefixes`](@ref) returns the full, de-duplicated list.
 """
 ament_prefix_paths() = String[p for p in _env_prefix_paths("AMENT_PREFIX_PATH") if isdir(p)]
 
 """
     search_prefixes() -> Vector{String}
 
-The ordered, de-duplicated install-prefix roots scanned for ament interface files,
-filtered to existing directories. Precedence (first wins under the overlay rule):
+The ordered, de-duplicated install-prefix roots scanned for ament interface
+files, filtered to existing directories. Precedence (the overlay rule — the
+first occurrence of a directory wins):
 
-1. `add_search_path!` roots (user-registered),
-2. `AMENT_PREFIX_PATH` (a sourced workspace),
-3. `CMAKE_PREFIX_PATH`,
-4. `/opt/ros/<distro>` system installs ($(join(_ROS_SYSTEM_DISTROS, ", "))).
+1. roots added via [`add_search_path!`](@ref) (user-registered),
+2. `AMENT_PREFIX_PATH` entries (a sourced workspace),
+3. `CMAKE_PREFIX_PATH` entries,
+4. the `/opt/ros/<distro>` system installs for rolling, jazzy, kilted, lyrical,
+   and humble.
+
+Underlies [`discover_ament_packages`](@ref) and the by-name ament lookup behind
+[`load_ament_type`](@ref).
 """
 function search_prefixes()
     prefixes = String[]
@@ -143,11 +156,16 @@ const _IFACE_EXTS = (".msg", ".srv", ".action")
 """
     discover_ament_packages() -> Dict{String, Vector{String}}
 
-Scan the [`search_prefixes`](@ref) install roots for installed interface packages,
-mapping each package name to the absolute paths of its `.msg`/`.srv`/`.action`
-files (§11 ament acquisition). A package is "interface" iff its `share/<pkg>` dir
-has at least one of those files. Later prefixes don't override earlier ones —
-first-seen wins, the ament overlay convention.
+Scan the [`search_prefixes`](@ref) install roots for installed ROS 2 interface
+packages, mapping each package name to the absolute paths of its
+`.msg` / `.srv` / `.action` files, grouped by qualifier (`msg`, then `srv`,
+then `action`) and name-sorted within each group (§11 ament acquisition). A
+package counts as an interface package when its `share/<pkg>` directory holds
+at least one such file.
+
+Under the overlay rule the first prefix to define a package wins; later
+prefixes' copies of the same package are shadowed. Returns an empty `Dict`
+outside a sourced workspace.
 """
 function discover_ament_packages()
     out = Dict{String, Vector{String}}()
@@ -188,17 +206,29 @@ function _find_ament_file(name::AbstractString)
 end
 
 """
-    load_ament_type(reg, name; register=true) -> Union{RegistryEntry, Nothing}
+    load_ament_type(reg::TypeRegistry, name; register=true) -> Union{RegistryEntry, Nothing}
 
-Resolve a fully-qualified ROS2 type `name` against the installed ament workspace
-(§11): find its `.msg`/`.srv`/`.action` file, parse it to IL, compute the RIHS01
-hash from the parsed AST, and (with `register=true`) register the entry under
-`(name, hash)`. Returns `nothing` when the type isn't installed.
+Resolve a fully-qualified ROS 2 type `name` (`"<pkg>/<qualifier>/<Name>"`)
+against the installed ament workspace (§11): locate its `.msg` / `.srv` /
+`.action` file across [`search_prefixes`](@ref) (overlay order, first match
+wins), parse it to IL, compute the RIHS01 hash from the parsed definition, and
+— with `register=true` (the default) — register the resulting
+[`RegistryEntry`](@ref) under `(name, hash)` with `:ament` provenance. Returns
+the entry, or `nothing` when the type is not installed.
 
-The hash is computed here from the parsed definition so an ament-acquired type is
-keyed identically to a wire-discovered one — RIHS01 is the common identity. Codegen
-resolves nested refs once the package's siblings are co-registered (the typical
-`@ros_msgs`-over-a-package shape).
+The hash is computed locally from the parsed AST so an ament-acquired type keys
+identically to a wire-discovered one — RIHS01 is the shared identity. For a
+self-contained message type the hash is exact; a type that references other
+packages keys correctly by name but its hash may differ from a remote's until
+its referenced siblings are co-registered, at which point the wire/cache path
+supplies the exact hash. When lowering yields no struct declaration at all to
+hash, the entry is keyed with the RIHS01 placeholder hash (version `01`,
+all-zero digest) — correct for keyexpr structure, with the wire/cache path
+supplying the exact hash for cross-version matching.
+
+The entry is left unrealized (codegen deferred); nested references resolve once
+the package's siblings are co-registered, the usual whole-package acquisition
+shape.
 """
 function load_ament_type(reg::TypeRegistry, name::AbstractString; register::Bool=true)
     path = _find_ament_file(name)
@@ -274,16 +304,27 @@ end
 """
     resolve_type(node_or_ctx, info::TypeInfo; ament=true, cache=true) -> Union{RegistryEntry, Nothing}
 
-The §11 acquisition front door: return the registry entry for `info`, acquiring it
-if needed. Tries three local sources in order: a registry hit, then the
-content-addressed cache, then an ament/static lookup by name. The dynamic
-over-the-wire path stays with the §12/§15 layer, which holds the remote node
-identity and async `ServiceClient` and calls [`register_type_description!`](@ref)
-on its reply. Returns `nothing` when the type can't be resolved locally; the caller
-then kicks off dynamic discovery or delivers raw bytes.
+Return the [`RegistryEntry`](@ref) for `info`, acquiring it from a local source
+when it is not yet registered (§11). This is the local acquisition front door;
+it tries three sources in order:
 
-Acquired entries stay unrealized (codegen deferred); call [`realize!`](@ref) or
-[`registered_type`](@ref) at first use.
+1. a registry hit (already known to this `Context`);
+2. the content-addressed on-disk cache, when `cache=true` — a cached blob is
+   re-validated against `info`'s RIHS01 and registered with `:cache`
+   provenance;
+3. an ament/static lookup by name in the installed workspace, when `ament=true`
+   (see [`load_ament_type`](@ref)).
+
+Returns `nothing` when none of the local sources resolves the type. The dynamic
+over-the-wire path (issuing a `GetTypeDescription` query) stays with the
+§12/§15 discovery layer, which holds the remote node identity and async
+`ServiceClient`; on a `nothing` result the caller either kicks off that
+discovery or delivers raw bytes for the topic.
+
+`node_or_ctx` is a node or a `Context`; the entry's `Context` registry is
+reached through it. A resolved entry stays unrealized (codegen deferred) — call
+`realize!` or `registered_type` at first use to obtain its
+concrete type.
 """
 function resolve_type(ctxlike, info::TypeInfo; ament::Bool=true, cache::Bool=true)
     reg = registry(_ctx(ctxlike))

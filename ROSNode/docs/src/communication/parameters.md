@@ -115,3 +115,39 @@ A parameter also attaches to a component: `@param` declares a live, `ros2 param`
 ## See also
 
 - [Interoperating with ROS 2](../interop/ros2.md) — drive a node's parameters from the `ros2 param` CLI.
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+```@docs
+@parameters
+ParameterServer
+ParameterClient
+CompositeParameterServer
+ParameterDescriptor
+ParameterType
+parameter_type
+descriptors
+validate
+transaction
+setproperties
+setproperties!
+declared_names
+parameter_names
+parameter
+dynamic_parameters
+set_parameter!
+get_parameters
+get_parameter_types
+set_parameters
+set_parameters_atomically
+list_parameters
+describe_parameters
+on_parameter_event
+ParameterEventBatch
+readonly
+ParameterRejection
+```

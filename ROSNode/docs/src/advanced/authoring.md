@@ -115,3 +115,18 @@ An authored `@ros_message`/`@ros_service`/`@ros_action` carries the same RIHS01 
 
 - [Interface Types](../foundations/interface-types.md) — importing existing interfaces and how wire identity works.
 - [Runtime Type Discovery](discovery.md) — handling types you learn off the wire.
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+```@docs
+@ros_package
+@ros_message
+@ros_service
+@ros_action
+FeedbackSink
+goal_handle
+```

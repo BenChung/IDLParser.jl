@@ -30,9 +30,15 @@ export QosProfile, TypeInfo, EndpointKind, default_qos,
 """
     ShutdownException()
 
-Raised into every blocked wait (clock sleeps, `call`, `wait_for_service`, graph
-waits, …) when the owning Context drains (§14). Catching it is the cooperative
-signal to unwind cleanly, so the drain path logs it as expected shutdown.
+Raised into every blocked wait — clock sleeps, `call`, `wait_for_service`, graph
+waits — when the owning Context begins to drain (§14). Catching it is the
+cooperative signal to unwind that wait cleanly and let the Context tear down; the
+drain path treats it as an expected shutdown and logs it as such. A subscription
+dispatch loop that sees it returns quietly, treating it as teardown rather than a
+handler failure.
+
+ROSNode's analogue of the rclpy/rclcpp shutdown signal that interrupts blocking
+calls once `rclpy.shutdown()` / context invalidation occurs.
 """
 struct ShutdownException <: Exception end
 
@@ -42,10 +48,16 @@ Base.showerror(io::IO, ::ShutdownException) =
 """
     Cancelled()
 
-Thrown by the action cancellation checkpoints (`checkpoint(goal)` /
-`feedback!`, §9) when a goal is transitioning to CANCELING. The framework's
-fail-safe settlement maps it to a CANCELED result rather than ABORTED, so a
-handler that lets it propagate settles cleanly without manual polling.
+Thrown by the action cancellation checkpoints — `checkpoint(goal)` and
+`feedback!(goal, …)` — when the goal has moved to the `CANCELING` action goal
+state (§9). A goal handler that lets it propagate settles cleanly: the fail-safe
+settlement maps a thrown `Cancelled` to a `CANCELED` result (filling the result
+cell with `canceled(default_result())`), where any other exception maps to
+`ABORTED`. Cancellation then unwinds structurally through the handler's call
+stack, with no manual status polling.
+
+Models the ROS 2 action goal-state path `{ACCEPTED, EXECUTING}` → `CANCELING` →
+`CANCELED`.
 """
 struct Cancelled <: Exception end
 
@@ -55,8 +67,8 @@ Base.showerror(io::IO, ::Cancelled) =
 # ── settlement status tokens ─────────────────────────────────────────────
 # The write-once-cell verbs of services (§8) and actions (§9): tags passed to
 # `respond!` to select an outcome. Singletons of a sealed abstract type (the
-# ClockSource §7 precedent) make dispatch on the token a compile-time choice, so
-# an unknown token is a `MethodError` rather than a silently-wrong branch.
+# ClockSource §7 precedent). `respond!` dispatches on the abstract type and uses
+# `is_terminal` to reject `feedback` where a result is due.
 #
 #   service:  return resp                  ⇒ success
 #             respond!(req, failure, msg)   ⇒ query error reply (client `call` raises)
@@ -66,9 +78,24 @@ Base.showerror(io::IO, ::Cancelled) =
 #             respond!(goal, feedback, fb)  ⇒ one feedback message (a stream, not the cell)
 #
 # `success`/`succeeded` and `failure`/`aborted` read differently at the two
-# call sites by design (a service has no goal lifecycle); they are distinct
-# tokens so a mis-paired use (e.g. `feedback` on a service) is a MethodError.
+# call sites by design (a service has no goal lifecycle); the distinct spellings
+# keep the service and action call sites self-describing.
 
+"""
+    SettlementStatus
+
+Sealed abstract supertype of the outcome tokens passed to `respond!` to settle a
+service request or an action goal. The singleton instances split by call site:
+services use [`success`](@ref) and [`failure`](@ref) (alias [`failed`](@ref));
+actions use [`succeeded`](@ref), [`canceled`](@ref), and [`aborted`](@ref) (the
+terminal result outcomes) plus [`feedback`](@ref) (a stream verb, not a terminal
+cell write).
+
+`respond!` dispatches on this abstract type, so it accepts any token; the
+non-terminal [`feedback`](@ref) passed where a result is due raises an
+`ArgumentError` from the `is_terminal` guard. The distinct service and action
+spellings document each call site rather than enforce a boundary.
+"""
 abstract type SettlementStatus end
 
 "Service handler succeeded — the response is delivered as a reply-ok."
@@ -84,15 +111,83 @@ struct Aborted     <: SettlementStatus end
 "Action feedback — a stream verb, not a terminal cell write."
 struct Feedback    <: SettlementStatus end
 
+"""
+    success :: Success
+
+Service-handler success token. `respond!(req, success, resp)` settles the
+in-flight request by delivering `resp` as a Zenoh reply-ok, the normal successful
+path of a ROS 2 service. Returning a response value from the handler reaches the
+same outcome — `settle_handler!` fills the result cell with `success` when the
+handler returns without having already settled. A terminal token (fills the
+write-once result cell).
+"""
 const success   = Success()
+
+"""
+    failure :: Failure
+
+Service-handler failure token (spelled [`failed`](@ref) at some call sites — the
+same singleton). `respond!(req, failure, msg)` settles the request as a Zenoh
+query *error* reply carrying `msg`, so the client's `call` raises `ServiceError`.
+A terminal token. The service counterpart of an action goal's [`aborted`](@ref),
+kept a distinct spelling so the service and action call sites read for their own
+lifecycle.
+"""
 const failure   = Failure()
+
+"""
+    succeeded :: Succeeded
+
+Action goal success token. `respond!(goal, succeeded, result)` — or returning the
+result from the goal handler — fills the write-once result cell as the SUCCEEDED
+action goal state, completing the goal normally. A terminal token. The action
+counterpart of a service's [`success`](@ref).
+"""
 const succeeded = Succeeded()
+
+"""
+    canceled :: Canceled
+
+Action goal cancellation token. `respond!(goal, canceled, result)` fills the
+result cell as the CANCELED action goal state. The fail-safe settlement also
+synthesizes this outcome when a goal handler unwinds via a thrown
+[`Cancelled`](@ref). A terminal token.
+"""
 const canceled  = Canceled()
+
+"""
+    aborted :: Aborted
+
+Action goal abort token. `respond!(goal, aborted, result)` fills the result cell
+as the ABORTED action goal state, the explicit failure verb for a goal. Also the
+fail-safe outcome: a goal handler that throws any exception other than
+[`Cancelled`](@ref), or that returns leaving the result cell empty, is settled as
+`aborted` so the client never hangs. A terminal token.
+"""
 const aborted   = Aborted()
+
+"""
+    feedback :: Feedback
+
+Action feedback token — a stream verb. `respond!(goal, feedback, fb)` publishes
+one feedback message on the goal's feedback topic (the sugar behind
+`feedback!(goal, fb)`) and leaves the goal running. It never fills the result
+cell, so the settlement layer rejects it where a terminal result is due
+(`is_terminal(feedback)` is `false`).
+
+Mirrors ROS 2 action feedback, the progress stream published while a goal
+executes.
+"""
 const feedback  = Feedback()
 
-# `failed` reads better than `failure` at the service `respond!(req, failed, …)`
-# call site (DESIGN §Services); same token, two spellings.
+"""
+    failed :: Failure
+
+Alias for [`failure`](@ref) — the identical singleton, spelled to read naturally
+at the service call site `respond!(req, failed, msg)`. Settles the request as a
+Zenoh query error reply, so the client's `call` raises `ServiceError`. A terminal
+token.
+"""
 const failed = failure
 
 Base.show(io::IO, ::Success)   = print(io, "success")
@@ -117,32 +212,47 @@ is_terminal(::Feedback)         = false
 """
     Concurrency
 
-Per-endpoint handler-dispatch policy: [`Serial`](@ref) (one sticky cooperative
-task, the default) or [`Parallel`](@ref) (up to `n` handlers on OS threads).
-Mirrors the rclcpp executor choice between single-threaded and multi-threaded
-dispatch; see the ROS 2 executor concepts:
-https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Executors.html
+Sealed abstract supertype of the per-endpoint handler-dispatch policy:
+[`Serial`](@ref) (one sticky cooperative task, the default) or [`Parallel`](@ref)
+(up to `n` handlers on OS threads). Passed as the `concurrency=` keyword when
+declaring a subscription (or other handler endpoint). Mirrors the rclcpp executor
+choice between a single-threaded and a multi-threaded executor, scoped to a single
+endpoint.
+
+See https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Executors.html
 """
 abstract type Concurrency end
 
 """
     Serial()
 
-One sticky worker, order preserved — the default. Handlers run cooperatively on a
-single OS thread (sticky, so they don't migrate even under `julia -t N`): never
-simultaneous, so no data races and no locks needed; blocking calls yield, so a
-blocking handler doesn't wedge the others.
+The default concurrency policy: one sticky worker task runs the endpoint's
+handlers one at a time, in arrival order, on a single OS thread (sticky, so it
+stays put even under `julia -t N`). Handlers run one at a time, so node-local
+handler state needs no locks or atomics; a blocking call inside a handler yields,
+letting the others make progress. The single-threaded-executor model from rclcpp.
 """
 struct Serial <: Concurrency end
 
 """
     Parallel(n)
 
-Up to `n` handlers in flight on OS threads (`Threads.@spawn`), order **not**
-preserved. `n` caps in-flight handlers (and, with `view=true`, pinned payloads);
-actual parallelism is `min(n, nthreads)`. `Parallel(Inf)` is unbounded spawn — an
-explicit foot-gun, never a default. Opt in per endpoint once its handler is
-thread-safe.
+Dispatch up to `n` handlers concurrently on OS threads; completion order is
+independent of arrival order. `n` persistent non-sticky worker tasks pull from the
+subscriber, so `n` caps the in-flight handlers (and, under [`Checked`](@ref) /
+[`Unchecked`](@ref) views, the pinned payloads); actual parallelism is bounded by
+`min(n, Threads.nthreads())`. Opt a specific endpoint into this once its handler is
+thread-safe — the multi-threaded-executor model from rclcpp.
+
+`Parallel(Inf)` spawns one task per message with no cap — an explicit foot-gun,
+never a default. `n` must be `>= 1`; `Parallel(n)` with `n < 1` throws
+`ArgumentError`.
+
+```julia
+Subscription(node, "/scan", LaserScan; concurrency=Parallel(4)) do msg
+    process(msg)   # up to 4 of these run at once, order independent of arrival
+end
+```
 """
 struct Parallel <: Concurrency
     n::Float64
@@ -163,48 +273,55 @@ Base.show(io::IO, c::Parallel) = print(io, "Parallel(", isfinite(c.n) ? Int(c.n)
 """
     ViewMode
 
-How a subscription delivers each message to its handler — the single `view=` knob:
+Sealed abstract supertype controlling how a subscription delivers each message to
+its handler — the single `view=` knob, on a safety-versus-speed curve:
 
-  - [`Owned`](@ref) (default) — materialize a fully-owned message; storable,
-    forwardable, spawnable, no lifetime caveats.
-  - [`Checked`](@ref) — zero-copy `CDRView` aliasing the payload, with a runtime
-    escape guard (a view used after the handler returns throws `BorrowError`).
-  - [`Unchecked`](@ref) — the same zero-copy view with the guard removed: fastest,
-    zero-allocation, but an escaping view is undefined behaviour.
+  - [`Owned`](@ref) (default) — a fully-owned message: storable, forwardable, and
+    safe to spawn beyond the handler's return, with no lifetime caveats.
+  - [`Checked`](@ref) — a zero-copy `CDRView` aliasing the payload, with a runtime
+    escape guard: a view used after the handler returns throws
+    `BorrowError`.
+  - [`Unchecked`](@ref) — the same zero-copy view with the guard removed: fastest
+    and zero-allocation; an escaping view is undefined behavior.
 
-`Checked` and `Unchecked` borrow over the *same* representation, so `Checked`
-validates exactly what `Unchecked` ships. `view=true`/`view=false` are accepted as
-shorthand for `Checked()`/`Owned()`.
+`Checked` and `Unchecked` borrow over the *same* representation, so validating
+under `Checked` exercises exactly what `Unchecked` runs. The Bool shorthands
+`view=true` and `view=false` map to `Checked()` and `Owned()`.
 """
 abstract type ViewMode end
 
 """
     Owned()
 
-Default delivery: the handler gets a fully-owned message (every field copied out
-of the payload), free to store, forward, or spawn beyond the handler's return
-(§3.1). `view=false` is shorthand for `Owned()`.
+Default [`ViewMode`](@ref): the handler receives a fully-owned message decoded out
+of the payload, with every field materialized (§3.1). The message is free to
+store, forward, or pass to a spawned task beyond the handler's return — no borrow
+lifetime applies. `view=false` is shorthand for `Owned()`.
 """
 struct Owned <: ViewMode end
 
 """
     Checked()
 
-Zero-copy delivery with a runtime escape guard: the handler gets a `CDRView`
-aliasing the payload, invalidated the instant it returns, so a `CDRView`/`CDRString`
-that escaped throws `BorrowError` on next access. The guard costs one allocation
-and borrows over the same representation [`Unchecked`](@ref) ships, so it validates
-the exact code you'll run unchecked. `view=true` is shorthand for `Checked()`. Run
-under `Checked()`, confirm no `BorrowError`, then switch to `Unchecked()`.
+Zero-copy [`ViewMode`](@ref) with a runtime escape guard: the handler receives a
+`CDRView` aliasing the payload, invalidated the instant the handler returns. A
+`CDRView` or `CDRString` that escaped the handler throws `BorrowError` on
+its next access. The guard costs one allocation and borrows over the same
+representation [`Unchecked`](@ref) ships, so it validates exactly the code the
+unchecked path will run. `view=true` is shorthand for `Checked()`. The intended
+workflow: run under `Checked()`, confirm no `BorrowError`, then switch to
+`Unchecked()`.
 """
 struct Checked <: ViewMode end
 
 """
     Unchecked()
 
-The production fast path: zero-copy `CDRView` over a bare isbits `PayloadView` —
-**zero-allocation**, no escape checking. An escaping `CDRView`/`CDRString` is
-undefined behaviour; validate with [`Checked`](@ref) first.
+The production fast-path [`ViewMode`](@ref): a zero-copy `CDRView` over a bare
+isbits `PayloadView`, zero-allocation and with no escape checking. A `CDRView` or
+`CDRString` that outlives the handler is undefined behavior — it reads freed
+memory. Validate the same handler under [`Checked`](@ref) first; once it shows no
+`BorrowError`, switch to `Unchecked()` for the zero-alloc tier.
 """
 struct Unchecked <: ViewMode end
 
@@ -250,11 +367,14 @@ const _WARMUP = Base.ScopedValues.ScopedValue(false)
 
 `true` while the framework is running a handler purely to warm its code path —
 either D8 `:execute` warm-up (the `_WARMUP` scope) or package precompilation
-(`jl_generating_output`). Lets handler code skip real side effects while still
-*compiling* them. A runtime value (not a type/`Val`) on purpose: both branches of
-a guard compile, only the live one runs — so warm-up exercises the stub yet still
-codegens the real branch. Must stay non-foldable (no `@pure`/`:foldable`), else a
-branch is DCE'd and the warm-up compiles the wrong specialization.
+(`jl_generating_output`). Lets handler code skip real side effects while the
+framework still *compiles* the handler at full native depth. Use
+[`@effectful`](@ref) for the common skip-this-effect-while-warming pattern.
+
+Returns a plain runtime `Bool` by design: both branches of a guard compile, and
+only the live one runs, so warm-up exercises the stub yet still codegens the real
+branch. Must stay non-foldable (no `@pure`/`:foldable`), or a branch is DCE'd and
+warm-up compiles the wrong specialization.
 """
 @inline is_warming()::Bool =
     _WARMUP[] || (ccall(:jl_generating_output, Cint, ()) != 0)
@@ -262,11 +382,16 @@ branch is DCE'd and the warm-up compiles the wrong specialization.
 """
     @effectful expr
 
-Run `expr` for its side effects on the live path, skipping it while warming
-(`is_warming()`). The skipped branch still **compiles** (the guard is a runtime
-value flag, so its branch codegens), so warm-up exercises the same specialization
-the real run will. Returns `expr`'s value at runtime, `nothing` while warming. For
-a value the warm-up path itself needs, write `is_warming() ? stub : real` directly.
+Run `expr` for its side effects on the live path, skipping it while the framework
+is warming the handler ([`is_warming`](@ref)). The skipped branch still
+**compiles** — the guard is a runtime value, so both arms codegen — so warm-up
+exercises the exact specialization the real run will use. Returns `expr`'s value
+at runtime, `nothing` while warming. When the warm-up path itself needs a usable
+value, write `is_warming() ? stub : real` directly.
+
+Wrap a non-ROS effect (hardware I/O, external calls) so it runs only on the live
+path; ROS effects like `publish`/`call` are null-routed by the framework during
+warm-up and need no wrapping.
 
     Subscription(node, "/cmd", Twist) do msg
         cmd = plan(msg)                  # compiled either way

@@ -1,7 +1,8 @@
 # Type-less subscription dispatch. The route is a wildcard data keyexpr matching
 # every type on the topic; each sample carries its `(name, hash)`, which we resolve
 # to a runtime-born type `T` and cross the world-age boundary with `invokelatest`
-# for decode and handler. Owned-only; the static form takes the min-copy `view` path.
+# for decode and handler. Every `ViewMode` applies as in the typed form; the typed
+# form is still faster (it drops the per-sample type resolution).
 #
 # Two tasks, so codegen never deadlocks against the blocking recv:
 #   • receiver (sticky): owns `z_recv`, only copies bytes and enqueues, staying

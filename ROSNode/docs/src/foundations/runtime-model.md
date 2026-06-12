@@ -77,3 +77,71 @@ See [Getting Started](../getting-started.md) for the `zenohd` command that bring
 - [Interface Types](interface-types.md)
 
 Once the skeleton is in place, fill the entity step with a [topic](../communication/topics.md).
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+### Context
+
+```@docs
+@context
+Context
+spin
+session
+registry
+graph
+resolve_name
+on_shutdown
+request_shutdown
+is_shutdown
+next_entity_id!
+EndpointInfo
+NodeInfo
+GraphIndex
+EndpointKind
+```
+
+### Node
+
+```@docs
+Node
+Entity
+dispose
+```
+
+### Settlement and shutdown
+
+```@docs
+ShutdownException
+Cancelled
+SettlementStatus
+success
+failure
+failed
+succeeded
+canceled
+aborted
+feedback
+```
+
+### Lifecycle nodes
+
+```@docs
+LifecycleNode
+LifecycleState
+Unconfigured
+Inactive
+Active
+Finalized
+TransitionResult
+isactive
+inner_node
+configure!
+activate!
+deactivate!
+cleanup!
+shutdown!
+```

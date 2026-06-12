@@ -93,3 +93,64 @@ Naming the type drops the per-message `invokelatest` hop and unlocks the zero-co
 
 - [Topics](../communication/topics.md) — publishers and subscribers end to end.
 - [Message Delivery](delivery.md) — view modes and concurrency for a typed subscription.
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+### Static generation and caching
+
+```@docs
+@ros_import
+@ros_cache
+flush_type_cache
+```
+
+### Warm-up
+
+```@docs
+@effectful
+is_warming
+```
+
+### Type description and introspection
+
+```@docs
+describe_type
+get_type_description
+fetch_type_description
+resolve_or_discover
+wire_get_type_description!
+```
+
+### Type support and resolution
+
+```@docs
+TypeRegistry
+RegistryEntry
+register_type!
+lookup_type
+resolve_type
+absorb_static_types!
+export_typesupport
+enable_project_cache!
+disable_project_cache!
+ament_prefix_paths
+search_prefixes
+add_search_path!
+discover_ament_packages
+load_ament_type
+```
+
+### Logging
+
+```@docs
+RosoutLogger
+logger
+Fatal
+set_logger_level!
+with_rosout
+bridge_zenoh_logs!
+```

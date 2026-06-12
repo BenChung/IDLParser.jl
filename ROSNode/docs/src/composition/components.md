@@ -204,3 +204,60 @@ The example uses `@publishes`, `@serves`, and `@every`. The mixin surface has th
 
 - [Parameters](../communication/parameters.md) — the live parameter model `@param` builds on.
 - [Interoperating with ROS 2](../interop/ros2.md) — driving a component's parameters, topics, and services from `ros2` tooling.
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+### Mixins and ports
+
+```@docs
+Component
+@mixin
+@param
+@publishes
+@uses
+@every
+@hears
+@serves
+@runs
+@interface
+@provides
+provides
+requires
+construct
+entities
+parameters
+```
+
+### Lifecycle hooks
+
+```@docs
+configure
+activate
+deactivate
+cleanup
+on_error
+```
+
+### Assembling and running
+
+```@docs
+@node
+Container
+container
+add!
+```
+
+### Node-kind registry
+
+```@docs
+register_node_kind!
+node_kind
+node_kinds
+load_node
+unload_node
+list_nodes
+```

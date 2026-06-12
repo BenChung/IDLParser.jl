@@ -5,13 +5,28 @@
 # Subscription on the feedback topic filtered by goal id.
 
 """
-    ActionClient{A, G, R, F}
+    ActionClient(node, name, A; qos=default_qos()) -> ActionClient
 
-A ROS 2 action client for action type `A` (§9). `close`-able; dies with its node.
-Use [`send`](@ref) to dispatch a goal, then iterate [`feedback`](@ref), block on
-[`fetch`](@ref) for the result, and [`cancel`](@ref) to request cancellation.
+A ROS 2 action client for action type `A`, declared on `node` at the resolved
+name `name`. Dispatch a goal with [`send`](@ref), then iterate
+[`feedback`](@ref), block on `fetch` for the result, and [`cancel`](@ref) to
+request cancellation. The three sub-messages of `A` — `Goal`/`Result`/`Feedback`
+— type the call and reply surface.
 
-See the ROS 2 actions concept:
+Each protocol-service call is a fresh one-shot Zenoh `get` carrying the rmw_zenoh
+request attachment (`sequence_number`, `source_timestamp`, `source_gid`) a real
+ROS 2 peer echoes into its reply. Feedback is a per-goal subscription on the
+`feedback` topic, filtered to the goal's id. Routing-match probes for `send_goal`
+and `get_result` are declared lazily on the first
+[`action_server_matched`](@ref)/[`wait_for_action_server`](@ref) call.
+
+`send`, `fetch`, and `feedback` resolve the protocol-wrapper structs `@ros_msgs`
+generates; an action generated with bare `@ros_msg` raises `ArgumentError` on the
+first such call.
+
+`close`-able and idempotent (reaping any lazy match probes); dies with its node.
+
+Follows the ROS 2 actions concept:
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
 mutable struct ActionClient{A, G, R, F}
@@ -33,12 +48,6 @@ mutable struct ActionClient{A, G, R, F}
     const _match_lock::ReentrantLock
 end
 
-"""
-    ActionClient(node, name, A; qos=default_qos()) -> ActionClient
-
-Declare an action client for action type `A` on `name` (§9). The three service
-requests are issued on demand via Zenoh `get`; feedback is subscribed per-goal.
-"""
 function ActionClient(node::Node, name::AbstractString, ::Type{A};
                       qos::QosProfile = default_qos()) where {A}
     support = ActionTypeSupport(A)
@@ -103,12 +112,14 @@ end
 """
     action_server_matched(client::ActionClient) -> Bool
 
-True iff the client is routing-matched to an action server right now: its
-`send_goal` and `get_result` Queriers have both matched the server's queryables (§9).
-When true, both [`send`](@ref) and [`fetch`](@ref) reach the server immediately;
-until then they retry on discovery. The routing-plane signal behind
-[`wait_for_action_server`](@ref); lazily declares the probes on first use. `false`
-for a closed client.
+True when the client is routing-matched to an action server right now: both its
+`send_goal` and `get_result` Queriers have matched a server's queryables. When
+true, [`send`](@ref) and `fetch` reach the server without discovery backoff;
+until then they retry on discovery. `false` for a closed client.
+
+The routing-plane signal behind [`wait_for_action_server`](@ref). The first call
+lazily declares the two match probes (Queriers) on the client; a client that
+never awaits its server declares none.
 """
 function action_server_matched(client::ActionClient)
     isopen(client) || return false
@@ -125,7 +136,7 @@ A client-side handle for a dispatched goal (§9): iterable over feedback,
 mutable struct ClientGoal{A, G, R, F}
     const client::ActionClient{A, G, R, F}
     const id::GoalId
-    @atomic _state::Symbol               # :accepted/:rejected/:executing/terminal
+    @atomic _state::Symbol               # :accepted/:rejected/:canceling/terminal
     # Lazily-opened feedback subscription (a SubscriptionHandle); nothing until
     # `feedback(goal)` is first iterated.
     _feedback_sub::Any
@@ -147,10 +158,29 @@ Base.show(io::IO, g::ClientGoal{A}) where {A} =
 """
     send(client, goal) -> ClientGoal
 
-Dispatch `goal` (a `Goal` struct for the action) on `client` and return a handle
-once the server replies accepted/rejected (§9). Blocks this task on the
-`send_goal` service reply (raises `ShutdownException` if the Context drains).
-Inspect [`state`](@ref); iterate [`feedback`](@ref); block on [`fetch`](@ref).
+Dispatch `goal` (a `Goal` struct for the action) on `client` and return a
+client-side goal handle once the server replies accepted or rejected. Blocks the
+calling task on the `send_goal` service reply.
+
+The client mints the 16-byte goal id (the correlation token reused for feedback,
+`get_result`, and cancel). Because a queryable can lag the liveliness token a
+peer discovers it by, `send` retries the one-shot `get` over roughly a two-second
+window (50 ms backoffs) while the route stays unmatched; the first reply that
+lands is authoritative. Inspect the outcome with [`state`](@ref) (`:accepted` or
+`:rejected`), iterate [`feedback`](@ref), and block on `fetch` for the result.
+
+`:rejected` covers every no-acceptance outcome alike — an `on_goal` rejection, an
+error reply (server inactive), no server discovered within the window, and a
+Context drain mid-window — so a caller that must tell them apart checks
+[`action_server_matched`](@ref) or `is_shutdown` separately.
+
+Throws `ArgumentError` if `client` is already closed.
+
+```julia
+goal = send(client, Fibonacci_Goal(; order = 10))
+state(goal) === :accepted || error("rejected")
+result = fetch(goal)
+```
 """
 function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     isopen(client) || throw(ArgumentError("send on a closed ActionClient"))
@@ -294,8 +324,9 @@ end
 Block until the goal settles and return its `Result` (§9). The goal settles exactly
 once, so the result lives in a single write-once slot the framework fills via one
 `get_result` request — the first `fetch`/`feedback` starts it, and every `fetch`
-returns that same result. Raises [`ShutdownException`](@ref) on drain, or an error if
-the goal was rejected or the server reported a failure.
+returns that same result. Raises an error if the goal was rejected, the server
+reported a failure, or the result never arrived (a Context drain ends the
+`get_result` retry early, surfacing as a timed-out-result error).
 """
 function Base.fetch(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     _ensure_result!(g)
@@ -319,11 +350,17 @@ _client_state_from_status(b::Integer) =
 """
     cancel(goal)
 
-Request cancellation of the goal (§9): issues a `cancel_goal` request to the
-server, which runs its `on_cancel` and (on accept) moves the goal to `CANCELING`
-so its handler's [`checkpoint`](@ref)/[`feedback!`](@ref) throw [`Cancelled`](@ref).
-Returns once the server replies; the goal's terminal state is observed via
-[`fetch`](@ref).
+Request cancellation of a dispatched goal: issue a `cancel_goal` request to the
+server, which runs its `on_cancel` and, on accept, moves the goal to `CANCELING`
+so the handler's [`checkpoint`](@ref)/[`feedback!`](@ref) throw
+[`Cancelled`](@ref). Returns `nothing` once the server replies (a one-shot `get`
+with a 5-second timeout); the goal's terminal state is observed through `fetch`.
+
+The request targets this goal's id (a zeroed id would be the server-side
+cancel-all sentinel). The handle's local state moves to `:canceling`
+unconditionally once the reply lands, so a `cancel` issued after the goal has
+already settled overwrites the terminal `state(goal)`; read the true terminal
+outcome through `fetch`, which is unaffected.
 """
 function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     client = g.client

@@ -17,14 +17,26 @@
 export CompositeParameterServer
 
 """
-    CompositeParameterServer(node, members) <: AbstractParameterServer
+    CompositeParameterServer(node, members) -> CompositeParameterServer
 
-The §4.4 node-level parameter view of a composed node: a façade over the members'
-per-mixin `ParameterServer`s presenting one flat, member-prefixed `ros2 param`
-namespace (`<member>.<field>`), one `/parameter_events` stream, and one set of the
-six standard services ([`wire_parameter_services!`](@ref)). `members` is a vector of
-`member-name => ParameterServer` in declared order (the order `ros2 param list`
-reflects). Reached as `node.parameters` for a composed node.
+The node-level parameter view of a composed node (§4.4): a façade over the
+members' per-mixin [`ParameterServer`](@ref)s that presents one flat,
+member-prefixed `ros2 param` namespace (`<member>.<field>`, dot-separated as
+ROS 2 nests parameters), one `/parameter_events` stream, and one set of the six
+standard parameter services. `members` is a
+`Vector{Pair{Symbol,ParameterServer}}` of member-name => its server in declared
+order — the order `ros2 param list` reflects. Reached as `node.parameters` for
+a composed node.
+
+Each member keeps its own typed `ParameterServer{P_M}` (so a member's own
+`parameters(m)` stays type-stable); the façade is only the node-level aggregate.
+It reuses the schema-independent service core by implementing the same six
+reflection handlers plus [`parameter_names`](@ref). It has no node-level dynamic
+tier — [`dynamic_parameters`](@ref) on it raises `ArgumentError`, directing you
+to a member's own server. A node-level atomic set
+([`set_parameters_atomically`](@ref)) validates every affected member first and
+commits only if all pass, coalescing the per-member commits into one
+`/parameter_events`.
 """
 mutable struct CompositeParameterServer <: AbstractParameterServer
     const node::Any                                       # the shared node-core
@@ -80,7 +92,6 @@ end
 # Each mirrors its `ParameterServer` counterpart (services.jl) but splits the
 # prefixed name and delegates to the owning member server; outputs re-prefix.
 
-"The flat union of every member's declared names as `<member>.<field>`, declared order."
 function parameter_names(s::CompositeParameterServer)
     names = Symbol[]
     for (nm, srv) in s.members

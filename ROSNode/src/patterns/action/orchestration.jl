@@ -2,21 +2,37 @@
 # An orchestrator over the low-level action API: one active goal plus a bounded
 # queue, the common one-actuator pattern. Wire it with
 # `on_accepted = g -> submit!(sched, g)` and `execute!(sched) do goal … end`.
-# Pause works through `checkpoint`: the orchestrator flips a flag the body's
-# `checkpoint` blocks on.
+# Pause gates at the dispatch boundary: the loop parks before dispatching the
+# next goal; a running body is unaffected.
 
 """
-    SingleFlight(; queue=4)
+    SingleFlight(; queue=4) -> SingleFlight
 
-Action orchestrator that runs one accepted goal at a time with a bounded `queue`
-of pending goals. Wire it via `on_accepted = g -> submit!(sched, g)` on an
-[`ActionServer`](@ref) (which should `defer` in `on_goal`), then drive execution
-with `execute!(sched) do goal … end`.
+An action orchestrator that runs one accepted goal at a time behind a bounded
+queue of `queue` pending goals — the common single-actuator pattern. It layers
+over the low-level [`ActionServer`](@ref) API.
 
-`SingleFlight` is a scheduling policy layered over the low-level API, separate
-from the server itself; `pause`, `resume`, and `active_goal` are its own surface.
+Wire it by having `on_goal` return [`defer`](@ref) and setting
+`on_accepted = g -> submit!(sched, g)`, then drive execution with
+`execute!(sched) do goal … end`. `submit!` enqueues a deferred goal (blocking
+when the queue is full, applying backpressure); `execute!` spawns a loop task
+that pulls one goal at a time, runs it through [`execute`](@ref) (the same
+cancellation + settlement wrapper), and waits for it to finish before the next.
+`pause`/`resume` gate at the dispatch boundary — while paused the loop parks
+before dispatching the next goal — and `active_goal` reports the running goal or
+`nothing`. Only `SingleFlight` itself is exported; reach the orchestrator surface
+qualified: `ROSNode.submit!`, `ROSNode.execute!`, `ROSNode.pause`,
+`ROSNode.resume`, `ROSNode.active_goal`.
 
-See the ROS 2 actions concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
+```julia
+sched = SingleFlight(queue = 8)
+server = ActionServer(node, "dock", Dock;
+                      on_goal = _ -> defer(),
+                      on_accepted = g -> ROSNode.submit!(sched, g))
+ROSNode.execute!(sched) do goal
+    # one goal at a time …
+end
+```
 """
 mutable struct SingleFlight
     const queue::Channel{Any}            # pending GoalHandles, bounded
@@ -48,7 +64,7 @@ end
 Run the orchestrator loop: pull one goal at a time off the queue and `execute` it
 with `body(goal)` (the same `Cancelled` + settlement wrapper), waiting for each to
 finish before the next (single-flight). [`pause`](@ref) gates at the dispatch
-boundary: while paused the loop holds the next goal in the queue. Spawned on its
+boundary: while paused the loop holds the next goal undispatched. Spawned on its
 own task; returns the task.
 """
 function execute!(body::Function, sched::SingleFlight)

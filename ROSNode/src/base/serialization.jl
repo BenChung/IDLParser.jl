@@ -9,7 +9,7 @@ using CDRSerialization: CDRReader, CDRWriter, CDRSizeCalculator, read_view,
                         iscompact, materialize, CDRView, CDR_LE
 using Zenoh: ZBytes, Sample, AbstractSample, payload, as_memory
 import ROSZenoh
-# `TypeInfo` is already in scope (core.jl re-exports it); `TypeHash` is not.
+# core.jl already re-exports `TypeInfo`; only `TypeHash` needs importing here.
 using ROSZenoh: TypeHash
 
 # `read`/`write`/`position` are Base; `addValue!` is CDRSerialization's own
@@ -55,18 +55,38 @@ end
 """
     as(x, ::Type{T}) -> T
 
-Boundary cast: re-materialize `x` as the layout-compatible ROS type `T`. For two
-distinct Julia structs that share one wire type (equal RIHS01 ⇒ identical CDR form
-and field layout — e.g. two modules' aliases of `sensor_msgs/msg/Image`), this hands
-`x`'s value across the nominal-type boundary via the exact wire codec, correct by the
-same round-trip invariant the wire relies on. Returns `x` unchanged when
-`typeof(x) === T`. A genuine layout mismatch surfaces as a decode error rather than a
-silent reinterpretation.
+Cast an owned ROS message value `x` to the layout-compatible message type `T` by
+round-tripping it through the CDR wire codec. Two distinct Julia structs that share
+one wire type carry equal RIHS01 type hashes, hence identical CDR field layout — for
+example two modules' separate aliases of `sensor_msgs/msg/Image`. `as` encodes `x` to
+its CDR bytes and decodes those bytes as `T`, handing the value across the
+nominal-type boundary with the same round-trip invariant the transport relies on.
+Returns `x` itself when `typeof(x) === T`, otherwise a fully-owned `T` (the decode
+copies every field out — see `decode_owned`).
 
-Use it when a value built as one alias reaches code expecting another — e.g. a handler
-on a Context whose `home` resolves the wire type to a different struct than the
-handler's body dispatches on: `f(as(msg, ThatType))`. A `CDRView` re-tags zero-copy
-through `CDRSerialization.retag`.
+Layout compatibility is the caller's contract: pass only equal-RIHS01 types. The
+decode is positional, so a mismatched `T` either overruns the payload (an
+`EOFError`/`BoundsError`) or, when its fields happen to fit the bytes, decodes
+silently into garbage.
+
+Use it when a value built as one alias reaches code expecting another. Type
+resolution warns when two distinct Julia structs settle on one RIHS01 wire type at a
+common dependent; handing such a value across that boundary is the canonical case:
+`f(as(msg, ThatType))`.
+
+The argument must be an owned message struct. The signature is unbounded in `x`, so
+a borrowed `CDRView` (from `decode(...; view=true)`) reaches the encoder and throws a
+`BoundsError` from inside it — the view stores its fields in one NamedTuple, so the
+size pass and write pass walk a layout that disagrees with `T`'s. Re-tag a view to a
+sibling type with `CDRSerialization.retag` for the zero-copy path, or copy it
+out with `decode_owned``(view)` first and then cast the owned value.
+
+```julia
+# Illustrative: ImageA and ImageB stand for two modules' aliases of
+# sensor_msgs/msg/Image (equal RIHS01).
+img_b = as(img_a, ImageB)   # owned ImageB carrying img_a's field values
+as(img_a, ImageA)           # returns img_a itself (identity short-circuit)
+```
 """
 as(x, ::Type{T}) where {T} = typeof(x) === T ? x : decode(_encode_to_vector(x), T)
 export as

@@ -3,9 +3,10 @@
 # Each macro generates interface types into the caller module and records them in a
 # module-local global `__ros_static_types__::Vector{Tuple{Type, String}}`: each type
 # paired with its canonical wire `TypeDescription` JSON. The global bakes into a
-# package image, or builds at eval in a script/REPL module. At Context creation these
-# globals are absorbed and each type is bound to its real RIHS01 hash, so keyexpr-only
-# resolution and the type-description server use the precompiled type directly.
+# package image, or builds at eval in a script/REPL module. Module load absorbs it
+# into ROSNode's singleton; Context creation then registers each type bound to its
+# real RIHS01 hash, so keyexpr-only resolution and the type-description server use
+# the precompiled type directly.
 
 # Module-local globals the macros populate: the baked static types, and the
 # `@ros_cache` persistence-dir marker (`""` selects the project default).
@@ -37,7 +38,7 @@ function _intern_static_entry!(@nospecialize(T), json::AbstractString; provenanc
 end
 
 # ROSNode-local singleton that the macros flush into and Context pulls from.
-# `@ros_import`/`@ros_cache` emit a call to `_absorb_static_module!` at module load —
+# `@ros_import`/`@ros_cache` emit a call to `absorb_static_types!` at module load —
 # from a generated `__init__` in precompiled packages, or a top-level call at eval in
 # script/REPL modules — which reads the module's accumulator into here. Entries are
 # interned by type, so repeated absorbs are idempotent.
@@ -52,13 +53,23 @@ const _STATIC_TYPES = _StaticTypeIndex(ReentrantLock(), RegistryEntry[], Set{Any
 """
     absorb_static_types!(mod::Module) -> nothing
 
-Flush a module's baked `@ros_import`/`@ros_cache` declarations (its
-`__ros_static_types__` / `__ros_cache_dir__` globals) into ROSNode's static-type
-singleton. The macros call this at module load. Call it yourself only when the module
-defines its own `__init__`, which the macros defer to. Idempotent.
+Flush a module's baked `@ros_import` / `@ros_cache` / `@ros_message` declarations
+into ROSNode's process-wide static-type singleton, so a later `Context` picks up
+the precompiled interface types and cache opt-ins. The macros emit a call to this
+at module load — from a generated `__init__` in a precompiled package, or a
+top-level call at eval in a script/REPL module. Call it yourself only when your
+module defines its own `__init__` (which the macros otherwise generate for you).
+Idempotent: entries are interned by type, so repeated absorbs of the same module
+are no-ops.
 
-These declarations carry precompiled ROS 2 interface types and their
-`TypeDescription` JSON; see https://design.ros2.org/articles/idl_interface_definition.html.
+It drains three module-local globals when present: `__ros_cache_dir__` (a
+`@ros_cache` opt-in directory), `__ros_authored_types__` (authored
+`@ros_message`-style types, interned by reflection and folded into the module's
+resolve table), and `__ros_static_types__` (each `@ros_import` type paired with
+its canonical `TypeDescription` JSON). Each carries a precompiled ROS 2 interface
+type and its type-description bytes; registration into a `Context` happens later,
+at `Context` creation. A per-type failure is logged and skipped so one bad
+declaration cannot abort the absorb. Returns `nothing`.
 """
 function absorb_static_types!(mod::Module)
     if isdefined(mod, _CACHE_MARKER)
@@ -113,7 +124,7 @@ function absorb_static_types!(mod::Module)
     return nothing
 end
 
-const _absorb_static_module! = absorb_static_types!   # internal alias used by the macros
+const _absorb_static_module! = absorb_static_types!
 
 """
     _register_static_types!(ctx) -> ctx

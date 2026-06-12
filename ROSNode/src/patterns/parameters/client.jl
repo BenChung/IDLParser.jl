@@ -153,7 +153,7 @@ end
 
 Remote `SetParametersAtomically` (§10): apply all of `params` as one transaction,
 returning the `SetParametersResult` as a `(successful::Bool, reason::String)` tuple.
-`params` is any [`_param_pairs`](@ref)-able form — a vector of `name => value`, a
+`params` is any `_param_pairs`-able form — a vector of `name => value`, a
 NamedTuple, or a Dict; values are native Julia (the wire tag is inferred).
 """
 function set_parameters_atomically(c::ParameterClient, params; timeout_ms::Integer = 2000)

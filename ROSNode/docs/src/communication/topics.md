@@ -52,3 +52,16 @@ To define your own message type directly in Julia, see [Authoring Interfaces in 
 ## Next
 
 [Services](services.md) extend the topic model to request/response calls.
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+```@docs
+PublisherHandle
+publish
+SubscriptionHandle
+DynamicSubscriptionHandle
+```

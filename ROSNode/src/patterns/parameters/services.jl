@@ -19,8 +19,22 @@ const PARAMETER_SERVICE_NAMES = (
     "set_parameters_atomically",
 )
 
-# name → its declared `ParameterDescriptor`, a synthesized one for a live dynamic
-# param, or a NOT_SET descriptor for an unknown name.
+"""
+    describe_parameters(server::ParameterServer, names) -> Vector{ParameterDescriptor}
+    describe_parameters(server::CompositeParameterServer, names) -> Vector{ParameterDescriptor}
+    describe_parameters(client::ParameterClient, names; timeout_ms=2000) -> Vector{ParameterDescriptor}
+
+The ROS 2 `DescribeParameters` service: a [`ParameterDescriptor`](@ref) per
+requested name (§10). A declared name returns its schema descriptor; a live
+dynamic name returns a synthesized descriptor (its runtime type, no constraint,
+not read-only); an unknown name returns a `PARAMETER_NOT_SET` descriptor. The
+[`ParameterServer`](@ref) and [`CompositeParameterServer`](@ref) forms reflect
+locally; the [`ParameterClient`](@ref) form is the remote dual over the wire.
+The wire carries name, type, description, and read-only faithfully but encodes
+the numeric-range or choice-set constraint only as the human
+`additional_constraints` string (and carries no default), so a client-decoded
+descriptor reads back with `constraint === nothing` and `default === nothing`.
+"""
 function describe_parameters(s::ParameterServer{P}, names) where {P}
     out = ParameterDescriptor[]
     for name in names
@@ -39,7 +53,18 @@ function describe_parameters(s::ParameterServer{P}, names) where {P}
     return out
 end
 
-# get_types: name → ParameterType tag (NOT_SET for unknowns). Flat over both tiers.
+"""
+    get_parameter_types(server::ParameterServer, names) -> Vector{ParameterType}
+    get_parameter_types(server::CompositeParameterServer, names) -> Vector{ParameterType}
+    get_parameter_types(client::ParameterClient, names; timeout_ms=2000) -> Vector{ParameterType}
+
+The ROS 2 `GetParameterTypes` service: the [`ParameterType`](@ref) tag of each
+requested name (§10), flat over both tiers. An unknown name reads back as
+`PARAMETER_NOT_SET`. The [`ParameterServer`](@ref) form reflects locally (the
+declared field type, or the runtime type of a dynamic value); the
+[`ParameterClient`](@ref) form is the remote dual over the wire, raising
+[`ServiceError`](@ref) on a timeout or error reply.
+"""
 function get_parameter_types(s::ParameterServer{P}, names) where {P}
     map(names) do name
         sym = Symbol(name)
@@ -53,8 +78,19 @@ function get_parameter_types(s::ParameterServer{P}, names) where {P}
     end
 end
 
-# get: name → current value (or `nothing` for an unknown — the service maps it to
-# a NOT_SET `ParameterValue`).
+"""
+    get_parameters(server::ParameterServer, names) -> Vector
+    get_parameters(server::CompositeParameterServer, names) -> Vector
+    get_parameters(client::ParameterClient, names; timeout_ms=2000) -> Vector{Any}
+
+The ROS 2 `GetParameters` service: the current value of each requested name
+(§10). Reads flat over both tiers; an unset or unknown name reads back as
+`nothing` (which the service maps to a `PARAMETER_NOT_SET` `ParameterValue`).
+The [`ParameterServer`](@ref) form reads locally — declared fields from the
+live atomic struct, dynamic ones from the side dict. The
+[`ParameterClient`](@ref) form is the remote dual: one wire call decoded back to
+native Julia values, raising [`ServiceError`](@ref) on a timeout or error reply.
+"""
 function get_parameters(s::ParameterServer{P}, names) where {P}
     map(names) do name
         sym = Symbol(name)
@@ -68,17 +104,53 @@ function get_parameters(s::ParameterServer{P}, names) where {P}
     end
 end
 
-# list: the flat union of names, optionally prefix-filtered. `depth`/separator
-# semantics of `ListParameters` are unimplemented.
+"""
+    list_parameters(server::ParameterServer; prefixes=()) -> Vector{Symbol}
+    list_parameters(server::CompositeParameterServer; prefixes=()) -> Vector{Symbol}
+    list_parameters(client::ParameterClient; prefixes=String[], depth=0, timeout_ms=2000) -> Vector{Symbol}
+
+The ROS 2 `ListParameters` service: the flat union of parameter names,
+optionally kept to those starting with one of `prefixes` (§10). The
+[`ParameterServer`](@ref) form lists declared names then dynamic names; the
+[`CompositeParameterServer`](@ref) form lists every member's `<member>.<field>`;
+the [`ParameterClient`](@ref) form is the remote dual, raising
+[`ServiceError`](@ref) on a timeout or error reply.
+
+A name matches a prefix by plain `startswith` — `"nav"` also matches
+`navigator.max_speed` — looser than rclcpp's separator-bounded match. The
+server implements `DEPTH_RECURSIVE` only: a non-zero `depth` arriving on the
+wire is accepted and ignored, so the full flat list comes back (`depth=0` on
+the client is `DEPTH_RECURSIVE`).
+"""
 function list_parameters(s::ParameterServer; prefixes=())
     names = parameter_names(s)
     isempty(prefixes) && return names
     filter(n -> any(p -> startswith(String(n), String(p)), prefixes), names)
 end
 
-# set (atomic): apply `name => value` pairs as one transaction. Returns the
-# `(successful, reason)` `SetParametersResult` shape, mapping a rejection to
-# `successful=false` so callers over the wire see a result rather than an exception.
+"""
+    set_parameters_atomically(server::ParameterServer, pairs) -> (successful::Bool, reason::String)
+    set_parameters_atomically(server::CompositeParameterServer, pairs) -> (successful::Bool, reason::String)
+    set_parameters_atomically(client::ParameterClient, params; timeout_ms=2000) -> (successful::Bool, reason::String)
+
+The ROS 2 `SetParametersAtomically` service: apply all pairs as one transaction
+(§10). Either every pair commits and the result is `(true, "")`, or the first
+rejection aborts the whole set and the result is `(false, reason)`. A
+constraint, read-only, or `validate` rejection (and an `ArgumentError`, e.g. an
+undeclared name) maps to the `(false, reason)` result; a value that fails to
+coerce to its declared field type throws instead, which a wire caller sees as
+[`ServiceError`](@ref) rather than a `SetParametersResult`.
+
+The [`ParameterServer`](@ref) form commits through one [`transaction`](@ref).
+The [`CompositeParameterServer`](@ref) form groups pairs by member, validates
+every member's candidate first, commits only if all pass, and surfaces the set
+as one combined `/parameter_events`; member servers lock independently, so a
+concurrent mutation racing the two phases can still leave earlier members
+committed while the call reports `(false, reason)`. The
+[`ParameterClient`](@ref) form is the remote dual; values are native Julia (the
+wire tag is inferred) and `params` may be a vector of `name => value`, a
+NamedTuple, or a Dict. Transport failure raises [`ServiceError`](@ref).
+"""
 function set_parameters_atomically(s::ParameterServer{P}, pairs) where {P}
     try
         transaction(s) do p
@@ -94,8 +166,21 @@ function set_parameters_atomically(s::ParameterServer{P}, pairs) where {P}
     end
 end
 
-# set (per-item): each pair is its own transaction, yielding one `SetParametersResult`
-# with independent success/failure (ROS2's `SetParameters`).
+"""
+    set_parameters(server::ParameterServer, pairs) -> Vector{Tuple{Bool,String}}
+    set_parameters(server::CompositeParameterServer, pairs) -> Vector{Tuple{Bool,String}}
+    set_parameters(client::ParameterClient, params; timeout_ms=2000) -> Vector{Tuple{Bool,String}}
+
+The ROS 2 `SetParameters` service: apply each `name => value` pair as its own
+independent transaction, yielding one `(successful, reason)`
+`SetParametersResult` per pair (§10). A pair that violates a constraint, hits
+the read-only gate, or fails `validate` fails on its own while the others may
+succeed; a value that fails to coerce to its declared field type throws instead
+of producing a per-pair result (a wire caller sees [`ServiceError`](@ref), with
+earlier pairs already committed). To apply all pairs all-or-nothing, use
+[`set_parameters_atomically`](@ref). The [`ParameterServer`](@ref) form applies
+locally; the [`ParameterClient`](@ref) form is the remote dual over the wire.
+"""
 function set_parameters(s::ParameterServer{P}, pairs) where {P}
     map(pairs) do (name, value)
         set_parameters_atomically(s, ((name, value),))
@@ -275,7 +360,7 @@ end
 Construct a node with a declared parameter schema `P` (a [`@parameters`](@ref)
 struct), §10. Equivalent to `Node(ctx, name; kwargs...)` plus a `ParameterServer{P}`
 attached at `node.parameters`, with the six standard parameter services and
-`/parameter_events` wired ([`wire_parameter_services!`](@ref)). `overrides` overlays
+`/parameter_events` wired (`wire_parameter_services!`). `overrides` overlays
 startup values (CLI/launch/YAML) onto the schema defaults; `allow_undeclared` opens
 the dynamic tier. Remaining `kwargs` forward to the base [`Node`](@ref) constructor.
 """
@@ -295,5 +380,4 @@ function Node(ctx::Context, name::AbstractString, ::Type{P};
     return node
 end
 
-"The undeclared/dynamic parameter dict of a node's parameter server (§10)."
 dynamic_parameters(node::Node) = dynamic_parameters(node.parameters)

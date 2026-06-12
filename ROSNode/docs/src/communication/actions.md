@@ -88,3 +88,32 @@ state(gh)                        # :canceling, then :canceled once it settles
 ## Next
 
 [Parameters](parameters.md) configure a node's behavior over the same wire. See also [Services](services.md) for request/response calls and [Interface Types](../foundations/interface-types.md) for how imported and authored action types share one wire identity.
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+```@docs
+ActionServer
+ActionClient
+GoalHandle
+send
+state
+fetch
+feedback!
+checkpoint
+iscancelled
+succeed
+abort
+execute
+cancel
+accept
+reject
+defer
+action_server_matched
+SingleFlight
+ActionTypeSupport
+GoalState
+```

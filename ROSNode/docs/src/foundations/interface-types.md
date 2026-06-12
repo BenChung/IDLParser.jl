@@ -66,3 +66,13 @@ That shared identity is what makes ROSNode wire-compatible with ROS 2 — see [I
 ## Next
 
 Carry one of these types onto a channel in [Topics](../communication/topics.md). For how a type's value reaches your handler, see [The Runtime Model](runtime-model.md).
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+```@docs
+as
+```

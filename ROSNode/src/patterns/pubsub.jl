@@ -25,12 +25,15 @@ export Publisher, Subscription, publish
 """
     PublisherHandle{T}
 
-A publisher for message type `T` on a topic ([ROS 2 topics](https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html), §6).
-Wraps the generic [`Entity`](@ref) (id, liveliness token, Zenoh `Publisher` route)
-and owns the monotone attachment sequence counter (§3.4). `close`-able; dies with
-its node.
+The handle returned by `Publisher(node, topic, T)` — a long-lived publisher for
+ROS 2 message type `T`. Send with [`publish`](@ref). Wraps the generic
+[`Entity`](@ref) (id, liveliness token, Zenoh data route) and owns the per-endpoint
+attachment sequence counter (§3.4). `isopen`/`close`-able and reaped when its node
+closes.
 
-Constructed via the `Publisher(node, topic, T)` spelling — see [`Publisher`](@ref).
+The second type parameter pins the concrete Zenoh route (a plain or Advanced
+publisher, set by the QoS durability) so the `put` stays monomorphic; callers only
+spell `PublisherHandle{T}`.
 """
 mutable struct PublisherHandle{T, R}
     const entity::Entity
@@ -38,17 +41,6 @@ mutable struct PublisherHandle{T, R}
     @atomic seq::Int64           # per-endpoint attachment sequence_number (§3.4)
 end
 
-"""
-    Publisher(node, topic, ::Type{T}; qos=default_qos(),
-              congestion_control=nothing, priority=nothing) -> PublisherHandle{T}
-
-Declare a publisher for ROS message type `T` on `topic` (§6). Materializes the
-`ROSZenoh.EndpointEntity`, declares its liveliness token and the Zenoh data route
-(`topic_keyexpr`, §2.2), and tracks it on `node` so `close(node)` reaps it.
-
-`Publisher` here is the `EndpointKind` enum instance given a call-method; the kind
-is fixed by the spelling. Publish with [`publish`](@ref).
-"""
 function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          qos::QosProfile=default_qos(),
                          congestion_control=nothing, priority=nothing,
@@ -69,17 +61,36 @@ function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
 end
 
 """
-    publish(pub::PublisherHandle, msg)
+    publish(pub::PublisherHandle{T}, msg::T) -> nothing
 
-Serialize and publish `msg` (§3.3): one exact-size `encode` pass, then a Zenoh
-`put` that *borrows* the heap buffer (no copy into transport). Each message
-carries the per-message attachment `(sequence_number, source_timestamp,
-source_gid)` (§3.4): the sequence increments per publisher, the timestamp is
-publish-time wall ns (distinct from `header.stamp`, §7), the gid is the entity's.
+Serialize and publish `msg` on `pub`'s topic (§3.3). One exact-size `encode` pass
+produces the CDR payload, then the Zenoh `put` transmits by borrowing that heap
+buffer (zero-copy into transport). Returns `nothing`.
 
-Publishing returns immediately as a no-op in three cases: the publisher is closed,
-its node is closed, or the node is gated inactive (§14.2 lifecycle gate — a managed
-publisher drops the message).
+Each message carries the rmw_zenoh per-message attachment `(sequence_number,
+source_timestamp, source_gid)` (§3.4): the sequence increments once per publisher
+per call, the timestamp is publish-time wall-clock nanoseconds — distinct from a
+message's own `header.stamp` (§7) — and the gid identifies this endpoint. A
+subscriber's `on_message_lost` listener reads the sequence to detect gaps.
+
+Publishing is a no-op (returns `nothing` without sending) in three cases: the
+publisher is closed, its node is closed, or the node is gated inactive — a managed
+node outside the `Active` lifecycle state drops the message (the §14.2 gate).
+
+When the intra-process short-circuit is enabled (§15.1), every same-Context
+subscriber matching the topic, type, and QoS receives the message directly —
+skipping serialize, the Zenoh hop, and decode. Those subscribers open their Zenoh
+subscriber with a local-origin filter (`local_origin`), so the direct
+delivery is their only copy of this publish; the `put` still goes out and reaches
+subscribers in other Contexts normally.
+
+Passing a `msg` whose type differs from `T` throws an `ArgumentError` naming the
+expected and actual types.
+
+```julia
+pub = Publisher(node, "/chatter", std_msgs.msg.String)
+publish(pub, std_msgs.msg.String(data = "hello"))
+```
 """
 function publish(pub::PublisherHandle{T}, msg::T) where {T}
     e = pub.entity
@@ -122,52 +133,16 @@ entity(pub::PublisherHandle) = pub.entity
 """
     SubscriptionHandle{T}
 
-A subscription for message type `T` on a topic ([ROS 2 topics](https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html), §6).
-Wraps the generic [`Entity`](@ref), whose consumer task (started by
-`declare_subscription!`, §4) decodes each sample and runs the stored handler per
-the `concurrency` policy. `close`-able; dies with its node.
-
-Constructed via the `Subscription(node, topic, T) do msg … end` spelling — see
-[`Subscription`](@ref).
+The handle returned by `Subscription(node, topic, T) do msg … end` — a subscription
+for ROS 2 message type `T`. Wraps the generic [`Entity`](@ref), whose consumer task
+(the §4 dispatch runtime) decodes each received sample and runs the stored handler
+per the subscription's `concurrency` policy. `isopen`/`close`-able and reaped when
+its node closes.
 """
 mutable struct SubscriptionHandle{T}
     const entity::Entity
 end
 
-"""
-    Subscription(node, topic, ::Type{T}; qos=default_qos(), view=Owned(),
-                 concurrency=Serial()) do msg … end -> SubscriptionHandle{T}
-
-Declare a subscription for ROS message type `T` on `topic` and start its dispatch
-runtime (§4/§6). The `do`-block handler runs once per received message, in the
-form chosen by `view` (a [`ViewMode`](@ref)):
-
-  - `Owned()` (default) — a fully-owned message: storable / forwardable /
-    spawnable, no lifetime caveats (§3.1).
-  - `Checked()` — a zero-copy `CDRView` aliasing the payload (valid only for the
-    handler's duration, §3.2; `collect`/`decode_owned` to keep it), with a runtime
-    guard so a view that escapes the handler throws `BorrowError` instead of
-    reading freed memory.
-  - `Unchecked()` — the same zero-copy view, unguarded: zero-copy and
-    zero-allocation; an escaping view is undefined behaviour. Validate under
-    `Checked()`, then switch.
-
-`view=true`/`view=false` are accepted as shorthand for `Checked()`/`Owned()`.
-
-`match=:weak` opts into a *weak-static* subscription: it declares type `T` in the
-graph and wildcard-matches the topic, so an off-type sample reaches a per-sample
-backstop — a wire type/version other than `T` fires `on_type_mismatch` (§12.2) and
-the sample is dropped. The default `:exact` matches only `T`'s keyexpr, so the wire
-delivers only matching-type samples.
-
-`concurrency` is `Serial()` (one handler at a time on a single sticky thread,
-order preserved, no user-side locks needed — the default, D3) or `Parallel(n)`
-(up to `n` handlers on OS threads, order not preserved, opt-in, D2). A handler
-throw is logged, never fatal.
-
-`Subscription` is the `EndpointKind` enum instance given a call-method; the kind
-is fixed by the spelling.
-"""
 function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T};
                             qos::QosProfile=default_qos(), view::Union{Bool, ViewMode}=Owned(),
                             concurrency::Concurrency=Serial(),
@@ -213,33 +188,16 @@ entity(sub::SubscriptionHandle) = sub.entity
 """
     DynamicSubscriptionHandle
 
-A keyexpr-only subscription (§11/D5): no compile-time message type — the data route
-is wildcarded and each sample's type is resolved at runtime (registry → cache →
-ament → wire `GetTypeDescription`). Wraps the generic [`Entity`](@ref); `close`-able
-and dies with its node. Constructed via the type-less
-`Subscription(node, topic) do msg … end` spelling.
+The handle returned by the type-less `Subscription(node, topic) do msg … end` — a
+subscription whose message type is resolved at runtime (§11/D5). The data route is
+wildcarded and each sample's type is resolved per sample (registry, then project
+cache, then ament, then a wire `GetTypeDescription` query). Wraps the generic
+[`Entity`](@ref); `isopen`/`close`-able and reaped when its node closes.
 """
 mutable struct DynamicSubscriptionHandle
     const entity::Entity
 end
 
-"""
-    Subscription(node, topic; qos=default_qos(), concurrency=Serial()) do msg … end
-        -> DynamicSubscriptionHandle
-
-The type-less subscription (§11/D5 S5): resolve the message type at runtime from
-each sample (no compile-time `T`). The handler receives the **real generated type**
-`msg::T` (not a boxed `Any`) — decode and the handler call cross the world-age
-boundary via `invokelatest`, so the handler *body* stays type-stable and fast while
-only the dispatch boundary pays the hop. The first sample of a type pays discovery
-+ codegen; the rest are fast registry lookups.
-
-`view` is the [`ViewMode`](@ref) (`Owned()` default; `Checked()`/`Unchecked()` for
-a zero-copy `CDRView{T}` aliasing the payload, guarded vs. bare — `true`/`false`
-shorthand accepted). (Graduating to `Subscription(node, topic, T)` is still faster
-— it drops the per-sample type resolution entirely — but a view mode removes the
-materialization either way.)
-"""
 function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     qos::QosProfile=default_qos(),
                                     view::Union{Bool, ViewMode}=Owned(),
@@ -281,18 +239,92 @@ entity(sub::DynamicSubscriptionHandle) = sub.entity
 # do-block form desugars to a function-first call, so the handler-carrying
 # `Subscription` arity takes `f` first (the `Timer(f, …)` precedent, §6).
 
-# Publisher(node, topic, T; …) — no handler.
+"""
+    Publisher(node::Node, topic, ::Type{T};
+              qos=default_qos(), congestion_control=nothing, priority=nothing,
+              warmup=nothing, warmup_sync=nothing, warmup_sample=nothing) -> PublisherHandle{T}
+
+Declare a publisher for ROS 2 message type `T` on `topic` and return a long-lived
+`PublisherHandle{T}` (§6). Send messages with [`publish`](@ref).
+
+`Publisher` is the `EndpointKind` enum value (re-exported from ROSZenoh); this
+call-method gives it the constructor spelling `Publisher(node, topic, T)`,
+paralleling `Timer(f, …)`. The kind is fixed by the spelling; a bare
+`Subscription(node, topic, T)` in this 3-arg position raises an `ArgumentError`
+demanding a do-block handler, and the other kinds raise too.
+
+Construction resolves `topic` against the node's namespace, builds the
+`ROSZenoh.EndpointEntity` (id, kind, topic, type identity, QoS), declares its
+liveliness token so peers discover the endpoint, records it in the local discovery
+graph (§12), and declares the Zenoh data route on the topic keyexpr (§2.2). The
+handle is tracked on `node`, so `close(node)` reaps it; `close(pub)` undeclares the
+route and withdraws the token on its own.
+
+`qos` is the ROS 2 QoS profile. `reliability` maps onto the Zenoh publisher
+(`:reliable`/`:best_effort`); `durability=:transient_local` upgrades the route to a
+Zenoh AdvancedPublisher whose sample cache, sized to the history depth, hands
+late-joining subscribers the latched history (the rmw_zenoh transient-local path,
+D4). `congestion_control` and `priority` pass through to the Zenoh publisher.
+
+`warmup` selects the §D8 precompilation policy for the publish/encode chain, so the
+chain is already compiled when the first real `publish` runs: `:precompile` (the
+default — a side-effect-free anchor), `:execute` (publish a synthesized sample once
+with the wire `put` suppressed), or `:off`. `warmup_sync=true` blocks the
+constructor until warm; `warmup_sample` supplies a representative message for
+`:execute`. Each defaults to the node's policy.
+
+```julia
+pub = Publisher(node, "/chatter", std_msgs.msg.String)
+publish(pub, std_msgs.msg.String(data = "hello"))
+```
+"""
 (k::EndpointKind)(node::Node, topic::AbstractString, ::Type{T}; kwargs...) where {T} =
     k === Publisher ? _make_publisher(node, topic, T; kwargs...) :
     k === Subscription ?
         throw(ArgumentError("Subscription requires a handler: `Subscription(node, topic, T) do msg … end`")) :
         throw(ArgumentError("$(k) is not a pub/sub kind (see Service/Client for §8)"))
 
-# Subscription(node, topic) do msg … end — the type-less (dynamic, D5 S5) form.
 # Distinct arity from both the no-handler form above (node, topic, ::Type) and the
 # typed handler-form in service.jl (handler, node, name, ::Type), and the arg types
-# don't overlap (here arg2 is the Node), so there's no method ambiguity. Only
-# Subscription has a type-less form — a Service needs a type to know request/response.
+# don't overlap (here arg2 is the Node), so there's no method ambiguity.
+"""
+    Subscription(node::Node, topic;
+                 qos=default_qos(), view=Owned(), concurrency=Serial(),
+                 warmup=nothing, warmup_sync=nothing) do msg … end
+        -> DynamicSubscriptionHandle
+
+Declare a dynamic subscription whose message type is resolved at runtime from each
+incoming sample (§11/D5), returning a [`DynamicSubscriptionHandle`](@ref). Use it
+when the topic's type is unknown ahead of time (a recorder, a bridge); graduate to
+`Subscription(node, topic, T)` once the type is known for the min-copy fast path.
+
+This call-method is the type-less spelling of the `Subscription` enum value,
+distinct from the typed `Subscription(node, topic, T) do … end`; `Subscription` is
+the only kind with a type-less form — a `Service` needs its type to know
+request/response. The data route wildcard-matches every type published on the
+topic; each sample carries its own `(name, hash)`, resolved through the registry,
+then the project cache, then ament, then a wire `GetTypeDescription` query.
+
+The handler receives the **real generated type** `msg::T`, not a boxed `Any`.
+Decode and the handler call cross the world-age boundary via `invokelatest`, so
+only that dispatch boundary pays the hop while the handler body stays type-stable.
+The first sample of each type pays type discovery plus codegen; subsequent samples
+are fast registry lookups. Resolution and codegen run on a dispatch worker task off
+the receive thread, so codegen's GC completes while the receiver keeps draining.
+
+`view` (a [`ViewMode`](@ref)) chooses owned delivery (`Owned()`, the default) or a
+zero-copy `CDRView{T}` aliasing the payload (`Checked()`/`Unchecked()`, or the
+`true`/`false` shorthand). `concurrency` is `Serial()` or `Parallel(n)` as for the
+typed form. Warm-up is deferred to first sight of each runtime type, and `:execute`
+degrades to `:precompile` here (running a discovered handler on a synthesized
+sample is the D9 manifest's job).
+
+```julia
+sub = Subscription(node, "/chatter") do msg
+    @info "heard a \$(typeof(msg))" msg
+end
+```
+"""
 (k::EndpointKind)(handler, node::Node, topic::AbstractString; kwargs...) =
     k === Subscription ? _make_dynamic_subscription(handler, node, topic; kwargs...) :
         throw(ArgumentError("$(k) has no type-less form; only `Subscription(node, topic) do … end` \

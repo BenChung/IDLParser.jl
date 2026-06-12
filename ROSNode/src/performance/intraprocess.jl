@@ -30,9 +30,9 @@ using ROSZenoh: ROSZenoh, qos_compatible
 using Zenoh: Localities
 
 # ── intra-process toggle ──────────────────────────────────────────────────────
-# On by default; a process can opt the whole mechanism out. The DESIGN names a
-# per-Context `intra_process=false` flag; the `Context` struct doesn't carry one
-# yet (context.jl is a lower layer), so the switch is process-global here. When the
+# Off by default (see the header); opt in process-wide. The DESIGN names a
+# per-Context `intra_process` flag; the `Context` struct doesn't carry one yet
+# (context.jl is a lower layer), so the switch is process-global here. When the
 # flag lands on `Context`, `intra_process_enabled(ctx)` is the single seam to
 # consult it instead.
 const _INTRA_PROCESS = Ref(false)
@@ -247,8 +247,8 @@ _qos_match(pub_qos::QosProfile, sub_qos::QosProfile) =
 # the publisher's `msg` into the subscriber's declared type. A genuinely *different* wire
 # type (different name or hash) fails `_types_match` and is dropped here — graph.jl's §12.2
 # detector flags that mismatch. (Same-session loopback is suppressed via `local_origin`, so
-# a matched local sub is served *only* by this direct path — hence we must deliver it, incl.
-# a sibling-alias sub that the old `{T}/{T}` constraint silently dropped → message loss.)
+# a matched local sub is served *only* by this direct path — every matching sub, sibling
+# aliases included, must be delivered here or the message is lost.)
 function _deliverable(pub::PublisherHandle, ls::LocalSubscription)
     isopen(ls.entity) || return false
     _types_match(pub.entity.endpoint.type_info, _local_type(ls)) &&
@@ -265,7 +265,7 @@ end
 # Delivery mirrors the §4 dispatch: `Serial()` runs the handler inline on the
 # publisher's task (preserving order; the publisher already owns the call), and
 # `Parallel(n)` spawns a task per message. A handler throw is logged, never fatal —
-# one bad delivery must not break the publisher (same contract as `_run_handler`).
+# one bad delivery must not break the publisher (the §4 dispatch runtime's contract).
 # Unlike the cross-process view path there is no `with_memory`/`BorrowError`: the
 # object is GC-backed, so escape is safe; only in-place mutation is shared state.
 
@@ -281,7 +281,7 @@ policy. The CDR serialize, the Zenoh hop, and the decode are all skipped.
 Returns `true` if at least one local subscriber was delivered to. The caller
 (`publish`) **still** issues the Zenoh `put` afterwards so any *remote*
 subscribers are served (the local subs suppress their own loopback via
-[`local_origin`](@ref), so they are not double-delivered). A no-op returning
+`local_origin`, so they are not double-delivered). A no-op returning
 `false` when the short-circuit is disabled or no local sub matches.
 """
 function deliver_local(pub::PublisherHandle{T}, msg::T) where {T}

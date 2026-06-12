@@ -2,7 +2,7 @@
 # One close-able handle backing every pattern (publisher/subscription/service/
 # client). It allocates the entity id, builds the `ROSZenoh.EndpointEntity`,
 # declares the liveliness token, and — for the data-plane kinds — declares the
-# data route (a `Zenoh.Publisher` for Publisher, a FIFO `SubscriberHandler` +
+# data route (a `Zenoh.Publisher` for Publisher, a FIFO-channel subscriber +
 # consumer task for Subscription). Service/Client carry the entity + token only;
 # their Zenoh queryable/querier wiring is the §8 layer's, attached via `wire`.
 #
@@ -12,14 +12,33 @@
 """
     Entity
 
-The generic close-able endpoint handle behind every §6 pattern. Owns the
-`ROSZenoh.EndpointEntity` (id + kind + topic + type + QoS), its liveliness token,
-and its data route (a Zenoh `Publisher` or a `SubscriberHandler` + consumer task,
-depending on `kind`). Created via [`make_entity`](@ref); `close` undeclares the
-route, withdraws the token, and drops the endpoint from the graph.
+The generic close-able endpoint handle behind every §6 pattern (publisher,
+subscription, service, client). It owns the wire entity (`ROSZenoh.EndpointEntity`:
+id, kind, topic, type info, QoS), the entity's liveliness token, the 16-byte
+`source_gid` stamped on its attachments (§3.4), and its data route — a Zenoh
+publisher for a Publisher; a FIFO-channel Zenoh subscriber (the advanced variant
+for transient_local, whose declaration issues the latched-history query, D4) plus
+a consumer task for a Subscription; or `nothing` for a Service/Client, whose
+queryable/querier is wired by the pattern layer into the `wire` slot.
 
-Pattern types (the publisher/subscription/service objects) hold an `Entity` so
-the id/token/route/graph lifecycle lives here once.
+An `Entity` is built and registered by `make_entity`, which allocates the
+id, declares the liveliness token, and tracks the entity on its node; the pattern
+layer then attaches the data route. Pattern types (the user-facing publisher/
+subscription/service/client objects) hold an `Entity` so the id/token/route/graph
+lifecycle lives in one place.
+
+`close(entity)` undeclares the route (which terminates a Subscription's consumer
+task), detaches any pattern-layer wiring in `wire`, withdraws the liveliness
+token, and drops the endpoint from the discovery index; it is idempotent, and
+`isopen(entity)` reports liveness. A transient_local subscription's Entity also
+carries a re-latch thunk, fired on a managed node's Inactive→Active transition
+to re-run its latched-history query, deduplicated against already-delivered
+samples (D4).
+
+Dispatch on a Subscription Entity is gated by the node's lifecycle state (§14.2):
+samples are delivered while the node is Active and dropped otherwise; a
+LifecycleNode's control surface is exempt. Use [`dispose`](@ref) to release a
+single entity before its node closes.
 """
 mutable struct Entity
     const node::Node
@@ -27,9 +46,10 @@ mutable struct Entity
     const lv_key::String                 # liveliness keyexpr (graph index key)
     const gid::NTuple{16, UInt8}         # source_gid for attachments (§3.4)
     _lv_token::Any                       # Zenoh LivelinessToken
-    # The data route: a `Zenoh.Publisher` (Publisher), a `SubscriberHandler`
-    # (Subscription, the FIFO channel sub), or `nothing` (Service/Client — their
-    # queryable/querier is wired by §8 and stored in `wire`).
+    # The data route: a `Zenoh.Publisher` (Publisher), a FIFO-channel subscriber
+    # handler — advanced variant under transient_local — (Subscription), or
+    # `nothing` (Service/Client — their queryable/querier is wired by §8 and
+    # stored in `wire`).
     _route::Any
     # The subscription consumer task (Subscription only); `nothing` otherwise.
     _consumer::Union{Task, Nothing}

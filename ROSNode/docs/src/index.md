@@ -70,3 +70,9 @@ Start with [Getting Started](getting-started.md): start a router, open a context
 **Interop**
 
 - [Interoperating with ROS 2](interop/ros2.md) — exchange topics, services, actions, and parameters with C++ and Python ROS 2 nodes.
+
+## The module
+
+```@docs
+ROSNode.ROSNode
+```

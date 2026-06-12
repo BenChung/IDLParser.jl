@@ -3,15 +3,26 @@
 # `@every`/`@hears`/`@serves`/`@runs` author DOES reactions; lifecycle hooks are plain
 # methods dispatched on the mixin; `@node` assembles members and `run` instantiates.
 #
-# Phase 1 (DESIGN §11.1): `@mixin` + the HAS/DOES surface (publisher / subscription /
-# timer), lifecycle methods, single-member `@node`, and `run` (standalone). Deferred to
-# later increments: `@serves`/`@runs`, multi-mixin assembly + the DI protocol (§4),
-# member-name namespacing (§4.4), the typed `P_Foo`/`E_Foo` codegen + §10 parameter
-# services (§3.5), `container`/`LoadNode` (§7), and `retime!`/drift detection (§3.4).
+# Deferred: `retime!`/drift detection for `:param` timer rates (§3.4), and `:client`
+# port materialisation for `@uses` (§3.1).
 #
 # The macros accumulate specs into per-type registries at load (the authored-types
 # deferred pattern, typesupport/authored.jl); `run` reads them to materialize a node.
 
+"""
+    abstract type Component end
+
+Supertype of every `@mixin` type (DESIGN-COMPONENTS.md §2). A mixin is a cohesive chunk
+of a node — its own mutable state, the ports authored onto its type, and the lifecycle
+hooks dispatched on it; a node is a collection of mixins sharing one node-core.
+
+`Component` carries the default lifecycle hooks ([`configure`](@ref) /
+[`activate`](@ref) / [`deactivate`](@ref) / [`cleanup`](@ref) / [`on_error`](@ref), all
+no-ops) and the default DI evidence ([`provides`](@ref) / [`requires`](@ref), both
+empty), so a bare mixin needs none of them spelled out. Subtype it with
+`@mixin struct M … end` — the macro injects the hidden runtime slot the reflective
+accessors ([`entities`](@ref) / [`parameters`](@ref)) resolve against.
+"""
 abstract type Component end
 
 export Component, @mixin, @param, @publishes, @uses, @every, @hears, @serves, @runs,
@@ -95,22 +106,40 @@ end
         field::T = default
         …
     end
+    @mixin struct M{B}
+        dep::B               # free type parameter, supplied by `construct`
+        field::T = default
+    end
 
-Declare a mixin (DESIGN §2): a **mutable, state-only** struct subtyping
-[`Component`](@ref) (so reactions can update fields), with a hidden runtime slot the
-framework fills at construction. Entities and parameters are *not* fields — they
-attach to the type with `@param`/`@publishes`/`@every`/`@hears` and are reached
-reflectively via [`parameters`](@ref) / [`entities`](@ref). Every field needs a
-default unless `construct` is overridden to supply it (the mixin is built with
-`construct`, default `M()`).
+Declare a mixin (DESIGN §2): a mutable, state-only struct subtyping
+[`Component`](@ref), expanded with `Base.@kwdef`. Reactions dispatch on the type and
+mutate its fields, so the struct holds only state — ports and parameters attach to the
+*type* with `@param`/`@publishes`/`@uses`/`@every`/`@hears`/`@serves`/`@runs` and are
+reached reflectively through [`entities`](@ref) / [`parameters`](@ref), never as
+fields.
 
-A mixin may be parametric (`struct Guard{B}`) for type-stable dependency injection: a
-free-type-parameter field (`battery_src::B`, no default) is supplied by `construct` —
-the DI form `construct(::Type{Guard}, node, deps…)` for composed injection, plus an
-explicit zero-dep `construct(::Type{Guard}, node)` choosing a default instantiation if
-the mixin should also load standalone (a parametric mixin without one raises a clear
-error). Reactions annotate the bare base (`m::Guard`, never `m::Guard{…}`) — the base
-covers every instantiation.
+The macro injects a hidden `__rt__` runtime slot (defaulting to `nothing`), registers
+the type in the mixin spec registry, registers it as a loadable node kind by name (so
+a container's `load_node` can instantiate it, §4.3/§7), and installs the module's
+single load `__init__` hook. That hook both drains the module's authored types
+(`@ros_message` / inline `@serves`/`@runs`) and generates each mixin's parameter
+schema, so a module mixing `@mixin` with authored-type macros covers both under one
+hook. Every declared field needs a default unless [`construct`](@ref) is overridden to
+supply it; with all fields defaulted the mixin builds as `M()`.
+
+A mixin may be parametric (`struct M{B}`) for type-stable dependency injection: a
+free-type-parameter field with no default is filled by `construct`. Supply the DI form
+`construct(::Type{M}, node, deps…)` for composed injection, and — to also load
+standalone — an explicit zero-dep `construct(::Type{M}, node)` choosing a default
+instantiation (a parametric mixin without one raises a clear error from
+[`construct`](@ref)). Reactions and declarations annotate the bare base (`m::M`, never
+`m::M{…}`); the base covers every instantiation, and the reaction macros reject a
+curly-annotated `m::M{…}`.
+
+Fields named `__rt__` collide with the injected slot. A component module extending the
+framework lifecycle/DI generics must `import ROSNode: configure, activate, deactivate,
+cleanup, on_error, requires, construct` (or qualify them) — a bare definition under
+`using ROSNode` defines a shadowing function the framework never calls.
 """
 macro mixin(structexpr)
     (structexpr isa Expr && structexpr.head === :struct) ||
@@ -151,10 +180,28 @@ end
 #   @param M  "doc"  name::T = default [∈ lo..hi | ∈ (a,b)] [|> readonly]
 
 """
-    @param M  [\"doc\"]  field::T = default  [∈ lo..hi | ∈ (choices…)]  [|> readonly]
+    @param M  ["doc"]  field::T = default
+    @param M  ["doc"]  field::T = default ∈ lo..hi
+    @param M  ["doc"]  field::T = default ∈ (choice₁, choice₂, …)
+    @param M  ["doc"]  field::T = default |> readonly
 
-Attach a parameter to mixin `M` (§3.1) — the §10 `@parameters` field grammar. Read it
-live in a reaction with `parameters(m).field`.
+Declare a ROS 2 parameter on mixin `M` (§3.1), reusing the `@parameters` field grammar.
+The optional leading string is the parameter's description (surfaced through its
+`ParameterDescriptor`). `∈ lo..hi` constrains to a closed numeric range; `∈ (a, b, …)`
+(or a `[…]` list) constrains to an explicit choice set. `|> readonly` marks the
+parameter read-only — a startup override still applies, runtime sets are rejected
+(§10).
+
+The parameter joins the mixin's generated schema `P_M` and is served by the node-core's
+`ParameterServer{P_M}`, so the node is `ros2 param`-driveable and a set is
+transactional. Read it live in a reaction with `parameters(m).field` — a type-stable
+field load against the current snapshot. A default is mandatory (the grammar errors
+otherwise). The macro expands to the registration side effect and returns `nothing`.
+
+```julia
+@param ImageCapture "capture rate" fps::Int64 = 30 ∈ 1..120
+@param ImageCapture device::String = "/dev/video0"
+```
 """
 macro param(M, args...)
     (doc, fieldstmt) = length(args) == 2 ? (args[1], args[2]) :
@@ -171,10 +218,23 @@ end
 # ── HAS ports: @publishes / @uses (§3.1) ────────────────────────────────────────
 
 """
-    @publishes M name :: T  [on \"topic\"]
+    @publishes M  name :: T
+    @publishes M  name :: T  on "topic"
 
-Attach an output port to mixin `M` (§3.1). The topic defaults to `name`; `on \"…\"`
-overrides it. Drive it from a reaction with `publish(entities(m).name, msg)`.
+Declare an output port (a publisher) on mixin `M` (§3.1) for message type `T`. The
+topic defaults to the port identifier `name`; `on "topic"` overrides it with an
+explicit ROS topic name. This is a HAS port — a typed handle the mixin holds, with no
+authored handler.
+
+At the configure step the framework materialises a `Publisher` on the node-core; drive
+it from a reaction with `publish(entities(m).name, msg)`. The materialised publisher
+honours the node's lifecycle gating, so a managed node only emits while Active. The
+macro expands to the registration side effect.
+
+```julia
+@publishes ImageCapture image :: sensor_msgs.msg.Image
+@publishes Heartbeat   beat  :: std_msgs.msg.UInt32  on "~/heartbeat"
+```
 """
 macro publishes(M, decl, on=nothing, wire=nothing)
     name, T = _parse_port_decl(decl)
@@ -184,10 +244,21 @@ macro publishes(M, decl, on=nothing, wire=nothing)
 end
 
 """
-    @uses M name :: T  [on \"topic\"]
+    @uses M  name :: T
+    @uses M  name :: T  on "name"
 
-Attach a client port (service/action client) to mixin `M` (§3.1). Drive it from a
-reaction via the handle, `entities(m).name`.
+Declare a client port (a service or action client) on mixin `M` (§3.1) for type `T`.
+The wire name defaults to the port identifier `name`; `on "…"` overrides it. This is a
+HAS port — a handle the mixin drives from its reactions and awaits a reply on (§3.5).
+
+Construct the client directly for now — `ServiceClient(node, name, T)` or
+`ActionClient(node, name, A)` against the node-core: `@uses` records a `:client` port
+spec, but port materialisation does not yet build a handle for the kind — it warns and
+skips, so `entities(m).name` is absent until materialisation is wired.
+
+```julia
+@uses Detector planner :: NavigateToPose on "/planner"
+```
 """
 macro uses(M, decl, on=nothing, wire=nothing)
     name, T = _parse_port_decl(decl)
@@ -216,12 +287,29 @@ end
 # `run` materialises, wiring the entity's data route to the reaction.
 
 """
-    @every rate function f(m::M) … end
+    @every rate    function f(m::M) … end
+    @every :param  function f(m::M) … end
 
-A timer on mixin `M` firing `f(m)` at `rate` Hz (§3.2). `rate` is a literal Hz number,
-or `:param` to take the rate from parameter `param` (drift on a later change is
-detected + warned, §3.4 — not auto-applied; rewire with `@on_parameter`, a later
-increment).
+Declare a timer on mixin `M` that fires the reaction `f(m)` at `rate` Hz (§3.2), a
+DOES port. `rate` is a literal Hz number, or a `Symbol` `:param` naming one of `M`'s
+parameters, whose value at materialisation sets the period. The macro both defines the
+dispatched method `f` and records a timer port pointing at it.
+
+The timer is built paused at the configure step and started at the activate step, so a
+tick cannot fire before the node is configured or while a managed node is gated below
+Active. Reach the live `Timer` handle through `entities(m)` under the reaction's name.
+
+A `:param` rate is read once at materialisation and then fixed: changing the parameter
+afterward does not re-time the timer, and no drift warning is emitted (the §3.4
+detect-and-warn plus `retime!`/`@on_parameter` rewiring are deferred). A `:param`
+naming a non-parameter fails at materialisation, as a field-access error on the
+parameter snapshot.
+
+```julia
+@every :fps function tick(m::ImageCapture)
+    publish(entities(m).image, grab_frame(m.dev))
+end
+```
 """
 macro every(rate, f)
     fname, M, _ = _parse_reaction_sig(f, 1)
@@ -233,11 +321,26 @@ macro every(rate, f)
 end
 
 """
-    @hears [\"topic\"] function f(m::M, msg::T) … end
+    @hears           function f(m::M, msg::T) … end
+    @hears "topic"   function f(m::M, msg::T) … end
 
-A subscription on mixin `M` running `f(m, msg)` per message (§3.2). The topic defaults
-to the function name; a leading string literal overrides it. `T` is the second
-argument's annotation.
+Declare a subscription on mixin `M` that runs `f(m, msg)` once per received message
+(§3.2), a DOES port. The message type `T` is taken from the second argument's
+annotation. The topic defaults to the function name; a leading string literal
+overrides it. The macro both defines the dispatched method `f` and records a
+subscription port pointing at it.
+
+At the configure step the framework materialises a `Subscription` on the node-core
+whose callback invokes `f` with the live `m`. Dispatch is gated by the node lifecycle,
+so a managed node only delivers messages to the handler while Active. The first
+argument must be annotated with the bare mixin base (`m::M`); a curly instantiation
+`m::M{…}` is rejected.
+
+```julia
+@hears function odom(m::ImageCapture, msg::Odometry)
+    m.pose = msg.pose.pose
+end
+```
 """
 macro hears(a, b=nothing)
     wire, f = b === nothing ? (nothing, a) : (String(a), b)
@@ -251,16 +354,35 @@ macro hears(a, b=nothing)
 end
 
 """
-    @serves [\"name\"] function f(m::M, req::SrvReqType) … end                       # existing type
-    @serves [\"name\"] function f(m::M, a::T, …)::@NamedTuple{out::U, …} … end          # author inline
+    @serves          function f(m::M, req::SrvReqType) … end                  # existing type
+    @serves "name"   function f(m::M, req::SrvReqType) … end
+    @serves          function f(m::M, a::A, …)::@NamedTuple{out::U, …} … end  # author inline
+    @serves "name"   function f(m::M, a::A, …)::@NamedTuple{out::U, …} … end
 
-A service on mixin `M` (§3.2), in either of `@ros_service`'s two type-sources. Without
-a return annotation, `f(m, req)` serves the **existing** service type `SrvReqType` (a
-generated `*_Request`) and returns the matching `*_Response`. With a `::@NamedTuple{…}`
-return, the arguments after `m` are the **authored** request fields and the return is
-the response — the macro generates `f_Request`/`f_Response` (package from `@ros_package`,
-else the module name) and a splatting adapter. The service name defaults to the
-function name; a leading string overrides it.
+Declare a service server on mixin `M` (§3.2), a DOES port, in either of
+`@ros_service`'s two type-sources. The service name defaults to the function name; a
+leading string literal overrides it (e.g. `"~/set_mode"`).
+
+Without a return annotation `f(m, req)` serves an **existing** service type:
+`req::SrvReqType` is a generated `*_Request`, and `f` returns the matching
+`*_Response`. With a `::@NamedTuple{…}` return the arguments after `m` are the
+**authored** request fields and the return is the response — the macro generates
+`f_Request`/`f_Response` (package from the module's `@ros_package`, else the
+snake-cased module name), registers them, and emits a splatting adapter that calls
+`f(m, fields…)` and converts the returned `@NamedTuple` to the response struct. Either
+way the framework materialises a `Service` on the node-core whose callback runs the
+handler with the live `m`; service dispatch honours lifecycle gating.
+
+The first argument must be the bare mixin base (`m::M`); a curly instantiation is
+rejected. The existing-type form needs at least `req` after `m`; the inline form needs
+the `@NamedTuple` return.
+
+```julia
+@serves function arm(m::ImageCapture, enable::Bool)::@NamedTuple{success::Bool}
+    m.enabled = enable
+    (success = enable,)
+end
+```
 """
 macro serves(a, b=nothing)
     wire, f = b === nothing ? (nothing, a) : (String(a), b)
@@ -313,15 +435,40 @@ function _emit_serves_inline(caller::Module, pkg::AbstractString, fname::Symbol,
 end
 
 """
-    @runs [\"name\"] function f(m::M, goalfield::T, …, fb::FeedbackSink{@NamedTuple{…}})::@NamedTuple{…} … end
+    @runs          function f(m::M, goal₁::T, …, fb::FeedbackSink{@NamedTuple{…}})::@NamedTuple{…} … end
+    @runs "name"   function f(m::M, goal₁::T, …, fb::FeedbackSink{@NamedTuple{…}})::@NamedTuple{…} … end
 
-An action server on mixin `M` (§3.2), authored inline like `@ros_action`: the
-arguments after `m` (minus the `FeedbackSink`) are the Goal fields, the sink's
-`@NamedTuple` gives the Feedback fields, and the `@NamedTuple` return is the Result.
-The macro generates the action's Goal/Result/Feedback + protocol-wrapper types
-(package from `@ros_package`, else the module name) and runs `f(m, goalfields…, fb)`
-per accepted goal; `fb((…,))` publishes feedback and is a cancel checkpoint. The
-action name defaults to the function name; a leading string overrides it.
+Declare an action server on mixin `M` (§3.2), a DOES port, authored inline like
+`@ros_action`. After `m`, the arguments other than the `FeedbackSink` are the Goal
+fields, the sink's `@NamedTuple` parameter gives the Feedback fields, and the
+`@NamedTuple` return is the Result. The macro generates the action's
+`_Goal`/`_Result`/`_Feedback` plus the five protocol-wrapper types
+(`_SendGoal_Request`/`_Response`, `_GetResult_Request`/`_Response`,
+`_FeedbackMessage`), registers them (package from `@ros_package`, else the snake-cased
+module name), and wires the action type-support to `typeof(f)`. The action name
+defaults to the function name; a leading string overrides it.
+
+The framework runs `f(m, goalfields…, fb)` once per accepted goal. Calling
+`fb((field = …,))` publishes a Feedback message and is a cancellation checkpoint — it
+throws when the goal is being canceled, settling it CANCELED. A normal return settles
+the goal SUCCEEDED with the converted Result; a throw settles it ABORTED. The first
+argument must be the bare mixin base; the handler needs a `::@NamedTuple{…}` return
+and exactly one `FeedbackSink` parameter.
+
+Known gap: the materialised action server does not consult the node lifecycle gate —
+it accepts goals, runs them, and publishes feedback/status in every lifecycle state.
+
+```julia
+@runs function fib(m::Counter, order::Int32,
+                   fb::FeedbackSink{@NamedTuple{partial_sequence::Vector{Int32}}})::@NamedTuple{sequence::Vector{Int32}}
+    seq = Int32[0, 1]
+    for i in 3:order
+        push!(seq, seq[end] + seq[end-1])
+        fb((partial_sequence = seq,))
+    end
+    (sequence = seq,)
+end
+```
 """
 macro runs(a, b=nothing)
     wire, f = b === nothing ? (nothing, a) : (String(a), b)
@@ -426,33 +573,101 @@ end
 # ── lifecycle (§3.3): plain methods, defaulting to no-ops on Component ──────────
 
 """
-    configure(m) / activate(m) / deactivate(m) / cleanup(m) / on_error(m)
+    configure(m::M)
 
-Lifecycle hooks for a mixin (§3.3), each defaulting to a no-op on [`Component`](@ref).
-`configure` acquires resources, `cleanup` releases them; under the action three-way a
-hook may return `failure` to revert or throw to enter error processing (a later
-increment wires the managed control surface).
+Lifecycle hook run when the node transitions into the configured state (§3.3) — the
+ROS 2 managed-node `on_configure` step, mapped to each member. Acquire resources here
+(open devices, load models) from parameters read via `parameters(m)`. Defaults to a
+no-op on [`Component`](@ref); override it for your mixin (importing or qualifying the
+generic). Member ports are materialised immediately before this hook runs, so
+`entities(m)` is available.
+
+Returning normally settles the transition SUCCESS; throwing enters error processing
+(the node's `on_error` fan-out). For a managed node it runs at the real `configure`
+transition; for an unmanaged node it runs at construction (autostart), in
+dependency-first order across members. [`cleanup`](@ref) is the paired release.
 """
 configure(::Component) = nothing
+
+"""
+    activate(m::M)
+
+Lifecycle hook run when the node transitions into the active state (§3.3) — the ROS 2
+managed-node `on_activate` step, mapped to each member. The framework starts the
+member's (paused) timers immediately before this hook runs, after which ports are live
+(a managed node's dispatch gate opens). Defaults to a no-op on [`Component`](@ref);
+override it to start streaming or enable behavior. Throwing enters error processing.
+Runs in dependency-first order across members.
+"""
 activate(::Component) = nothing
+
+"""
+    deactivate(m::M)
+
+Lifecycle hook run when the node transitions out of the active state back to inactive
+(§3.3) — the ROS 2 managed-node `on_deactivate` step, mapped to each member in reverse
+dependency order. Defaults to a no-op on [`Component`](@ref); override it to pause
+behavior. Ports stay materialised; a managed node's dispatch gate closes, silencing
+publishes, subscription dispatch, timer ticks, and service dispatch while inactive.
+Throwing enters error processing.
+"""
 deactivate(::Component) = nothing
+
+"""
+    cleanup(m::M)
+
+Lifecycle hook run when the node tears down (§3.3) — the ROS 2 managed-node
+`on_cleanup`/`on_shutdown` step, mapped to each member in reverse dependency order.
+Release what [`configure`](@ref) acquired (close devices, free handles). Defaults to a
+no-op on [`Component`](@ref); override it for your mixin.
+
+Runs at most once per `configure`: it is guarded on the member's materialised ports,
+so it fires only for a member that was configured, and a second teardown trigger is a
+no-op. The framework closes the member's port handles after this hook. A throwing
+`cleanup` is caught and logged, so one member's failure does not block the others'
+teardown. Because materialisation precedes `configure`, a member whose own `configure`
+threw still has its `cleanup` run — write it to tolerate partially-acquired state
+(e.g. guard `m.handle === nothing`).
+"""
 cleanup(::Component) = nothing
+
+"""
+    on_error(m::M)
+
+Lifecycle hook run when a transition's processing throws (§3.3) — the ROS 2
+managed-node `on_error` step, mapped to each member. Use it to recover or reset member
+state. Defaults to a no-op on [`Component`](@ref); override it for your mixin.
+
+Known gaps in the current fan-out: a member's throwing `on_error` halts the remaining
+members' recovery and lands the node Finalized, and error processing runs only these
+hooks — member `cleanup` is skipped and ports stay open, so resources `configure`
+acquired persist on the error path.
+"""
 on_error(::Component) = nothing
 
 # ── reflective accessors (§3.5) ─────────────────────────────────────────────────
 
-"""
-    entities(m::Component) -> NamedTuple
-
-The mixin's materialised port handles, keyed by name (§3.5): `entities(m).image` is
-the live `Publisher`, `entities(m).tick` the `Timer`. Reached reflectively through the
-hidden runtime binding; errors if read before the ports are materialised.
-"""
 function _ports_value(m::Component)
     rt = getfield(m, :__rt__)
     rt === nothing && error("entities($(typeof(m))): not materialised yet (no node-core)")
     return (rt::MixinRuntime).ports
 end
+
+"""
+    entities(m::Component) -> NamedTuple
+
+The mixin's materialised port handles, keyed by port identifier (§3.5):
+`entities(m).image` is the live `Publisher`, `entities(m).tick` the `Timer`,
+`entities(m).<service>` the `Service`. Drive each through its own typed methods
+(`publish`, …).
+
+Resolved reflectively through the mixin's hidden runtime binding, so the struct stays
+state-only. Reading it before the ports are materialised (before the node is
+configured) errors with a clear message; reactions run only after materialisation.
+First materialisation generates a type-stable per-type method
+(`entities(m::M)::PortsNT`), so `entities(m).field` is an inlinable typed field load
+against the captured concrete NamedTuple type.
+"""
 entities(m::Component) = _ports_value(m)
 
 # Type-stable per-mixin `entities`. The ports NamedTuple's concrete type is fixed per
@@ -471,15 +686,6 @@ function _ensure_entities_accessor!(::Type{M}, ports) where {M}
     return nothing
 end
 
-"""
-    parameters(m::Component) -> P_M
-
-The mixin's live parameter snapshot (§3.5): a typed `@parameters`-style struct
-generated from the mixin's `@param`s, read type-stably as `parameters(m).fps`. Backed
-by the node-core's §10 `ParameterServer`, so the node is `ros2 param`-driveable and a
-set is transactional. (For a single-mixin node the node schema *is* `P_M`; multi-mixin
-slicing/namespacing, §4.4, is a later increment.)
-"""
 # The live parameter snapshot for `m` — dynamically typed. `_ensure_schema!` generates
 # a per-mixin `parameters(m::M)` that branches on the unset slot (reusing this error)
 # then asserts `::ParameterServer{P_M}` for a statically-dispatched `current`; this
@@ -489,6 +695,23 @@ function _param_value(m::Component)
     rt === nothing && error("parameters($(typeof(m))): not materialised yet (no node-core)")
     return current((rt::MixinRuntime).pserver)
 end
+
+"""
+    parameters(m::Component) -> P_M
+
+The mixin's live parameter snapshot (§3.5): a typed `@parameters`-style struct `P_M`
+generated from `M`'s [`@param`](@ref) declarations, read type-stably as
+`parameters(m).field`. Backed by the node-core's `ParameterServer{P_M}`, so the node
+is `ros2 param`-driveable and a set is transactional (the returned struct is a
+complete, never half-applied snapshot).
+
+Resolved reflectively through the hidden runtime binding; reading it before the
+node-core is attached errors clearly. Schema generation emits a type-stable per-mixin
+method `parameters(m::M)` (returning `P_M`), so `parameters(m).fps` is a typed field
+load. For a single-mixin node the node schema *is* `P_M` and parameters are
+un-prefixed; a composed `@node` member-namespaces them at the node level (§4.4) while
+`parameters(m)` stays mixin-local.
+"""
 parameters(m::Component) = _param_value(m)
 
 # ── construction hook (§4.2) ────────────────────────────────────────────────────
@@ -498,10 +721,25 @@ parameters(m::Component) = _param_value(m)
 
 """
     construct(::Type{M}, node) -> M
+    construct(::Type{M}, node, deps…) -> M
 
-Build a mixin instance (§4.2). Defaults to `M()` (every field defaulted). Override to
-inject dependencies (`construct(::Type{M}, node, deps…)`); a parametric mixin defines
-the zero-dep form explicitly to choose its default instantiation for standalone loads.
+Build a mixin instance during node assembly (§4.2). The default
+`construct(::Type{M}, node)` returns `M()` for a plain mixin (every field defaulted).
+Override it to inject dependencies: a mixin that `requires` interfaces receives the
+resolved sibling providers as `deps…`, positionally in `requires` order, and stores
+them — typically into a free type parameter for type-stable access.
+
+`node` is the node-core handle. An injected provider is constructed-but-unconfigured
+at this point (its `configure` runs later, in dependency-first order), so store it and
+use it from `configure` onward. A parametric mixin (free type parameter) needs an
+explicit zero-dep `construct(::Type{M}, node)` to choose its standalone instantiation;
+without one the default raises a clear error directing you to define it or compose it
+via `@node`.
+
+```julia
+requires(::Type{Detector}) = (PoseSource,)
+construct(::Type{Detector}, node, src) = Detector(src = src)
+```
 """
 construct(::Type{M}, node) where {M <: Component} = _zero_dep_construct(M)
 
@@ -525,12 +763,22 @@ _zero_dep_construct(M::UnionAll) = error(
 abstract type ComponentInterface end
 
 """
-    @interface Name  method(_)::T  …
+    @interface Name
+    @interface Name  method₁(_)::T  method₂(_)  …
 
-Declare an interface (§4.1): a NAME — a marker type `Name <: ComponentInterface` — for
-the generic functions a provider must define. `@provides`/`requires` resolve against
-this marker; a provider satisfies it by defining the listed methods (the method list
-is documentation here; an expansion-time backing check is a later increment).
+Declare a dependency interface (§4.1): a NAME for a set of generic functions, emitted
+as an empty marker struct `Name <: ComponentInterface`. [`@provides`](@ref) /
+[`requires`](@ref) resolve against this marker — provision is Holy-trait evidence, not
+subtyping (a mixin may provide any number) and not method existence.
+
+The method signatures after the name are documentation only: the macro discards them,
+and a provider satisfies the interface by defining the methods and declaring
+`@provides M Name` — the resolver trusts the declaration (an expansion-time backing
+check is a later increment, §4.1).
+
+```julia
+@interface PoseSource  last_pose(_)::Pose
+```
 """
 macro interface(name, methods...)
     return esc(quote
@@ -540,28 +788,48 @@ macro interface(name, methods...)
 end
 
 """
-    provides(::Type{M}) -> Tuple of interfaces
+    provides(::Type{M}) -> Tuple
 
-The interfaces mixin `M` provides (§4.1) — Holy-trait evidence, set with `@provides`.
-Empty by default.
+The interfaces mixin `M` provides (§4.1) — Holy-trait evidence consulted by the node
+assembler to resolve sibling [`requires`](@ref) edges. Defaults to the empty tuple
+`()`; set it with [`@provides`](@ref) (or define a method directly). Each element is
+an `@interface` marker type.
 """
 provides(::Type) = ()
 
 """
-    requires(::Type{M}) -> Tuple of interfaces
+    requires(::Type{M}) -> Tuple
 
-The interfaces mixin `M` depends on (§4.2). Empty by default; override to declare
-dependencies, which the node assembler resolves to sibling providers, toposorts, and
-injects into `construct(::Type{M}, node, deps…)`. Pin an ambiguous provider with
-`I => MemberOrType`.
+The interfaces mixin `M` depends on (§4.2). Defaults to the empty tuple `()`; override
+it to declare dependencies. At assembly the node resolver maps each required interface
+to the single sibling member that provides it (excluding `M` itself, so a mixin cannot
+satisfy its own requirement), forms a dependency edge, toposorts the members, and
+injects the resolved providers positionally into `construct(::Type{M}, node, deps…)`
+in `requires` order.
+
+Zero providers is an unsatisfied-dependency error; more than one is an ambiguity
+error. Known gap: the pin-pair disambiguation DESIGN §4.2 describes (an entry
+`I => :member` or `I => MixinType`) is not yet honored — the resolver treats every
+entry as a bare interface type, so a `Pair` entry raises the unsatisfied-dependency
+error. Resolve an ambiguity by restructuring which members provide the interface.
 """
 requires(::Type) = ()
 
 """
-    @provides M Interface…
+    @provides M  Interface₁  Interface₂  …
 
 Declare that mixin `M` provides the given interfaces (§4.1) — emits the Holy-trait
-evidence `provides(::Type{M}) = (Interface…,)`. A mixin may provide any number.
+evidence `provides(::Type{M}) = (Interface₁, …)`. A mixin may provide any number of
+interfaces.
+
+The declaration is taken on trust: a check that `M` defines each interface's methods
+is a later increment (§4.1). The node assembler reads this evidence to resolve
+siblings' [`requires`](@ref) to providers (§4.2).
+
+```julia
+last_pose(m::ImageCapture) = m.pose
+@provides ImageCapture PoseSource
+```
 """
 macro provides(M, ifaces...)
     return esc(:( $(GlobalRef(@__MODULE__, :provides))(::Type{$M}) = ($(ifaces...),) ))

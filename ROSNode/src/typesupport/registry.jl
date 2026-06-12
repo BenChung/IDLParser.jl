@@ -34,29 +34,36 @@ export TypeRegistry, RegistryEntry, register_type!, lookup_type,
        enable_project_cache!, disable_project_cache!, absorb_static_types!
 
 # ── registry entry shape (§11) ────────────────────────────────────────────
-# The value stored in the Context's `(name, hash)`-keyed table. Holds the IL (the
-# hub form), the wire `TypeDescription` blob (source of truth for persistence and
-# the `~/get_type_description` server, §15), a provenance tag, and — once realized
-# — the generated `Module` and the type within it reached via `invokelatest`.
 
 """
-    RegistryEntry
+    RegistryEntry(info::TypeInfo, il; td=nothing, provenance::Symbol=:wire)
 
-A single type registry record (§11). Keyed in the [`TypeRegistry`](@ref) by
-`(type_name, RIHS01-hash)`. ROS 2 interface/type-description concepts:
-<https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html>. Carries:
+One record in the [`TypeRegistry`](@ref), keyed there by `(type_name,
+RIHS01-hash)` (§11). Holds everything the runtime knows about a single ROS 2
+interface type
+(https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html):
 
-- `info` — the `TypeInfo` (qualified name + hash) this entry answers for.
-- `il` — the `ROSMessages.IL` (`RMessage`/`RService`/`RAction`), the hub form
-  every consumer reads from.
-- `td` — the wire `TypeDescriptionMsg` (main + referenced closure), the source of
-  truth for persistence and the type-description service; `nothing` for a
-  statically-acquired type, which has no wire description.
-- `provenance` — `:static` / `:ament` / `:wire` / `:cache`, where the type came
-  from (orthogonal to how it is used).
-- `mod` — the generated `Module` once codegen has run (lazy; `nothing` until
-  realized), and `type` the concrete struct within it — reached via
-  `Base.invokelatest` because it is born in a newer world age.
+- `info::TypeInfo` — the qualified name plus RIHS01 hash this entry answers for.
+- `il` — the `ROSMessages.IL` (`RMessage` / `RService` / `RAction`), the hub
+  form every consumer (codegen, hashing, persistence, the type-description
+  server) reads from.
+- `td::Union{TypeDescriptionMsg, Nothing}` — the wire type description (main
+  type plus its referenced closure), the source of truth for persistence and
+  the `~/get_type_description` service (§15). Present for `:wire` and `:cache`
+  entries (the received blob) and for `:static` / `:authored` entries (the
+  baked or reflected description they were generated from); `nothing` for an
+  `:ament` entry, which is parsed straight from installed `.msg` / `.srv` /
+  `.action` text and so has no wire description.
+- `provenance::Symbol` — where the type came from: `:static`, `:authored`,
+  `:ament`, `:wire`, or `:cache`.
+- `mod::Union{Module, Nothing}` and `type` — the generated module and the
+  concrete struct within it, populated by `realize!` at first use (a
+  statically-interned entry arrives with them already bound to the compiled
+  type). Callers reach them via `Base.invokelatest`, since codegen runs in a
+  newer world age than the compiled dispatcher.
+
+The convenience constructor defers codegen (`mod`/`type` start `nothing`) and
+defaults `provenance` to `:wire`.
 """
 mutable struct RegistryEntry
     const info::TypeInfo

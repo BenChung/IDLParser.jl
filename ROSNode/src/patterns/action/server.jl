@@ -6,20 +6,59 @@
 # node-close for free; the queryable/publisher routes hang off `entity.wire`.
 
 """
-    ActionServer{A, G, R, F}
+    ActionServer(node, name, A; on_goal=accept-all, on_cancel=accept-all, on_accepted, qos=default_qos())
+    ActionServer(node, name, A; concurrency=Serial(), on_goal=…, on_cancel=…) do goal … end
 
-A ROS 2 action server for action type `A` (§9). Owns the three protocol services
-(`send_goal`/`cancel_goal`/`get_result`), the `feedback` + `status` topics, the
-goal table (live goals + the result cache), and the user callbacks
-(`on_goal`/`on_cancel`/`on_accepted`). `close`-able; dies with its node, joining
-outstanding goal tasks (incl. detached post-cancel cleanup) up to the Context
-drain timeout (§14).
+A ROS 2 action server for action type `A`, declared on `node` at the resolved
+name `name`. Owns the three action-protocol services (`send_goal`, `cancel_goal`,
+`get_result`), the `feedback` and `status` topics, the goal table (live goals
+plus the settled-result cache), and the user callbacks. The three sub-messages of
+`A` — `Goal` (`G`), `Result` (`R`), `Feedback` (`F`) — drive the handler
+signatures.
 
-The goal/feedback/result lifecycle and cancellation model follow the upstream ROS 2
-action concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
+Two construction forms share one constructor:
 
-Construct via [`ActionServer`](@ref)'s constructor — the low-level three-callback
-form or the high-level `do`-block sugar.
+- High-level (`do`-block): the body is the goal's execution. The framework spawns
+  it wrapped in the cancellation + fail-safe settlement machinery, scheduled per
+  `concurrency` — `Serial()` (the default) runs one goal at a time on a sticky
+  cooperative task in acceptance order, `Parallel` runs each body on its own OS
+  thread.
+- Low-level: supply `on_accepted=callback`; you own when, whether, and where each
+  accepted goal runs (the `GoalHandle` is handed to you). Pair this with
+  [`SingleFlight`](@ref) or your own orchestrator.
+
+Pass either a `do`-block body or `on_accepted=`, never both; a server with
+neither raises `ArgumentError`. `on_goal(request)` returns
+[`accept`](@ref)/[`reject`](@ref)/[`defer`](@ref) (default accept-all);
+`on_cancel(goal)` returns `accept`/`reject` (default accept).
+
+The three services key off rmw_zenoh SERVICE-level type names and RIHS01 hashes —
+`<pkg>/action/<A>_SendGoal`, `…_GetResult`, and `action_msgs/srv/CancelGoal` fill
+the type+hash segments of each data keyexpr — matching a real ROS 2 peer;
+`feedback` and `status` carry their own wire types (`<A>_FeedbackMessage`,
+`action_msgs/GoalStatusArray`). Construction requires `A` to be generated with
+`@ros_msgs` so the protocol-wrapper structs exist; a bare `@ros_msg` raises
+`ArgumentError`.
+
+`close`-able and idempotent; closing awaits outstanding goal tasks (including
+detached post-cancel cleanup) up to the Context drain timeout before withdrawing
+each sub-endpoint's liveliness token and Zenoh route — a goal task that overruns
+the timeout is left running detached (close warns and proceeds) — and the server
+dies with its node.
+
+```julia
+server = ActionServer(node, "fibonacci", Fibonacci) do goal
+    seq = Int32[0, 1]
+    for _ in 1:goal.request.order
+        feedback!(goal, Fibonacci_Feedback(; partial_sequence = seq))
+        push!(seq, seq[end] + seq[end-1])
+    end
+    Fibonacci_Result(; sequence = seq)
+end
+```
+
+Follows the ROS 2 actions concept:
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
 mutable struct ActionServer{A, G, R, F}
     const node::Node
@@ -50,24 +89,6 @@ mutable struct ActionServer{A, G, R, F}
     @atomic open::Bool
 end
 
-"""
-    ActionServer(node, name, A; on_goal=…, on_cancel=…, on_accepted, qos=default_qos())
-    ActionServer(node, name, A; concurrency=Serial(), on_goal=…, on_cancel=…) do goal … end
-
-Declare an action server for action type `A` on `name` (§9). Two forms share one
-constructor:
-
-- **Low-level** — supply `on_accepted` (and optionally `on_goal`/`on_cancel`);
-  you own when/whether/where each accepted goal runs (the `GoalHandle` is yours).
-- **High-level** (`do`-block) — the body *is* the execution; the framework
-  spawns it wrapped in the `Cancelled` + fail-safe settlement machinery, one at a
-  time (`concurrency = Serial()`, default) or up to `n` concurrent
-  (`Parallel(n)`, §4).
-
-`on_goal(request)` returns [`accept`](@ref)/[`reject`](@ref)/[`defer`](@ref)
-(default accept-all); `on_cancel(goal)` returns `accept`/`reject` (default
-accept). The five sub-endpoints are declared on `node` and reaped with it.
-"""
 function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                              on_goal::Function = _default_on_goal,
                              on_cancel::Function = _default_on_cancel,
@@ -450,11 +471,19 @@ end
     execute(goal) do goal … end
     execute(goal, body)
 
-Run `body(goal)` as this goal's execution, wrapped in the `Cancelled` + fail-safe
-settlement machinery (§9) — the low-level/`defer` counterpart of the high-level
-`do`-block. Spawns the body on its own task (tracked for the server drain) and
-transitions the goal to `EXECUTING`. Use it from an `on_accepted` that deferred,
-or from an orchestrator.
+Run `body(goal)` as this goal's execution, wrapped in the cancellation +
+fail-safe settlement machinery — the low-level and `defer` counterpart of the
+high-level `do`-block server. Spawns the body on its own OS-thread task (tracked
+so `close(server)` joins it on drain); the task transitions the goal to
+`EXECUTING` and publishes the status change before running the body. Returns
+`nothing` immediately; the body runs concurrently.
+
+Use it from an `on_accepted` callback that chose to defer, or from an
+orchestrator such as [`SingleFlight`](@ref). Each call spawns a fresh task, so
+two `execute` calls on different goals run simultaneously — the caller owns any
+one-at-a-time policy. The body's normal return settles `SUCCEEDED`, a thrown
+[`Cancelled`](@ref) settles `CANCELED`, any other throw settles `ABORTED` and
+logs.
 """
 function execute(body::Function, g::GoalHandle{A, G, R, F}) where {A, G, R, F}
     g._task = Threads.@spawn _run_goal_body(g, body, Parallel(Inf))

@@ -54,3 +54,48 @@ The zero-copy `view` modes pair with a static typed subscription, `Subscription(
 
 - [Topics](../communication/topics.md)
 - [Runtime Type Discovery](discovery.md)
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+### View modes and concurrency
+
+```@docs
+ViewMode
+Owned
+Checked
+Unchecked
+Concurrency
+Serial
+Parallel
+```
+
+### Graph introspection
+
+```@docs
+endpoints
+publishers_info
+subscriptions_info
+count_publishers
+count_subscribers
+topic_names_and_types
+node_names
+service_is_ready
+wait_for_service
+wait_for_action_server
+wait_for_graph_change
+```
+
+### Delivery events
+
+```@docs
+on_type_mismatch
+on_qos_incompatible
+on_message_lost
+TypeMismatch
+QosIncompatible
+MessageLost
+```

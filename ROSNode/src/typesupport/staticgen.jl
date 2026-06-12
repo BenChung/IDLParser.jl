@@ -24,11 +24,10 @@ using ROSMessages: ROSMessages, IL
 export @ros_import, @ros_cache, flush_type_cache
 
 # `_STATIC_GLOBAL` / `_CACHE_MARKER` (the module-local globals the macros populate)
-# are typesupport.jl's, already in module scope.
+# are static_types.jl's, already in module scope.
 
 # ── name → source-file resolution (ament + vendored), with transitive closure ──
 
-# Interface file extension for a qualifier.
 _iface_ext(qual::AbstractString) = qual == "srv" ? ".srv" : qual == "action" ? ".action" : ".msg"
 
 # Resolve one fully-qualified `(package, qualifier, bare)` to a source path: BYO
@@ -392,51 +391,76 @@ end
     @ros_import from="dir" "pkg/qual/Name" ...
 
 Statically generate ROS 2 interface types ([`.msg`/`.srv`/`.action`](https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html))
-resolved by name from ament/vendored sources into the calling module, the static
-counterpart to dynamic discovery. Each name is a package
-(`"sensor_msgs"` — all its interfaces) or a fully-qualified type
-(`"sensor_msgs/msg/Imu"`); the transitive reference closure (e.g. `std_msgs/Header`)
-is pulled automatically. Sources are found in ROSNode's vendored dir and, when inside
-a sourced ROS2 env, `AMENT_PREFIX_PATH`.
+resolved by name into the calling module — the static counterpart to runtime
+discovery. Each argument names either a package (`"sensor_msgs"`, all of its
+interfaces) or a fully-qualified type (`"sensor_msgs/msg/Imu"`). The transitive
+reference closure (every referenced type, e.g. `std_msgs/Header`) is pulled in
+automatically so generation is self-contained.
 
-**BYO interfaces (`from=`).** Pass `from="dir"` (or `from=["a", "b"]`) to add local
-search roots for your own `.msg`/`.srv`/`.action` files, then reference them by name
-like any other type — they go through the *same* registration pipeline (RIHS01,
-single-copy aliasing, the §13 server), unlike raw `@ros_msg`/`@ros_msgs` which only
-emit structs. A root is a *parent-of-packages* dir laid out the ROS way,
-`<root>/<pkg>/<qual>/<Name>.<ext>` (e.g. `interfaces/robot_msgs/msg/Widget.msg` →
-`@ros_import from="interfaces" "robot_msgs/msg/Widget"`). Per name the search order is
-`from`-roots (in order) → vendored → ament, so a BYO package can supply types a
-sourced env lacks or shadow one it has; a dep not found in any root falls through the
-same way. Relative roots resolve against the source file (like `@ros_msg`). The roots'
-files are tracked as precompile dependencies, so edits re-trigger generation.
+Names resolve against, in order, any `from=` roots, then ROSNode's vendored
+interface dir, then `AMENT_PREFIX_PATH` (an installed, sourced ROS 2 environment).
+A name that resolves to no source — explicit or transitively referenced — is warned
+and skipped, so the rest still generates; the macro errors when nothing resolves at
+all, naming the search roots it tried. Generation runs at macro expansion /
+precompile time: the types land at `<pkg>.<qual>.<Name>` and bake into the module
+image, so a loaded module starts with them already compiled.
 
-Generation reuses the same pipeline as [`@ros_msg`](@ref) (structs +
-`include_dependency`); types land at `<pkg>.<qual>.<Name>`. They are additionally
-**auto-registered** (real RIHS01) on Context creation, so a keyexpr-only
-`Subscription(node, "/t")` uses the precompiled type with no runtime codegen, and the
-type-description server can serve their descriptions. Resolution always reads
-ament/vendored directly, the durable source, so there is no JSON cache to keep in sync.
+# Binding
+Resolution mirrors Julia's `import`. An explicitly-named fully-qualified type binds
+its bare leaf, like `import Mod: Name`: a message binds its struct —
+`@ros_import "sensor_msgs/msg/Image"` gives `Image` (and `sensor_msgs.msg.Image`) —
+and a service or action binds its request/goal namespace module (`Name.Request`,
+`Name.Goal`). A bare package binds the module, like `import Mod` —
+`@ros_import "sensor_msgs"` gives `sensor_msgs`, used as `sensor_msgs.msg.X`.
+Transitively-pulled dependencies stay reachable only by their `pkg.qual.Name` path,
+keeping the leaf namespace to the types you named. Naming two types with the same
+leaf in one call errors, pointing at `as`.
 
-**Binding (Julia-`import`-like).** A fully-qualified *message* type binds its bare
-leaf, like `import Mod: Name` — `@ros_import "sensor_msgs/msg/Image"` gives `Image`
-directly (and `sensor_msgs.msg.Image` too, since `sensor_msgs` is in scope). A bare
-package binds the module, like `import Mod` — `@ros_import "sensor_msgs"` gives
-`sensor_msgs` (use `sensor_msgs.msg.X`). Transitively-pulled deps stay reachable only
-by path (`pkg.qual.Name`), keeping the leaf namespace to the types you named. Two
-imports binding the same leaf error, pointing at `as`.
+`… as Alias` binds the imported message type to `Alias` directly — for a short handle,
+or to disambiguate two same-named but different-RIHS01 versions. The `as` form accepts
+only a fully-qualified message type (`"pkg/msg/Name"`); a service or action has no
+single struct to bind and errors. A generated `as` type is isolated in a hidden
+submodule so its `pkg.qual.Name` path cannot collide with another import; a provided
+one binds straight through.
 
-**Single-copy:** any type whose `(name, RIHS01)` is already provided by a loaded
-module — the vendored canonical copy, or one a dependency `@ros_import`ed (see
-[`provided_type`](@ref)) — is *aliased* to that one struct rather than re-generated.
-So transitively-pulled commons are shared, a second import re-aliases instead of
-redefining, and a type package C imports is reused by downstream A and B (provided C
-is loaded when they expand the macro).
+# Registration
+Generated types are auto-registered with their real RIHS01 hash when a `Context` is
+created, so a keyexpr-only `Subscription(node, "/t")` decodes into the precompiled
+type with no runtime codegen, and the `~/get_type_description` server can answer for
+them. Resolution reads ament/vendored sources — the durable source — directly, so
+there is no JSON cache to keep in sync (contrast [`@ros_cache`](@ref)).
 
-`… as Alias` binds the imported type to `Alias` instead of its `pkg.qual.Name` path —
-for a short handle, or to disambiguate a name collision (two same-named but
-different-RIHS01 versions). A *generated* `as` type is isolated in a hidden submodule
-so its path can't clash with another import; a *provided* one binds straight through.
+# Single-copy aliasing
+Any type whose `(name, RIHS01)` is already provided by a loaded module — the vendored
+canonical copy, or one a dependency already `@ros_import`ed (see `provided_type`)
+— is aliased to that single struct, so one wire type maps to one Julia struct.
+Transitively-pulled commons are shared, a repeated import re-aliases the same struct,
+and a type a package C imports is reused by downstream packages A and B (provided C
+is loaded when they expand the macro). Actions always generate, since their implicit
+protocol types are not provided.
+
+# BYO interfaces (`from=`)
+Pass `from="dir"` (or `from=["a", "b"]`) to add local search roots for your own
+interface files, then reference them by name like any other type. They go through the
+same registration pipeline (RIHS01, single-copy aliasing, the `~/get_type_description`
+server) that ament/vendored types do. A root is a *parent-of-packages* dir laid out
+the ROS way, `<root>/<pkg>/<qual>/<Name>.<ext>` (so `interfaces/robot_msgs/msg/Widget.msg`
+is `@ros_import from="interfaces" "robot_msgs/msg/Widget"`). A `from` root precedes
+both vendored and ament in the search order, so it can supply types a sourced
+environment lacks or shadow one it has. Relative roots resolve against the source
+file, like `@ros_msg`. The roots' resolved files are registered as precompile
+dependencies — and a bare-package import registers the package dir — so editing a
+file, or adding one to an imported package, re-triggers generation on the next load.
+
+The `from=` value must be a string or vector-of-strings literal; a non-literal errors,
+because roots are resolved at macro-expansion time.
+
+```julia
+@ros_import "sensor_msgs/msg/Imu"            # binds `Imu`
+@ros_import "std_msgs"                       # binds `std_msgs`; use std_msgs.msg.Header
+@ros_import "geometry_msgs/msg/Twist" as Cmd
+@ros_import from="interfaces" "robot_msgs/msg/Widget"
+```
 """
 macro ros_import(names...)
     # Split into bare imports, `"pkg/qual/Name" as Alias` triples, and `from=` roots.
@@ -543,16 +567,49 @@ function _cache_specs(seen::Set{String}, td::TypeDescriptionMsg)
 end
 
 """
-    @ros_cache [dir]
+    @ros_cache
+    @ros_cache "dir"
 
-Opt into project-local persistence + static baking of dynamically-discovered types
-(D5/D9). At precompile it reads the project cache (`.json` `TypeDescription` blobs
-under `dir`, default `<project>/ros_typesupport`), generates static types for them
-into the calling module, `include_dependency`s the blobs (so a grown cache
-re-precompiles + regenerates next load), and auto-registers them (so keyexpr-only
-subs use the precompiled type — no runtime codegen). It also turns on runtime
-persistence, so *this* run's newly-discovered types are written to the cache for next
-time. Converges a deployment toward fast warm-up as discovery saturates.
+Opt a project into persistence plus static baking of types learned by runtime
+discovery. Written once in a module, it makes a discovered wire type stick: the next
+load starts from the baked static type, already compiled.
+
+The macro splits its work across two phases.
+
+*At macro expansion / precompile time* it reads the project cache — the `.json`
+`TypeDescription` blobs under `dir` (default `<project>/ros_typesupport`, in the
+active project's directory) — generates static types for each into the calling
+module, and registers the cache directory and every blob as precompile dependencies.
+The directory is created on the spot, so the dependency is tracked from the first
+run; a cache *grown* during a run therefore invalidates precompilation and bakes the
+new types on the next load. The cached types also join the module's resolution
+table, so a keyexpr-only subscription decodes into the precompiled struct with no
+runtime codegen.
+
+*At module load* the baked registration flushes the types and the cache directory
+into ROSNode's static-type singleton ([`absorb_static_types!`](@ref), via a generated
+`__init__`, or at eval for a script/REPL module). The first `Context` creation then
+registers the types under their real RIHS01 and enables project-local persistence:
+types discovered off the wire from that point on are written back to the cache for
+next time. Discovery itself works without the macro; `@ros_cache` is what makes a
+discovery durable.
+
+Across repeated runs this converges a deployment toward fast warm-up: as discovery
+saturates, more types arrive already baked and fewer need a wire
+`GetTypeDescription` round-trip.
+
+The optional argument is a string-literal directory; anything else errors. An
+explicit directory is baked verbatim; the default form bakes a relocatable marker
+recomputed against the active project at load time. A project may carry several
+`@ros_cache` directories — reads search all of them, and new discoveries persist to
+the lexicographically smallest.
+
+```julia
+module RobotApp
+using ROSNode
+@ros_cache            # persist under <project>/ros_typesupport
+end
+```
 """
 macro ros_cache(args...)
     dir = isempty(args) ? _default_project_cache_dir() :
@@ -561,7 +618,7 @@ macro ros_cache(args...)
     # Ensure the cache dir exists before depending on it: `include_dependency` errors
     # on a missing path, and on the first run (empty cache) the dir does not exist yet.
     # Creating it here registers the dependency from run 1, so a cache *grown* this run
-    # invalidates precompilation and re-bakes next load (the D5/D9 convergence).
+    # invalidates precompilation and re-bakes next load.
     isdir(dir) || mkpath(dir)
 
     blobs = sort!(filter(f -> endswith(f, ".json"), readdir(dir; join=true)))
@@ -610,11 +667,25 @@ end
 """
     flush_type_cache(to; dir = <project cache>, format = :msg) -> Vector{String}
 
-Graduate the project-local discovered-type cache out to folder `to` (D5): write each
-cached type in `format` (`:msg` default — a colcon-buildable interface package;
-`:julia` for precompilable source; `:typedesc` for the raw wire blob). Returns the
-paths written. Produces a durable, user-owned export of the types learned by running
-against the live graph, suitable for checking into a project.
+Graduate the project-local discovered-type cache out to folder `to`, producing a
+durable, user-owned export of the types learned by running against the live graph —
+suitable for checking into a project. Returns the paths written.
+
+Each `.json` blob in `dir` is loaded, re-hashed from its content to recover the
+type's RIHS01 identity, and written in `format`:
+
+- `:msg` (default) — ROS interface text in a colcon-buildable package layout
+  (`<to>/<pkg>/<qual>/<Name>.<ext>`).
+- `:julia` — precompilable `.jl` source, moving the once-dynamic type onto the
+  static fast path.
+- `:typedesc` — the raw wire `TypeDescription` JSON blob, language-agnostic.
+
+`dir` defaults to the primary write cache directory: the `\$ROS_TYPESUPPORT_CACHE`
+override, then the configured cache dir, then the project default. An unparseable
+blob is skipped, and a per-type export failure is logged and skipped, leaving the
+rest of the run intact; an empty vector comes back when `dir` holds no readable
+blobs. The exported identity is whatever the blob's content hashes to — the
+content-address revalidation that guards the discovery read path does not run here.
 """
 function flush_type_cache(to::AbstractString; dir::AbstractString=_cache_dir(),
                           format::Symbol=:msg)

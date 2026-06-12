@@ -50,3 +50,20 @@ The server settles every request. A normal return replies success. `respond!(req
 ## Next
 
 [Actions](actions.md) extend the request/response shape with progress feedback and cancellation.
+
+## API reference
+
+```@meta
+CurrentModule = ROSNode
+```
+
+```@docs
+ServiceHandle
+ServiceClient
+call
+respond!
+service_matched
+request_type
+response_type
+ServiceError
+```

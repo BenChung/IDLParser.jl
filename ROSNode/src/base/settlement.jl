@@ -86,7 +86,7 @@ The single settlement verb (DESIGN §respond!). The terminal tokens — service
 
 An *explicit* second terminal `respond!` is the one hard error (it signals a
 double-settle bug); the return-value and fail-safe paths instead go through
-[`fill!`](@ref), which silently ignores an already-full cell.
+`fill!`, which silently ignores an already-full cell.
 
 [`feedback`](@ref) is not terminal — it never touches the cell; the Action layer
 dispatches it to the feedback stream before reaching settlement.

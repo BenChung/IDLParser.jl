@@ -11,33 +11,57 @@
 export register_node_kind!, node_kind, node_kinds, load_node, unload_node, list_nodes
 
 # ── the node-kind registry (rclcpp_components_register_nodes analog, §7) ─────────
-# Process-global name → kind (a `NodeKind` from `@node`, or a `@mixin` type used as a
-# node). `@node`/`@mixin` emit the registration as a top-level statement, so it runs
-# when the defining module's body is evaluated — fine for scripts / REPL / `Main` and
-# `include`d modules. Like the component layer's `_register_mixin!`, it is NOT deferred
-# to `__init__`, so a *precompiled* package's kinds are not in this table at load (the
-# top-level mutation of ROSNode's global doesn't persist across precompile); registering
-# such a package's kinds is a follow-up if/when components ship as precompiled libraries.
+# Process-global name → kind. Like the component layer's `_register_mixin!`, registration
+# is a top-level statement (not deferred to `__init__`); see `register_node_kind!` for
+# the precompile caveat.
 
 const _NODE_KINDS = Dict{String, Any}()
 const _NODE_KINDS_LOCK = ReentrantLock()
 
 """
-    register_node_kind!(name, K) -> K
+    register_node_kind!(name::AbstractString, K) -> K
 
-Register node kind `K` (a [`NodeKind`](@ref) or a `@mixin` type) under `name` in the
-process-global registry (§7) — the `rclcpp_components_register_nodes` analog that
-`@node`/`@mixin` emit, so a container's `load_node` can instantiate it by name.
+Register node kind `K` under `name` in the process-global kind registry, returning `K`
+(§7). This is the `rclcpp_components_register_nodes` analog: it makes a kind
+instantiable by name, so a container's [`load_node`](@ref) (and the
+`~/_container/load_node` service behind `ros2 component load`) can build it from a load
+request.
+
+`K` is a `NodeKind` (from `@node N = […]`) or a `@mixin` type used directly as
+a node. `@node` and `@mixin` emit this call as a top-level statement in the defining
+module, so a kind registers when that module's body is evaluated — covering scripts,
+the REPL, `Main`, and `include`d modules. The call is thread-safe (guarded by the
+registry lock), and a repeated `name` is last-writer-wins.
+
+A kind defined inside a *precompiled* package must be registered from that package's
+runtime initialization (`__init__`): the top-level registration runs during precompile,
+and its mutation of ROSNode's global registry does not survive into the cached image.
 """
 function register_node_kind!(name::AbstractString, @nospecialize(K))
     @lock _NODE_KINDS_LOCK (_NODE_KINDS[String(name)] = K)
     return K
 end
 
-"The registered kind for `name` (a `NodeKind` or `@mixin` type), or `nothing` (§7)."
+"""
+    node_kind(name::AbstractString) -> Union{NodeKind, Type, Nothing}
+
+The node kind registered under `name` — the `NodeKind` or `@mixin` type passed
+to [`register_node_kind!`](@ref) — or `nothing` when no kind carries that name (§7).
+Thread-safe (guarded by the registry lock).
+
+The lookup is by the exact registered name; a container's load path additionally
+tolerates a namespaced spelling (`my_pkg::Talker`, `pkg/Talker`, `pkg.Talker`) by
+retrying on the last `::`/`/`/`.`-separated segment.
+"""
 node_kind(name::AbstractString) = @lock _NODE_KINDS_LOCK get(_NODE_KINDS, String(name), nothing)
 
-"The names of every registered node kind, sorted (§7)."
+"""
+    node_kinds() -> Vector{String}
+
+The names of every registered node kind, sorted ascending (§7). Each name resolves
+through [`node_kind`](@ref) and is loadable by a container's [`load_node`](@ref) / the
+`~/_container/load_node` service. Thread-safe (guarded by the registry lock).
+"""
 node_kinds() = @lock _NODE_KINDS_LOCK sort!(collect(keys(_NODE_KINDS)))
 
 # Resolve a `(package_name, plugin_name)` load request to a registered kind. The
@@ -87,12 +111,39 @@ end
 
 """
     load_node(c::Container, package_name, plugin_name;
-              name="", namespace="", parameters=(;)) -> (ComponentNode, unique_id)
+              name="", namespace="", parameters=(;)) -> (ComponentNode, unique_id::UInt64)
 
-Instantiate the registered kind named `plugin_name` on container `c` (§7) — the
-programmatic form of `ros2 component load`. `name`/`namespace` empty fall back to the
-kind's defaults; `parameters` is a `run` `overrides` NamedTuple (mixin-local or
-member-prefixed keys). Throws `ArgumentError` if no such kind is registered.
+Instantiate the registered kind named `plugin_name` on container `c`, returning the
+live `ComponentNode` and the container-unique id it is tracked under (§7).
+This is the programmatic form of `ros2 component load`; the `~/_container/load_node`
+service (`composition_interfaces/srv/LoadNode`) drives the same path from the wire.
+
+Resolution tries `plugin_name` verbatim against the process-global registry, then its
+last `::`/`/`/`.`-separated segment; `package_name` is advisory and does not shard the
+registry. `name` defaults to the kind's name (the `@node` name, or the mixin type's
+snake-cased name) and `namespace` to the Context's namespace; pass either to override.
+
+`parameters` is a `run` `overrides` NamedTuple. A key is mixin-local (`fps`, applying
+to every member that declares it) or member-prefixed (`var"camera.fps"`, targeting one
+member and winning over the mixin-local form). The prefix is the member's name within
+the node — a `@node` member's declared name, or the snake-cased mixin type for a mixin
+loaded directly as a node — independent of the node instance `name`.
+
+The node is built by `run(K; ctx = c.ctx, block = false, …)` on the container's shared
+Context and autostarts (configure, then activate) like a standalone unmanaged node,
+then is registered for [`list_nodes`](@ref) / [`unload_node`](@ref) under a fresh
+1-based id. Throws `ArgumentError` when no kind is registered under `plugin_name`;
+assembly errors (a wire-name clobber, unsatisfied or ambiguous DI, a `construct` or
+`configure` exception) propagate from the underlying `run`. The wire
+`~/_container/load_node` service catches the same errors and returns them as a
+`success = false` response instead.
+
+```julia
+container("vision"; block = false) do c
+    cn, uid = load_node(c, "my_pkg", "Camera"; name = "front",
+                        parameters = (; var"camera.fps" = 30))
+end
+```
 """
 function load_node(c::Container, package_name::AbstractString, plugin_name::AbstractString;
                    name::AbstractString = "", namespace::AbstractString = "",
@@ -108,16 +159,24 @@ function load_node(c::Container, package_name::AbstractString, plugin_name::Abst
 end
 
 """
-    unload_node(c::Container, unique_id) -> Bool
+    unload_node(c::Container, unique_id::Integer) -> Bool
 
-Close and forget the loaded node with `unique_id` (§7) — `ros2 component unload`.
-Returns `false` if no node carries that id.
+Close and forget the loaded node tracked under `unique_id` on container `c`, returning
+`true` when a node carried that id and `false` otherwise (§7). This is the programmatic
+form of `ros2 component unload`; the `~/_container/unload_node` service
+(`composition_interfaces/srv/UnloadNode`) drives the same path.
+
+The id is popped from the container's loaded set and node list inside one critical
+section, so two concurrent unloads of the same id cannot both claim it (and
+double-close). The `close` — which runs each member's `cleanup` in reverse dependency
+order and tears down the node's entities, driving a managed node through its
+`LifecycleNode` shutdown — happens outside the lock. `close` is idempotent, so a later
+Context drain that also closes the node is a no-op.
 """
 function unload_node(c::Container, unique_id::Integer)
     uid = UInt64(unique_id)
-    # Pop-and-own under a single critical section, so two concurrent unloads of the
-    # same id can't both claim it (and double-close). The `close` runs outside the lock
-    # (it tears down entities + member cleanup — not something to hold the lock across).
+    # Pop-and-own under the lock (concurrent unloads can't double-close); `close` —
+    # entity teardown + member cleanup — is too heavy to run holding it.
     cn = @lock c.lock begin
         node = get(c.loaded, uid, nothing)
         node === nothing && return false
@@ -132,8 +191,12 @@ end
 """
     list_nodes(c::Container) -> Vector{Tuple{UInt64, String}}
 
-The loaded nodes as `(unique_id, full_node_name)` pairs, ascending by id (§7) —
-`ros2 component list`.
+The nodes loaded on container `c` as `(unique_id, full_node_name)` pairs, ascending by
+id (§7). This is the programmatic form of `ros2 component list`; the
+`~/_container/list_nodes` service (`composition_interfaces/srv/ListNodes`) returns the
+same pairs split into the response's parallel `unique_ids` / `full_node_names` arrays.
+`full_node_name` is the node's fully-qualified name (`namespace/name`). Thread-safe
+(snapshot taken under the container lock).
 """
 function list_nodes(c::Container)
     @lock c.lock begin

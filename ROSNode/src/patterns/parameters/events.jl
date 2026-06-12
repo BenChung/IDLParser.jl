@@ -21,11 +21,26 @@ struct ParameterEventBatch
 end
 
 """
-    on_parameter_event(f, server) -> f
+    on_parameter_event(f, server::ParameterServer) -> f
+    on_parameter_event(f, client::ParameterClient) -> f
 
-Register `f(batch::ParameterEventBatch)` to run after each committed transaction,
-the in-process side of `/parameter_events`. Listeners run synchronously under the
-commit's mutation lock; a throwing listener is logged and the commit proceeds.
+Register a callback `f(batch::ParameterEventBatch)` for parameter changes (§10)
+— the in-process and remote sides of ROS 2's `/parameter_events`. Returns `f`.
+
+On a [`ParameterServer`](@ref) the listener runs synchronously after each
+committed transaction, under the server's mutation lock; a throwing listener is
+logged and the commit proceeds. The batch's `changed` maps each moved parameter
+to its new value and `previous` holds the prior value.
+
+On a [`ParameterClient`](@ref) it subscribes the remote's `/parameter_events`
+and calls `f` per event from this client's target node, surfacing the event's
+new and changed parameters; for a typed client the changed values are coerced to
+their field types, and `batch.previous` is empty (the wire event carries only
+current values). A remote's `deleted_parameters` (a parameter undeclaration) is
+not reported. The filter is an exact string compare of the event's `node` field
+against the resolved `target` — a remote whose published FQN differs (namespace
+or normalization mismatch) has its events silently dropped. The subscription is
+reaped by `close(client)`.
 """
 function on_parameter_event(f, s::ParameterServer)
     push!(s.listeners, f)

@@ -106,7 +106,7 @@ from_wire_individual(itd) =
 Convert a decoded wire `type_description_interfaces/msg/TypeDescription` (e.g. from
 a `GetTypeDescription` reply) back into ROSMessages' internal `TypeDescriptionMsg`,
 the form the integrity gate (`calculate_rihs01_hash`), `lift`, and the registry
-consume. Inverse of [`to_wire_td`](@ref).
+consume. Inverse of `to_wire_td`.
 """
 from_wire_td(w) =
     TypeDescriptionMsg(from_wire_individual(w.type_description),

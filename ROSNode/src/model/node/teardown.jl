@@ -48,11 +48,20 @@ function Base.close(e::Entity)
 end
 
 """
-    dispose(node, entity::Entity)
+    dispose(node::Node, entity::Entity)
 
 Close `entity` and remove it from `node`'s tracked set, releasing it before the
-node itself is closed. `close(node)` tears down any entities still tracked at that
-point. A no-op if `entity` isn't owned by `node`.
+node itself is closed. Use this to reclaim a single publisher/subscription/service/
+client (undeclaring its route, withdrawing its liveliness token, and dropping it
+from the discovery index) while keeping the node alive; otherwise `close(node)`
+tears down every entity still tracked at that point.
+
+`close(entity)` always runs first, then the entity is removed from `node.entities`
+if present there. Returns `nothing`.
+
+`dispose` does not verify ownership: `entity` is closed whether or not `node` owns
+it, and only the removal from `node.entities` is conditional — passing an entity
+owned by another node still tears that entity down.
 """
 function dispose(node::Node, e::Entity)
     close(e)

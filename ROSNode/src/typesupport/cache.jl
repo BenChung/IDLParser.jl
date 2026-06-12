@@ -5,10 +5,11 @@
 # cache holds the definition and regenerates the code on load.
 #
 # Location & opt-in: the cache is a project-local folder (in the active project's
-# dir) of `.json` blobs keyed by RIHS01 hash, off by default. The user enables
-# persistence by adding the [`@ros_cache`](@ref) macro to their module (which calls
-# [`enable_project_cache!`](@ref) from its `__init__`), or by the
-# `$ROS_TYPESUPPORT_CACHE` env override (ops/tests, force-enables with that dir).
+# dir) of `.json` blobs keyed by RIHS01 hash, off by default. Three opt-ins: the
+# [`@ros_cache`](@ref) macro (its dir marker is absorbed at module load and
+# registered via `_register_cache_dirs!` at Context creation), an explicit
+# [`enable_project_cache!`](@ref) call, and the `$ROS_TYPESUPPORT_CACHE` env
+# override (ops/tests, force-enables with that dir).
 # ROSNode is a library; discovered types are deployment-specific, so they belong in
 # the importing project, owned by the user — not a package-global scratchspace.
 # The JSON body is the exact `to_ros2_json` text plus the type name on a header line
@@ -34,15 +35,28 @@ function _default_project_cache_dir()
 end
 
 """
-    enable_project_cache!(dir = <project>/ros_typesupport) -> String
+    enable_project_cache!(dir = "<active-project-dir>/ros_typesupport") -> String
 
-Turn on project-local persistence of dynamically-discovered [type descriptions][1].
-Discovery writes `.json` `TypeDescription` blobs (keyed by RIHS01) under `dir`, and
-resolution reads a cached blob first, falling back to the wire on a miss. Off by
-default: the [`@ros_cache`](@ref) macro calls this from its `__init__`, so a project
-opts in by adding the macro. Returns the (created) directory.
+Turn on project-local persistence of dynamically-discovered type descriptions.
+Once enabled, discovery writes `.json` `TypeDescription` blobs keyed by RIHS01
+under `dir`, and [`resolve_type`](@ref) reads a cached blob before the wire,
+re-validating each blob against its hash on load and discarding a stale one.
+Returns the directory (created if absent).
 
-[1]: https://design.ros2.org/articles/idl_interface_definition.html
+Persistence is off by default — ROSNode is a library, and discovered types are
+deployment-specific, so they belong to the importing project. `dir` defaults to
+`ros_typesupport` under the active project's directory (the current working
+directory when no project is active). Calling this sets `dir` as both the
+single write directory and the sole read directory, replacing any previously
+registered set.
+
+The `@ros_cache` macro is the declarative alternative: a project opts in by
+adding the macro to a module, and the absorbed cache directories are registered
+at `Context` creation — which likewise replaces the registered set, so the last
+registration wins; call `enable_project_cache!` after `Context()` when its
+directory must win over macro-registered ones. The `ROS_TYPESUPPORT_CACHE`
+environment variable force-enables persistence at its directory (an ops/test
+escape hatch) regardless of this call.
 """
 function enable_project_cache!(dir::AbstractString=_default_project_cache_dir())
     d = String(dir)
@@ -70,7 +84,18 @@ function _register_cache_dirs!(dirs)
     return _CACHE.dir
 end
 
-"Disable project-local type-description persistence (the default state)."
+"""
+    disable_project_cache!() -> nothing
+
+Turn off project-local type-description persistence and clear the registered
+cache directories, returning to the default (disabled) state. Discovery then
+resolves types from the registry, ament, and the wire only, writing nothing to
+disk.
+
+The `ROS_TYPESUPPORT_CACHE` environment override keeps persistence
+force-enabled at its directory independently of this call, since
+`_cache_enabled` treats the env var as an unconditional opt-in.
+"""
 disable_project_cache!() = (_CACHE.enabled = false; _CACHE.dirs = String[]; nothing)
 
 # Is the on-disk cache active? The env override force-enables (ops/test escape hatch).

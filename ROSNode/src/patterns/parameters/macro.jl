@@ -16,20 +16,43 @@
         …
     end
 
-Declare a typed parameter schema (§10). Generates an immutable `struct P` (so
-reads are type-stable), a keyword constructor `P(; field=default, …)` that
-overlays startup overrides onto the defaults and coerces to the field types, and a
-`descriptors(::Type{P})` method. Legal field types are the ROS2 `ParameterValue`
-set — `Bool`, `Int64`, `Float64`, `String`, `Symbol` (string-with-choices sugar),
-and `Vector` of those (plus `Vector{UInt8}` byte arrays). Anything else errors at
-expansion.
+Declare a typed parameter schema (ROS 2 node parameters, §10). Generates an
+immutable `struct P` so declared reads are type-stable, a keyword constructor
+`P(; field=default, …)` that overlays startup overrides (CLI/launch/YAML) onto
+the defaults and coerces each to its field type, and a `descriptors(::Type{P})`
+method the parameter services reflect over.
+
+Legal field types are the ROS 2 `ParameterValue` set: `Bool`, `Int64`,
+`Float64`, `String`, `Symbol` (string-with-choices sugar), and `Vector` of those
+plus `Vector{UInt8}` byte arrays. An illegal field type is caught lazily: the
+struct expands and constructs, and `ArgumentError` surfaces when
+[`descriptors`](@ref)`(P)` is first evaluated — i.e. when the parameter services
+reflect over the schema. Parametric structs are rejected at expansion.
+
+Per-field annotations, on the right of the `=`:
+- a leading string literal is the field `description`;
+- `∈ lo..hi` is a numeric range constraint, stored as the tuple `(lo, hi)`;
+- `∈ (a, b, …)` (or a vector) is a choice set — stored as an untagged tuple, so
+  a choice set of exactly two numbers collides with the range representation and
+  is enforced as a range;
+- `|> readonly` marks the field read-only, blocking runtime sets while still
+  permitting a startup override.
+
+Define `ROSNode.validate(p::P)` (default no-op) to add cross-field rules —
+ROS 2's `add_on_set_parameters_callback`, expressed as a method on the whole
+candidate. Pair the schema with [`ParameterServer`](@ref) (or
+`Node(ctx, name, P)`) to expose the six standard parameter services.
 
 See the ROS 2 parameters concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
 
-Per-field annotations: a leading string literal is the description; `∈ lo..hi` is
-a numeric range; `∈ (a, b, …)` is a choice set; `|> readonly` blocks runtime sets.
-A user `validate(::P)` method (default no-op) adds cross-field rules — exactly
-ROS2's `add_on_set_parameters_callback`.
+```julia
+@parameters struct PlannerParams
+    "max linear speed (m/s)"
+    max_speed::Float64 = 1.0 ∈ 0.0..10.0
+    mode::Symbol = :auto ∈ (:auto, :manual)
+    robot_id::Int64 = 7 |> readonly
+end
+```
 """
 macro parameters(structdef)
     structdef isa Expr && structdef.head === :struct ||
@@ -158,9 +181,12 @@ _coerce_param(::Type{Vector{T}}, v::AbstractVector) where {T} = collect(T, v)
 
 """
     descriptors(::Type{P}) -> Vector{ParameterDescriptor}
+    descriptors(value) -> Vector{ParameterDescriptor}
 
-The ordered per-field metadata for a `@parameters` schema `P` — the reflection
-root for the parameter services. A type with no generated method (a plain struct
+The ordered per-field metadata for a [`@parameters`](@ref) schema `P` — the
+reflection root the parameter services read (§10). [`@parameters`](@ref)
+generates the `::Type{P}` method; the value form forwards to
+`descriptors(typeof(value))`. A type with no generated method (a plain struct
 used as a schema) gets an empty descriptor list.
 """
 descriptors(::Type) = ParameterDescriptor[]
@@ -169,21 +195,27 @@ descriptors(p) = descriptors(typeof(p))
 """
     validate(candidate::P)
 
-User hook for cross-field rules — ROS2's `add_on_set_parameters_callback`,
-expressed as a method on the whole candidate (§10). The default is a no-op.
-Throw [`ParameterRejection`](@ref) (or any exception) to reject a transaction; an
-internal caller sees the throw, an external client sees a rejected
-`SetParametersResult`. Define `ROSNode.validate(p::PlannerParams) = …` to override.
+User hook for cross-field parameter rules — ROS 2's
+`add_on_set_parameters_callback`, expressed as a method on the whole candidate
+value (§10). The default is a no-op. Define `ROSNode.validate(p::PlannerParams) = …`
+to override, throwing [`ParameterRejection`](@ref) (or any exception) to reject
+the candidate. The hook runs inside the commit, against the fully-assembled
+candidate, after the per-field read-only and constraint checks. A local internal
+caller sees the throw; an external [`ParameterClient`](@ref) or ROS 2 client
+sees a rejected `SetParametersResult` (`successful=false`).
 """
 validate(_) = nothing
 
 """
-    ParameterRejection(reason)
+    ParameterRejection(reason::AbstractString)
 
-Signals a rejected parameter set, raised by a per-field constraint, a `read_only`
-runtime set, or a user `validate`. Carries the human `reason` string that becomes
-the wire `SetParametersResult.reason`. Internal callers see it raised; the service
-layer catches it into a `successful=false` reply (§10).
+Exception signaling a rejected parameter set (§10), raised by a per-field
+constraint violation, a `read_only` runtime set, or a user [`validate`](@ref).
+Carries the human `reason` string that becomes the wire
+`SetParametersResult.reason`. A local caller of
+[`transaction`](@ref)/[`set_parameter!`](@ref) sees it raised; the service layer
+catches it into a `successful=false` reply, and a [`ParameterClient`](@ref)
+re-raises it on a rejected set so the failure contract is uniform local↔remote.
 """
 struct ParameterRejection <: Exception
     reason::String
@@ -197,10 +229,12 @@ Base.showerror(io::IO, e::ParameterRejection) =
     setproperties(base::P, overrides::NamedTuple) -> P
     setproperties(base::P, overrides::P) -> P
 
-A pure (non-effectful) rebuild of an immutable schema value with `overrides`
-applied — a NamedTuple is a partial overlay, a full `P` value is replace-all
-(§10). No `node` involved: this is the value-level primitive the transaction
-commit and the `setproperties!` sugar build on.
+The value-level rebuild primitive the transaction commit and the
+[`setproperties!`](@ref) sugar build on (§10): a pure rebuild of an immutable
+schema value with `overrides` applied. A NamedTuple is a partial overlay — its
+named fields change, the rest copy from `base` — rebuilt through `P`'s keyword
+constructor, so each field is re-coerced to its declared type. A full `P` value
+is replace-all: the result is `overrides` itself.
 """
 function setproperties(base::P, overrides::NamedTuple) where {P}
     fns = fieldnames(P)

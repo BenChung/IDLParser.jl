@@ -31,28 +31,34 @@ export RosoutLogger, with_rosout, Fatal, logger, set_logger_level!,
 # (the §11 dynamic-discovery handshake, seen from the *serving* side). The request
 # is `(type_name::String, type_hash::String, include_type_sources::Bool)`; the
 # reply is `(successful::Bool, failure_reason::String, type_description, …)`.
-#
-# The answer is a registry read: `lookup_type(registry, TypeInfo(name, hash))`
-# returns the §11 entry, from which the typesupport layer can produce a canonical
-# `TypeDescription` whose `calculate_rihs01_hash` equals the requested hash. That
-# canonicalization (and the entry shape) is typesupport's; here we own the lookup,
+# Canonicalization (and the entry shape) is typesupport's; here we own the lookup,
 # the hash-string parsing, and the not-found contract.
 
 """
     describe_type(ctx_or_node, type_name, type_hash) -> Union{TypeDescriptionMsg, Nothing}
 
-Look up the registry entry (§11) for `(type_name, type_hash)` and return the
-canonical internal `TypeDescriptionMsg` (main + referenced closure) to serve over
-`~/get_type_description`, or `nothing` if the exact name+version isn't registered.
-`type_hash` is the REP-2011 RIHS string (e.g. `"RIHS01_<64-hex>"`); an empty hash
-matches any registered version of `type_name` (the rmw_zenoh "I have the name,
-send me whatever you advertise" form).
+Look up the type registry (§11) for `(type_name, type_hash)` and return the canonical
+internal `TypeDescriptionMsg` (the main type plus its referenced-type closure) that
+`~/get_type_description` serves, or `nothing` when no entry with that exact name and
+version is registered. This is the server-side half of rmw_zenoh's dynamic type
+discovery: a peer that sees a `(name, RIHS01)` on the graph but lacks the type fetches
+its description here.
 
-The result is canonicalized (referenced closure sorted by `type_name`) so its
-`calculate_rihs01_hash` equals the hash we advertise (§13). `nothing` lookups
-become a well-formed `successful=false` reply — the correct "type not available"
-contract. The server ([`wire_get_type_description!`](@ref)) converts the result to
-the wire form via [`to_wire_td`](@ref).
+`type_hash` is the REP-2011 RIHS string (`"RIHS01_<64-hex>"`); an empty string matches
+any registered version of `type_name` (the "I have the name, send me whatever you
+advertise" form), resolving to the first matching entry under the registry lock. A
+malformed RIHS string resolves to `nothing` (treated as not-found).
+
+An entry that stores a `td` (wire-discovered, cached, or well-known) is served from it
+directly, its closure sorted by `type_name` so that `calculate_rihs01_hash` of the
+served description equals the hash advertised on the graph (the integrity invariant a
+receiving peer re-checks). An IL-only entry (ament/static) is rebuilt: the main type
+from the struct AST, the closure collected from the registry by name — and that
+collection carries only referenced types that themselves store a `td`, so an ament
+compound type with ament-only members serves an incomplete closure whose recomputed
+RIHS01 can differ from the advertised hash (the §11 ament-refs gap; see the TODO in
+acquire.jl). [`wire_get_type_description!`](@ref) converts the result to the wire form
+via `to_wire_td`; a `nothing` result becomes a `successful=false` reply.
 """
 function describe_type(ctx_or_node, type_name::AbstractString,
                        type_hash::AbstractString)
@@ -84,12 +90,14 @@ function _lookup_any_version(reg, name::String)
 end
 
 # Project a §11 registry entry to the canonical internal `TypeDescriptionMsg` we
-# serve. Prefer the entry's stored `td` (wire-discovered / cached / well-known
-# entries carry it); otherwise rebuild from the IL (ament/static entries) — lower
-# to the struct AST, hash-encode it, and collect the referenced closure from the
-# registry. The closure is sorted by `type_name` so `calculate_rihs01_hash` of
-# what we serve equals the hash we advertise (§13 hash parity). `nothing` when the
-# entry has neither a `td` nor a recoverable struct AST — a fail-safe not-found.
+# serve. An entry's stored `td` (wire-discovered / cached / well-known) is served
+# directly, closure sorted by `type_name` so `calculate_rihs01_hash` of what we
+# serve equals the hash we advertise (§13 hash parity). An IL-only entry (ament/
+# static) is rebuilt — lower to the struct AST, collect the referenced closure
+# from the registry — and that closure carries only refs that store a `td`, so it
+# can be incomplete for ament-only members (§11 ament-refs gap, acquire.jl TODO).
+# `nothing` when the entry has neither a `td` nor a recoverable struct AST — a
+# fail-safe not-found.
 function _entry_type_description(reg, entry::RegistryEntry)
     entry.td !== nothing && return _canonicalize_tdmsg(entry.td)
     pkg, _, _ = split_ros_name(entry.info.name)
@@ -115,8 +123,9 @@ _canonicalize_tdmsg(td::TypeDescriptionMsg) =
 _entry_main_td(e::RegistryEntry) = e.td === nothing ? nothing : e.td.type_description
 
 # Transitively collect the referenced types of `main` from the registry (by name),
-# sorted by `type_name` — so a served description carries the closure a peer needs
-# to codegen a referencing type (§11/§13). Refs not in the registry are skipped.
+# sorted by `type_name` — the closure a peer needs to codegen a referencing type
+# (§11/§13). Refs lacking a registry entry or a stored `td` are skipped, so the
+# closure can be incomplete for ament-only nested members (§11 ament-refs gap).
 function _collect_registry_closure(reg, main::TypeDescription)
     seen = Set{String}()
     out = TypeDescription[]
@@ -140,15 +149,20 @@ end
     get_type_description(client, type_name; type_hash="", include_sources=false,
                          timeout_ms=2000) -> GetTypeDescription_Response
 
-Client side of `~/get_type_description` (§11 dynamic discovery, §13): ask a remote
-node for the `TypeDescription` of `(type_name, type_hash)`. Blocks the calling task
-on the reply (like [`call`](@ref)); raises [`ServiceError`](@ref) on an error reply
-(or no server within `timeout_ms`) and returns the decoded response otherwise
-(whose `successful` flag distinguishes "have it" from "don't").
+Client side of `~/get_type_description`: ask a remote node for the `TypeDescription`
+of `(type_name, type_hash)` (rmw_zenoh dynamic type discovery, §11/§13). Blocks the
+calling task on the reply exactly like [`call`](@ref) — it yields while the request is
+in flight — and returns the decoded `GetTypeDescription_Response`, whose `successful`
+flag distinguishes "the remote has this type" from "it doesn't". Raises
+[`ServiceError`](@ref) on an error reply, or when no reply arrives — a wait bounded by
+`timeout_ms` plus `call`'s small hard backstop.
 
-`client` is a [`ServiceClient`](@ref) for the remote's `~/get_type_description`,
-built over the statically-compiled `GetTypeDescription` service type (S1). The
-higher-level [`fetch_type_description`](@ref) wraps this with the registry landing.
+`client` is a [`ServiceClient`](@ref) built over the statically compiled
+`GetTypeDescription` service type and pointed at the remote's `~/get_type_description`.
+`type_hash` is the REP-2011 RIHS string (empty matches any advertised version);
+`include_sources` requests the regenerated interface text (`type_sources`) alongside
+the description. The higher-level [`fetch_type_description`](@ref) wraps this call with
+the verify-and-register landing into the node's registry.
 """
 function get_type_description(client, type_name::AbstractString;
                              type_hash::AbstractString="",
@@ -163,16 +177,24 @@ end
 """
     fetch_type_description(node, remote, type_name, hash; timeout_ms=2000) -> Union{RegistryEntry, Nothing}
 
-The wire half of dynamic discovery (§11): call `<remote>/get_type_description` for
-`(type_name, hash)`, and on a successful reply verify + lift + register the result
-into the node's registry (the back half [`register_type_description!`](@ref), which
-also persists it to the content-addressed cache). Returns the registered
-[`RegistryEntry`](@ref), or `nothing` if the remote doesn't have it / no server
-answered / the reply failed the RIHS01 integrity gate.
+The wire step of dynamic type discovery (§11): call `<remote>/get_type_description`
+for `(type_name, hash)`, then on a successful reply verify, lift, and register the
+result into the node's type registry (via `register_type_description!`, which
+also persists it to the content-addressed cache for the next run). Returns the
+registered [`RegistryEntry`](@ref), or `nothing` when the remote lacks the type, no
+server answered, or the reply failed the RIHS01 integrity gate.
 
-`remote` is the serving node's FQN (e.g. `"/talker"`); `hash` is a `TypeHash` (or a
-RIHS string). The orchestration of *which* source to try (registry → cache → ament
-→ this wire path) is [`resolve_or_discover`](@ref)'s; this is just the wire step.
+Blocks the calling task. First it waits up to `timeout_ms` for the remote's service
+to become routable ([`wait_for_service`](@ref)) — discovery is eventually consistent,
+so a query issued before the queryable is matched would silently match nothing — then
+issues the [`get_type_description`](@ref) call under the same budget. `remote` is the
+serving node's fully qualified name (e.g. `"/talker"`); `hash` is a `TypeHash` or a
+RIHS string (a malformed string returns `nothing`). The client is closed before
+return. A [`ShutdownException`](@ref) propagates; every other error (timeout, decode
+failure, hash mismatch from the gate) is caught and reported as `nothing`.
+
+Choosing *which* source to try — registry, then cache, then ament, then this wire
+path — is [`resolve_or_discover`](@ref)'s job; this function is only the wire leg.
 """
 function fetch_type_description(node, remote::AbstractString, type_name::AbstractString,
                                 hash; timeout_ms::Integer=2000)
@@ -232,19 +254,27 @@ end
     resolve_or_discover(node, name, hash; ament=true, cache=true, wire=true,
                         timeout_ms=2000) -> Union{Type, Nothing}
 
-Resolve `(name, hash)` to a realized (generated) Julia type, trying every source in
-order, each short-circuiting the next (§11 / D5 S4):
+Resolve `(name, hash)` to a realized (generated) Julia type, trying each source in
+order and short-circuiting on the first hit (§11):
 
-1. **registry** — already realized this run.
-2. **project cache** — a prior run's persisted `.json` blob (opt-in; [`@ros_cache`](@ref)).
-3. **ament** — an installed `.msg`/`.srv` when inside a sourced ROS2 env.
+1. **registry** — a type already realized this run.
+2. **project cache** — a prior run's persisted `.json` blob (opt-in, [`@ros_cache`](@ref)).
+3. **ament** — an installed `.msg`/`.srv` when inside a sourced ROS 2 environment.
 4. **wire** — call the advertising remote's `~/get_type_description`
    ([`fetch_type_description`](@ref)), verify, register, and persist for next run.
 
-The first sample of a type pays discovery + codegen; the rest are fast registry
-lookups; across runs the cache (or a baked `@ros_cache` static type) skips
-re-discovery. Returns the generated type (reached by the caller via `invokelatest`,
-newer world age, §11) or `nothing` if unresolvable from any source.
+Returns the generated type, or `nothing` when no source can resolve it. Steps 1–3 run
+in [`resolve_type`](@ref); step 4 runs only when `wire=true` and steps 1–3 missed, and
+blocks the calling task on discovery and the remote call (bounded by `timeout_ms`).
+The wire step is taken against whichever node advertises `(name, hash)` on the graph,
+preferring a remote advertiser over a local one. `ament`/`cache`/`wire` switch off the
+corresponding source; `hash` is a `TypeHash` or RIHS string (a malformed string
+returns `nothing`).
+
+The first sample of a type pays for discovery and codegen; subsequent samples are fast
+registry lookups, and across runs the cache (or a baked `@ros_cache` static type) skips
+re-discovery. The returned type lives in a newer world age than the compiled dispatch
+path, so callers reach it through `Base.invokelatest`.
 """
 function resolve_or_discover(node, name::AbstractString, hash;
                              ament::Bool=true, cache::Bool=true, wire::Bool=true,
@@ -325,17 +355,18 @@ end
 """
     wire_get_type_description!(node) -> ServiceHandle
 
-Declare the hidden `~/get_type_description` service on `node` (§13): a
-`type_description_interfaces/srv/GetTypeDescription` server whose handler answers
-from the Context type registry (§11) via [`describe_type`](@ref), converting the
-canonical internal `TypeDescriptionMsg` to the wire form ([`to_wire_td`](@ref)). A
-request for an unknown `(name, hash)` is a clean `successful=false` reply. Every
-node serves this so peers can fetch the descriptions it advertises. The handle is
-tracked on `node` (closed with it) like any other entity.
+Declare the hidden `~/get_type_description` service on `node` and start serving it
+(§13). The handler answers from the Context type registry (§11) via
+[`describe_type`](@ref), converting the canonical internal `TypeDescriptionMsg` to the
+wire `type_description_interfaces/srv/GetTypeDescription` form (`to_wire_td`).
+A request for an unknown `(name, hash)` gets a clean `successful=false` reply rather
+than an error. Every node serves this so peers can fetch the descriptions it
+advertises on the graph.
 
-When `include_type_sources` is requested, `type_sources` carries one regenerated
-`IL.unparse` text per served type (via [`_type_sources`](@ref)); the default reply
-leaves it empty, since the description alone suffices for decode.
+Returns the [`ServiceHandle`](@ref), tracked on `node` and reaped by `close(node)`
+like any other entity. When a request sets `include_type_sources`, `type_sources`
+carries one regenerated `IL.unparse` text per served type (via `_type_sources`);
+otherwise it is empty, since the description alone is enough to decode.
 """
 function wire_get_type_description!(node)
     return Service(node, "~/get_type_description", GetTypeDescription_Request) do req
@@ -373,8 +404,20 @@ end
 const LogMsg  = Interfaces.rcl_interfaces.msg.Log
 const TimeMsg = Interfaces.builtin_interfaces.msg.Time
 
-# A FATAL level above Julia's `Error` (2000) so a Julia program can request ROS2's
-# FATAL severity explicitly (`@logmsg Fatal …`); plain `@error` stays at ERROR.
+"""
+    Fatal
+
+A Julia `LogLevel` of `3000`, one step above `Logging.Error` (`2000`), giving Julia
+code a way to request ROS 2's `FATAL` severity, which Julia's standard levels don't
+provide. A [`RosoutLogger`](@ref) maps `@logmsg Fatal …` to the `rcl_interfaces/msg/Log`
+`FATAL` constant (`0x32`) and labels the console line `[FATAL]`; a plain `@error` stays
+at ROS 2 `ERROR`.
+
+```julia
+using Logging
+@logmsg Fatal "reactor breach"
+```
+"""
 const Fatal = Logging.LogLevel(3000)
 
 # ROS2 severity constants (rcl_interfaces/msg/Log). Named here so the bridge is
@@ -409,19 +452,34 @@ end
     RosoutLogger(node; name=node.fqn, parent=nothing, console=true,
                  min_level=Logging.BelowMinLevel)
 
-An `AbstractLogger` that, per record (§13, D7): writes the ROS console line
-`[LEVEL] [stamp] [name]: msg` to stderr (when `console`), publishes an
-`rcl_interfaces/msg/Log` on `node`'s shared `/rosout` publisher, and — if a `parent`
-logger is supplied — forwards the raw record to it too (an extra file/Julia-console
-sink). `name` is the ROS logger name (node FQN by default; `logger(node,"child")`
-makes a `.`-separated child). `min_level` is the logger's own floor; per-name
-overrides come from the node's level table ([`set_logger_level!`](@ref)).
+An `AbstractLogger` that bridges Julia logging to ROS 2's `/rosout`. Per record it
+writes the ROS console line `[LEVEL] [secs.nanosec] [name]: msg` to stderr (when
+`console`), publishes an `rcl_interfaces/msg/Log` on `node`'s shared `/rosout`
+publisher, and — when a `parent` logger is supplied — forwards the raw record to that
+extra sink (a file or Julia console). Installing it routes a plain `@info`/`@warn`/
+`@error`/`@logmsg` to ROS 2 logging with no special macros; the request dispatcher
+installs the node's logger around every handler so handler logs reach `/rosout`
+automatically.
 
-Default ([`logger`](@ref)) is `console=true, parent=nothing` — a bare node logs in
-ROS format. Pass a `parent` (e.g. a `ConsoleLogger`) to add Julia's native output
-alongside. If `node` has no live session the `/rosout` publisher can't be declared and
-that sink is skipped (console/parent still work), so installing the logger is always
-safe.
+`name` is the ROS logger name (the node FQN by default; [`logger`](@ref)`(node,
+"child")` makes a `.`-separated child sharing the same publisher and console).
+`min_level` is this logger's own floor; per-name overrides come from the node's level
+table ([`set_logger_level!`](@ref)) and take precedence by longest matching prefix.
+The Julia level `Logging.Error` maps to ROS 2 `ERROR`; use [`Fatal`](@ref) for ROS 2
+`FATAL`.
+
+Each sink is best-effort and isolated: a failure in one (a bad `show`, a dead
+`/rosout` route) is reported to stderr and never breaks the others or escapes the
+handler. Installing the logger is always safe: the console and `parent` sinks work
+unconditionally, and the `/rosout` sink engages whenever the node has a live session
+to declare the publisher on.
+
+```julia
+lg = RosoutLogger(node; parent = ConsoleLogger())
+with_logger(lg) do
+    @info "armed"          # ROS console, /rosout, AND the Julia console
+end
+```
 """
 mutable struct RosoutLogger <: AbstractLogger
     const node::Any                              # the Node whose /rosout we publish to
@@ -475,11 +533,16 @@ end
     logger(node) -> RosoutLogger
     logger(node, child::AbstractString) -> RosoutLogger
 
-The node's default ROS logger (cached on the node; name = FQN), or a `.`-separated
-child logger (`"<fqn>.child"`) sharing the node's `/rosout` publisher and console.
-The dispatcher installs `logger(node)` around every handler (D7), so handlers rarely
-need this directly; use it for hierarchy or outside a handler via
-`with_logger(node) do … end`.
+The node's default ROS logger, or a `.`-separated child of it. `logger(node)` returns
+the one logger cached on the node (name = node FQN), building it once on first call;
+`logger(node, child)` returns a fresh [`RosoutLogger`](@ref) named `"<fqn>.child"` that
+shares the node's `/rosout` publisher and console.
+
+The request dispatcher installs `logger(node)` around every handler, so handlers rarely
+need this directly. Reach for it to build a child logger for sub-component hierarchy,
+or to log outside a handler via `with_logger(node) do … end`. The single-argument form
+uses double-checked locking so the per-message dispatch path stays lock-free once the
+logger is cached.
 """
 function logger(node::Node)
     # Unlocked fast path: `_logger` is set once. The dispatcher calls this per
@@ -538,7 +601,7 @@ end
 # `maxlog`: emit at most `maxlog` records per call-site `id`. Counts live on the
 # logger (`ConsoleLogger` does the same). The frontend does NOT enforce `maxlog`,
 # so without this `@info … maxlog=1` would log every time. (Counts race under
-# `Parallel(n)` concurrent handlers — benign, like `ConsoleLogger`'s own limits.)
+# `Parallel(n)` concurrent handlers, like `ConsoleLogger`'s own limits.)
 function _maxlog_exceeded!(lg::RosoutLogger, id, kwargs)
     maxlog = get(kwargs, :maxlog, nothing)
     maxlog === nothing && return false
@@ -654,13 +717,18 @@ Logging.catch_exceptions(lg::RosoutLogger) =
     lg.parent === nothing ? false : Logging.catch_exceptions(lg.parent)
 
 """
-    set_logger_level!(node, level)            # sets the node's own logger (FQN)
-    set_logger_level!(node, name, level)      # sets a specific logger name
+    set_logger_level!(node, level::LogLevel)              # the node's own logger (FQN)
+    set_logger_level!(node, name::AbstractString, level::LogLevel)  # a specific logger name
 
-Set the per-logger minimum level (§7, D7). `name` matches the logger and any
-`.`-separated descendant lacking its own entry (`set_logger_level!(node, "/n", Warn)`
-also gates `"/n.child"`). The programmatic form of `--ros-args --log-level name:=…`,
-which will populate the same table once ros-args parsing lands (§5).
+Set a per-logger minimum severity in the node's level table (§7). A `name` entry gates
+that logger and every `.`-separated descendant that lacks its own entry — so
+`set_logger_level!(node, "/n", Logging.Warn)` also gates `"/n.child"` (longest matching
+prefix wins). The two-argument form targets the node's own logger (its FQN). This is
+the programmatic form of `--ros-args --log-level name:=…`, which will populate the same
+table once ros-args parsing lands.
+
+Returns `nothing`. Levels are Julia `LogLevel`s; a [`RosoutLogger`](@ref) consults this
+table on every `shouldlog`/`min_enabled_level` check.
 """
 set_logger_level!(node::Node, name::AbstractString, level::LogLevel) =
     (node._log_levels[String(name)] = level.level; nothing)
@@ -673,16 +741,18 @@ Logging.with_logger(f::Function, node::Node) = Logging.with_logger(f, logger(nod
 Logging.global_logger(node::Node) = Logging.global_logger(logger(node))
 
 """
-    with_rosout(f, node; kwargs...)
+    with_rosout(f, node; name=node.fqn, parent=nothing, console=true,
+                min_level=Logging.BelowMinLevel)
 
-Run `f()` with a fresh [`RosoutLogger`](@ref) (built with `kwargs`) installed as the
-active logger (§13). `with_logger(node) do … end` is the usual form (it reuses the
-node's cached logger); `with_rosout` lets you override logger options
-(`parent=`, `console=`, `min_level=`) for a scope.
+Run `f()` with a fresh [`RosoutLogger`](@ref) (built from the keyword arguments)
+installed as the active logger for the dynamic extent of the call (§13). Returns
+whatever `f()` returns. Use this to override logger options — `parent=`, `console=`,
+`min_level=`, `name=` — for one scope; `with_logger(node) do … end` is the everyday
+form and reuses the node's cached logger.
 
 ```julia
 with_rosout(node; parent = ConsoleLogger()) do
-    @info "armed"          # → ROS console, /rosout, AND Julia console
+    @info "armed"          # ROS console, /rosout, AND the Julia console
 end
 ```
 """
@@ -707,15 +777,23 @@ _julia_log_level(s) =
     s == Zenoh.LogSeverities.INFO  ? Logging.Info  : Logging.Debug
 
 """
-    bridge_zenoh_logs!(node; min_severity=Zenoh.LogSeverities.WARN, capacity=256)
+    bridge_zenoh_logs!(node; min_severity=Zenoh.LogSeverities.WARN, capacity=256) -> Zenoh.LogStream
 
-Capture Zenoh's transport logs (at `min_severity`+) and re-emit them on `node`'s
-`/rosout` under a `<fqn>.zenoh` child logger (§8, D7). Opt-in; spawns a drain task
-that the node's Context drain closes (§14.1). Returns the `Zenoh.LogStream`.
+Capture Zenoh's transport logs (session, transport, liveliness) at `min_severity` and
+above, and re-emit each one through Julia logging under a `<fqn>.zenoh` child logger,
+so they ride the same path to `/rosout`, the ROS console, and the node's level table
+(§8). Returns the `Zenoh.LogStream`.
 
-Zenoh's logger is **process-global and one-shot** — call this at most once per
-process, and not together with `Zenoh.setup_logging`. Keep `min_severity` at `WARN`
-(the default): it's the primary defense against a log→publish→log feedback loop.
+Opt-in and off by default. It spawns a background task that drains the stream; the
+node's Context registers an [`on_shutdown`](@ref) hook that closes the stream on drain,
+which ends the iterator and lets the task exit cleanly. `capacity` bounds the stream's
+drop-oldest ring.
+
+Zenoh's logger is process-global and one-shot: call this at most once per process, and
+not together with `Zenoh.setup_logging`. Keep `min_severity` at `WARN` (the default):
+the WARN floor keeps steady-state forwarding self-contained — a `/rosout` publish's own
+data-plane DEBUG/TRACE records stay below it, so forwarded logs never feed back into
+the stream.
 """
 function bridge_zenoh_logs!(node::Node;
                             min_severity = Zenoh.LogSeverities.WARN,

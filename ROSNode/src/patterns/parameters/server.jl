@@ -8,19 +8,34 @@
 # `node.parameters` to it.
 
 """
-    ParameterServer{P}(node, initial::P; allow_undeclared=false) -> ParameterServer{P}
+    ParameterServer(node, initial::P; allow_undeclared=false) -> ParameterServer{P}
+    ParameterServer{P}(node; overrides=(;), allow_undeclared=false) -> ParameterServer{P}
 
-The §10 parameter subsystem for one node, parameterized on the declared schema
-`P`. The live value sits behind an atomic field (whole-struct swap → readers see a
-complete value, rollback is free); undeclared params live in `dynamic_parameters`
-(gated by `allow_undeclared`, default off). Mutate via [`transaction`](@ref) or
-the sugar (`server.field = v`, [`setproperties!`](@ref)); read declared fields
-with `server.field`.
+The parameter subsystem for one node, parameterized on a [`@parameters`](@ref)
+schema `P` (ROS 2 node parameters, §10). It owns the live schema value and
+applies sets directly; [`ParameterClient`](@ref) is its remote dual, driving
+another node's parameter services asynchronously and fallibly over the wire.
+
+The live schema value sits behind an `@atomic` field swapped whole on every
+commit, so a concurrent reader sees a complete old-or-new value and rollback is
+free. Read a declared field with `server.field` (type-stable). Mutate through
+[`transaction`](@ref), the single-statement sugar `server.field = v`,
+[`setproperties!`](@ref), or [`set_parameter!`](@ref) — all route through one
+commit path under the server's mutation lock.
+
+Undeclared parameters live in a separate `Any`-typed side dict reached via
+[`dynamic_parameters`](@ref), gated by `allow_undeclared` (default off); with
+the gate off, a dynamic read or write raises `ArgumentError`. The two-argument
+form takes an already-built `initial::P`; the `{P}`-keyword form builds the
+initial value by overlaying `overrides` (startup CLI/launch/YAML) onto the
+schema defaults. A startup override of a `read_only` field is allowed —
+read-only blocks only runtime sets.
+
+Typically reached as `node.parameters`. The six standard parameter services and
+`/parameter_events` are wired generically over `P` by
+`wire_parameter_services!` (done for you by `Node(ctx, name, P)`).
 
 Implements the ROS 2 parameter model: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
-
-Typically reached as `node.parameters`; the six standard parameter services and
-`/parameter_events` are wired generically over `P` (see [`wire_parameter_services!`](@ref)).
 """
 mutable struct ParameterServer{P} <: AbstractParameterServer
     const node::Any                                  # the owning Node (loosely held)
@@ -42,16 +57,6 @@ function ParameterServer(node, initial::P; allow_undeclared::Bool=false) where {
                               allow_undeclared, ReentrantLock(), Any[], nothing, Any[])
 end
 
-# Convenience: build the server straight from a schema type, overlaying startup
-# overrides (CLI/launch/YAML) as a NamedTuple onto the schema defaults. Startup
-# overrides bypass the read-only runtime gate (§10).
-"""
-    ParameterServer{P}(node; overrides=(;), allow_undeclared=false)
-
-Build the server for schema `P`, constructing the initial value by overlaying
-`overrides` (startup CLI/launch/YAML) onto the schema defaults. A startup override
-of a `read_only` field is allowed — read-only only blocks runtime sets (§10).
-"""
 ParameterServer{P}(node; overrides::NamedTuple=(;), allow_undeclared::Bool=false) where {P} =
     ParameterServer(node, P(; overrides...); allow_undeclared=allow_undeclared)
 
@@ -65,10 +70,30 @@ current(s::ParameterServer) = @atomic s.value
 "The declared schema type `P` of this server."
 schema_type(::ParameterServer{P}) where {P} = P
 
-"The declared parameter names, in schema order (§10)."
+"""
+    declared_names(server::ParameterServer{P}) -> NTuple{N,Symbol}
+
+The declared parameter names of a [`ParameterServer`](@ref), in schema order —
+`fieldnames(P)` (§10). [`parameter_names`](@ref) adds the dynamic tier for the
+full flat namespace.
+"""
 declared_names(s::ParameterServer{P}) where {P} = fieldnames(P)
 
-"The dynamic (undeclared) parameter dict (§10) — errors if `allow_undeclared` is off."
+"""
+    dynamic_parameters(server::ParameterServer) -> Dict{Symbol,Any}
+    dynamic_parameters(node::Node) -> Dict{Symbol,Any}
+
+The undeclared (dynamic) parameter side dict of a node's parameter server (§10)
+— the `Any`-typed tier for parameters outside the [`@parameters`](@ref) schema.
+The dict is returned by reference, so a direct write
+(`dynamic_parameters(node)[:gain] = 2.0`) adds or changes an undeclared
+parameter immediately, but bypasses the mutation lock and publishes no
+`/parameter_events` — listeners and remote [`ParameterClient`](@ref)s never
+observe it. Route through [`set_parameter!`](@ref)/[`transaction`](@ref) when an
+event is required. Requires `allow_undeclared=true`; with the gate off it raises
+`ArgumentError`. A [`CompositeParameterServer`](@ref) has no node-level dynamic
+tier and raises `ArgumentError` directing you to a member's own server.
+"""
 function dynamic_parameters(s::ParameterServer)
     s.allow_undeclared ||
         throw(ArgumentError("undeclared parameters disabled (allow_undeclared=false)"))
@@ -87,7 +112,6 @@ function Base.getproperty(s::ParameterServer{P}, name::Symbol) where {P}
     if name in fieldnames(P)
         return getfield(@atomic(s.value), name)
     end
-    # A dynamic param read is allowed only when the gate is open.
     if getfield(s, :allow_undeclared)
         dyn = getfield(s, :dynamic)
         haskey(dyn, name) && return dyn[name]
@@ -98,12 +122,16 @@ end
 Base.propertynames(s::ParameterServer{P}) where {P} = fieldnames(P)
 
 """
-    parameter(server, name::Symbol)
+    parameter(server::ParameterServer, name::Symbol)
+    parameter(client::ParameterClient, name; timeout_ms=2000)
 
-Read a parameter by `name` across both tiers (§10): a declared field reads from
-the live struct, a dynamic one from the side dict (when `allow_undeclared`). The
-flat-namespace read the services use; throws for an undeclared name when the gate
-is off.
+Read one parameter by `name` across both tiers (§10). On a
+[`ParameterServer`](@ref) a declared field reads from the live atomic struct and
+a dynamic one from the side dict (when `allow_undeclared`); an undeclared name
+with the gate off raises `ArgumentError`. On a [`ParameterClient`](@ref) it is
+one remote `GetParameters` for the single name — an unset or unknown name reads
+back as `nothing`, and a timeout or error reply raises [`ServiceError`](@ref).
+This is the flat-namespace read the services and the composite resolver use.
 """
 function parameter(s::ParameterServer{P}, name::Symbol) where {P}
     name in fieldnames(P) && return getfield(@atomic(s.value), name)
@@ -114,10 +142,17 @@ function parameter(s::ParameterServer{P}, name::Symbol) where {P}
 end
 
 """
-    parameter_names(server) -> Vector{Symbol}
+    parameter_names(server::ParameterServer) -> Vector{Symbol}
+    parameter_names(server::CompositeParameterServer) -> Vector{Symbol}
+    parameter_names(client::ParameterClient; kwargs...) -> Vector{Symbol}
 
-The flat union of declared field names and live dynamic names (§10) — what `list`
-and `/parameter_events` reflect over. Declared names come first, in schema order.
+The flat list of parameter names a node exposes (§10) — what `list` and
+`/parameter_events` reflect over. For a [`ParameterServer`](@ref) this is the
+union of declared field names (first, in schema order) and the live dynamic
+names (sorted, only when `allow_undeclared`). For a
+[`CompositeParameterServer`](@ref) it is every member's declared names as
+`<member>.<field>` in declared order. For a [`ParameterClient`](@ref) it
+forwards to a remote `ListParameters` ([`list_parameters`](@ref)).
 """
 function parameter_names(s::ParameterServer{P}) where {P}
     names = collect(Symbol, fieldnames(P))
@@ -174,20 +209,42 @@ end
 Base.propertynames(d::Draft{P}) where {P} = fieldnames(P)
 
 """
-    transaction(f, server::ParameterServer)
-    transaction(server::ParameterServer) do p … end
+    transaction(f, server::ParameterServer{P}) -> P
+    transaction(server::ParameterServer{P}) do p … end -> P
+    transaction(f, client::ParameterClient{P}; timeout_ms=2000) -> P
 
-The mutation primitive (§10). Runs `f(draft)` against a mutable draft of the
-current parameters — assignments record pending overrides (reads inside see them),
-touch nothing live, and publish nothing. On clean exit the candidate is built,
-validated as a whole (per-field constraints + read-only gate + user
-[`validate`](@ref)), swapped in atomically under the node's single mutation lock,
-and one batched `/parameter_events` is published. Any throw aborts with free
-rollback — the live cell never held a partial state.
+The parameter mutation primitive (§10). Runs `f(draft)` against a mutable draft
+of the current parameters: assignments record pending overrides that reads
+inside the block observe, while nothing live is touched and nothing is published
+until commit.
 
-Returns the committed schema value. Held under the lock for the block's duration,
-so transactions serialize (the consistency boundary the foreign-thread dispatch
-relies on).
+For a [`ParameterServer`](@ref) the call holds the server's single mutation lock
+for the block's whole duration, so transactions serialize (the consistency
+boundary the foreign-thread dispatch relies on). On clean exit the candidate is
+assembled via [`setproperties`](@ref), validated as a whole (the per-field
+read-only gate and constraints, then the user [`validate`](@ref) hook), swapped
+in with one atomic whole-struct store, and one batched `/parameter_events` is
+published. Any throw aborts with free rollback — the live cell never held a
+partial state. Returns the committed schema value. A constraint, read-only, or
+`validate` violation raises [`ParameterRejection`](@ref), which unwinds the lock
+with nothing committed.
+
+For a [`ParameterClient`](@ref) the same do-block shape drives a remote: `f`
+runs against a draft of the fetched current value, the candidate is checked
+locally first for fast feedback (field constraints, the read-only gate, and any
+`validate` method defined in the client process — rules defined only on the
+remote are enforced by the remote's authoritative re-validation), then pushed as
+one `set_parameters_atomically`. Returns the new `P` on success or raises
+[`ParameterRejection`](@ref) on a rejected set. A schemaless
+`ParameterClient{Nothing}` raises `ArgumentError` — use
+[`set_parameters_atomically`](@ref) instead.
+
+```julia
+transaction(node.parameters) do p
+    p.max_speed = 9.0
+    p.mode = :manual
+end
+```
 """
 function transaction(f, s::ParameterServer{P}) where {P}
     @lock s.lock begin
@@ -268,13 +325,16 @@ function Base.setproperty!(s::ParameterServer{P}, name::Symbol, value) where {P}
 end
 
 """
-    setproperties!(server, overrides::NamedTuple)
-    setproperties!(server, full::P)
+    setproperties!(server::ParameterServer{P}, overrides::NamedTuple) -> P
+    setproperties!(server::ParameterServer{P}, full::P) -> P
 
 Effectful multi-field set as one implicit transaction (§10). A NamedTuple is a
-partial overlay (only the named fields change); a full `P` value is replace-all
-(every field is set, so each is validated and event-reported). Commits atomically
-through the same path as [`transaction`](@ref); returns the committed value.
+partial overlay — only the named fields change. A full `P` value is replace-all
+— every field is staged, and validation and the event batch consider only the
+fields whose value actually changes, so restating a read-only field at its
+current value commits as a no-op rather than a rejection. Commits atomically
+through the same path as [`transaction`](@ref) and returns the committed value;
+a rejection raises [`ParameterRejection`](@ref).
 """
 function setproperties!(s::ParameterServer{P}, overrides::NamedTuple) where {P}
     transaction(s) do p
@@ -293,11 +353,19 @@ function setproperties!(s::ParameterServer{P}, full::P) where {P}
 end
 
 """
-    set_parameter!(server, name::Symbol, value) -> committed value
+    set_parameter!(server::ParameterServer, name::Symbol, value) -> P
+    set_parameter!(client::ParameterClient, name, value; timeout_ms=2000) -> value
 
-Set one parameter by name across both tiers (§10) — a declared field routes to the
-typed struct, an undeclared name to the dynamic dict (when `allow_undeclared`).
-The single-name entry the parameter `set` service calls per item.
+Set one parameter by name (§10), atomically. On a [`ParameterServer`](@ref) a
+declared field routes to the typed struct (value coerced to the field type) and
+an undeclared name to the dynamic dict (when `allow_undeclared`); it runs as a
+single-statement transaction and returns the whole committed schema struct `P`
+(for a dynamic name the returned struct does not carry that key — only the
+declared tier is part of `P`). On a [`ParameterClient`](@ref) it issues one
+`set_parameters_atomically` and returns the passed `value` on success, raising
+[`ParameterRejection`](@ref) if the remote rejects it (constraint, read-only, or
+`validate`) — the same exception the local form raises, so the failure contract
+is uniform local↔remote.
 """
 function set_parameter!(s::ParameterServer{P}, name::Symbol, value) where {P}
     transaction(s) do p

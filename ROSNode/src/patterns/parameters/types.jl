@@ -26,8 +26,9 @@ export @parameters, ParameterServer, ParameterClient, ParameterDescriptor, Param
 # ── legal value types (§10) ───────────────────────────────────────────────────
 # The closed set ROS2's `ParameterValue` tagged union can carry: bool, int64,
 # float64, string, byte arrays, and `Vector` of {bool,int64,float64,string}.
-# `Symbol` is accepted as sugar over string-with-choices. Anything else is
-# rejected at macro expansion (below) rather than silently coerced on the wire.
+# `Symbol` is accepted as sugar over string-with-choices. An illegal type is
+# rejected by `parameter_type` (below), which the generated `descriptors` body
+# calls — so the rejection lands when descriptors are first built, not at expansion.
 
 const _SCALAR_PARAM_TYPES = (Bool, Int64, Float64, String, Symbol)
 const _ARRAY_ELT_TYPES    = (Bool, Int64, Float64, String, UInt8)
@@ -44,9 +45,14 @@ abstract type AbstractParameterServer end
 
 The `rcl_interfaces/msg/ParameterType` tag enum (§10), `UInt8`-backed so it
 marshals straight onto the wire `type` byte. `PARAMETER_NOT_SET` (0) is the
-unset/unknown sentinel (never stored for a declared field); the other arms mirror
-ROS2's `ParameterValue` union. `get_parameter_types` returns these, and a
-[`ParameterDescriptor`](@ref) carries one as its `ptype`.
+unset/unknown sentinel — never stored for a declared field, and what an unknown
+parameter name or unrecognized wire tag reads back as. The remaining arms mirror
+ROS 2's `ParameterValue` union: `PARAMETER_BOOL`, `PARAMETER_INTEGER`,
+`PARAMETER_DOUBLE`, `PARAMETER_STRING`, `PARAMETER_BYTE_ARRAY`, and the four
+`*_ARRAY` arms.
+
+[`get_parameter_types`](@ref) returns these, and a [`ParameterDescriptor`](@ref)
+carries one as its `ptype`.
 
 See the ROS 2 parameter concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
 """
@@ -88,8 +94,9 @@ end
     parameter_type(::Type) -> ParameterType
 
 The `rcl_interfaces/msg/ParameterType` tag for a declared field type. `Symbol`
-maps to STRING (string-with-choices sugar). Throws for anything outside the
-legal value set — the same check the macro applies at expansion time.
+maps to STRING (string-with-choices sugar). Throws `ArgumentError` for anything
+outside the legal value set; the generated [`descriptors`](@ref) body calls
+this, so an illegal field type surfaces when descriptors are first built.
 """
 function parameter_type(::Type{T}) where {T}
     T === Bool            && return PARAMETER_BOOL
@@ -104,25 +111,31 @@ function parameter_type(::Type{T}) where {T}
     throw(ArgumentError("not a legal parameter type: $(T)"))
 end
 
-# Predicate form used by the macro to validate field types up front.
+# Boolean form of the legal-type check. Currently unused — type validation runs
+# through `parameter_type`'s throw inside the generated `descriptors` body.
 _is_legal_param_type(::Type{T}) where {T} =
     (T in _SCALAR_PARAM_TYPES) ||
     (T <: Vector && eltype(T) in _ARRAY_ELT_TYPES)
 
 # ── descriptors (§10) ───────────────────────────────────────────────────────────
-# One per declared field. `constraint` is `nothing` (no bound), a 2-tuple
-# `(lo, hi)` numeric range, or a tuple of allowed values (the `∈ choices` form);
-# `validate_value` checks a candidate field value against it. `read_only` blocks
-# *runtime* sets (a startup override is still allowed, §10).
 
 """
     ParameterDescriptor
 
-Per-field metadata for a declared parameter (§10): its `name`, Julia `type`, ROS2
-`ptype` tag, human `description`, optional `constraint`, `read_only` flag, and the
-schema `default`. Built by [`@parameters`](@ref); reflected over by the six
-parameter services (`describe`/`get_types`/…). `constraint` is `nothing`, a
-numeric `(lo, hi)` range, or a tuple of allowed values (`∈ choices`).
+Per-field metadata for one declared parameter (ROS 2
+`rcl_interfaces/msg/ParameterDescriptor`, §10): its `name::Symbol`, Julia `type`,
+[`ParameterType`](@ref) tag `ptype`, human `description`, optional `constraint`,
+`read_only` flag, and schema `default`. Built by [`@parameters`](@ref) and
+reflected over by the parameter services (`describe_parameters`,
+`get_parameter_types`, …).
+
+`constraint` is one of: `nothing` (no bound), a numeric `(lo, hi)` range tuple,
+or a tuple of allowed values (the `∈ choices` form). The tuple is untagged, so a
+choice set of exactly two numbers is indistinguishable from a range and is
+validated as one. On the wire the structured constraint travels only as the
+human `additional_constraints` string and no default travels at all, so a
+descriptor decoded by a remote [`ParameterClient`](@ref) carries both
+`constraint === nothing` and `default === nothing`.
 """
 struct ParameterDescriptor
     name::Symbol
@@ -167,10 +180,14 @@ end
 """
     readonly(default)
 
-Mark a `@parameters` field read-only: `field::T = default |> readonly`. Read-only
-blocks runtime sets (an exception internally; a rejected `SetParametersResult`
-on the wire) while still permitting a startup override (CLI/launch/YAML) (§10).
-The marker is consumed at macro expansion, so the stored default is the bare value.
+Mark a [`@parameters`](@ref) field read-only inside the schema DSL:
+`field::T = default |> readonly` (§10). Read-only blocks runtime sets — a
+runtime set raises [`ParameterRejection`](@ref) internally and returns a
+rejected `SetParametersResult` on the wire — while still permitting a startup
+override (CLI/launch/YAML), which goes through the constructor rather than a
+transaction. The marker is detected and stripped at macro expansion, so the
+stored default is the bare value; a stray `readonly(x)` evaluated outside the
+DSL just wraps `x` in an inert holder.
 """
 readonly(x) = _ReadOnly(x)
 

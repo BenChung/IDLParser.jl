@@ -7,26 +7,36 @@
 """
     export_typesupport(node_or_ctx, names; to=pwd(), format=:msg) -> Vector{String}
 
-Write discovered (or any registered) types out of the in-memory registry into
-durable, user-owned form (§11). `names` is a type name (or iterable of them);
-`format` selects the output:
+Write registered (typically discovered) types out of the in-memory registry
+into durable, user-owned files (§11), returning the paths written. `names` is a
+single type name or any iterable of names; `format` selects the layout (the
+ROS 2 interface concept:
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html):
 
-See the ROS 2 interface concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html
+- `:msg` (default) / `:julia_text` — `IL.unparse` the type into ROS interface
+  text at `<to>/<package>/<qualifier>/<Name>.<ext>` (`.msg` / `.srv` /
+  `.action` per the IL kind). The most portable form: `colcon build` turns the
+  tree into a real interface package. A discovered type's text carries exactly
+  the field definitions RIHS01 covers, so it is wire-faithful; constants and
+  defaults are absent (`lift` drops them), so it is lossy as documentation.
+- `:julia` — emit `Generation.generate_code`'s output as `.jl` source at
+  `<to>/<package>.jl` (or `<to>/<Name>.jl` for a package-less name) to check in
+  and `include`. The strongest port-forward: the once-dynamic type becomes
+  static, precompilable, and back on the min-copy fast path. The file carries
+  inline `import StaticArrays, CDRSerialization` so it reparses standalone. This
+  emits the entry's own IL only; a self-contained type loads as written, while a
+  type with nested cross-package fields needs its referenced types exported
+  alongside it (the closure), which this single-type path leaves out.
+- `:typedesc` — the raw wire `TypeDescription` JSON bundle at
+  `<to>/<Name>.typedesc.json`; language-agnostic and reloadable by ROSNode.
 
-- `:msg` / `:julia_text` — `IL.unparse` the IL into ROS interface text
-  (`<to>/<package>/<qualifier>/<Name>.<ext>`). Most portable: `colcon build` turns
-  it into a real package. A discovered type carries fields only — RIHS01/`lift`
-  drops constants and defaults — so the emitted text is wire-faithful but lossy as
-  documentation.
-- `:julia` — emit `Generation.generate_code`'s output as `.jl` source
-  (`<to>/<package>.jl`) to check in and `include`. The strongest port-forward: the
-  once-dynamic type becomes static, precompilable, and back on the min-copy fast
-  path.
-- `:typedesc` — the raw `TypeDescription` JSON bundle (`<to>/<Name>.typedesc.json`);
-  language-agnostic and reloadable by us.
-
-Returns the paths written. Errors if a requested name isn't registered (resolve it
-first via discovery/ament).
+Throws `ArgumentError` when a requested name is not registered (discover or
+[`load_ament_type`](@ref) it first), when an unknown `format` is given, or when
+`:typedesc` is requested for an `:ament`-acquired entry — one parsed from local
+interface text, which carries no wire `TypeDescription`. The `:wire`, `:cache`,
+`:static`, and `:authored` entries all carry one and export as `:typedesc`
+fine. Name resolution ignores the hash version — the first registry entry
+matching the name is exported.
 """
 function export_typesupport(ctxlike, names; to::AbstractString=pwd(),
                             format::Symbol=:msg)
@@ -68,7 +78,7 @@ function _export_one(entry::RegistryEntry, to::AbstractString, format::Symbol)
 end
 
 # `:typedesc` — the raw wire blob as canonical JSON. Requires the entry to carry a
-# `TypeDescriptionMsg` (wire/cache provenance); a purely-static entry has none.
+# `TypeDescriptionMsg`; an `:ament` entry (parsed from local interface text) has none.
 function _export_typedesc(entry::RegistryEntry, to::AbstractString)
     entry.td === nothing &&
         throw(ArgumentError("type $(entry.info.name) has no TypeDescription to \

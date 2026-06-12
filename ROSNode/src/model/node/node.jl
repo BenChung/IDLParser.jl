@@ -37,21 +37,50 @@ export Node, Entity, dispose
 # is tracked here and dies with it (close-on-close, §6).
 
 """
-    Node(ctx, name; namespace=nothing, enclave=nothing)
+    Node(ctx, name; namespace=nothing, enclave=nothing, serve_type_description=true,
+         warmup=:precompile, warmup_sync=false)
 
-A ROS 2 node sharing Context `ctx`'s session (§6); see
-https://docs.ros.org/en/rolling/Concepts/Basic/About-Nodes.html. `name` is the
-bare node name; `namespace` defaults to the Context's (FQN = `namespace`/`name`).
-Constructing a Node allocates an entity id, builds a `ROSZenoh.NodeEntity`, and
-declares the node liveliness token so peers discover it.
+A ROS 2 node sharing Context `ctx`'s Zenoh session (§6). The node is the identity
+under which publishers, subscriptions, services, clients, timers, and parameters
+are created, and the naming root for relative/private name resolution; see
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Nodes.html. The parameter
+server itself is attached by the schema form `Node(ctx, name, P)` (§10), reached
+as `node.parameters`; this two-positional-arg form leaves `node.parameters ===
+nothing`.
 
-Entities (publishers, subscriptions, services, …) are created against the node
-with type-constructors and tracked here: `close(node)` undeclares its token and
-every entity it owns. The Node is also registered with the Context so a drain
-(§14) closes it.
+`name` is the bare node name and must be non-empty. `namespace` defaults to the
+Context's namespace; the fully-qualified name is `namespace/name`, validated at
+construction. `enclave` defaults to the Context's enclave (SROS2 security enclave).
 
-A clock surface (`clock(node)`, `now(node)`, `Timer(node, …)`, §7) reads through
-the node's `clocks` table, routed to the Context's session/sim source.
+Construction allocates an entity id from `ctx`, builds the wire identity
+(`ROSZenoh.NodeEntity`), declares the node's liveliness token so peers discover it
+(the `NN` node-liveliness kind, §2.2), and injects the node into the local
+discovery index so self-queries see it immediately (§12). The node is registered
+with `ctx`, so a Context drain (§14) closes it. `serve_type_description=true` also
+declares the `~/get_type_description` service (matching real ROS 2 nodes on Jazzy
+and later) so peers can resolve the types this node advertises; a failure
+declaring it is logged and construction continues.
+
+`warmup`/`warmup_sync` set the default warm-up policy for entities created on the
+node (see `WarmupPolicy`, §D8); each entity constructor's own
+`warmup`/`warmup_sync` keywords override per-endpoint. `warmup=:precompile`
+anchors the dispatch chain side-effect-free at construction; `warmup_sync=true`
+blocks each entity constructor until warm.
+
+Every entity created against the node is tracked and dies with it: `close(node)`
+leaves the Context's sim-time set, closes each owned entity in reverse creation
+order (failures logged, teardown continues), withdraws the node liveliness token,
+and drops the node from the discovery index. `close` is idempotent and
+`isopen(node)` reports liveness. Clock access (`clock(node)`, `now(node)`,
+`Timer(node, …)`, §7) reads through the node's per-source clock table, routed to
+the Context's session or sim time source.
+
+```julia
+ctx = Context()
+node = Node(ctx, "sensor_driver"; namespace="/robot1")
+# node.fqn == "/robot1/sensor_driver"
+close(node)
+```
 """
 mutable struct Node
     const context::Context
@@ -175,7 +204,6 @@ function Base.close(node::Node)
             @error "close(node): closing entity failed" exception=(err, catch_backtrace())
         end
     end
-    # Withdraw the node token + drop from the index.
     if node._lv_token !== nothing
         try
             close(node._lv_token)
