@@ -1,3 +1,6 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 ROSNode = "bb9e268e-7981-4227-9ebf-b0919ec29e7a"
+
+[sources]
+ROSNode = { path = ".." }
