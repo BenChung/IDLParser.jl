@@ -96,13 +96,14 @@ function _emit_parameter_event!(s::ParameterServer{P}, old::P, new::P,
     return nothing
 end
 
-# Event timestamp: the node's clock when one is attached, otherwise host wall-clock
-# ns. Keeps this file decoupled from the clock wiring.
+# Event timestamp: the node's sim-aware ROS clock when one is attached, otherwise
+# host wall-clock ns. The wire publish reuses this stamp, so in-process listeners
+# and /parameter_events carry the same instant.
 function _server_stamp_ns(s::ParameterServer)
     node = s.node
     node === nothing && return round(Int64, Dates.datetime2unix(Dates.now()) * 1e9)
     try
-        return nanoseconds(Dates.now(node, System()))
+        return nanoseconds(Dates.now(node))
     catch
         return round(Int64, Dates.datetime2unix(Dates.now()) * 1e9)
     end

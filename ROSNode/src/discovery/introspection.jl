@@ -53,12 +53,12 @@ An entry that stores a `td` (wire-discovered, cached, or well-known) is served f
 directly, its closure sorted by `type_name` so that `calculate_rihs01_hash` of the
 served description equals the hash advertised on the graph (the integrity invariant a
 receiving peer re-checks). An IL-only entry (ament/static) is rebuilt: the main type
-from the struct AST, the closure collected from the registry by name — and that
-collection carries only referenced types that themselves store a `td`, so an ament
-compound type with ament-only members serves an incomplete closure whose recomputed
-RIHS01 can differ from the advertised hash (the §11 ament-refs gap; see the TODO in
-acquire.jl). [`wire_get_type_description!`](@ref) converts the result to the wire form
-via `to_wire_td`; a `nothing` result becomes a `successful=false` reply.
+from the struct AST, the closure collected from the registry by name, IL-only
+referenced types rebuilt the same way. A referenced type that cannot be resolved from
+the registry throws an `ArgumentError` — a truncated closure would fail the receiving
+peer's integrity gate anyway. [`wire_get_type_description!`](@ref) converts the result
+to the wire form via `to_wire_td`; a `nothing` result becomes a `successful=false`
+reply.
 """
 function describe_type(ctx_or_node, type_name::AbstractString,
                        type_hash::AbstractString)
@@ -94,20 +94,12 @@ end
 # directly, closure sorted by `type_name` so `calculate_rihs01_hash` of what we
 # serve equals the hash we advertise (§13 hash parity). An IL-only entry (ament/
 # static) is rebuilt — lower to the struct AST, collect the referenced closure
-# from the registry — and that closure carries only refs that store a `td`, so it
-# can be incomplete for ament-only members (§11 ament-refs gap, acquire.jl TODO).
-# `nothing` when the entry has neither a `td` nor a recoverable struct AST — a
-# fail-safe not-found.
+# from the registry, rebuilding IL-only refs the same way. `nothing` when the
+# entry has neither a `td` nor a recoverable struct AST — a fail-safe not-found.
 function _entry_type_description(reg, entry::RegistryEntry)
     entry.td !== nothing && return _canonicalize_tdmsg(entry.td)
-    pkg, _, _ = split_ros_name(entry.info.name)
-    ast = try
-        _scan_for_struct(lower(entry.il; package = pkg))
-    catch
-        nothing
-    end
-    ast === nothing && return nothing
-    main = type_description_from_struct(ast, entry.info.name; package = pkg, qualifier = "msg")
+    main = _entry_main_td(entry)
+    main === nothing && return nothing
     return TypeDescriptionMsg(main, _collect_registry_closure(reg, main))
 end
 
@@ -118,14 +110,25 @@ _canonicalize_tdmsg(td::TypeDescriptionMsg) =
     TypeDescriptionMsg(td.type_description,
         sort(td.referenced_type_descriptions; by = t -> t.type_name))
 
-# The main internal `TypeDescription` of a registry entry, if recoverable (its
-# stored `td`'s main; rebuilding from IL is the describe path's job, not here).
-_entry_main_td(e::RegistryEntry) = e.td === nothing ? nothing : e.td.type_description
+# The main internal `TypeDescription` of a registry entry, if recoverable: its
+# stored `td`'s main, else rebuilt from the IL via the struct AST — one path for
+# the described type and for the IL-only refs in its closure.
+function _entry_main_td(e::RegistryEntry)
+    e.td !== nothing && return e.td.type_description
+    pkg, _, _ = split_ros_name(e.info.name)
+    ast = try
+        _scan_for_struct(lower(e.il; package = pkg))
+    catch
+        nothing
+    end
+    ast === nothing && return nothing
+    return type_description_from_struct(ast, e.info.name; package = pkg, qualifier = "msg")
+end
 
 # Transitively collect the referenced types of `main` from the registry (by name),
 # sorted by `type_name` — the closure a peer needs to codegen a referencing type
-# (§11/§13). Refs lacking a registry entry or a stored `td` are skipped, so the
-# closure can be incomplete for ament-only nested members (§11 ament-refs gap).
+# (§11/§13). An unresolvable ref throws: a truncated closure would re-hash to a
+# RIHS01 differing from the advertised one and fail every peer's integrity gate.
 function _collect_registry_closure(reg, main::TypeDescription)
     seen = Set{String}()
     out = TypeDescription[]
@@ -134,9 +137,10 @@ function _collect_registry_closure(reg, main::TypeDescription)
             nt = f.field_type.nested_type_name
             (isempty(nt) || nt in seen) && continue
             e = _lookup_any_version(reg, nt)
-            e isa RegistryEntry || continue
-            sub = _entry_main_td(e)
-            sub === nothing && continue
+            sub = e isa RegistryEntry ? _entry_main_td(e) : nothing
+            sub === nothing && throw(ArgumentError("cannot serve a complete type \
+                description for $(main.type_name): referenced type $(nt) is not \
+                resolvable from the registry"))
             push!(seen, nt); push!(out, sub); visit(sub)
         end
     end
@@ -493,6 +497,12 @@ mutable struct RosoutLogger <: AbstractLogger
     # `maxlog` is the logger's responsibility (the frontend doesn't enforce it):
     # per-call-site-id emit counts, mirroring `ConsoleLogger`'s `message_limits`.
     const _maxlog_counts::Dict{Any, Int}
+    # Guards `_maxlog_counts`: the node's one logger is shared across `Parallel(n)`
+    # handler threads, and concurrent `Dict` mutation can corrupt it.
+    const _maxlog_lock::ReentrantLock
+    RosoutLogger(node, name, parent, console, min_level, _pub, _maxlog_counts) =
+        new(node, name, parent, console, min_level, _pub, _maxlog_counts,
+            ReentrantLock())
 end
 
 _default_logger_name(node) = node isa Node ? node.fqn : string(node)
@@ -511,8 +521,10 @@ end
 # and every `logger(node,"child")` (so children don't each declare a duplicate).
 # rmw_zenoh publishes `/rosout` as a transient-local `rcl_interfaces/msg/Log` topic
 # with a deep history, so late subscribers (`ros2 topic echo /rosout`) get the
-# backlog. A sessionless/closed node can't carry one — return `nothing` and the
-# bridge skips the /rosout sink rather than throwing during logger construction.
+# backlog. The QoS is ROS 2's rosout default (KEEP_LAST 1000, reliable,
+# transient-local, 10 s lifespan) so native peers see a matching offer. A
+# sessionless/closed node can't carry one — return `nothing` and the bridge skips
+# the /rosout sink rather than throwing during logger construction.
 function _rosout_publisher!(node)
     (node isa Node && isopen(node)) || return nothing
     @lock node.lock begin
@@ -520,7 +532,8 @@ function _rosout_publisher!(node)
         node._rosout_pub = try
             Publisher(node, "/rosout", LogMsg;
                       qos = QosProfile(durability = :transient_local,
-                                       reliability = :reliable, depth = 1000))
+                                       reliability = :reliable, depth = 1000,
+                                       lifespan = ROSZenoh.Duration(10, 0)))
         catch err
             @debug "rosout bridge: /rosout publisher declaration failed" exception=(err, catch_backtrace())
             nothing
@@ -600,15 +613,18 @@ end
 
 # `maxlog`: emit at most `maxlog` records per call-site `id`. Counts live on the
 # logger (`ConsoleLogger` does the same). The frontend does NOT enforce `maxlog`,
-# so without this `@info … maxlog=1` would log every time. (Counts race under
-# `Parallel(n)` concurrent handlers, like `ConsoleLogger`'s own limits.)
+# so without this `@info … maxlog=1` would log every time. Locked: unlike a
+# per-task `ConsoleLogger`, this one logger is shared across `Parallel(n)`
+# concurrent handler threads.
 function _maxlog_exceeded!(lg::RosoutLogger, id, kwargs)
     maxlog = get(kwargs, :maxlog, nothing)
     maxlog === nothing && return false
-    n = get(lg._maxlog_counts, id, 0)
-    n >= maxlog && return true
-    lg._maxlog_counts[id] = n + 1
-    return false
+    @lock lg._maxlog_lock begin
+        n = get(lg._maxlog_counts, id, 0)
+        n >= maxlog && return true
+        lg._maxlog_counts[id] = n + 1
+        return false
+    end
 end
 
 # The node's ROS clock instant as `(sec, nanosec)` for a stamp; `(0,0)` if the clock

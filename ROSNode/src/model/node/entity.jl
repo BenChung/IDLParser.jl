@@ -75,7 +75,7 @@ mutable struct Entity
 end
 
 """
-    make_entity(node, kind, topic, type_info, qos; consumer=nothing) -> Entity
+    make_entity(node, kind, topic, type_info=nothing; qos=default_qos()) -> Entity
 
 Build and register an endpoint on `node` (§6). Allocates an entity id from the
 Context, constructs the `ROSZenoh.EndpointEntity`, declares its liveliness token,

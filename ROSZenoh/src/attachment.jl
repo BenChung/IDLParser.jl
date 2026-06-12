@@ -97,12 +97,21 @@ encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8}) =
 """
     decode_attachment(sample) -> (seq::Int64, ts::Int64, gid::NTuple{16,UInt8})
 
-Read an attachment back from a received `Sample` (or `ZBytes`). The inverse of
-[`encode_attachment`](@ref); the gid arrives length-prefixed (`[u8;16]`) and is
-rebuilt into the fixed-width `NTuple{16,UInt8}`.
+Read an attachment back from a received `Sample` (its put attachment) or raw
+attachment `ZBytes`. The inverse of [`encode_attachment`](@ref); the gid arrives
+length-prefixed (`[u8;16]`) and is rebuilt into the fixed-width
+`NTuple{16,UInt8}`. Returns `nothing` for a sample that carries no attachment.
 """
-function decode_attachment(sample)
-    seq, ts, gid = Zenoh.deserialize(Tuple{Int64, Int64, Vector{UInt8}}, sample)
+# Deserializing a Sample directly reads its PAYLOAD (Zenoh's
+# `ZDeserializer(s::Sample) = ZDeserializer(payload(s))`) — pull the put
+# attachment explicitly.
+function decode_attachment(sample::Zenoh.AbstractSample)
+    att = Zenoh.attachment(sample)
+    att === nothing && return nothing
+    return decode_attachment(att)
+end
+function decode_attachment(bytes)
+    seq, ts, gid = Zenoh.deserialize(Tuple{Int64, Int64, Vector{UInt8}}, bytes)
     length(gid) == 16 ||
         throw(ArgumentError("attachment gid is $(length(gid)) bytes, expected 16"))
     return (seq, ts, NTuple{16, UInt8}(gid))

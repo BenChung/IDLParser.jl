@@ -107,8 +107,8 @@ _default_field(::Type{S}) where {S} =
 # ── per-kind anchors ───────────────────────────────────────────────────────────
 
 # Publisher: warm `encode(T)` and the monomorphic `publish` (which `put`s through
-# the concrete route `R`). :execute publishes once — encode runs, the `put` itself
-# null-routes (`_WARMUP[]` guard in `publish`).
+# the concrete route `R`). :execute publishes once — encode and attach run, the seq
+# commit and the `put` itself null-route (`_WARMUP[]` guard in `publish`).
 function _warm_publisher(policy::WarmupPolicy, pub::PublisherHandle{T, R}, sample) where {T, R}
     precompile(encode, (T,))
     precompile(publish, (PublisherHandle{T, R}, T))

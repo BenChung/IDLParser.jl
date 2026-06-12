@@ -23,10 +23,9 @@ https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html):
   `<to>/<package>.jl` (or `<to>/<Name>.jl` for a package-less name) to check in
   and `include`. The strongest port-forward: the once-dynamic type becomes
   static, precompilable, and back on the min-copy fast path. The file carries
-  inline `import StaticArrays, CDRSerialization` so it reparses standalone. This
-  emits the entry's own IL only; a self-contained type loads as written, while a
-  type with nested cross-package fields needs its referenced types exported
-  alongside it (the closure), which this single-type path leaves out.
+  inline `import StaticArrays, CDRSerialization` so it reparses standalone, and
+  emits the entry's referenced types alongside it (the same closure `realize!`
+  generates from), so nested cross-package fields resolve on `include`.
 - `:typedesc` — the raw wire `TypeDescription` JSON bundle at
   `<to>/<Name>.typedesc.json`; language-agnostic and reloadable by ROSNode.
 
@@ -82,7 +81,9 @@ end
 function _export_typedesc(entry::RegistryEntry, to::AbstractString)
     entry.td === nothing &&
         throw(ArgumentError("type $(entry.info.name) has no TypeDescription to \
-                             export as :typedesc (it was acquired statically)"))
+                             export as :typedesc (an :ament entry parsed from \
+                             local interface text carries none — export it as \
+                             :julia or :msg instead)"))
     _, _, bare = split_ros_name(entry.info.name)
     isdir(to) || mkpath(to)
     path = joinpath(to, bare * ".typedesc.json")
@@ -115,7 +116,7 @@ end
 function _export_julia(entry::RegistryEntry, to::AbstractString)
     package, _, _ = split_ros_name(entry.info.name)
     # Exported file is reparsed standalone, so each module emits its own imports.
-    exprs = _generate_exprs(entry.il, package; emit_imports=true)
+    exprs = _generate_exprs_multi(_closure_ils(entry, package); emit_imports=true)
     isdir(to) || mkpath(to)
     fname = isempty(package) ? split_ros_name(entry.info.name)[3] : package
     path = joinpath(to, fname * ".jl")

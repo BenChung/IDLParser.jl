@@ -76,9 +76,13 @@ end
 # vanilla install; nonexistent ones are dropped by the `isdir` filter.
 const _ROS_SYSTEM_DISTROS = ("rolling", "jazzy", "kilted", "lyrical", "humble")
 
-# User-added prefixes (highest precedence), populated via `add_search_path!`. A
-# plain global vector: search-path config is process-global and set at startup.
+# User-added prefixes (highest precedence), populated via `add_search_path!`.
 const _USER_SEARCH_PATHS = String[]
+
+# Guards the process-global typesupport config — `_USER_SEARCH_PATHS` and the
+# `_CACHE` state (cache.jl) — so a late reconfigure cannot race concurrent type
+# resolution. A leaf lock: critical sections touch only the guarded fields.
+const _TS_CONFIG_LOCK = ReentrantLock()
 
 """
     add_search_path!(path) -> Vector{String}
@@ -88,17 +92,18 @@ process-wide and at the highest precedence (ahead of `AMENT_PREFIX_PATH`).
 `path` should be an install prefix whose interface files live under
 `<path>/share/<pkg>/{msg,srv,action}/`, the same shape as an
 `AMENT_PREFIX_PATH` entry. The path is expanded (`~`), normalized to an
-absolute path, and de-duplicated against prior registrations. Returns the
-current user-registered search-path list.
+absolute path, and de-duplicated against prior registrations. Returns a
+snapshot of the current user-registered search-path list.
 
-The registration is global mutable process state, intended to be set once at
-startup; it is not synchronized, so configure it before concurrent type
-resolution begins.
+The registration is global mutable process state, lock-guarded so it is safe
+to call concurrently with type resolution.
 """
 function add_search_path!(path::AbstractString)
     p = abspath(expanduser(String(path)))
-    p in _USER_SEARCH_PATHS || push!(_USER_SEARCH_PATHS, p)
-    return _USER_SEARCH_PATHS
+    @lock _TS_CONFIG_LOCK begin
+        p in _USER_SEARCH_PATHS || push!(_USER_SEARCH_PATHS, p)
+        return copy(_USER_SEARCH_PATHS)
+    end
 end
 
 # Colon-separated entries of env var `var`, empties dropped (no `isdir` filter —
@@ -138,7 +143,8 @@ Underlies [`discover_ament_packages`](@ref) and the by-name ament lookup behind
 function search_prefixes()
     prefixes = String[]
     seen = Set{String}()
-    sources = Iterators.flatten((_USER_SEARCH_PATHS,
+    user = @lock _TS_CONFIG_LOCK copy(_USER_SEARCH_PATHS)
+    sources = Iterators.flatten((user,
                                  _env_prefix_paths("AMENT_PREFIX_PATH"),
                                  _env_prefix_paths("CMAKE_PREFIX_PATH"),
                                  (joinpath("/opt/ros", d) for d in _ROS_SYSTEM_DISTROS)))

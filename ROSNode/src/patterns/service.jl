@@ -512,10 +512,9 @@ it, plus graph tracking) and a long-lived Zenoh `Querier` on the service keyexpr
 That querier is the transport every [`call`](@ref) queries through, and the handle
 behind [`service_matched`](@ref) and [`wait_for_service`](@ref).
 
-The querier targets `:best_matching`, which routes to the nearest complete
-queryable — fitting a ROS service's single server, where the first matching reply
-settles a call. (rmw_zenoh itself targets ALL_COMPLETE; the two agree for one
-server and diverge only across redundant servers on one name.) The client keyexpr
+The querier targets `:all_complete` — every queryable declared complete — like
+rmw_zenoh clients, so redundant servers on one service name see the same fan-out
+a native client produces; the first reply still settles a call. The client keyexpr
 carries the SERVICE-level type identity (service name plus service RIHS), matching
 the server's queryable under rmw_zenoh. `SrvType` is the generated `*_Request`
 struct; the response is its `*_Response` sibling. `qos` maps onto the ROS 2 QoS
@@ -543,12 +542,12 @@ function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
     # Service-level keyexpr type, matching the server's queryable (see `_make_service`).
     sti = something(service_type_info_of(Req, Resp), type_info_of(Req))
     ent = make_entity(node, Client, sname, sti; qos=qos)
-    # The call transport: a Querier on the service keyexpr. `:best_matching` fits a
-    # ROS service's single server — the first matching reply settles the call.
+    # The call transport: a Querier on the service keyexpr. `:all_complete` fans to
+    # every complete server, like rmw_zenoh clients; the first reply settles the call.
     # Stashed in `entity.wire` (reaped on close).
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
-    querier = Querier(ctx.session, Keyexpr(tk); target=:best_matching)
+    querier = Querier(ctx.session, Keyexpr(tk); target=:all_complete)
     ent.wire = _ClientWire(querier, nothing, ReentrantLock())
     return ServiceClient{Req, Resp}(ent, 0)
 end
@@ -625,10 +624,11 @@ via `current_exceptions(task)`) to reach the original; the synchronous path does
 that unwrapping itself.
 
 `timeout_ms` bounds the wait by arming a cancellation timer on the in-flight get
-(`0` leaves the get unbounded). The synchronous path additionally applies a hard
+(`0` arms no timer). The synchronous path additionally applies a hard
 backstop — `timeout_ms/1000 + 2` seconds when set, 60 seconds when
-`timeout_ms == 0` — and raises [`ServiceError`](@ref) when it elapses, covering
-even a `Zenoh.get` that fails to honor its own timeout. The backstop is
+`timeout_ms == 0` — and when it elapses cancels the in-flight get and raises
+[`ServiceError`](@ref), covering even a `Zenoh.get` that fails to honor its own
+timeout. The backstop is
 synchronous-only: an async call is bounded only by the cancellation timer and the
 transport's own query timeout.
 
@@ -660,16 +660,18 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     ts = nanoseconds(Dates.now(e.node, System()))      # request-time wall ns (§3.4)
     attach = encode_attachment(seq, ts, gid(e))
 
+    # A querier get carries no per-call timeout in libzenoh, so bound it with a
+    # `CancellationToken`: cancel fires → the in-flight get ends → the drain
+    # completes cleanly (no abandoned task). A deadline timer arms it when
+    # `timeout_ms > 0`; the sync backstop cancels it on its own deadline (so the
+    # token exists even at `timeout_ms == 0`); an unbounded async call leans on
+    # the transport's query timeout.
+    tok = CancellationToken()
     run = function ()
-        # A querier get carries no per-call timeout in libzenoh, so bound it with a
-        # `CancellationToken` armed on a deadline timer: cancel fires → the in-flight
-        # get ends → the drain completes cleanly (no abandoned task). `timeout_ms == 0`
-        # ⇒ no token; the sync path's outer `timedwait` is then the only ROSNode-side
-        # bound (the async path leans on the transport's query timeout).
-        tok = timeout_ms > 0 ? CancellationToken() : nothing
         # `Base.Timer` — ROSNode's own `Timer` (ROS timer, time.jl) shadows it here.
-        timer = tok === nothing ? nothing :
-            Base.Timer(_ -> (try; Zenoh.cancel(tok); catch; end), timeout_ms / 1000)
+        timer = timeout_ms > 0 ?
+            Base.Timer(_ -> (try; Zenoh.cancel(tok); catch; end), timeout_ms / 1000) :
+            nothing
         try
             gh = Base.get(querier; payload=bytes, attachment=attach, cancellation=tok)
             return _resolve_reply(gh, Resp, e.endpoint.topic)
@@ -687,7 +689,8 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     # most a deadline past `timeout_ms`; if the underlying `Zenoh.get` doesn't honor
     # its own timeout (e.g. wedged, or its I/O thread starved under transport/
     # multicast-discovery contention), we raise `ServiceError` rather than block
-    # indefinitely. The abandoned drain task dies with the process; the caller proceeds.
+    # indefinitely, cancelling the token so the abandoned get/drain terminates
+    # instead of leaking a blocked task per timed-out call.
     fut = Threads.@spawn run()
     deadline = timeout_ms > 0 ? timeout_ms / 1000 + 2.0 : 60.0
     if timedwait(() -> istaskdone(fut), deadline; pollint=0.01) === :ok
@@ -702,6 +705,7 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
             rethrow()
         end
     end
+    try; Zenoh.cancel(tok); catch; end
     throw(ServiceError("no reply from service $(e.endpoint.topic) within \
                         $(round(deadline; digits=1))s (timeout, no server, or transport contention)"))
 end

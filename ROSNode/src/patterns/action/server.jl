@@ -21,8 +21,8 @@ Two construction forms share one constructor:
 - High-level (`do`-block): the body is the goal's execution. The framework spawns
   it wrapped in the cancellation + fail-safe settlement machinery, scheduled per
   `concurrency` — `Serial()` (the default) runs one goal at a time on a sticky
-  cooperative task in acceptance order, `Parallel` runs each body on its own OS
-  thread.
+  cooperative task in acceptance order, `Parallel(n)` runs each body on its own
+  OS thread, at most `n` in flight (`Inf` = unbounded).
 - Low-level: supply `on_accepted=callback`; you own when, whether, and where each
   accepted goal runs (the `GoalHandle` is handed to you). Pair this with
   [`SingleFlight`](@ref) or your own orchestrator.
@@ -86,6 +86,9 @@ mutable struct ActionServer{A, G, R, F}
     # time, §4). Dedicated to goal bodies so the node-wide lock (guarding cross-
     # entity state) stays free while a long mission runs.
     const serial_lock::ReentrantLock
+    # Per-endpoint attachment sequence_numbers (§3.4), one per published topic.
+    @atomic feedback_seq::Int64
+    @atomic status_seq::Int64
     @atomic open::Bool
 end
 
@@ -142,7 +145,7 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                                       send_goal_ent, cancel_goal_ent, get_result_ent,
                                       feedback_ent, status_ent,
                                       Dict{GoalId, GoalHandle{A, G, R, F}}(),
-                                      ReentrantLock(), ReentrantLock(), true)
+                                      ReentrantLock(), ReentrantLock(), 0, 0, true)
 
     _wire_action_server!(server)
 
@@ -252,6 +255,9 @@ end
 
 function _handle_send_goal(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
     isopen(server) || return _reply_inactive(q)
+    # §14.2 gate: an inactive managed node's action services error-reply, like
+    # service.jl's `_serve_query`. Unmanaged nodes are always active.
+    isactive(server.send_goal_ent) || return _reply_inactive(q)
     id, goal_req = _decode_send_goal(server, q)
 
     # Idempotent re-send: a client retries `send_goal` when its reply is lost/slow, so a
@@ -365,6 +371,7 @@ end
 
 function _handle_cancel_goal(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
     isopen(server) || return _reply_inactive(q)
+    isactive(server.cancel_goal_ent) || return _reply_inactive(q)   # §14.2 gate
     target = _decode_cancel(server, q)            # GoalId, or nothing ⇒ cancel-all
 
     canceling = GoalHandle{A, G, R, F}[]
@@ -397,6 +404,7 @@ end
 
 function _handle_get_result(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
     isopen(server) || return _reply_inactive(q)
+    isactive(server.get_result_ent) || return _reply_inactive(q)   # §14.2 gate
     id = _decode_get_result(server, q)
     g = @lock server.lock get(server.goals, id, nothing)
     if g === nothing
@@ -420,11 +428,16 @@ end
 # never-responded exit → ABORTED. Scheduling is `concurrency` (§4): each body runs
 # on its own task (so the send_goal handler can reply accepted promptly); `Serial()`
 # bodies are sticky and serialize on the server's dedicated `serial_lock` (one goal
-# at a time, order-of-acceptance preserved), `Parallel` bodies run free.
+# at a time, order-of-acceptance preserved), `Parallel(n)` bodies run on spawned
+# threads, at most `n` in flight (`Inf` = unbounded).
 
 function _high_level_on_accepted(body::Function, concurrency::Concurrency)
+    # One semaphore per server, shared by every goal body, so `Parallel(n)` caps
+    # in-flight bodies (the service-path bound, service.jl).
+    sem = concurrency isa Parallel && isfinite(concurrency.n) ?
+          Base.Semaphore(Int(concurrency.n)) : nothing
     return function (g::GoalHandle)
-        run = () -> _run_goal_body(g, body, concurrency)
+        run = () -> _run_goal_body(g, body, concurrency, sem)
         # The body is always its own task so `on_accepted` (which runs on the
         # send_goal request task) returns promptly to reply accepted. Under
         # `Serial()` the task is sticky, staying on the node's cooperative thread
@@ -446,8 +459,10 @@ end
 
 # Execute one goal body under the settlement wrapper. `Serial()` serializes bodies
 # on the server's dedicated `serial_lock` (§4 one-at-a-time), leaving the node-wide
-# lock free during a long mission; `Parallel` runs free.
-function _run_goal_body(g::GoalHandle{A, G, R, F}, body::Function, concurrency::Concurrency) where {A, G, R, F}
+# lock free during a long mission; `Parallel(n)` admits at most `n` bodies at once
+# via `sem` (`nothing` = unbounded).
+function _run_goal_body(g::GoalHandle{A, G, R, F}, body::Function, concurrency::Concurrency,
+                        sem::Union{Base.Semaphore, Nothing} = nothing) where {A, G, R, F}
     _transition!(g, GOAL_EXECUTING)
     server = g.server
     _publish_status(server)
@@ -459,6 +474,8 @@ function _run_goal_body(g::GoalHandle{A, G, R, F}, body::Function, concurrency::
                                    log_id = g.id)
     if concurrency isa Serial
         @lock server.serial_lock runner()
+    elseif sem !== nothing
+        Base.acquire(runner, sem)
     else
         runner()
     end
@@ -560,10 +577,12 @@ _goal_status_byte(s::GoalState) = Int8(s)
 function _publish_feedback(server::ActionServer{A, G, R, F}, id::GoalId, fb::F) where {A, G, R, F}
     e = server.feedback_ent
     isopen(e) || return nothing
+    isactive(e) || return nothing                 # §14.2: gated (inactive) node ⇒ drop
     route = e._route
     route === nothing && return nothing
     msg = _feedback_message_type(A)(; goal_id = _to_uuid(id), feedback = fb)
-    attach = encode_attachment(0, _now_ns(server.node), gid(e))
+    seq = (@atomic server.feedback_seq += 1)
+    attach = encode_attachment(seq, _now_ns(server.node), gid(e))
     put(route::ZPublisher, encode(msg); attachment=attach)
     nothing
 end
@@ -577,6 +596,7 @@ end
 function _publish_status(server::ActionServer)
     e = server.status_ent
     isopen(e) || return nothing
+    isactive(e) || return nothing                 # §14.2: gated (inactive) node ⇒ drop
     route = e._route
     route === nothing && return nothing
     stamp = to_msg(_Time, Dates.now(server.node))
@@ -585,7 +605,8 @@ function _publish_status(server::ActionServer)
                     status = _goal_status_byte(@atomic g.status))
         for g in values(server.goals) if !(@atomic g.fetched)]
     msg = _GoalStatusArray(; status_list = statuses)
-    attach = encode_attachment(0, _now_ns(server.node), gid(e))
+    seq = (@atomic server.status_seq += 1)
+    attach = encode_attachment(seq, _now_ns(server.node), gid(e))
     put(route::ZPublisher, encode(msg); attachment=attach)
     nothing
 end

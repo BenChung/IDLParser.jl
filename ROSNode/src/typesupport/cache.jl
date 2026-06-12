@@ -19,6 +19,8 @@
 # `dirs` is the ordered read search-list (a project may register several `@ros_cache`
 # dirs); `dir` is the single primary write dir (the deterministic min of `dirs`, or
 # the last explicit `enable_project_cache!`). Reads consult every entry in `dirs`.
+# Field access goes through `_TS_CONFIG_LOCK` (acquire.jl); writers rebind `dirs`
+# wholesale (never mutate in place), so a vector handed out under the lock stays valid.
 mutable struct _CacheState
     enabled::Bool
     dir::Union{String, Nothing}
@@ -60,9 +62,11 @@ escape hatch) regardless of this call.
 """
 function enable_project_cache!(dir::AbstractString=_default_project_cache_dir())
     d = String(dir)
-    _CACHE.enabled = true
-    _CACHE.dir = d
-    _CACHE.dirs = String[d]          # explicit opt-in: this dir is the read+write set
+    @lock _TS_CONFIG_LOCK begin
+        _CACHE.enabled = true
+        _CACHE.dir = d
+        _CACHE.dirs = String[d]      # explicit opt-in: this dir is the read+write set
+    end
     isdir(d) || mkpath(d)
     return d
 end
@@ -72,16 +76,18 @@ end
 # `>1`-dir project is warned: discovery persists, but only to that one dir.
 function _register_cache_dirs!(dirs)
     ds = sort!(unique(String[String(d) for d in dirs]))
-    isempty(ds) && return _CACHE.dir
-    _CACHE.enabled = true
-    _CACHE.dirs = ds
-    _CACHE.dir = ds[1]               # deterministic primary write dir
+    isempty(ds) && return @lock _TS_CONFIG_LOCK _CACHE.dir
+    @lock _TS_CONFIG_LOCK begin
+        _CACHE.enabled = true
+        _CACHE.dirs = ds
+        _CACHE.dir = ds[1]           # deterministic primary write dir
+    end
     for d in ds
         isdir(d) || mkpath(d)
     end
     length(ds) > 1 && @warn "typesupport: multiple @ros_cache directories registered; \
         reads search all of them, new discoveries persist only to $(ds[1])" dirs=ds maxlog=1
-    return _CACHE.dir
+    return ds[1]
 end
 
 """
@@ -96,16 +102,20 @@ The `ROS_TYPESUPPORT_CACHE` environment override keeps persistence
 force-enabled at its directory independently of this call, since
 `_cache_enabled` treats the env var as an unconditional opt-in.
 """
-disable_project_cache!() = (_CACHE.enabled = false; _CACHE.dirs = String[]; nothing)
+disable_project_cache!() =
+    @lock _TS_CONFIG_LOCK (_CACHE.enabled = false; _CACHE.dir = nothing; _CACHE.dirs = String[]; nothing)
 
 # Is the on-disk cache active? The env override force-enables (ops/test escape hatch).
-_cache_enabled() = haskey(ENV, "ROS_TYPESUPPORT_CACHE") || _CACHE.enabled
+_cache_enabled() = haskey(ENV, "ROS_TYPESUPPORT_CACHE") || @lock _TS_CONFIG_LOCK _CACHE.enabled
 
 # Resolve the cache directory, creating it on demand. The env override wins; else the
 # configured dir; else the project-local default. Only meaningful when enabled.
 function _cache_dir()
     base = get(ENV, "ROS_TYPESUPPORT_CACHE", "")
-    isempty(base) && (base = _CACHE.dir === nothing ? _default_project_cache_dir() : _CACHE.dir)
+    if isempty(base)
+        d = @lock _TS_CONFIG_LOCK _CACHE.dir
+        base = d === nothing ? _default_project_cache_dir() : d
+    end
     isdir(base) || mkpath(base)
     return base
 end
@@ -116,8 +126,9 @@ end
 function _cache_read_dirs()
     base = get(ENV, "ROS_TYPESUPPORT_CACHE", "")
     isempty(base) || return String[base]
-    isempty(_CACHE.dirs) || return _CACHE.dirs
-    return String[_CACHE.dir === nothing ? _default_project_cache_dir() : _CACHE.dir]
+    dirs, dir = @lock _TS_CONFIG_LOCK (_CACHE.dirs, _CACHE.dir)
+    isempty(dirs) || return dirs
+    return String[dir === nothing ? _default_project_cache_dir() : dir]
 end
 
 # The content-addressed leaf for a hash: `<64-hex>.json`. The bare hex (not the

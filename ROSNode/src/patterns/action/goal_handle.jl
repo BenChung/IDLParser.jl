@@ -181,11 +181,20 @@ explicit terminal `respond!` is the one hard error (settlement.jl). Returns
 `true` if this call filled the cell.
 
 `respond!(goal, feedback, fb)` is the stream form (`feedback!` sugar), dispatched
-separately — it never touches the cell.
+separately — it never touches the cell. The service tokens
+([`success`](@ref)/[`failure`](@ref)) have no goal status and raise
+`ArgumentError`.
 """
 function respond!(g::GoalHandle{A, G, R, F}, status::SettlementStatus, payload) where {A, G, R, F}
     respond!(g.cell, status, payload)
 end
+
+# Service tokens are terminal for the cell but have no goal-status mapping
+# (`_terminal_state`); rejecting here keeps them from latching the cell with a
+# status `get_result` can never publish.
+respond!(::GoalHandle, status::Union{Success, Failure}, _) =
+    throw(ArgumentError("respond!: $(status) is a service token; settle a goal \
+                         with succeeded/canceled/aborted"))
 
 """
     succeed(goal, result)

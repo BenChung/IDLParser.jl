@@ -302,8 +302,8 @@ Active. Reach the live `Timer` handle through `entities(m)` under the reaction's
 A `:param` rate is read once at materialisation and then fixed: changing the parameter
 afterward does not re-time the timer, and no drift warning is emitted (the §3.4
 detect-and-warn plus `retime!`/`@on_parameter` rewiring are deferred). A `:param`
-naming a non-parameter fails at materialisation, as a field-access error on the
-parameter snapshot.
+naming a non-parameter or a non-numeric parameter errors at materialisation, naming
+the member, port, and symbol.
 
 ```julia
 @every :fps function tick(m::ImageCapture)
@@ -638,10 +638,11 @@ Lifecycle hook run when a transition's processing throws (§3.3) — the ROS 2
 managed-node `on_error` step, mapped to each member. Use it to recover or reset member
 state. Defaults to a no-op on [`Component`](@ref); override it for your mixin.
 
-Known gaps in the current fan-out: a member's throwing `on_error` halts the remaining
-members' recovery and lands the node Finalized, and error processing runs only these
-hooks — member `cleanup` is skipped and ports stay open, so resources `configure`
-acquired persist on the error path.
+A throwing `on_error` is caught and logged, so the remaining members still recover —
+but any member's throw means recovery failed and the node lands Finalized. Known gap
+in the current fan-out: error processing runs only these hooks — member `cleanup` is
+skipped and ports stay open, so resources `configure` acquired persist on the error
+path.
 """
 on_error(::Component) = nothing
 

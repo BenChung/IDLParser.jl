@@ -55,7 +55,7 @@ end
 """
     as(x, ::Type{T}) -> T
 
-Cast an owned ROS message value `x` to the layout-compatible message type `T` by
+Cast a ROS message value `x` to the layout-compatible message type `T` by
 round-tripping it through the CDR wire codec. Two distinct Julia structs that share
 one wire type carry equal RIHS01 type hashes, hence identical CDR field layout — for
 example two modules' separate aliases of `sensor_msgs/msg/Image`. `as` encodes `x` to
@@ -74,12 +74,11 @@ resolution warns when two distinct Julia structs settle on one RIHS01 wire type 
 common dependent; handing such a value across that boundary is the canonical case:
 `f(as(msg, ThatType))`.
 
-The argument must be an owned message struct. The signature is unbounded in `x`, so
-a borrowed `CDRView` (from `decode(...; view=true)`) reaches the encoder and throws a
-`BoundsError` from inside it — the view stores its fields in one NamedTuple, so the
-size pass and write pass walk a layout that disagrees with `T`'s. Re-tag a view to a
-sibling type with `CDRSerialization.retag` for the zero-copy path, or copy it
-out with `decode_owned``(view)` first and then cast the owned value.
+A borrowed `CDRView` (from `decode(...; view=true)`) takes its own method: the view
+stores its fields in one NamedTuple, so it cannot walk the encoder directly — it is
+copied out of its buffer first (`decode_owned`) and the owned value cast. `as` on a
+view therefore always returns an owned `T`, including when `T` is the view's own
+tag. For a zero-copy cast of a view to a sibling type use `CDRSerialization.retag`.
 
 ```julia
 # Illustrative: ImageA and ImageB stand for two modules' aliases of
@@ -89,6 +88,10 @@ as(img_a, ImageA)           # returns img_a itself (identity short-circuit)
 ```
 """
 as(x, ::Type{T}) where {T} = typeof(x) === T ? x : decode(_encode_to_vector(x), T)
+# A view's single-NamedTuple layout can't walk the @generated encoder (its buffer is
+# not reachable either — no struct-start offset, and a nested view's buffer is the
+# outer message's bytes); copy it out, then cast.
+as(v::CDRView, ::Type{T}) where {T} = as(decode_owned(v), T)
 export as
 
 # ── decode: ZBytes / Sample → message ────────────────────────────────────

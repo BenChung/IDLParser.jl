@@ -653,26 +653,27 @@ end
 
 # Generate Julia code for several IL interfaces together (cross-refs resolve), the
 # IL analogue of ROSMessages' file-based `_expand_msg_files`.
-function _generate_exprs_multi(ils_with_pkg)
+function _generate_exprs_multi(ils_with_pkg; emit_imports::Bool=false)
     decls = IDLParser.Parse.Decl[]
     for (pkg, il) in ils_with_pkg
         append!(decls, lower(il; package=pkg))
     end
     resolved = IDLParser.ConstResolution.resolve_constants(decls)
-    return IDLParser.Generation.generate_code(resolved)
+    return IDLParser.Generation.generate_code(resolved; emit_imports=emit_imports)
 end
 
 # ── flushing the cache out to a folder (explicit graduation) ────────────────────
 
 """
-    flush_type_cache(to; dir = <project cache>, format = :msg) -> Vector{String}
+    flush_type_cache(to; dir = <all cache dirs>, format = :msg) -> Vector{String}
 
 Graduate the project-local discovered-type cache out to folder `to`, producing a
 durable, user-owned export of the types learned by running against the live graph —
 suitable for checking into a project. Returns the paths written.
 
-Each `.json` blob in `dir` is loaded, re-hashed from its content to recover the
-type's RIHS01 identity, and written in `format`:
+Each `.json` blob under `dir` — a single directory or an iterable of them — is
+loaded, re-hashed from its content to recover the type's RIHS01 identity, and
+written in `format`:
 
 - `:msg` (default) — ROS interface text in a colcon-buildable package layout
   (`<to>/<pkg>/<qual>/<Name>.<ext>`).
@@ -680,29 +681,43 @@ type's RIHS01 identity, and written in `format`:
   static fast path.
 - `:typedesc` — the raw wire `TypeDescription` JSON blob, language-agnostic.
 
-`dir` defaults to the primary write cache directory: the `\$ROS_TYPESUPPORT_CACHE`
-override, then the configured cache dir, then the project default. An unparseable
-blob is skipped, and a per-type export failure is logged and skipped, leaving the
-rest of the run intact; an empty vector comes back when `dir` holds no readable
-blobs. The exported identity is whatever the blob's content hashes to — the
-content-address revalidation that guards the discovery read path does not run here.
+`dir` defaults to the full read search-list: the `\$ROS_TYPESUPPORT_CACHE`
+override, else every registered `@ros_cache` dir, else the project default — so a
+multi-cache project's blobs all graduate, wherever discovery persisted them. A
+type cached under several dirs exports once, from the first dir in search order.
+A nonexistent dir is warned and skipped, an unparseable blob is skipped, and a
+per-type export failure is logged and skipped, leaving the rest of the run
+intact; an empty vector comes back when no dir holds a readable blob. The exported identity is whatever the blob's content
+hashes to — the content-address revalidation that guards the discovery read path
+does not run here.
 """
-function flush_type_cache(to::AbstractString; dir::AbstractString=_cache_dir(),
+function flush_type_cache(to::AbstractString; dir=_cache_read_dirs(),
                           format::Symbol=:msg)
+    dirs = dir isa AbstractString ? String[String(dir)] : String[String(d) for d in dir]
     written = String[]
-    isdir(dir) || return written
-    for f in sort!(readdir(dir; join=true))
-        endswith(f, ".json") || continue
-        parsed = _load_cache_blob(f)
-        parsed === nothing && continue
-        (name, td) = parsed
-        hash = type_hash_from_rihs_string(calculate_rihs01_hash(td))
-        hash === nothing && continue
-        entry = RegistryEntry(TypeInfo(name, hash), lift(td); td=td, provenance=:cache)
-        try
-            append!(written, _export_one(entry, to, format))
-        catch err
-            @warn "flush_type_cache: export failed for $name" exception=err
+    seen = Set{String}()                 # leaf = RIHS01 hex, the cache's type key
+    for d in dirs
+        if !isdir(d)
+            @warn "flush_type_cache: cache dir does not exist: $d"
+            continue
+        end
+        for f in sort!(readdir(d; join=true))
+            endswith(f, ".json") || continue
+            basename(f) in seen && continue
+            parsed = _load_cache_blob(f)
+            parsed === nothing && continue
+            (name, td) = parsed
+            hash = type_hash_from_rihs_string(calculate_rihs01_hash(td))
+            hash === nothing && continue
+            # marked only once usable, so a corrupt copy doesn't shadow a later
+            # dir's good one — same fall-through as `_cache_load`
+            push!(seen, basename(f))
+            entry = RegistryEntry(TypeInfo(name, hash), lift(td); td=td, provenance=:cache)
+            try
+                append!(written, _export_one(entry, to, format))
+            catch err
+                @warn "flush_type_cache: export failed for $name" exception=err
+            end
         end
     end
     return written

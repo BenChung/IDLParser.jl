@@ -133,10 +133,8 @@ function get_parameters(s::CompositeParameterServer, names)
     end
 end
 
-function list_parameters(s::CompositeParameterServer; prefixes=())
-    names = parameter_names(s)
-    isempty(prefixes) && return names
-    filter(n -> any(p -> startswith(String(n), String(p)), prefixes), names)
+function list_parameters(s::CompositeParameterServer; prefixes=(), depth::Integer=0)
+    _filter_names(parameter_names(s), prefixes, depth)
 end
 
 # Per-item set: each `(name, value)` is its own (single-member) atomic transaction,
@@ -268,7 +266,9 @@ function _publish_event!(s::CompositeParameterServer, entries::Vector{Tuple{Stri
         end
     end
     (isempty(new_params) && isempty(changed_params)) && return nothing
-    ev = _ParameterEvent(; stamp = to_msg(_Time, Dates.now(node)),
+    # The merged event carries the newest member commit's stamp.
+    sec, nanosec = _sec_nanosec(maximum(b.stamp_ns for (_, b) in entries))
+    ev = _ParameterEvent(; stamp = _Time(; sec, nanosec),
         node = node === nothing ? "" : String(node.fqn),
         new_parameters = new_params, changed_parameters = changed_params,
         deleted_parameters = _Parameter[])

@@ -41,8 +41,8 @@ function describe_parameters(s::ParameterServer{P}, names) where {P}
         sym = Symbol(name)
         if haskey(s.by_name, sym)
             push!(out, s.by_name[sym])
-        elseif s.allow_undeclared && haskey(s.dynamic, sym)
-            v = s.dynamic[sym]
+        elseif s.allow_undeclared && (dv = _dynamic_find(s, sym)) !== nothing
+            v = something(dv)
             push!(out, ParameterDescriptor(sym, typeof(v), parameter_type(typeof(v)),
                                            "", nothing, false, v))
         else
@@ -70,8 +70,8 @@ function get_parameter_types(s::ParameterServer{P}, names) where {P}
         sym = Symbol(name)
         if sym in fieldnames(P)
             parameter_type(fieldtype(P, sym))
-        elseif s.allow_undeclared && haskey(s.dynamic, sym)
-            parameter_type(typeof(s.dynamic[sym]))
+        elseif s.allow_undeclared && (dv = _dynamic_find(s, sym)) !== nothing
+            parameter_type(typeof(something(dv)))
         else
             PARAMETER_NOT_SET
         end
@@ -96,8 +96,8 @@ function get_parameters(s::ParameterServer{P}, names) where {P}
         sym = Symbol(name)
         if sym in fieldnames(P)
             getfield(@atomic(s.value), sym)
-        elseif s.allow_undeclared && haskey(s.dynamic, sym)
-            s.dynamic[sym]
+        elseif s.allow_undeclared && (dv = _dynamic_find(s, sym)) !== nothing
+            something(dv)
         else
             nothing
         end
@@ -105,8 +105,8 @@ function get_parameters(s::ParameterServer{P}, names) where {P}
 end
 
 """
-    list_parameters(server::ParameterServer; prefixes=()) -> Vector{Symbol}
-    list_parameters(server::CompositeParameterServer; prefixes=()) -> Vector{Symbol}
+    list_parameters(server::ParameterServer; prefixes=(), depth=0) -> Vector{Symbol}
+    list_parameters(server::CompositeParameterServer; prefixes=(), depth=0) -> Vector{Symbol}
     list_parameters(client::ParameterClient; prefixes=String[], depth=0, timeout_ms=2000) -> Vector{Symbol}
 
 The ROS 2 `ListParameters` service: the flat union of parameter names,
@@ -117,15 +117,28 @@ the [`ParameterClient`](@ref) form is the remote dual, raising
 [`ServiceError`](@ref) on a timeout or error reply.
 
 A name matches a prefix by plain `startswith` — `"nav"` also matches
-`navigator.max_speed` — looser than rclcpp's separator-bounded match. The
-server implements `DEPTH_RECURSIVE` only: a non-zero `depth` arriving on the
-wire is accepted and ignored, so the full flat list comes back (`depth=0` on
-the client is `DEPTH_RECURSIVE`).
+`navigator.max_speed` — looser than rclcpp's separator-bounded match. `depth`
+bounds how far past each matched prefix (past the root when `prefixes` is
+empty) the listing reaches; `depth=0` is `DEPTH_RECURSIVE`, the full list.
+Levels count as rclcpp counts them — `.` separators in the post-prefix tail,
+the joining dot excluded — so an exact prefix match always survives and
+`depth=1` reaches a prefix's direct children.
 """
-function list_parameters(s::ParameterServer; prefixes=())
-    names = parameter_names(s)
-    isempty(prefixes) && return names
-    filter(n -> any(p -> startswith(String(n), String(p)), prefixes), names)
+function list_parameters(s::ParameterServer; prefixes=(), depth::Integer=0)
+    _filter_names(parameter_names(s), prefixes, depth)
+end
+
+# The shared `ListParameters` prefix+depth filter (semantics in the docstring
+# above). The count difference minus one is the post-prefix separator count
+# with the joining dot excluded, matching rclcpp's `substr(prefix.length() + 1)`.
+function _filter_names(names, prefixes, depth)
+    if isempty(prefixes)
+        depth == 0 && return names
+        return filter(n -> count('.', String(n)) < depth, names)
+    end
+    matches(str, p) = startswith(str, p) &&
+        (depth == 0 || str == p || count('.', str) - count('.', p) - 1 < depth)
+    filter(n -> any(p -> matches(String(n), String(p)), prefixes), names)
 end
 
 """
@@ -301,7 +314,7 @@ function wire_parameter_services!(s::AbstractParameterServer)
     end)
 
     push!(s.services, Service(node, "~/list_parameters", _RCL_SRV.ListParameters_Request) do req
-        names = list_parameters(s; prefixes = req.prefixes)
+        names = list_parameters(s; prefixes = req.prefixes, depth = req.depth)
         return _RCL_SRV.ListParameters_Response(;
             result = _ListParametersResult(;
                 names = String[String(n) for n in names], prefixes = String[]))
@@ -340,7 +353,8 @@ function _publish_parameter_event(s::ParameterServer, batch::ParameterEventBatch
         push!(haskey(batch.previous, name) ? changed_params : new_params, p)
     end
 
-    ev = _ParameterEvent(; stamp = to_msg(_Time, Dates.now(node)),
+    sec, nanosec = _sec_nanosec(batch.stamp_ns)
+    ev = _ParameterEvent(; stamp = _Time(; sec, nanosec),
         node = node === nothing ? "" : String(node.fqn),
         new_parameters = new_params, changed_parameters = changed_params,
         deleted_parameters = _Parameter[])

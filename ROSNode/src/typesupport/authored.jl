@@ -62,7 +62,12 @@ function _emit_structs(caller::Module, pkg::AbstractString, qual::Symbol, specs)
     end
     qualpath = Expr(:., pkgsym, QuoteNode(qual))               # <pkg>.<qual>
     for (name, fields) in specs
-        decls = Any[:(Expr(:(::), $(QuoteNode(fn)), $(ft))) for (fn, ft) in fields]   # $(ft) → Type in caller
+        # A fieldless interface must still carry rosidl's synthetic uint8 member — the RIHS
+        # IL injects it (`IL.nonempty_fields`), so the struct's wire form has to match; the
+        # `= 0x00` default lets `@kwdef` construct it bare.
+        decls = isempty(fields) ?
+            Any[:(Expr(:(=), Expr(:(::), $(QuoteNode(IL.EMPTY_STRUCT_MEMBER)), UInt8), 0x00))] :
+            Any[:(Expr(:(::), $(QuoteNode(fn)), $(ft))) for (fn, ft) in fields]   # $(ft) → Type in caller
         # `@kwdef` so the action/service runtime can build wrappers/sections by keyword
         # (e.g. `SendGoal_Request(; goal_id=…, goal=…)`, client.jl); the positional ctor the
         # generic CDR reader and `struct_from_nt` use is retained.
@@ -388,6 +393,13 @@ function _nt_fields(ntexpr)
 end
 
 # ── service runtime: adapter + Function-marker dispatch + client (defined once) ───
+# The synthetic empty-interface member exists for the wire/RIHS only; the handler-splat
+# and @NamedTuple surfaces treat a synthetic-only section as fieldless.
+_synthetic_only(::Type{T}) where {T} = fieldnames(T) === (IL.EMPTY_STRUCT_MEMBER,)
+_surface_fields(::Type{T}) where {T} = _synthetic_only(T) ? () : fieldnames(T)
+_from_nt(::Type{T}, nt::NamedTuple) where {T} = _synthetic_only(T) ? T() : ROSMessages.struct_from_nt(T, nt)
+_to_nt(x) = _synthetic_only(typeof(x)) ? (;) : ROSMessages.nt_from_struct(x)
+
 # Splat the decoded request's fields into the handler; build the response struct from its
 # returned @NamedTuple (by field name). A throw maps to a message-preserving `failed` reply
 # so its text reaches the client's `ServiceError`.
@@ -395,12 +407,12 @@ function _authored_service_adapter(f::F) where {F<:Function}
     Req = request_type(F); Resp = response_type(F)
     return function (req)
         out = try
-            f((getfield(req, n) for n in fieldnames(Req))...)
+            f((getfield(req, n) for n in _surface_fields(Req))...)
         catch e
             respond!(req, failed, sprint(showerror, e)); return nothing
         end
         out === nothing && return nothing
-        return out isa Resp ? out : ROSMessages.struct_from_nt(Resp, out)
+        return out isa Resp ? out : _from_nt(Resp, out)
     end
 end
 
@@ -416,8 +428,8 @@ ServiceClient(node::Node, name::AbstractString, f::F; kwargs...) where {F<:Funct
 
 # kwargs in, @NamedTuple out — mirrors the handler. (Struct-passing `call(client, req)` stays.)
 function call(client::ServiceClient{Req, Resp}; async::Bool=false, timeout_ms::Integer=0, fields...) where {Req, Resp}
-    out = call(client, ROSMessages.struct_from_nt(Req, NamedTuple(fields)); async=async, timeout_ms=timeout_ms)
-    return async ? out : ROSMessages.nt_from_struct(out)
+    out = call(client, _from_nt(Req, NamedTuple(fields)); async=async, timeout_ms=timeout_ms)
+    return async ? out : _to_nt(out)
 end
 
 # ── @ros_action ──────────────────────────────────────────────────────────────────
@@ -561,7 +573,7 @@ underlying `GoalHandle` for the lower-level verbs (`succeed`, `abort`, `state`, 
 struct FeedbackSink{F}
     gh::GoalHandle
 end
-(fb::FeedbackSink{F})(nt::NamedTuple) where {F} = (feedback!(fb.gh, ROSMessages.struct_from_nt(F, nt)); nothing)
+(fb::FeedbackSink{F})(nt::NamedTuple) where {F} = (feedback!(fb.gh, _from_nt(F, nt)); nothing)
 (fb::FeedbackSink{F})(msg::F)         where {F} = (feedback!(fb.gh, msg); nothing)
 
 """
@@ -586,9 +598,9 @@ function _authored_action_adapter(f::FN, ::Type{AT}) where {FN<:Function, AT}
     fb_pos = _feedback_param_index(AT)
     return function (g::GoalHandle)
         sink    = FeedbackSink{FB}(g)
-        gfields = Any[getfield(g.request, n) for n in fieldnames(G)]
+        gfields = Any[getfield(g.request, n) for n in _surface_fields(G)]
         out     = f(_splice(gfields, sink, fb_pos)...)
-        return out isa R ? out : ROSMessages.struct_from_nt(R, out)
+        return out isa R ? out : _from_nt(R, out)
     end
 end
 
@@ -602,7 +614,7 @@ ActionClient(node::Node, name::AbstractString, f::FN; kwargs...) where {FN<:Func
 
 # kwargs in → builds the Goal struct (the struct-passing `send(client, goal)` stays).
 send(client::ActionClient{A, G, R, F}; fields...) where {A, G, R, F} =
-    send(client, ROSMessages.struct_from_nt(G, NamedTuple(fields)))
+    send(client, _from_nt(G, NamedTuple(fields)))
 
 # @NamedTuple out for authored actions — mirrors the handler. Keyed on the function marker, so
 # `@ros_import` actions (tag-struct marker, not <:Function) keep returning their structs. Field
@@ -613,7 +625,7 @@ function feedback(g::ClientGoal{A, G, R, F}) where {A<:Function, G, R, F}
     out = Channel{NamedTuple}(32)
     errormonitor(Threads.@spawn begin
         try
-            for fb in src; put!(out, ROSMessages.nt_from_struct(fb)); end
+            for fb in src; put!(out, _to_nt(fb)); end
         finally
             close(out)
         end
@@ -622,6 +634,6 @@ function feedback(g::ClientGoal{A, G, R, F}) where {A<:Function, G, R, F}
 end
 
 Base.fetch(g::ClientGoal{A, G, R, F}) where {A<:Function, G, R, F} =
-    ROSMessages.nt_from_struct(invoke(Base.fetch, Tuple{ClientGoal}, g))
+    _to_nt(invoke(Base.fetch, Tuple{ClientGoal}, g))
 
 export @ros_package, @ros_message, @ros_service, @ros_action, FeedbackSink, goal_handle

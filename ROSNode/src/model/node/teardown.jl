@@ -56,18 +56,16 @@ client (undeclaring its route, withdrawing its liveliness token, and dropping it
 from the discovery index) while keeping the node alive; otherwise `close(node)`
 tears down every entity still tracked at that point.
 
-`close(entity)` always runs first, then the entity is removed from `node.entities`
-if present there. Returns `nothing`.
-
-`dispose` does not verify ownership: `entity` is closed whether or not `node` owns
-it, and only the removal from `node.entities` is conditional — passing an entity
-owned by another node still tears that entity down.
+The entity is removed from `node.entities` first, then closed. If `node` does not
+track `entity` (it is owned by another node, or was already disposed), `dispose`
+is a no-op: the entity is left open. Returns `nothing`.
 """
 function dispose(node::Node, e::Entity)
-    close(e)
     @lock node.lock begin
         i = findfirst(===(e), node.entities)
-        i === nothing || deleteat!(node.entities, i)
+        i === nothing && return nothing
+        deleteat!(node.entities, i)
     end
+    close(e)
     nothing
 end

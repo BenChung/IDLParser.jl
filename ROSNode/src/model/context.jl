@@ -2,8 +2,8 @@
 # N nodes share it (hiroz's `ZContext`). It owns: the session (+ shared `z_id`),
 # an atomic entity-id counter, the domain id, default namespace/enclave, the
 # keyexpr formatter, the type registry (§11), the discovery index (§12) fed by a
-# single `@ros2_lv/**` liveliness subscriber, a clock (§7), the `on_shutdown`
-# hooks, and the shutdown state machine + drain (§14).
+# single `@ros2_lv/<domain>/**` liveliness subscriber, a clock (§7), the
+# `on_shutdown` hooks, and the shutdown state machine + drain (§14).
 #
 # `# TODO(layer):` markers stub seams whose owning layer hasn't landed
 # (`--ros-args` remap parsing, the multi-Context signal manager, discovery-range
@@ -87,11 +87,12 @@ The Context's discovery index: the observed `EndpointInfo` set keyed by
 liveliness keyexpr, behind a lock, plus a `Condition` that graph waits park on
 and a list of user `on_graph_change` listeners.
 
-The single `@ros2_lv/**` liveliness subscriber drives it — a token PUT inserts
-or updates a record, a DELETE removes it by the same key — and our own entities
-are injected directly (§6). The `changed` condition is notified on every change
-so waiters (`wait_for_service`, `on_graph_change`) re-check their predicate.
-This is the one change stream every §12 detector and wait is a view over.
+The single `@ros2_lv/<domain>/**` liveliness subscriber drives it — a token PUT
+inserts or updates a record, a DELETE removes it by the same key — and our own
+entities are injected directly (§6). The `changed` condition is notified on
+every change so waiters (`wait_for_service`, `on_graph_change`) re-check their
+predicate. This is the one change stream every §12 detector and wait is a view
+over.
 
 The no-argument constructor builds an empty index; the Context creates exactly
 one.
@@ -191,10 +192,10 @@ The process-level container (§5) shared by every node in a program — one
 hiroz's `ZContext`). It owns the session and its hex `z_id`, an atomic
 entity-id counter, the `domain_id`, the default `namespace`/`enclave`, the
 keyexpr formatter, the type registry (§11), the discovery index with its
-`@ros2_lv/**` liveliness subscriber (§12), a clock (§7), the `on_shutdown`
-hooks, and the shutdown state machine (§14). It is the RAII/shutdown root:
-`close(ctx)` runs the drain, undeclares entities, and closes the session (the
-`rclcpp::init`/`shutdown` bracket).
+`@ros2_lv/<domain>/**` liveliness subscriber (§12), a clock (§7), the
+`on_shutdown` hooks, and the shutdown state machine (§14). It is the
+RAII/shutdown root: `close(ctx)` runs the drain, undeclares entities, and
+closes the session (the `rclcpp::init`/`shutdown` bracket).
 
 Configuration is two layers. The Zenoh session config is Zenoh.jl's `Config`
 (`config=`, default a fresh peer-mode `Config`); `localhost_only` and `peers`
@@ -206,13 +207,12 @@ loopback router (`tcp/localhost:7447`); `peers` sets `connect/endpoints`;
 `ROS_DOMAIN_ID`/`ROS_NAMESPACE`/`ROS_ENCLAVE` when left `nothing`, with the
 kwarg winning; the namespace is normalized to a leading-slash,
 no-trailing-slash form (empty becomes `/`). `domain_id` is stamped into every
-data-plane topic keyexpr, so topic traffic stays within its domain; the
-discovery index currently ingests liveliness tokens from every domain (graph
-queries are not yet domain-filtered). `home` binds a module whose baked
-`__ros_resolve__` table this Context resolves wire types through, so every
-keyexpr-only subscription sees one consistent picture; leave it `nothing` for
-content-canonical resolution only. `format` selects the keyexpr dialect
-(`RmwZenoh()` for rmw_zenoh, the primary target).
+data-plane topic keyexpr and scopes the liveliness subscription, so topic
+traffic and graph discovery both stay within the domain. `home` binds a module
+whose baked `__ros_resolve__` table this Context resolves wire types through,
+so every keyexpr-only subscription sees one consistent picture; leave it
+`nothing` for content-canonical resolution only. `format` selects the keyexpr
+dialect (`RmwZenoh()` for rmw_zenoh, the primary target).
 
 The constructor opens the session, registers the canonical bootstrap and
 statically-generated types, and starts the discovery consumer task before
@@ -240,8 +240,9 @@ mutable struct Context
     @atomic _next_id::Int                # atomic entity-id allocator (§5)
     const registry::TypeRegistry
     const graph::GraphIndex
-    # The `@ros2_lv/**` liveliness subscriber (channel form) feeding `graph`, drained
-    # by a Julia consumer task (so no foreign thread runs Julia — see `_start_discovery!`).
+    # The `@ros2_lv/<domain>/**` liveliness subscriber (channel form) feeding `graph`,
+    # drained by a Julia consumer task (so no foreign thread runs Julia — see
+    # `_start_discovery!`).
     # `Any` because Zenoh's handler type isn't in scope as a field constraint here and
     # `close` is duck-typed.
     _lv_sub::Any
@@ -281,14 +282,15 @@ end
 
 # Render the session's `z_id_t` into ROSZenoh's canonical lowercase-hex form.
 # zenoh's own `z_id_to_string` reverses the LE bytes (MSB first) and elides
-# leading zero bytes; we reproduce that so the hex matches what rmw_zenoh writes
-# into liveliness tokens (and what `parse_liveliness` reads back).
+# leading zero nibbles (hex digits, so possibly odd-length); we reproduce that
+# so the hex matches what rmw_zenoh writes into liveliness tokens (and what
+# `parse_liveliness` reads back).
 function _zid_hex(s::Session)
     le = to_le_bytes(zid(s))                       # NTuple{16,UInt8}, little-endian
-    be = reverse(collect(le))
-    i = findfirst(!=(0x00), be)                    # strip leading zero bytes
+    hex = bytes2hex(reverse(collect(le)))
+    i = findfirst(!=('0'), hex)                    # strip leading zero nibbles
     i === nothing && return "0"                    # all-zero ⇒ invalid session
-    bytes2hex(@view be[i:end])
+    hex[i:end]
 end
 
 # ROS env → values, with explicit kwargs winning. Kept tiny: domain/namespace/
@@ -432,8 +434,8 @@ registry(ctx::Context) = ctx.registry
     graph(ctx) -> GraphIndex
 
 The Context's discovery index (§12): the live `EndpointInfo` set fed by the
-`@ros2_lv/**` liveliness subscriber and by our own injected entities. The
-graph-query and graph-wait surface (`endpoints`, `topic_names_and_types`,
+`@ros2_lv/<domain>/**` liveliness subscriber and by our own injected entities.
+The graph-query and graph-wait surface (`endpoints`, `topic_names_and_types`,
 `wait_for_service`, `on_graph_change`) are views over this one index.
 """
 graph(ctx::Context) = ctx.graph
@@ -707,7 +709,7 @@ function _apply_remap(node, resolved::AbstractString, ::Symbol)
     resolved
 end
 
-# ── discovery: the @ros2_lv/** liveliness subscriber (§12) ─────────────────
+# ── discovery: the @ros2_lv/<domain>/** liveliness subscriber (§12) ────────
 # One channel-form subscriber per Context, drained by a Julia consumer task. Each
 # token PUT/DELETE updates the index and fans a `GraphChange` to listeners. Parse
 # failures are logged and skipped — a malformed/foreign token must not kill the task.
@@ -720,13 +722,15 @@ end
 # a safepoint → deadlock. Draining a FIFO on a Julia-managed (GC-safe) consumer task
 # keeps ALL Julia execution off foreign threads, so a GC can always complete (§12/D8).
 
-# The wildcard liveliness keyexpr. rmw_zenoh tokens live under `@ros2_lv/**`;
-# ros2dds under `@/<zid>/@ros2_lv/**`, so `**/@ros2_lv/**` covers both.
-_lv_wildcard(::RmwZenoh) = "@ros2_lv/**"
-_lv_wildcard(::KeyExprFormat) = "**/@ros2_lv/**"
+# The wildcard liveliness keyexpr. rmw_zenoh tokens carry the domain as their
+# first segment (`@ros2_lv/<domain>/...`), so the subscription itself scopes
+# discovery to this Context's domain. ros2dds tokens (`@/<zid>/@ros2_lv/...`)
+# carry no domain segment, so the generic form stays unscoped.
+_lv_wildcard(::RmwZenoh, domain_id::Integer) = "@ros2_lv/$domain_id/**"
+_lv_wildcard(::KeyExprFormat, ::Integer) = "**/@ros2_lv/**"
 
 function _start_discovery!(ctx::Context)
-    ke = Keyexpr(_lv_wildcard(ctx.format))
+    ke = Keyexpr(_lv_wildcard(ctx.format, ctx.domain_id))
     # `history=true` replays the live token set so a late-joining Context sees the
     # existing graph (§12 eventual consistency). Capacity is generous: a discovery
     # burst (many tokens at once) buffers rather than drops, and the consumer drains
@@ -776,6 +780,9 @@ function _ingest_liveliness!(ctx::Context, sample)
     entity = parse_liveliness(ctx.format, key)
     # A node token (`NN` kind) parses to a `NodeEntity` — no endpoint to index.
     entity isa EndpointEntity || return nothing
+    # Backstop behind the domain-scoped wildcard. ros2dds entities carry no node
+    # (hence no domain) and pass through.
+    entity.node === nothing || entity.node.domain_id == ctx.domain_id || return nothing
 
     info = _endpoint_info(entity; is_local=false)
     @lock ctx.graph.lock ctx.graph.endpoints[key] = info

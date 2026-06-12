@@ -53,9 +53,10 @@ const _STATIC_TYPES = _StaticTypeIndex(ReentrantLock(), RegistryEntry[], Set{Any
 """
     absorb_static_types!(mod::Module) -> nothing
 
-Flush a module's baked `@ros_import` / `@ros_cache` / `@ros_message` declarations
-into ROSNode's process-wide static-type singleton, so a later `Context` picks up
-the precompiled interface types and cache opt-ins. The macros emit a call to this
+Flush a module's baked `@ros_import` / `@ros_cache` declarations and authored
+types (`@ros_message` / `@ros_service` / `@ros_action`) into ROSNode's
+process-wide static-type singleton, so a later `Context` picks up the
+precompiled interface types and cache opt-ins. The macros emit a call to this
 at module load — from a generated `__init__` in a precompiled package, or a
 top-level call at eval in a script/REPL module. Call it yourself only when your
 module defines its own `__init__` (which the macros otherwise generate for you).
@@ -63,13 +64,14 @@ Idempotent: entries are interned by type, so repeated absorbs of the same module
 are no-ops.
 
 It drains three module-local globals when present: `__ros_cache_dir__` (a
-`@ros_cache` opt-in directory), `__ros_authored_types__` (authored
-`@ros_message`-style types, interned by reflection and folded into the module's
-resolve table), and `__ros_static_types__` (each `@ros_import` type paired with
-its canonical `TypeDescription` JSON). Each carries a precompiled ROS 2 interface
-type and its type-description bytes; registration into a `Context` happens later,
-at `Context` creation. A per-type failure is logged and skipped so one bad
-declaration cannot abort the absorb. Returns `nothing`.
+`@ros_cache` opt-in directory), `__ros_authored_types__` (types authored with
+`@ros_message` / `@ros_service` / `@ros_action`, interned by reflection and
+folded into the module's resolve table), and `__ros_static_types__` (each
+`@ros_import` type paired with its canonical `TypeDescription` JSON). Each
+carries a precompiled ROS 2 interface type and its type-description bytes;
+registration into a `Context` happens later, at `Context` creation. A per-type
+failure is logged and skipped so one bad declaration cannot abort the absorb.
+Returns `nothing`.
 """
 function absorb_static_types!(mod::Module)
     if isdefined(mod, _CACHE_MARKER)

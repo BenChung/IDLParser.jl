@@ -98,14 +98,20 @@ function publish(pub::PublisherHandle{T}, msg::T) where {T}
     isactive(e) || return nothing                   # §14.2: gated (inactive) node ⇒ drop
 
     payload = encode(msg)
-    seq = (@atomic pub.seq += 1)
     ts = nanoseconds(Dates.now(e.node, System()))   # publish-time wall ns (§3.4)
-    attach = encode_attachment(seq, ts, gid(e))
     # §D8 :execute warm-up compiles and runs the encode/attach path in-memory but
-    # skips the wire `put`. The hot path reads only the scoped value: `publish` never
-    # runs during package precompilation, so the `jl_generating_output` check in
-    # `is_warming()` is unneeded here.
-    _WARMUP[] && return nothing
+    # skips the wire `put` and the seq commit — sequence numbers are wire state, so
+    # the first real message must carry seq=1. The speculative read may duplicate a
+    # racing real publish's seq; harmless, the warm-up attachment never leaves this
+    # frame. The hot path reads only the scoped value: `publish` never runs during
+    # package precompilation, so the `jl_generating_output` check in `is_warming()`
+    # is unneeded here.
+    if _WARMUP[]
+        encode_attachment((@atomic pub.seq) + 1, ts, gid(e))
+        return nothing
+    end
+    seq = (@atomic pub.seq += 1)
+    attach = encode_attachment(seq, ts, gid(e))
     deliver_local(pub, msg)                           # §15.1: hand to same-Context subs directly (no-op when disabled)
     put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced route)
     return nothing

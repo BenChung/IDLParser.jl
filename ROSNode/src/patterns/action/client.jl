@@ -357,10 +357,9 @@ so the handler's [`checkpoint`](@ref)/[`feedback!`](@ref) throw
 with a 5-second timeout); the goal's terminal state is observed through `fetch`.
 
 The request targets this goal's id (a zeroed id would be the server-side
-cancel-all sentinel). The handle's local state moves to `:canceling`
-unconditionally once the reply lands, so a `cancel` issued after the goal has
-already settled overwrites the terminal `state(goal)`; read the true terminal
-outcome through `fetch`, which is unaffected.
+cancel-all sentinel). The handle's local state moves to `:canceling` once the
+reply lands, unless the goal has already settled — a terminal `state(goal)` is
+kept; read the true terminal outcome through `fetch`, which is unaffected.
 """
 function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     client = g.client
@@ -374,7 +373,7 @@ function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
                       attachment=_request_attachment(client), timeout_ms=5000)
         break
     end
-    @atomic g._state = :canceling
+    _is_terminal_client_state(@atomic g._state) || @atomic g._state = :canceling
     nothing
 end
 

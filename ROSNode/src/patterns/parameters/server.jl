@@ -107,14 +107,24 @@ end
 
 const _SERVER_FIELDS = fieldnames(ParameterServer)
 
+# Dynamic-tier lookup, locked: `_commit!` mutates `s.dynamic` under `s.lock`
+# while Parallel service handlers read from other OS threads. `Some`-wrapped
+# hit / `nothing` miss; declared-tier reads stay lock-free (atomic struct).
+function _dynamic_find(s::ParameterServer, name::Symbol)
+    @lock s.lock begin
+        dyn = s.dynamic
+        haskey(dyn, name) ? Some(dyn[name]) : nothing
+    end
+end
+
 function Base.getproperty(s::ParameterServer{P}, name::Symbol) where {P}
     name in _SERVER_FIELDS && return getfield(s, name)
     if name in fieldnames(P)
         return getfield(@atomic(s.value), name)
     end
     if getfield(s, :allow_undeclared)
-        dyn = getfield(s, :dynamic)
-        haskey(dyn, name) && return dyn[name]
+        v = _dynamic_find(s, name)
+        v !== nothing && return something(v)
     end
     throw(ArgumentError("no parameter $(repr(name)) (declared: $(fieldnames(P)))"))
 end
@@ -135,8 +145,9 @@ This is the flat-namespace read the services and the composite resolver use.
 """
 function parameter(s::ParameterServer{P}, name::Symbol) where {P}
     name in fieldnames(P) && return getfield(@atomic(s.value), name)
-    if s.allow_undeclared && haskey(s.dynamic, name)
-        return s.dynamic[name]
+    if s.allow_undeclared
+        v = _dynamic_find(s, name)
+        v !== nothing && return something(v)
     end
     throw(ArgumentError("no parameter $(repr(name))"))
 end
@@ -156,7 +167,7 @@ forwards to a remote `ListParameters` ([`list_parameters`](@ref)).
 """
 function parameter_names(s::ParameterServer{P}) where {P}
     names = collect(Symbol, fieldnames(P))
-    s.allow_undeclared && append!(names, sort!(collect(keys(s.dynamic))))
+    s.allow_undeclared && append!(names, sort!(@lock s.lock collect(keys(s.dynamic))))
     return names
 end
 

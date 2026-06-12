@@ -189,7 +189,10 @@ function settle_handler!(cell::ResultCell, body;
             # thunk); never let that defeat the fill — force_abort! covers it.
             try
                 fill!(cell, status, default_result())
-            catch
+            catch fe
+                # Sole log on the Cancelled path (the outer @error skips it):
+                # without this a Cancelled goal force-aborts with no trace.
+                @error "fail-safe settlement fill failed" exception=(fe, catch_backtrace()) status handle=log_id
             end
         end
         # Cancelled is the cooperative cancel signal, not an error (§9); anything

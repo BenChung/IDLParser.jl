@@ -357,10 +357,12 @@ _ipc_copy(msg::T) where {T} = isbitstype(T) ? msg : deepcopy(msg)
 _ipc_own(::Type{S}, msg::S)   where {S} = _ipc_copy(msg)            # same alias, owned
 _ipc_share(::Type{S}, msg::S) where {S} = msg                      # same alias, shared
 # Cross-alias: owned round-trips through the codec (correct by the same invariant the wire
-# uses, and always cheaper than the Zenoh fallback). A `CDRView` re-tags zero-copy; any other
-# *materialized* sibling falls back to the owned copy — a var-length struct with a nested
-# *message* field can't be shared by reference (its `Vector{B.Point}` ≠ `Vector{A.Point}`),
-# the one corner where `view=true` loses zero-copy (isbits-bitcast is a deferred optimization).
+# uses, and always cheaper than the Zenoh fallback); a `CDRView` is copied out of its buffer
+# first (`as`'s view method). Shared: a `CDRView` re-tags zero-copy; any other *materialized*
+# sibling falls back to the owned copy — a var-length struct with a nested *message* field
+# can't be shared by reference (its `Vector{B.Point}` ≠ `Vector{A.Point}`), the one corner
+# where `view=true` loses zero-copy (isbits-bitcast is a deferred optimization).
 _ipc_own(::Type{S}, msg)          where {S} = as(msg, S)            # codec round-trip (== `as`)
+_ipc_own(::Type{S}, v::CDRView)   where {S} = as(v, S)              # materialize, then cast
 _ipc_share(::Type{S}, v::CDRView) where {S} = CDRSerialization.retag(v, S)
 _ipc_share(::Type{S}, msg)        where {S} = _ipc_own(S, msg)

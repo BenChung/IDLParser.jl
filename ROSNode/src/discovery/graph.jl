@@ -378,9 +378,10 @@ _graph_keyset(ctx::Context) = @lock ctx.graph.lock Set(keys(ctx.graph.endpoints)
 
 # ── mismatch detection (§12.2) — views on the change stream ─────────────────
 # Both detectors are `on_graph_change` listeners: when an endpoint appears, they
-# compare it to our *local* endpoints on the same topic and, on a violation, fire
-# a programmatic event and emit a throttled+deduped warning. Detection is per
-# matched (ours, theirs) pair, keyed so we report each distinct mismatch once.
+# compare it to the standing endpoints on the other side of the local/remote
+# divide on the same topic and, on a violation, fire a programmatic event and
+# emit a throttled+deduped warning. Detection is per matched (ours, theirs)
+# pair, keyed so we report each distinct mismatch once.
 #
 # The graph is the primary signal; for type-mismatch a per-sample backstop in the
 # subscription path (`check_sample_type`) catches wildcard subs whose concrete
@@ -450,8 +451,8 @@ function _detectors(ctx::Context)
 end
 
 # Register the umbrella `on_graph_change` listener once: it scans `change.added`
-# for endpoints that match (by topic) one of our locals and dispatches the two
-# detectors. Idempotent — guarded by `installed`.
+# for endpoints that match (by topic) a standing endpoint on the other side and
+# dispatches the two detectors. Idempotent — guarded by `installed`.
 function _ensure_detectors_installed!(ctx::Context, d::_Detectors)
     @lock d.lock begin
         d.installed && return nothing
@@ -464,17 +465,22 @@ function _ensure_detectors_installed!(ctx::Context, d::_Detectors)
     nothing
 end
 
-# For each freshly-added *remote* endpoint, find our local endpoints on the same
-# topic with the complementary kind (their pub ↔ our sub, their sub ↔ our pub) and
-# check type + QoS. Local-vs-local and remote-vs-remote are not our concern.
+# For each freshly-added endpoint, find the standing endpoints across the
+# local/remote divide — an added remote vs our locals, an added local vs the
+# already-discovered remotes — on the same topic with the complementary kind
+# (their pub ↔ our sub, their sub ↔ our pub) and check type + QoS.
+# Local-vs-local and remote-vs-remote are not our concern. Checks always run as
+# (local, remote) pairs, so a pair added in one change dedupes to one signature.
 function _run_detectors(ctx::Context, d::_Detectors, added::Vector{EndpointInfo})
-    locals = filter(e -> e.is_local, endpoints_snapshot(ctx))
-    isempty(locals) && return nothing
-    for remote in added
-        remote.is_local && continue
-        for local_e in locals
-            local_e.topic == remote.topic || continue
-            _complementary(local_e.kind, remote.kind) || continue
+    snapshot = endpoints_snapshot(ctx)
+    locals = filter(e -> e.is_local, snapshot)
+    remotes = filter(e -> !e.is_local, snapshot)
+    for e in added
+        standing = e.is_local ? remotes : locals
+        for other in standing
+            other.topic == e.topic || continue
+            _complementary(other.kind, e.kind) || continue
+            local_e, remote = e.is_local ? (e, other) : (other, e)
             _check_type_mismatch(d, local_e, remote)
             _check_qos_incompat(d, local_e, remote)
         end
@@ -593,16 +599,17 @@ end
 """
     on_type_mismatch(f, node_or_ctx) -> f
 
-Register `f(::TypeMismatch)` to fire when a remote endpoint with an incompatible
-type appears on a topic this node also uses — a different type name, or the same
-name with a different RIHS01 version (§12.2). Return `f`. The ROS 2
+Register `f(::TypeMismatch)` to fire when one of our endpoints and a remote
+endpoint on the same topic carry incompatible types — a different type name, or
+the same name with a different RIHS01 version (§12.2). Return `f`. The ROS 2
 incompatible-type event surface.
 
-Detection runs as a listener on the discovery change stream: when a remote
-endpoint is added, it is compared against local endpoints of the complementary
-kind (our subscription versus their publisher, and vice versa) on the same
-topic. Each distinct mismatch reports once per throttle window, keyed by a
-(topic, kinds, reason) signature, so a flapping endpoint does not spam
+Detection runs as a listener on the discovery change stream: when an endpoint
+is added, it is compared against standing endpoints of the complementary kind
+(our subscription versus their publisher, and vice versa) on the same topic —
+a new remote against our locals, a new local endpoint against the remotes
+already discovered. Each distinct mismatch reports once per throttle window,
+keyed by a (topic, kinds, reason) signature, so a flapping endpoint does not spam
 listeners. The per-sample backstop for wildcard subscriptions
 (`check_sample_type`) feeds the same dedupe, so a mismatch seen both on
 the wire and in the graph reports once. Listeners run outside the detector
@@ -628,10 +635,10 @@ end
 """
     on_qos_incompatible(f, node_or_ctx) -> f
 
-Register `f(::QosIncompatible)` to fire when a remote endpoint whose QoS is
-incompatible with ours appears on a shared topic — under the DDS
-Request-vs-Offered rule, the offered profile ranks below the requested one on
-some policy (§12.2). Return `f`. The ROS 2 incompatible-QoS event surface,
+Register `f(::QosIncompatible)` to fire when one of our endpoints shares a
+topic with a remote endpoint whose QoS is incompatible with ours — under the
+DDS Request-vs-Offered rule, the offered profile ranks below the requested one
+on some policy (§12.2). Return `f`. The ROS 2 incompatible-QoS event surface,
 covering reliability, durability, deadline, and liveliness (kind and lease).
 
 Detection runs on the discovery change stream and is deduplicated by signature
@@ -726,13 +733,8 @@ next sequence number we expected from it; `got_seq` is the one that arrived; and
 `count` is the number of messages lost in between (`got_seq - expected_seq`).
 
 ROS 2 inherits this event from DDS; here it is reconstructed from the
-`sequence_number` the wire protocol carries per message (§3.4) rather than from a
-DDS-native lost count.
-
-The sequence number rides in the rmw_zenoh put attachment. The detector feeding
-this event currently reads the message payload instead of the attachment
-(`note_sequence!` audit bug B3), so against a real peer the gap arithmetic runs
-on body bytes, not the sequence number, and the event does not fire correctly.
+`sequence_number` the rmw_zenoh put attachment carries per message (§3.4) rather
+than from a DDS-native lost count.
 """
 struct MessageLost
     topic::String
@@ -744,7 +746,8 @@ end
 
 # Per-subscription message-lost tracking: the last seen sequence number per source
 # gid (a topic may have several publishers). A gap (`got > expected`) is a loss; a
-# repeat/reorder (`got <= last`) is ignored (best-effort delivery can reorder).
+# small back-step is an ignored reorder/dupe (best-effort delivery can reorder); a
+# large one is a publisher restart (per-instance counters) and rebaselines the mark.
 mutable struct _LostTracker
     lock::ReentrantLock
     last_seq::Dict{NTuple{16, UInt8}, Int64}
@@ -770,13 +773,9 @@ path begins decoding each sample's metadata and feeding it to the detector
 (`note_sequence!`); with no listener the common path skips that decode
 entirely. Sequence tracking is per source gid, so a topic with several
 publishers is tracked independently per publisher. Reordered or duplicate
-messages (a sequence number at or below the high-water mark) are ignored,
-matching best-effort delivery.
-
-The decode currently reads the message payload rather than the put attachment
-that carries the sequence number (audit bug B3, `note_sequence!`), so a
-registered listener does not fire correctly against a real peer until that read
-path is fixed.
+messages (a sequence number slightly below the high-water mark) are ignored,
+matching best-effort delivery; a sequence number far below it is treated as a
+publisher restart and rebaselines tracking for that gid.
 
 ```julia
 on_message_lost(sub) do ml
@@ -800,25 +799,21 @@ end
 Feed one received sample to the message-lost detector for `sub` (§12.3): decode
 `(seq, _, gid)` and, if `seq` skipped ahead of the last value seen from that
 `gid`, fire the `on_message_lost` listeners and return the `MessageLost`. Returns
-`nothing` when in-order (or the very first message from a gid, or the decode
-yields no value). The subscription dispatch path calls this per sample, gated on
-`Entity._track_lost`.
-
-The decode goes through `decode_attachment(sample)`, which currently
-deserializes the message payload rather than the put attachment that carries the
-sequence number (audit bug B3): against a real peer the `(seq, _, gid)` triple is
-read from body bytes, so the gap test runs on the wrong source and the event does
-not fire correctly until that read path is fixed.
+`nothing` when in-order (or the very first message from a gid, or the sample
+carries no usable attachment). The subscription dispatch path calls this per
+sample, gated on `Entity._track_lost`.
 """
 # dispatch.jl gates this call on `Entity._track_lost`, so the common no-listener
 # path never decodes the attachment.
 function note_sequence!(sub, sample)
     e = _client_entity(sub)
-    seq, _, srcgid = try
+    decoded = try
         decode_attachment(sample)
     catch
-        return nothing                 # no/garbled attachment — nothing to track
+        nothing                        # garbled attachment
     end
+    decoded === nothing && return nothing  # absent/garbled — nothing to track
+    seq, _, srcgid = decoded
     # No tracker ⇒ no listeners registered, skip the work. Guard the lookup: the
     # registry Dict isn't safe to read concurrently with a registration insert.
     t = @lock _LOST_LOCK get(_LOST, objectid(e), nothing)
@@ -829,8 +824,10 @@ function note_sequence!(sub, sample)
         if last !== nothing && seq > last + 1
             lost = MessageLost(e.endpoint.topic, srcgid, last + 1, seq, seq - last - 1)
         end
-        # Track the high-water mark; reorders/dupes (seq <= last) don't lower it.
-        if last === nothing || seq > last
+        # Track the high-water mark; small back-steps (≤64, comfortably above
+        # best-effort reorder depth) are reorders/dupes and don't lower it. A larger
+        # drop means the per-publisher-instance counter reset — rebaseline.
+        if last === nothing || seq > last || seq < last - 64
             t.last_seq[srcgid] = seq
         end
     end

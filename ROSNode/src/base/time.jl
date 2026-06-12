@@ -457,6 +457,8 @@ _timer_active(node) = node isa Node ? isactive(node) : true
 # handler runs the user `f` guarding against its throws so one bad tick can't
 # kill the timer task.
 function _start!(t::Timer{C}) where {C<:Union{Steady,System}}
+    # no-op while armed: replacing a live impl orphans it, double-firing each period
+    t.impl !== nothing && isopen(t.impl) && return t
     secs = t.period.ns / 1e9
     t.impl = Base.Timer(secs; interval=secs) do _
         (@atomic t.open) || return
@@ -476,6 +478,8 @@ end
 # source. TODO(graph): subscribe to the node's ROS-clock advances; for now run
 # it as a wall timer so non-sim deployments work.
 function _start!(t::Timer{ROS})
+    # no-op while armed: replacing a live impl orphans it, double-firing each period
+    t.impl !== nothing && isopen(t.impl) && return t
     secs = t.period.ns / 1e9
     t.impl = Base.Timer(secs; interval=secs) do _
         (@atomic t.open) || return

@@ -95,9 +95,9 @@ spent and is typically closed.
 
 Also the landing when error processing fails to recover: a callback that throws
 runs `on_error`, and any `on_error` outcome other than success drops the node here.
-`close` runs [`shutdown!`](@ref) first, which normally lands here; a
-recovering `on_error` during shutdown leaves the latched state
-[`Unconfigured`](@ref) even as the node closes.
+A throwing `on_shutdown` lands here even when `on_error` recovers — shutdown is the
+terminal path, so error processing cannot divert it. `close` runs
+[`shutdown!`](@ref) first, which normally lands here.
 """
 struct Finalized    <: LifecycleState end
 
@@ -130,6 +130,11 @@ const TRANSITION_UNCONFIGURED_SHUTDOWN = 0x05
 const TRANSITION_INACTIVE_SHUTDOWN    = 0x06
 const TRANSITION_ACTIVE_SHUTDOWN      = 0x07
 
+# Internal error-processing outcome ids (`Transition.msg` 60/61): published on the
+# error-recovery edge's `transition_event`, never requestable via `change_state`.
+const TRANSITION_ON_ERROR_SUCCESS     = 0x3c
+const TRANSITION_ON_ERROR_FAILURE     = 0x3d
+
 # ── LifecycleNode (§14.2) ──────────────────────────────────────────────────────
 # Wraps a plain `Node` (entities are created against the wrapped node, so they get
 # the full §6 id/token/route/graph lifecycle for free) and adds the managed-node
@@ -155,10 +160,10 @@ The six transition callbacks each take the `LifecycleNode` and run under the act
 three-way settlement (§9): returning normally is SUCCESS (land in the target state);
 returning the [`failure`](@ref) token is FAILURE (a clean "can't right now" that
 reverts to the origin state); throwing is ERROR (`on_error` runs — its SUCCESS
-recovers to [`Unconfigured`](@ref), any other outcome drops the node to
-[`Finalized`](@ref)). Each callback defaults to a no-op, so a node with no behavior
-still transitions cleanly. A thrown `ShutdownException` propagates unchanged — it
-signals context shutdown, not a callback error.
+recovers to [`Unconfigured`](@ref), any other outcome — or any `on_shutdown` error —
+drops the node to [`Finalized`](@ref)). Each callback defaults to a no-op, so a node
+with no behavior still transitions cleanly. A thrown `ShutdownException` propagates
+unchanged — it signals context shutdown, not a callback error.
 
 While the node is not [`Active`](@ref), every application entity created on it is
 gated at dispatch ([`isactive`](@ref)): publishers drop, subscriptions and timers
@@ -249,8 +254,18 @@ function LifecycleNode(ctx::Context, name::AbstractString;
     # case). A failed/erroring transition leaves the node in whatever state the
     # three-way landed it; we don't force Active.
     if autostart
-        configure!(ln)
-        state(ln) === Inactive() && activate!(ln)
+        try
+            configure!(ln)
+            state(ln) === Inactive() && activate!(ln)
+        catch
+            # A throw escaping configure!/activate! (ShutdownException, re-latch
+            # snapshot) would leak the wired node: the constructor never returns, so
+            # no owner exists to drive `close`. Tear down inline — node before gate,
+            # since a gateless node reads as active (§14.2 fast path).
+            close(ln.node)
+            _unregister_gate!(ln)
+            rethrow()
+        end
     end
     return ln
 end
@@ -363,6 +378,7 @@ end
 #   callback returns the `failure` tok ⇒ FAILURE  → revert to `origin` (clean no-op)
 #   callback throws                    ⇒ ERROR    → `on_error`; its SUCCESS recovers
 #                                                    to Unconfigured, else Finalized
+#                                                    (shutdown: always Finalized)
 # A non-applicable transition for the current state is an `ArgumentError` (the
 # external `change_state` maps this to a `success=false` reply; in-process it
 # surfaces to the caller).
@@ -378,7 +394,8 @@ Alias for `Symbol`: the outcome of a lifecycle transition, returned by
   - `:failure` — the callback returned the [`failure`](@ref) token; the node stayed
     in its origin state (a clean decline, nothing published).
   - `:error` — the callback threw; `on_error` ran, recovering to [`Unconfigured`](@ref)
-    on its success or dropping to [`Finalized`](@ref) otherwise.
+    on its success or dropping to [`Finalized`](@ref) otherwise. A [`shutdown!`](@ref)
+    error drops to `Finalized` either way (shutdown is terminal).
 
 The wire `~/change_state` reply reports `success = (result === :success)`.
 """
@@ -492,10 +509,10 @@ managed node. Matches the ROS 2 managed-node `shutdown` transition; the
 
 Returns `:success` once the node lands in [`Finalized`](@ref); a node already
 `Finalized` is a `:success` no-op (idempotent), even when closed. Returns `:error`
-if `on_shutdown` throws: `on_error` runs, and the node lands in
-[`Unconfigured`](@ref) on its success or [`Finalized`](@ref) otherwise — the shared
-error-recovery rule, which for shutdown means a recovering `on_error` leaves the
-node non-terminal. Throws `ArgumentError` if a non-`Finalized` node is closed.
+if `on_shutdown` throws: `on_error` runs (cleanup), but the node lands in
+[`Finalized`](@ref) regardless of its outcome — shutdown is the terminal path, so
+error recovery cannot return the node to service. Throws `ArgumentError` if a
+non-`Finalized` node is closed.
 """
 function shutdown!(ln::LifecycleNode)
     origin = state(ln)
@@ -516,7 +533,8 @@ _shutdown_transition_id(::LifecycleState) = TRANSITION_INACTIVE_SHUTDOWN
 #   2. runs `callback(ln)` under the three-way,
 #   3. on SUCCESS latches `target` + publishes the transition_event,
 #   4. on FAILURE leaves `origin` (publishes no event — nothing changed),
-#   5. on ERROR runs `on_error` and lands in Unconfigured (its SUCCESS) or Finalized.
+#   5. on ERROR runs `on_error` and lands in Unconfigured (its SUCCESS) or Finalized;
+#      a shutdown's error lands Finalized either way (terminal path).
 # Returns the `TransitionResult`. Closed node ⇒ the only hard error.
 function _drive!(ln::LifecycleNode, origin::LifecycleState, target::LifecycleState,
                  callback::Function, transition_id::UInt8, label::AbstractString)
@@ -535,7 +553,7 @@ function _drive!(ln::LifecycleNode, origin::LifecycleState, target::LifecycleSta
             # Clean decline: revert to (stay in) the origin; nothing to publish.
             return :failure
         else  # :error → on_error decides recovery
-            return _handle_error!(ln, origin, label)
+            return _handle_error!(ln, origin, target, label)
         end
     end
 end
@@ -570,11 +588,17 @@ end
 # the node cleaned up and recovers to `Unconfigured`; any other outcome (decline or
 # a second throw) drops the node to `Finalized` — the safe terminal. `on_error`
 # returning `failure` is treated as "could not recover" (→ Finalized), matching the
-# rclcpp ERROR-processing contract.
-function _handle_error!(ln::LifecycleNode, origin::LifecycleState, label::AbstractString)
+# rclcpp ERROR-processing contract. Shutdown (`target` Finalized) is the carve-out:
+# it is the terminal path in the managed-node spec, so it lands `Finalized` even
+# when `on_error` recovers (`on_error` is cleanup, not a way back to service).
+function _handle_error!(ln::LifecycleNode, origin::LifecycleState, target::LifecycleState,
+                        label::AbstractString)
     recovered = _run_transition(ln, ln.on_error, "$(label):on_error")
-    target = recovered === :success ? Unconfigured() : Finalized()
-    _land!(ln, origin, target, TRANSITION_ACTIVATE)  # error-recovery edge reported as ACTIVATE on the wire (see BUGS-COMPONENT-LIFECYCLE.md)
+    if recovered === :success && target !== Finalized()
+        _land!(ln, origin, Unconfigured(), TRANSITION_ON_ERROR_SUCCESS)
+    else
+        _land!(ln, origin, Finalized(), TRANSITION_ON_ERROR_FAILURE)
+    end
     return :error
 end
 
@@ -643,6 +667,8 @@ function _transition_label(id::UInt8)
     id == TRANSITION_UNCONFIGURED_SHUTDOWN && return "unconfigured_shutdown"
     id == TRANSITION_INACTIVE_SHUTDOWN     && return "inactive_shutdown"
     id == TRANSITION_ACTIVE_SHUTDOWN       && return "active_shutdown"
+    id == TRANSITION_ON_ERROR_SUCCESS      && return "on_error_success"
+    id == TRANSITION_ON_ERROR_FAILURE      && return "on_error_failure"
     return "transition_$(id)"
 end
 
@@ -770,8 +796,8 @@ end
 
 Finalize and tear down the managed node (§14.2/§14). Runs [`shutdown!`](@ref) (the
 lifecycle drain, normally landing in [`Finalized`](@ref)) if not already terminal,
-drops the gate registration, then closes the wrapped [`Node`] — which undeclares
-every entity (control surface + application) and the node token. Idempotent.
+closes the wrapped [`Node`] — which undeclares every entity (control surface +
+application) and the node token — then drops the gate registration. Idempotent.
 """
 function Base.close(ln::LifecycleNode)
     isopen(ln) || return nothing
@@ -786,7 +812,9 @@ function Base.close(ln::LifecycleNode)
         @error "close(LifecycleNode): shutdown! failed" node=ln.node.fqn exception=(err, catch_backtrace())
     end
     (@atomicswap ln.open = false) || return nothing
-    _unregister_gate!(ln)
     close(ln.node)            # reaps every entity (control + application) + token
+    # Unregister last: a gateless node reads as active (§14.2 fast path), so dropping
+    # the entry earlier would let in-flight dispatch fire mid-teardown.
+    _unregister_gate!(ln)
     nothing
 end

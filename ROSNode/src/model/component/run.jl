@@ -33,6 +33,9 @@ mutable struct ComponentNode
                                     # lifecycle fan-out + reverse-order teardown (§4.2/§5)
     const wires::Dict{Symbol, Dict{Symbol, String}}  # member => (port => resolved wire name), §4.4 remaps
     lifecycle::Any                  # the LifecycleNode (managed) or nothing
+    owned_ctx::Union{Context, Nothing}  # the Context `run` opened for this node (§5), closed by
+                                        # `close`; `nothing` when the caller supplied one
+    @atomic open::Bool              # single-winner close latch (unmanaged path)
 end
 
 Base.show(io::IO, c::ComponentNode) =
@@ -64,18 +67,26 @@ inner_node(c::ComponentNode) = c.node
 lifecycle(c::ComponentNode) = c.lifecycle
 
 # Closing a node tears it down (§5): run each member's `cleanup` in reverse DI order,
-# then undeclare its entities + node token. Unmanaged closes here directly; managed
-# routes through `close(LifecycleNode)` → `shutdown!` → the `on_shutdown` hook, which
-# fans out the same `_member_cleanup!`. `_member_cleanup!` is a no-op on a member whose
-# ports aren't materialised (never configured / already cleaned), so this is safe on a
-# half-built node and idempotent under a double close.
+# then undeclare its entities + node token. Unmanaged closes here directly, behind a
+# single-winner `@atomicswap` latch — an `unload_node` service task and the Context
+# drain hook can close concurrently, and `_member_cleanup!`'s materialised-ports guard
+# is check-then-act, not atomic; managed routes through `close(LifecycleNode)` →
+# `shutdown!` → the `on_shutdown` hook, which fans out the same `_member_cleanup!`
+# behind its own latch. `_member_cleanup!` is a no-op on a member whose ports aren't
+# materialised (never configured / already cleaned), so this is safe on a half-built
+# node and idempotent under a (sequential) double close.
 function Base.close(c::ComponentNode)
     if c.lifecycle === nothing
+        (@atomicswap c.open = false) || return nothing
         foreach(nm -> _member_cleanup!(c, nm), reverse(c.order))
         close(c.node)
     else
         close(c.lifecycle)
     end
+    # A `run`-owned Context closes with its node. Skip when a drain is already
+    # underway: the drain hook re-enters here, and a nested `close(ctx)` would
+    # park on its own drain until `drain_timeout`.
+    c.owned_ctx === nothing || is_shutdown(c.owned_ctx) || close(c.owned_ctx)
     return nothing
 end
 
@@ -248,7 +259,7 @@ _default_name(::Type{M}) where {M} = _snake(String(nameof(M)))
 # handle NamedTuple (`entities(m)`) and the paused timers to start at activate.
 # `wiremap` is the member's resolved §4.4 remap (port => wire name); a port not in it
 # uses its authored `_wire(p)`.
-function _materialize_ports!(node::Node, m, specs::Vector{PortSpec}, pvalue,
+function _materialize_ports!(node::Node, m, member::Symbol, specs::Vector{PortSpec}, pvalue,
                              wiremap::Dict{Symbol, String} = Dict{Symbol, String}())
     handles = Pair{Symbol, Any}[]
     timers = Any[]
@@ -273,7 +284,14 @@ function _materialize_ports!(node::Node, m, specs::Vector{PortSpec}, pvalue,
             body = _component_action_adapter(f, support, p.extra.fb_pos, m)
             push!(handles, p.name => _make_action_server(node, _wire(p, wiremap), typeof(f); body = body))
         elseif p.kind === :timer
-            hz = p.extra.rate isa Symbol ? getproperty(pvalue, p.extra.rate) : p.extra.rate
+            hz = p.extra.rate
+            if hz isa Symbol
+                hz in fieldnames(typeof(pvalue)) || error(
+                    "@every: member `$(member)` timer `$(p.name)` rate `:$(hz)` does not name a declared parameter of $(_base(typeof(m)))")
+                hz = getproperty(pvalue, hz)
+                hz isa Real || error(
+                    "@every: member `$(member)` timer `$(p.name)` rate parameter `:$(p.extra.rate)` must be numeric (got `$(typeof(hz))`)")
+            end
             react = p.reaction
             t = _paused_timer(node, Duration(round(Int64, 1.0e9 / hz)), () -> react(m))
             push!(handles, p.name => t)
@@ -409,7 +427,8 @@ function _resolve_di(members::Vector{NodeMember})
                       "other member provides it")
             length(cands) == 1 ||
                 error("@node: member `$(mem.name)` requires $(I), provided by multiple " *
-                      "members $(cands) — pin one with `requires(::Type{$(mem.mixin)}) = ($(I) => :member,)`")
+                      "members $(cands) — pin pairs (`$(I) => :member`) are not yet " *
+                      "supported; restructure so a single member provides $(I)")
             push!(deps, cands[1])
         end
         edges[mem.name] = deps
@@ -493,7 +512,7 @@ end
 function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
     rt = getfield(m, :__rt__)::MixinRuntime
-    ports, timers = _materialize_ports!(cnode.node, m, mixin_spec(_base(typeof(m))).ports,
+    ports, timers = _materialize_ports!(cnode.node, m, nm, mixin_spec(_base(typeof(m))).ports,
                                         current(rt.pserver),
                                         get(cnode.wires, nm, Dict{Symbol, String}()))
     rt.ports = ports
@@ -543,10 +562,28 @@ function _member_cleanup!(cnode::ComponentNode, nm::Symbol)
     return nothing
 end
 
+# on_error: run every member's hook, catching throws so one member cannot strand the
+# rest's recovery. Any throw still means recovery failed: return the `failure` token,
+# which `_handle_error!` honors by landing the node Finalized rather than silently
+# recovering to Unconfigured.
+function _members_on_error!(cnode::ComponentNode, order::Vector{Symbol})
+    failed = false
+    for nm in order
+        try
+            on_error(cnode.members[nm])
+        catch err
+            failed = true
+            @error "component: on_error threw" member = nm exception = (err, catch_backtrace())
+        end
+    end
+    return failed ? failure : nothing
+end
+
 # ── assembly (the one path; §4/§5) ──────────────────────────────────────────────
 
 function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
-                   managed::Bool, autostart::Bool)
+                   managed::Bool, autostart::Bool,
+                   log_level::Union{LogLevel, Nothing} = nothing)
     order, bytype, edges = _members_plan(K)
     composed = K isa NodeKind            # the construction path drives prefixing (§4.3), not member count
     declared = composed ? Symbol[m.name for m in K.members] : copy(order)  # listing/view order
@@ -562,14 +599,17 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
             on_deactivate = _ -> (foreach(nm -> deactivate(cnref[].members[nm]), reverse(order)); nothing),
             on_cleanup    = _ -> (foreach(nm -> _member_cleanup!(cnref[], nm), reverse(order)); nothing),
             on_shutdown   = _ -> (foreach(nm -> _member_cleanup!(cnref[], nm), reverse(order)); nothing),
-            on_error      = _ -> (foreach(nm -> on_error(cnref[].members[nm]), order); nothing))
+            on_error      = _ -> _members_on_error!(cnref[], order))
         node = inner_node(ln)
     else
         ln = nothing
         node = Node(ctx, name; namespace = namespace)
     end
+    # Before any member code (construct/configure/activate), so a requested level
+    # governs the node's logging from the start.
+    log_level === nothing || set_logger_level!(node, log_level)
 
-    cnode = ComponentNode(node, Dict{Symbol, Any}(), order, wires, ln)
+    cnode = ComponentNode(node, Dict{Symbol, Any}(), order, wires, ln, nothing, true)
     cnref[] = cnode
 
     # A failure mid-assembly (clobber/construct/DI/param-wiring/configure) must not leave
@@ -612,7 +652,18 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
         end
 
         if managed
-            autostart && (configure!(ln); state(ln) === Inactive() && activate!(ln))
+            # Log rather than throw on a failed transition: a managed node is
+            # retryable via `configure!`.
+            if autostart
+                res = configure!(ln)
+                res === :success ||
+                    @error "component: autostart configure! failed" node = name result = res
+                if state(ln) === Inactive()
+                    res = activate!(ln)
+                    res === :success ||
+                        @error "component: autostart activate! failed" node = name result = res
+                end
+            end
         else
             foreach(nm -> _member_configure!(cnode, nm), order)
             foreach(nm -> _member_activate!(cnode, nm), order)
@@ -649,8 +700,12 @@ end
 Instantiate a node standalone (DESIGN §5/§7): open a `Context` (unless `ctx` is
 given), build the node-core, construct the mixin(s) in DI order, autostart
 (configure → activate), and — when `block` (default) — `spin` until shutdown, closing
-an owned Context on exit. `overrides` is a NamedTuple of mixin-local parameter values
-(§4.3).
+an owned Context on exit. With `block=false` the returned node holds any owned
+Context, and `close` on the node closes it after member teardown; a caller-supplied
+`ctx` is never closed. `overrides` is a NamedTuple of mixin-local parameter values
+(§4.3). `log_level` (a `LogLevel`, default `nothing` = the node default) sets the
+node's logger level ([`set_logger_level!`](@ref)) before any member code runs, so
+records from the construct/configure/activate hooks already honor it.
 
 `managed=true` makes the node-core a `LifecycleNode` (the lifecycle control surface +
 dispatch gating, §5/§14.2); it then starts `Unconfigured` and is driven externally
@@ -664,10 +719,12 @@ function Base.run(::Type{M}; name::AbstractString = _default_name(M),
                   peers::AbstractVector{<:AbstractString} = String[],
                   localhost_only::Bool = false,
                   managed::Bool = false, autostart::Bool = !managed,
+                  log_level::Union{LogLevel, Nothing} = nothing,
                   block::Bool = true) where {M <: Component}
     _check_runnable(M, "run")
     _ensure_schema!(M)
-    return _run(ctx, M, name, namespace, overrides, peers, localhost_only, managed, autostart, block)
+    return _run(ctx, M, name, namespace, overrides, peers, localhost_only, managed, autostart,
+                log_level, block)
 end
 
 function Base.run(k::NodeKind; name::AbstractString = String(k.name),
@@ -677,28 +734,32 @@ function Base.run(k::NodeKind; name::AbstractString = String(k.name),
                   peers::AbstractVector{<:AbstractString} = String[],
                   localhost_only::Bool = false,
                   managed::Bool = false, autostart::Bool = !managed,
+                  log_level::Union{LogLevel, Nothing} = nothing,
                   block::Bool = true)
     for mem in k.members
         _check_runnable(mem.mixin, "@node member `$(mem.name)`")
         _ensure_schema!(mem.mixin)
     end
-    return _run(ctx, k, name, namespace, overrides, peers, localhost_only, managed, autostart, block)
+    return _run(ctx, k, name, namespace, overrides, peers, localhost_only, managed, autostart,
+                log_level, block)
 end
 
 # Shared run body: open/own the Context, assemble (under `invokelatest` so freshly
 # generated `P_M` methods are visible), then spin/close when blocking.
 function _run(ctx, @nospecialize(K), name, namespace, overrides, peers, localhost_only,
-              managed, autostart, block)
+              managed, autostart, log_level, block)
     owns = ctx === nothing
     ctx = owns ? Context(; peers = collect(String, peers), localhost_only = localhost_only) : ctx
     local cnode
     try
         cnode = Base.invokelatest(_assemble, ctx, K, name, namespace, overrides;
-                                  managed = managed, autostart = autostart)
+                                  managed = managed, autostart = autostart,
+                                  log_level = log_level)
     catch err
         owns && close(ctx)
         rethrow()
     end
+    owns && (cnode.owned_ctx = ctx)
     if block
         try
             spin(ctx; handle_signals = owns)
@@ -832,11 +893,11 @@ in dependency order, wires the parameter services, and brings the node up. Unman
 by mixin-local name (`fps`), or by prefixed `var"member.field"` to target one member
 when two members share a field name.
 
-Do not pass `ctx` or `block`: a caller-supplied value silently overrides the
-container's own — `ctx` builds the node on a foreign Context while the container
-still tracks it, and `block=true` parks `add!` (and the `container` block) on `spin`.
-Transport is fixed when `container` opens the Context, so `run`'s
-`peers`/`localhost_only` are ignored here.
+`ctx`, `block`, `peers`, and `localhost_only` are rejected with an `ArgumentError`:
+the container pins `ctx = c.ctx` and `block = false` (a foreign `ctx` would build a
+node the container tracks but whose Context it never closes; `block=true` would park
+`add!` on `spin`), and transport is fixed when `container` opens the Context, so
+`run`'s `peers`/`localhost_only` would have no effect here.
 
 ```julia
 container("fleet") do c
@@ -846,6 +907,13 @@ end
 ```
 """
 function add!(c::Container, @nospecialize(K); kwargs...)
+    # Guard explicitly: the last-wins kwarg splat would otherwise let ctx/block
+    # silently override the pinned values, and peers/localhost_only only apply
+    # when `run` owns the Context (it never does here).
+    for k in (:ctx, :block, :peers, :localhost_only)
+        haskey(kwargs, k) &&
+            throw(ArgumentError("add!: `$k` is fixed by the container; set transport options on `container`"))
+    end
     cn = run(K; ctx = c.ctx, block = false, kwargs...)
     _track_loaded!(c, cn)
     return cn

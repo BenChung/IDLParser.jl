@@ -214,10 +214,12 @@ const _COMP_SRV = Interfaces.composition_interfaces.srv
 # node's default.
 _loglevel_from_ros(b::Integer) =
     b == 0    ? nothing :
-    b >= 0x32 ? Fatal :
-    b >= 0x28 ? Logging.Error :
-    b >= 0x1e ? Logging.Warn :
-    b >= 0x14 ? Logging.Info : Logging.Debug
+    b == 0x32 ? Fatal :
+    b == 0x28 ? Logging.Error :
+    b == 0x1e ? Logging.Warn :
+    b == 0x14 ? Logging.Info :
+    b == 0x0a ? Logging.Debug :
+    (@warn "load_node: invalid log_level; left unset" log_level = Int(b); nothing)
 
 """
     _wire_container_services!(c::Container) -> c
@@ -238,22 +240,35 @@ function _wire_container_services!(c::Container)
                     (isempty(req.package_name) ? "" : " (package '$(req.package_name)')"),
                 full_node_name = "", unique_id = UInt64(0))
         end
+        # Rejected up front: a success=true response with unapplied remaps would tell
+        # the caller (ros2 component load --remap-rule, launch remappings) the remap
+        # took effect.
+        if !isempty(req.remap_rules)
+            return _COMP_SRV.LoadNode_Response(; success = false,
+                error_message = "remap_rules not supported (§4.4 remap wiring is a follow-up); " *
+                    "load without remaps or remap at the @node member (`Mixin{port => target}`)",
+                full_node_name = "", unique_id = UInt64(0))
+        end
+        local cn = nothing
         try
             nm = isempty(req.node_name) ? _kind_default_name(K) : req.node_name
             ns = isempty(req.node_namespace) ? nothing : req.node_namespace
             ov = _overrides_from_wire(req.parameters)
-            cn = run(K; ctx = c.ctx, block = false, name = nm, namespace = ns, overrides = ov)
-            uid = _track_loaded!(c, cn)
-            lvl = _loglevel_from_ros(req.log_level)
-            lvl === nothing || set_logger_level!(cn.node, lvl)
-            isempty(req.remap_rules) ||
-                @warn "load_node: remap_rules not yet applied (§4.4 remap is a follow-up)" rules = req.remap_rules node = cn.node.fqn
+            # Through `run`, not post-hoc: the level must be set before autostart so
+            # the configure/activate records already honor it.
+            cn = run(K; ctx = c.ctx, block = false, name = nm, namespace = ns, overrides = ov,
+                     log_level = _loglevel_from_ros(req.log_level))
             isempty(req.extra_arguments) ||
                 @debug "load_node: extra_arguments ignored" node = cn.node.fqn
+            # Tracking last, so a failure response never leaves a tracked node.
+            uid = _track_loaded!(c, cn)
             return _COMP_SRV.LoadNode_Response(; success = true, error_message = "",
                 full_node_name = String(cn.node.fqn), unique_id = uid)
         catch err
             err isa ShutdownException && rethrow()
+            # The client never learns an id on failure, so a surviving node would be
+            # unreachable from the wire — close anything already built.
+            cn === nothing || close(cn)
             return _COMP_SRV.LoadNode_Response(; success = false,
                 error_message = sprint(showerror, err), full_node_name = "", unique_id = UInt64(0))
         end
