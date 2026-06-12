@@ -41,19 +41,32 @@ export endpoints, publishers_info, subscriptions_info,
     endpoints(node_or_ctx; topic=nothing, kind=nothing, node=nothing,
               namespace=nothing) -> Vector{EndpointInfo}
 
-Every discovered (or locally-injected) endpoint matching the filters (§12.1).
-`topic` is matched as a resolved FQN (a relative name is resolved against the
-node first, so `endpoints(node; topic="chatter")` finds `/chatter`). `kind` is an
-`EndpointKind` (`Publisher`/`Subscription`/`Service`/`Client`); `node`/`namespace`
-filter by the owning node's name/namespace. A `nothing` filter is a wildcard.
+Return every endpoint in the discovery graph matching the given filters, the
+primary entry into the ROS 2 graph as this stack sees it (§12.1). Each result is
+an `EndpointInfo` carrying node identity, `kind`, resolved topic, `TypeInfo`
+(type name + RIHS01 hash), `QosProfile`, gid, and an `is_local` flag.
 
-Self entities are authoritative (injected immediately on construction); remotes
-are eventually-consistent via liveliness — which is why [`wait_for_service`](@ref)
-exists.
+Filters combine conjunctively, and a `nothing` filter matches anything. `topic`
+matches the resolved fully-qualified name: a relative name resolves against the
+node first, so `endpoints(node; topic="chatter")` finds endpoints on `/chatter`.
+`kind` is an `EndpointKind` (`Publisher`, `Subscription`, `Service`, or
+`Client`). `node` and `namespace` match the owning node's name and namespace.
 
-The primary entry into the ROS graph as this stack sees it; for the ROS 2
-discovery model see
-https://docs.ros.org/en/rolling/Concepts/Basic/About-Discovery.html.
+The query filters a snapshot of the index taken under the index lock, so it sees
+one consistent instant. Local entities are authoritative the instant they are
+declared (injected on construction); remote entities become visible as their
+Zenoh liveliness tokens arrive, which is why [`wait_for_service`](@ref) exists
+for code that must block until a peer appears.
+
+See the ROS 2 discovery model:
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Discovery.html
+
+```julia
+# every remote publisher this node can see on /chatter
+for pub in endpoints(node; topic="chatter", kind=Publisher)
+    pub.is_local || @info "remote pub" node=pub.node_name type=pub.type
+end
+```
 """
 function endpoints(node_or_ctx; topic::Union{AbstractString, Nothing}=nothing,
                    kind::Union{EndpointKind, Nothing}=nothing,
@@ -78,30 +91,63 @@ end
 """
     publishers_info(node, topic) -> Vector{EndpointInfo}
 
-The publishers on `topic` (resolved FQN), each carrying its `TypeInfo` (name +
-RIHS01 hash), `QosProfile`, and gid — enough for a caller to run its own type/QoS
-compatibility check (§12.2) against ours. `subscriptions_info` is the dual.
+Return the publishers currently advertised on `topic` (resolved to its
+fully-qualified name). Each `EndpointInfo` carries the publisher's `TypeInfo`
+(type name + RIHS01 hash), `QosProfile`, and gid, enough for a caller to run its
+own type and QoS compatibility check (§12.2) against its local endpoint. The
+ROS 2 `get_publishers_info_by_topic` equivalent; [`subscriptions_info`](@ref) is
+the dual.
 """
 publishers_info(node, topic::AbstractString) =
     endpoints(node; topic=topic, kind=Publisher)
 
-"The subscriptions on `topic` (resolved FQN); dual of [`publishers_info`](@ref)."
+"""
+    subscriptions_info(node, topic) -> Vector{EndpointInfo}
+
+Return the subscriptions currently present on `topic` (resolved to its
+fully-qualified name), each carrying the subscriber's `TypeInfo`, `QosProfile`,
+and gid. The ROS 2 `get_subscriptions_info_by_topic` equivalent and the dual of
+[`publishers_info`](@ref).
+"""
 subscriptions_info(node, topic::AbstractString) =
     endpoints(node; topic=topic, kind=Subscription)
 
-"Number of publishers on `topic` (resolved FQN) — `length(publishers_info(...))`."
+"""
+    count_publishers(node, topic) -> Int
+
+Return the number of publishers on `topic` (resolved to its fully-qualified
+name), equal to `length(publishers_info(node, topic))`. The ROS 2
+`count_publishers` equivalent.
+"""
 count_publishers(node, topic::AbstractString) = length(publishers_info(node, topic))
 
-"Number of subscriptions on `topic` (resolved FQN)."
+"""
+    count_subscribers(node, topic) -> Int
+
+Return the number of subscriptions on `topic` (resolved to its fully-qualified
+name), equal to `length(subscriptions_info(node, topic))`. The ROS 2
+`count_subscribers` equivalent.
+"""
 count_subscribers(node, topic::AbstractString) = length(subscriptions_info(node, topic))
 
 """
     topic_names_and_types(node_or_ctx; include_services=false) -> Dict{String, Vector{TypeInfo}}
 
-Map each topic (resolved FQN) to the distinct `TypeInfo`s advertised on it
-(§12.1). More than one entry for a topic ⇒ a type mismatch on the wire (different
-type *name* or RIHS01 *version*). Pub/sub topics only by default; pass
-`include_services=true` to fold in service/client endpoints too.
+Map each topic (resolved fully-qualified name) to the distinct `TypeInfo`s
+advertised on it across the graph, the ROS 2 `get_topic_names_and_types`
+equivalent (§12.1). By default the map covers pub/sub topics; pass
+`include_services=true` to fold in service and client endpoints as well.
+
+Two or more `TypeInfo` entries for one topic signal a type mismatch on the wire:
+endpoints differ either in type name or in RIHS01 hash (a version skew).
+Endpoints whose type is the `EMPTY_TOPIC_TYPE` token (`type === nothing`) are
+omitted, since they carry no type to report.
+
+```julia
+for (topic, types) in topic_names_and_types(node)
+    length(types) > 1 && @warn "mixed types on \$topic" types
+end
+```
 """
 function topic_names_and_types(node_or_ctx; include_services::Bool=false)
     ctx = _ctx(node_or_ctx)
@@ -118,11 +164,16 @@ end
 """
     node_names(node_or_ctx) -> Vector{NodeInfo}
 
-The distinct nodes seen in the graph (§12.1), recovered from the owning-node
-identity carried on each endpoint (a node's own presence is injected as a
-topic-less endpoint shell, node.jl). Endpoints without a node (the ros2dds
-bridge-compat gap, where `parse_liveliness` yields `node === nothing`) are
-skipped, since there is no identity to report.
+Return the distinct nodes seen in the graph, the ROS 2
+`get_node_names_and_namespaces` equivalent (§12.1). Identity is recovered from
+the owning-node fields carried on each endpoint (a node advertises its own
+presence as a topic-less endpoint shell), deduplicated by `(namespace, name)`.
+
+Endpoints with no node identity are skipped: the ros2dds bridge yields
+liveliness tokens whose `parse_liveliness` leaves the node blank, and there is
+no name to report for those. Each returned `NodeInfo` carries an empty enclave
+string: rmw_zenoh always writes the `%` (empty) sentinel into the token's
+enclave slot, so no non-default enclave survives the wire.
 """
 function node_names(node_or_ctx)
     ctx = _ctx(node_or_ctx)
@@ -133,8 +184,8 @@ function node_names(node_or_ctx)
         key = (e.namespace, e.node_name)
         key in seen && continue
         push!(seen, key)
-        # Enclave isn't round-trippable through rmw_zenoh liveliness (always "%");
-        # report empty rather than invent one.
+        # rmw_zenoh always writes "%" in the enclave slot, so no enclave survives
+        # the wire; report empty rather than invent one.
         push!(out, NodeInfo(e.node_name, e.namespace, ""))
     end
     out
@@ -149,7 +200,7 @@ end
 # Block until `pred()` holds or the deadline/shutdown fires. Returns true if the
 # predicate became true; false on timeout. Raises ShutdownException if the Context
 # drains while we wait (the cooperative unwind signal, §14). `timeout` is seconds;
-# `nothing`/≤0-with-`nothing` means wait forever.
+# `nothing` waits forever.
 function _wait_on_graph(ctx::Context, pred; timeout::Union{Real, Nothing})
     pred() && return true
     deadline = timeout === nothing ? nothing : time() + Float64(timeout)
@@ -182,14 +233,17 @@ end
     service_is_ready(client) -> Bool
     service_is_ready(node, service_name) -> Bool
 
-True if a matching service server is present in the graph (§12.1). The client
-form reads the service name/type from the client handle (its `Entity`); the
-name form is a pure graph predicate (a `Service`-kind endpoint on the resolved
-service name exists). Self entities count — our own service is authoritative the
-instant it's declared.
+Return `true` when a service server is present in the graph on the resolved
+service name, the ROS 2 `Client.service_is_ready` equivalent (§12.1). The client
+form reads the resolved name and owning node from the client handle's `Entity`;
+the name form resolves `service_name` against the node. Readiness means a
+`Service`-kind endpoint exists on that name; local entities count, so our own
+service reads as ready the instant it is declared.
 
-This is a graph *predicate*, not a connectivity check: it reports liveliness, the
-same eventually-consistent view [`wait_for_service`](@ref) blocks on.
+Reports graph liveliness: the same eventually-consistent view
+[`wait_for_service`](@ref) blocks on. For the stronger guarantee that Zenoh
+routing to the server has settled, await the client form of
+[`wait_for_service`](@ref).
 """
 function service_is_ready(node, service_name::AbstractString)
     ctx = _ctx(node)
@@ -200,11 +254,9 @@ function service_is_ready(node, service_name::AbstractString)
     false
 end
 
-# Client form. The §8 Service/Client layer isn't landed yet, so this is duck-typed
-# against the client handle's shape: a `ServiceClient` holds an `Entity` whose
-# `endpoint.topic` is the resolved service name and whose `node` we query through.
-# TODO(§8): once `ServiceClient` lands, this dispatches on its concrete type; the
-# duck-typed accessors (`.entity.endpoint.topic`, `.entity.node`) are the contract.
+# Client form, duck-typed against the handle's shape: any client holding an
+# `Entity` in `.entity` (`ServiceClient` does) whose `endpoint.topic` is the
+# resolved service name and whose `node` we query through.
 function service_is_ready(client)
     e = _client_entity(client)
     service_is_ready(e.node, e.endpoint.topic)
@@ -214,21 +266,28 @@ end
     wait_for_service(client::ServiceClient; timeout=nothing) -> Bool
     wait_for_service(node, service_name; timeout=nothing) -> Bool
 
-Block the calling task until a matching service server is reachable, or `timeout`
-seconds elapse (`nothing` = forever). Returns `true` when ready, `false` on
-timeout; raises [`ShutdownException`](@ref) if the Context drains while waiting.
+Block the calling task until a matching service server is reachable, the ROS 2
+`Client.wait_for_service` equivalent (§12.1). Return `true` once ready, or
+`false` if `timeout` seconds elapse first (`nothing` waits forever). Raises
+[`ShutdownException`](@ref) if the Context begins draining while the task is
+parked, so a blocked wait cooperatively unwinds and lets the drain proceed.
 
-The **client form** waits on a real *routing* match — the client's `Querier`
-actually matched a server's queryable ([`service_matched`](@ref)) — the strong
-guarantee that a subsequent [`call`](@ref) will reach a server. The **name form**
-has no querier handle, so it waits on graph *liveliness* (a `Service` endpoint on
-the resolved name, [`service_is_ready`](@ref)); for a same-process server that is
-authoritative the instant the service is declared, *before* routing settles, so
-prefer the client form whenever you hold the client.
+The client form waits on a real routing match: the client's `Querier` has
+actually matched a server's queryable ([`service_matched`](@ref)), the strong
+guarantee that a subsequent [`call`](@ref) reaches a server. The name form has no
+querier handle, so it waits on graph liveliness ([`service_is_ready`](@ref)) — a
+`Service` endpoint on the resolved name; for a same-process server that becomes
+true the instant the service is declared, before routing settles. Prefer the
+client form whenever you hold the client.
 
-Both park on the discovery change stream and re-check — *why* they exist: remotes
-(and routing) are eventually-consistent, so a client created before its server
-must wait.
+Both forms park on the discovery change stream and re-check on each event, which
+is why they exist: remotes and routing are eventually-consistent, so a client
+created before its server must wait for it to appear.
+
+```julia
+wait_for_service(client; timeout=5.0) || error("no server within 5s")
+resp = call(client, request)
+```
 """
 function wait_for_service(node, service_name::AbstractString;
                           timeout::Union{Real, Nothing}=nothing)
@@ -257,17 +316,21 @@ end
 """
     wait_for_action_server(client::ActionClient; timeout=nothing) -> Bool
 
-Block until the action client is routing-matched to a server — its `send_goal`
-*and* `get_result` Queriers both matched the server's queryables (§9) — or
-`timeout` seconds elapse (`nothing` = forever). Returns `true` when matched,
-`false` on timeout; raises [`ShutdownException`](@ref) if the Context drains.
+Block the calling task until the action client is routing-matched to a server,
+the ROS 2 `ActionClient.wait_for_server` equivalent (§9). Matching requires both
+the client's `send_goal` and `get_result` Queriers to have matched the server's
+queryables. Return `true` once matched, or `false` if `timeout` seconds elapse
+(`nothing` waits forever). Raises [`ShutdownException`](@ref) if the Context
+begins draining while parked.
 
 The action analogue of the client form of [`wait_for_service`](@ref), reusing the
-same routing-match machinery (lazily-declared Queriers + [`action_server_matched`](@ref)).
-Matching *both* services is what matters: `send` retries discovery on its own, but
-`fetch`'s `get_result` is a one-shot get with a long timeout — so awaiting its match
-keeps a `send`→`fetch` sequence from blocking. (cancel_goal/feedback aren't gated:
-`cancel` is opt-in and feedback is a subscription.)
+same routing-match machinery (lazily-declared Queriers plus
+[`action_server_matched`](@ref)). Both services must match because
+[`send`](@ref) retries discovery on its own, while [`fetch`](@ref)'s
+`get_result` is a one-shot get with a long timeout — awaiting the `get_result`
+match keeps a `send` followed by `fetch` from blocking on an unmatched service.
+The `cancel_goal` and feedback channels are not gated: cancel is opt-in and
+feedback is an ordinary subscription.
 """
 function wait_for_action_server(client::ActionClient; timeout::Union{Real, Nothing}=nothing)
     ws = _ensure_action_match!(client)
@@ -283,7 +346,7 @@ function _service_present(ctx::Context, want::AbstractString)
 end
 
 # Recover the generic `Entity` from a client handle. Pattern handles (pubsub.jl's
-# `PublisherHandle`/`SubscriptionHandle`, the future `ServiceClient`) all *hold*
+# `PublisherHandle`/`SubscriptionHandle`, service.jl's `ServiceClient`) all *hold*
 # an `Entity` in a `.entity` field — accept that shape directly, or an `Entity`.
 _client_entity(e::Entity) = e
 _client_entity(client) = hasproperty(client, :entity) ? client.entity::Entity :
@@ -292,16 +355,21 @@ _client_entity(client) = hasproperty(client, :entity) ? client.entity::Entity :
 """
     wait_for_graph_change(node_or_ctx; timeout=nothing) -> Bool
 
-Block until the next discovery change (any endpoint appears or disappears), or
-`timeout` seconds elapse. Returns `true` if a change occurred, `false` on timeout;
-raises [`ShutdownException`](@ref) on drain. The low-level wait behind the polling
-forms of the graph queries — `on_graph_change` (context.jl) is the push form.
+Block the calling task until the set of endpoints in the graph differs from the
+set observed at entry — an endpoint appeared or disappeared — the low-level wait
+behind the polling forms of the graph queries (§12.1). Return `true` when a
+change is observed, or `false` if `timeout` seconds elapse (`nothing` waits
+forever). Raises [`ShutdownException`](@ref) if the Context begins draining
+while parked.
+
+The predicate compares the index keyset before and after each wakeup, so a
+spurious notify (an in-place endpoint update with no add or remove) keeps
+waiting, and add/remove churn that restores the original keyset between wakeups
+coalesces away. For a push-based callback on every change, register an
+`on_graph_change` listener (context.jl).
 """
 function wait_for_graph_change(node_or_ctx; timeout::Union{Real, Nothing}=nothing)
     ctx = _ctx(node_or_ctx)
-    # Snapshot the index identity-set; "changed" = the keyset differs. Park on the
-    # condition and re-check, so a spurious notify (e.g. an update with no add/
-    # remove) doesn't falsely report a structural change.
     before = _graph_keyset(ctx)
     _wait_on_graph(ctx, () -> _graph_keyset(ctx) != before; timeout=timeout)
 end
@@ -319,13 +387,15 @@ _graph_keyset(ctx::Context) = @lock ctx.graph.lock Set(keys(ctx.graph.endpoints)
 # remote type only shows up on the wire.
 
 """
-    TypeMismatch(local_endpoint, remote_endpoint, reason)
+    TypeMismatch(local_endpoint, remote_endpoint, reason, suggestion)
 
-A detected type incompatibility between one of our endpoints and a remote on the
-same topic (§12.2). `reason` is `:name` (a different type entirely — wrong topic
-wiring) or `:hash` (same name, different RIHS01 — a version skew that makes the
-remote's bytes decode-unsafe against our struct). `suggestion` is a human-facing
-fix hint.
+A detected type incompatibility between one of our endpoints and a remote
+endpoint on the same topic, delivered to [`on_type_mismatch`](@ref) listeners
+(§12.2). `local_endpoint` and `remote_endpoint` are the two `EndpointInfo`s
+involved. `reason` is `:name` (the two carry entirely different types —
+typically a wrong topic wiring) or `:hash` (same type name, different RIHS01
+hash — a version skew that makes the remote's bytes decode-unsafe against our
+struct). `suggestion` is a human-facing fix hint.
 """
 struct TypeMismatch
     local_endpoint::EndpointInfo
@@ -335,11 +405,14 @@ struct TypeMismatch
 end
 
 """
-    QosIncompatible(local_endpoint, remote_endpoint, issues)
+    QosIncompatible(local_endpoint, remote_endpoint, issues, suggestion)
 
-A detected QoS RxO incompatibility between one of our endpoints and a remote on
-the same topic (§12.2). `issues::Vector{QosIncompatibility}` are the offending
-policies (from `ROSZenoh.qos_compatible`); `suggestion` names the fix.
+A detected QoS incompatibility between one of our endpoints and a remote
+endpoint on the same topic, delivered to [`on_qos_incompatible`](@ref) listeners
+(§12.2). The two `EndpointInfo`s are `local_endpoint` and `remote_endpoint`.
+`issues::Vector{QosIncompatibility}` lists the offending policies under the DDS
+Request-vs-Offered rule (computed by `qos_compatible`), and `suggestion`
+is a human-facing fix hint naming each offered-versus-requested gap.
 """
 struct QosIncompatible
     local_endpoint::EndpointInfo
@@ -453,8 +526,9 @@ end
 
 # Dedupe + throttle, then fan to user listeners. The signature collapses repeats
 # of the same (topic, kinds, reason) so a flapping endpoint doesn't spam; the
-# throttle bounds even distinct re-appearances. We always fire the programmatic
-# event on a *fresh* signature; the warning log is additionally throttled.
+# throttle bounds even distinct re-appearances. One `_mark_seen!` gate covers
+# both the warning and the listener fan-out: a signature inside the throttle
+# window fires neither.
 function _emit_type_mismatch(d::_Detectors, local_e, remote, reason, suggestion)
     sig = (:type, local_e.topic, local_e.kind, remote.kind, reason)
     fresh = _mark_seen!(d, sig)
@@ -520,9 +594,28 @@ end
     on_type_mismatch(f, node_or_ctx) -> f
 
 Register `f(::TypeMismatch)` to fire when a remote endpoint with an incompatible
-type (different name, or different RIHS01 version) appears on a topic we also use
-(§12.2). Deduped by signature and throttled — a stable mismatch reports once.
-Returns `f`.
+type appears on a topic this node also uses — a different type name, or the same
+name with a different RIHS01 version (§12.2). Return `f`. The ROS 2
+incompatible-type event surface.
+
+Detection runs as a listener on the discovery change stream: when a remote
+endpoint is added, it is compared against local endpoints of the complementary
+kind (our subscription versus their publisher, and vice versa) on the same
+topic. Each distinct mismatch reports once per throttle window, keyed by a
+(topic, kinds, reason) signature, so a flapping endpoint does not spam
+listeners. The per-sample backstop for wildcard subscriptions
+(`check_sample_type`) feeds the same dedupe, so a mismatch seen both on
+the wire and in the graph reports once. Listeners run outside the detector
+lock; a throwing listener is logged and the others still run.
+
+Detection covers endpoints that appear after registration. A mismatch already
+standing in the graph when `f` is registered does not fire retroactively.
+
+```julia
+on_type_mismatch(node) do tm
+    @error "type mismatch" topic=tm.local_endpoint.topic reason=tm.reason
+end
+```
 """
 function on_type_mismatch(f::Function, node_or_ctx)
     ctx = _ctx(node_or_ctx)
@@ -535,9 +628,18 @@ end
 """
     on_qos_incompatible(f, node_or_ctx) -> f
 
-Register `f(::QosIncompatible)` to fire when a remote endpoint whose QoS is RxO-
-incompatible with ours (offered < requested) appears on a shared topic (§12.2).
-Deduped + throttled like [`on_type_mismatch`](@ref). Returns `f`.
+Register `f(::QosIncompatible)` to fire when a remote endpoint whose QoS is
+incompatible with ours appears on a shared topic — under the DDS
+Request-vs-Offered rule, the offered profile ranks below the requested one on
+some policy (§12.2). Return `f`. The ROS 2 incompatible-QoS event surface,
+covering reliability, durability, deadline, and liveliness (kind and lease).
+
+Detection runs on the discovery change stream and is deduplicated by signature
+and throttled, the same way [`on_type_mismatch`](@ref) is. The requester side is
+the subscription (or client) and the offered side is the publisher (or service);
+the check runs in the correct direction for whichever role is local. Listeners
+run outside the detector lock, and a mismatch already standing in the graph at
+registration does not fire retroactively.
 """
 function on_qos_incompatible(f::Function, node_or_ctx)
     ctx = _ctx(node_or_ctx)
@@ -556,13 +658,11 @@ sample's topic keyexpr (`parse_topic_keyexpr`) and compare its `TypeInfo` to the
 subscription's. Returns a `TypeMismatch` (and lets the caller decide to drop/warn)
 or `nothing` when types agree or the key carries no type (ros2dds, EMPTY).
 
-The subscription dispatch path may call this before decoding; a hash mismatch
-means the bytes are decode-unsafe against the local struct.
+The subscription dispatch path (`_predispatch`, dispatch.jl) calls this before
+decoding for weak-static subscriptions and routes a mismatch through
+`report_type_mismatch!`; a hash mismatch means the bytes are
+decode-unsafe against the local struct.
 """
-# TODO(§12.2): defined but unwired — the subscription consumer loop (node.jl) has no
-# caller, so the wildcard-sub type backstop is dormant (the graph detector still fires
-# on a graph match; this only adds the on-the-wire case). Wire into the per-sample
-# dispatch alongside the message-lost hook below.
 function check_sample_type(sub, sample)
     e = _client_entity(sub)
     want = e.endpoint.type_info
@@ -618,10 +718,21 @@ end
 """
     MessageLost(topic, source_gid, expected_seq, got_seq, count)
 
-A detected gap in a publisher's attachment `sequence_number` (§12.3): we expected
-`expected_seq` next from `source_gid` but received `got_seq`, so `count` messages
-were lost in transit. The ROS2 message-lost event, reconstructed from the per-
-message attachment (§3.4) rather than inherited from DDS.
+A detected gap in a publisher's per-message sequence numbers, delivered to
+[`on_message_lost`](@ref) listeners — the ROS 2 `MessageLost` event reconstructed
+from the rmw_zenoh per-message sequence number (§12.3). `topic` is the resolved
+topic; `source_gid` is the publisher whose stream gapped; `expected_seq` is the
+next sequence number we expected from it; `got_seq` is the one that arrived; and
+`count` is the number of messages lost in between (`got_seq - expected_seq`).
+
+ROS 2 inherits this event from DDS; here it is reconstructed from the
+`sequence_number` the wire protocol carries per message (§3.4) rather than from a
+DDS-native lost count.
+
+The sequence number rides in the rmw_zenoh put attachment. The detector feeding
+this event currently reads the message payload instead of the attachment
+(`note_sequence!` audit bug B3), so against a real peer the gap arithmetic runs
+on body bytes, not the sequence number, and the event does not fire correctly.
 """
 struct MessageLost
     topic::String
@@ -649,10 +760,29 @@ _lost_tracker(e::Entity) = @lock _LOST_LOCK get!(() -> _LostTracker(), _LOST, ob
 """
     on_message_lost(f, sub) -> f
 
-Register `f(::MessageLost)` to fire when a gap in the attachment `sequence_number`
-is detected on subscription `sub` (§12.3) — one publisher's `seq` jumping by more
-than one between consecutive received messages. Returns `f`. The dispatch path
-calls [`note_sequence!`](@ref) per received sample to drive this.
+Register `f(::MessageLost)` to fire when a gap opens in a publisher's
+per-message sequence numbers on subscription `sub` — one publisher's sequence
+number jumping by more than one between consecutive received messages (§12.3).
+Return `f`. The ROS 2 message-lost event surface.
+
+Registering the first listener flips a per-subscription gate so the dispatch
+path begins decoding each sample's metadata and feeding it to the detector
+(`note_sequence!`); with no listener the common path skips that decode
+entirely. Sequence tracking is per source gid, so a topic with several
+publishers is tracked independently per publisher. Reordered or duplicate
+messages (a sequence number at or below the high-water mark) are ignored,
+matching best-effort delivery.
+
+The decode currently reads the message payload rather than the put attachment
+that carries the sequence number (audit bug B3, `note_sequence!`), so a
+registered listener does not fire correctly against a real peer until that read
+path is fixed.
+
+```julia
+on_message_lost(sub) do ml
+    @warn "dropped messages" topic=ml.topic count=ml.count
+end
+```
 """
 function on_message_lost(f::Function, sub)
     e = _client_entity(sub)
@@ -667,14 +797,21 @@ end
 """
     note_sequence!(sub, sample) -> Union{MessageLost, Nothing}
 
-Feed one received sample's attachment to the message-lost detector for `sub`
-(§12.3): decode `(seq, _, gid)` and, if `seq` skipped ahead of the last value seen
-from that `gid`, fire the `on_message_lost` listeners and return the `MessageLost`.
-Returns `nothing` when in-order (or the very first message from a gid, or the
-attachment is absent). The subscription dispatch path calls this per sample.
+Feed one received sample to the message-lost detector for `sub` (§12.3): decode
+`(seq, _, gid)` and, if `seq` skipped ahead of the last value seen from that
+`gid`, fire the `on_message_lost` listeners and return the `MessageLost`. Returns
+`nothing` when in-order (or the very first message from a gid, or the decode
+yields no value). The subscription dispatch path calls this per sample, gated on
+`Entity._track_lost`.
+
+The decode goes through `decode_attachment(sample)`, which currently
+deserializes the message payload rather than the put attachment that carries the
+sequence number (audit bug B3): against a real peer the `(seq, _, gid)` triple is
+read from body bytes, so the gap test runs on the wrong source and the event does
+not fire correctly until that read path is fixed.
 """
-# node.jl gates this call on `Entity._track_lost`, so the common no-listener path
-# never decodes the attachment.
+# dispatch.jl gates this call on `Entity._track_lost`, so the common no-listener
+# path never decodes the attachment.
 function note_sequence!(sub, sample)
     e = _client_entity(sub)
     seq, _, srcgid = try
@@ -703,8 +840,8 @@ function note_sequence!(sub, sample)
     lost
 end
 
-# Drop a subscription's detector state when it closes (called from `close(::Entity)`,
-# node.jl); safe to call for entities that never registered one.
+# Drop a subscription's detector state when it closes (called from the entity
+# teardown path, teardown.jl); safe to call for entities that never registered one.
 function _forget_lost_tracker!(e::Entity)
     @lock _LOST_LOCK delete!(_LOST, objectid(e))
     nothing
