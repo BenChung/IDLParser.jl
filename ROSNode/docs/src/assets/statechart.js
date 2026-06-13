@@ -11,23 +11,39 @@
 (function () {
   "use strict";
 
-  var MERMAID_SRC = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js";
+  var MERMAID_BASE = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min"; // no .js — RequireJS appends it
+  var MERMAID_SRC = MERMAID_BASE + ".js";
   var _mermaidPromise = null;
   var _uid = 0;
 
+  function initMermaid(m) {
+    try { m.initialize({ startOnLoad: false, securityLevel: "loose", theme: "neutral" }); } catch (e) { /* render() surfaces real failures */ }
+    return m;
+  }
+
   // Load mermaid from CDN once, shared across every widget on the page.
+  //
+  // Documenter ships RequireJS. Loading mermaid's UMD via a bare <script> makes its
+  // AMD branch call an anonymous define() that RequireJS rejects ("Mismatched
+  // anonymous define()"). So when an AMD loader is present we load mermaid THROUGH it
+  // (the anonymous define is then captured under the configured module id); otherwise
+  // we fall back to a plain <script>.
   function loadMermaid() {
-    if (window.mermaid) return Promise.resolve(window.mermaid);
+    if (window.mermaid) return Promise.resolve(initMermaid(window.mermaid));
     if (_mermaidPromise) return _mermaidPromise;
     _mermaidPromise = new Promise(function (resolve, reject) {
+      if (typeof window.require === "function" && window.define && window.define.amd) {
+        try { window.require.config({ paths: { mermaid_cdn: MERMAID_BASE } }); } catch (e) {}
+        window.require(
+          ["mermaid_cdn"],
+          function (m) { resolve(initMermaid(m || window.mermaid)); },
+          function (err) { reject(err || new Error("mermaid CDN unavailable")); }
+        );
+        return;
+      }
       var s = document.createElement("script");
       s.src = MERMAID_SRC;
-      s.onload = function () {
-        try {
-          window.mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: "neutral" });
-        } catch (e) { /* keep going; render() will surface any real failure */ }
-        resolve(window.mermaid);
-      };
+      s.onload = function () { resolve(initMermaid(window.mermaid)); };
       s.onerror = function () { reject(new Error("mermaid CDN unavailable")); };
       document.head.appendChild(s);
     });
