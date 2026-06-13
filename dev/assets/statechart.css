@@ -1,0 +1,81 @@
+/* Interactive state-machine widget (see statechart.js). Theme-neutral: borders +
+   accent colors that read on Documenter's light and dark themes. */
+
+.rosnode-statechart {
+  border: 1px solid var(--sc-border, #d0d7de);
+  border-radius: 8px;
+  padding: 1rem 1.1rem 1.1rem;
+  margin: 1.25rem 0;
+  font-size: 0.92rem;
+  background: var(--sc-bg, #fbfcfd);
+}
+html.theme--documenter-dark .rosnode-statechart {
+  --sc-border: #4a4a4a;
+  --sc-bg: #2b2b33;
+}
+
+.rosnode-statechart .sc-head { margin-bottom: 0.75rem; }
+.rosnode-statechart .sc-title { font-weight: 700; font-size: 1.02rem; }
+.rosnode-statechart .sc-summary { opacity: 0.85; margin-top: 0.25rem; line-height: 1.4; }
+
+/* the state chips */
+.rosnode-statechart .sc-states {
+  display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0 0.75rem;
+}
+.rosnode-statechart .sc-chip {
+  font: inherit; cursor: pointer;
+  border: 1.5px solid; border-radius: 999px;
+  padding: 0.18rem 0.7rem; background: transparent;
+  opacity: 0.55; transition: opacity 0.12s, box-shadow 0.12s, transform 0.12s;
+}
+.rosnode-statechart .sc-chip:hover { opacity: 0.85; }
+.rosnode-statechart .sc-chip.sc-active {
+  opacity: 1; font-weight: 700; transform: translateY(-1px);
+  box-shadow: 0 0 0 3px rgba(0,0,0,0.06);
+}
+.rosnode-statechart .sc-chip.sc-inspect { opacity: 0.95; border-style: dashed; }
+
+/* kind colors */
+.rosnode-statechart .sc-kind-primary   { border-color: #2f6feb; color: #2f6feb; }
+.rosnode-statechart .sc-kind-transient { border-color: #b8860b; color: #9a6f08; }
+.rosnode-statechart .sc-kind-error     { border-color: #d1242f; color: #d1242f; }
+.rosnode-statechart .sc-kind-terminal  { border-color: #6e7781; color: #6e7781; }
+.rosnode-statechart .sc-chip.sc-active.sc-kind-primary   { background: #2f6feb; color: #fff; }
+.rosnode-statechart .sc-chip.sc-active.sc-kind-transient { background: #b8860b; color: #fff; }
+.rosnode-statechart .sc-chip.sc-active.sc-kind-error     { background: #d1242f; color: #fff; }
+.rosnode-statechart .sc-chip.sc-active.sc-kind-terminal  { background: #6e7781; color: #fff; }
+html.theme--documenter-dark .rosnode-statechart .sc-kind-transient { border-color: #d9a93b; color: #d9a93b; }
+
+/* current-state description */
+.rosnode-statechart .sc-desc {
+  border-left: 3px solid var(--sc-border, #d0d7de);
+  padding: 0.35rem 0.7rem; margin: 0.5rem 0 0.85rem; line-height: 1.45;
+}
+.rosnode-statechart .sc-desc-name { font-weight: 700; margin-right: 0.5rem; }
+.rosnode-statechart .sc-desc-text { opacity: 0.9; }
+
+/* transition controls */
+.rosnode-statechart .sc-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; }
+.rosnode-statechart .sc-ev-label, .rosnode-statechart .sc-path-label { font-weight: 600; opacity: 0.8; }
+.rosnode-statechart .sc-events { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; }
+.rosnode-statechart .sc-event {
+  font: inherit; cursor: pointer; border: 1px solid #2f6feb; color: #2f6feb;
+  background: transparent; border-radius: 5px; padding: 0.18rem 0.6rem;
+}
+.rosnode-statechart .sc-event:hover { background: #2f6feb; color: #fff; }
+.rosnode-statechart .sc-terminal { opacity: 0.6; font-style: italic; }
+.rosnode-statechart .sc-reset {
+  font: inherit; cursor: pointer; margin-left: auto; border: 1px solid var(--sc-border, #d0d7de);
+  background: transparent; border-radius: 5px; padding: 0.18rem 0.6rem; opacity: 0.8;
+}
+.rosnode-statechart .sc-reset:hover { opacity: 1; }
+
+/* path breadcrumb */
+.rosnode-statechart .sc-path { margin-top: 0.7rem; line-height: 1.6; }
+.rosnode-statechart .sc-path-list { margin-left: 0.4rem; }
+.rosnode-statechart .sc-path-node {
+  font-family: var(--sc-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.86rem; padding: 0.05rem 0.3rem; border-radius: 4px;
+  background: rgba(47,111,235,0.1);
+}
+.rosnode-statechart .sc-path-ev { opacity: 0.6; font-size: 0.82rem; }
