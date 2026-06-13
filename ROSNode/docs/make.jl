@@ -1,10 +1,18 @@
 using Documenter
 using ROSNode
 
+# Generate the interactive state-machine definitions from ROSNode's reified transition
+# tables, so the diagrams embedded in the concept pages track the runtime.
+include("statemachines.jl")
+StateMachines.write_js(joinpath(@__DIR__, "src", "assets", "rosnode-machines.js"))
+
 makedocs(;
     sitename = "ROSNode.jl",
     modules = [ROSNode],
-    format = Documenter.HTML(; prettyurls = get(ENV, "CI", nothing) == "true"),
+    format = Documenter.HTML(;
+        prettyurls = get(ENV, "CI", nothing) == "true",
+        assets = ["assets/xstate.umd.min.js", "assets/rosnode-machines.js",
+                  "assets/statechart.js", "assets/statechart.css"]),
     checkdocs = :exports,
     pages = [
         "Home" => "index.md",

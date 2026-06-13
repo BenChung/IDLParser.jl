@@ -43,9 +43,21 @@ end
 
 `wait_for_service` returns `true` once a server route-matches within the timeout, gating the call on a reachable server. For concurrent requests, `call(client, req; async = true)` returns a Task you `fetch` later, so several requests stay in flight at once.
 
-## Error replies
+## Error replies — the settlement three-way
 
-The server settles every request. A normal return replies success. `respond!(req, failed, msg)` sends an explicit failure, which raises a `ServiceError` at the client's `call`, surfacing the error where the request was made. A throw inside the handler also becomes an error reply, so every call resolves.
+The server settles every request exactly once, and the handler reaches that settlement in one of three ways. This three-way is the same pattern action goals and the node [lifecycle](../composition/components.md) settle through, met here in its simplest form — step through it:
+
+```@raw html
+<div class="rosnode-statechart" data-machine="threeway"></div>
+```
+
+| The handler… | Service outcome |
+|---|---|
+| **returns** a response | reply-ok — the client's [`call`](@ref) returns it |
+| **declines** — `respond!(req, failed, msg)` | a `ServiceError` reply, raised at the client's [`call`](@ref) |
+| **throws** | an error reply, so the call still resolves rather than hanging |
+
+The same three branches settle an [action goal](actions.md) (`succeeded` / `canceled` / `aborted`) and drive a [lifecycle transition](../composition/components.md) (land the target state / revert / error processing).
 
 ## Next
 

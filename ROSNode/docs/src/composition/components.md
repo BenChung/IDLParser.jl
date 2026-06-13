@@ -167,11 +167,23 @@ deactivate!(ln)     # → Inactive: members deactivate in reverse order, gating 
 cleanup!(ln)        # → Unconfigured: each cleanup runs, entities close — a configure! starts fresh
 ```
 
+Those calls drive one state machine — the same one a `ros2 lifecycle` orchestrator drives over `~/change_state`. Each transition runs the members' hooks under the [settlement three-way](../communication/services.md), so it can land its target, decline back to its origin, or divert into error processing. Step through it:
+
+```@raw html
+<div class="rosnode-statechart" data-machine="lifecycle"></div>
+```
+
 While a managed node is in any state other than `Active`, its publishers, subscriptions, timers, and services are gated at dispatch: publishers drop, subscriptions and timers don't fire, services error-reply. Action servers are gated the same way: goal, cancel, and result requests error-reply, and feedback/status publications drop. The control surface stays live throughout, as do the parameter services and `~/get_type_description` — an orchestrator drives transitions and tunes parameters on an inactive node. `activate`/`deactivate` therefore carry only work beyond that automatic gating — pre-rolling a device, flushing a buffer.
 
 In a multi-mixin node the hooks fan out in dependency order: `configure`, `activate`, and `on_error` run providers first, `deactivate` and `cleanup` in reverse. In `Vehicle`, the `Sensor` configures before the `Guard` it was injected into, and cleans up after it.
 
-A hook signals failure by throwing. The fan-out discards hook return values, so a hook that returns the lifecycle `failure` token completes the transition as a success. On a managed transition the throw enters error processing: each member's `on_error` runs in dependency order, and the node recovers to `Unconfigured` when every one returns cleanly; a throwing `on_error` is logged, the remaining members still run, and the node then lands in `Finalized`. Error processing runs the hooks alone — entities stay materialised — so `on_error` releases what the member's hooks acquired. During unmanaged construction `run` / `add!` tears the partial node down, then the throw propagates — every member that reached `configure` cleans up (the thrower included, against its partial state), declared entities close, and nothing is left on the Context.
+A hook signals failure by throwing — the fan-out discards return values, so returning the lifecycle `failure` token still completes the transition. On a managed node a throw enters error processing:
+
+```@raw html
+<div class="rosnode-statechart" data-machine="recovery"></div>
+```
+
+Across a node's members, `on_error` runs in dependency order; the node recovers to `Unconfigured` only when every member returns cleanly, and a throwing `on_error` (logged, with the remaining members still run) drops it to `Finalized`. Error processing runs the hooks alone — entities stay materialised — so `on_error` releases what the member's hooks acquired. An *unmanaged* node has no error processing: `run` / `add!` tears the partial node down — every member that reached `configure` cleans up against its partial state, entities close, and nothing is left on the Context — then the throw propagates.
 
 `cleanup` runs at most once per `configure`. Teardown has several triggers — explicit `close`, `unload_node`, the shutdown transition, the Context drain — and a node can see more than one; the member's materialised entities are the guard, so the first trigger runs `cleanup` and later ones are no-ops. The framework logs a throwing `cleanup` and teardown continues: the member's entities still close and the remaining members still clean up. After `cleanup` the entities drop; the managed `cleanup!` transition runs the same guarded step, so a re-`configure!` rematerialises them.
 
@@ -247,6 +259,7 @@ on_error
 Container
 container
 add!
+ros_init!
 ```
 
 ### Node-kind registry

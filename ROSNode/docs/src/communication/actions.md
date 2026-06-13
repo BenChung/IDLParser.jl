@@ -65,15 +65,13 @@ end
 
 ## Goal states
 
-`state(gh)` reports where a goal sits in its lifecycle:
+`state(gh)` reports where a goal sits in its lifecycle. Step a goal through it — click a transition to advance, any state to read it:
 
-- `:accepted` — the server took the goal.
-- `:rejected` — the server declined it.
-- `:executing` — the handler is running.
-- `:canceling` — a cancel request is in flight; the handler runs to its next checkpoint.
-- `:succeeded` — the handler returned a Result.
-- `:canceled` — a checkpoint raised `Cancelled` and the goal stopped.
-- `:aborted` — the handler threw, ending the goal in failure.
+```@raw html
+<div class="rosnode-statechart" data-machine="goal"></div>
+```
+
+How the handler ends the goal is the [settlement three-way](services.md) again, specialized: returning a Result settles `:succeeded`, a checkpoint raising [`Cancelled`](@ref) settles `:canceled`, and any other throw settles `:aborted`. `:rejected` is a client-side handle state — the server declined the goal with [`reject`](@ref) and never registered it.
 
 ## Cancelling a goal
 
