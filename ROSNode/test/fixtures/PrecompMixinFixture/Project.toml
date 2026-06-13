@@ -1,0 +1,6 @@
+name = "PrecompMixinFixture"
+uuid = "f1a7e5c2-0b3d-4e6a-9c8f-1d2e3f4a5b6c"
+version = "0.0.1"
+
+[deps]
+ROSNode = "bb9e268e-7981-4227-9ebf-b0919ec29e7a"

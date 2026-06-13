@@ -63,18 +63,25 @@ mutable struct MixinSpec
 end
 MixinSpec() = MixinSpec(ParamSpec[], PortSpec[])
 
-const _MIXINS = IdDict{Type, MixinSpec}()
-const _MIXINS_LOCK = ReentrantLock()
-
-_register_mixin!(::Type{M}) where {M} =
-    @lock _MIXINS_LOCK (get!(MixinSpec, _MIXINS, M); nothing)
-mixin_spec(::Type{M}) where {M} = @lock _MIXINS_LOCK _MIXINS[M]
-ismixin(::Type{M}) where {M} = @lock _MIXINS_LOCK haskey(_MIXINS, M)
+# Spec storage is per-mixin and lives in the mixin's OWN module: `@mixin` defines a
+# `const MixinSpec()` there and a `mixin_spec(::Type{M})` method returning it, so the
+# container rides that module's precompile image (which persists its own globals). A
+# registry held here in ROSNode breaks under precompilation — a consuming package's
+# top-level mutation of ROSNode's dict happens in the package's precompile process and
+# is discarded with ROSNode's deserialized state, never reaching the package cache.
+# `ismixin` is likewise a per-type method `@mixin` emits. Both dispatch (no shared dict,
+# no lock); a missing `mixin_spec` method means the `@mixin` is absent or defined below.
+function mixin_spec end
 ismixin(@nospecialize(_)) = false
+
+# Lock for the process-global codegen caches (`_SCHEMAS`, `_ENTITIES_DONE`) — runtime
+# state rebuilt every load, so precompile-safe; the lock just serialises concurrent
+# first-touches.
+const _CACHE_LOCK = ReentrantLock()
 
 # Declarations attach to the registered base; a concrete instantiation reaching here is
 # a value-level spelling (type alias, `typeof`) the syntactic macro guards can't see —
-# it would `get!` a shadow registry entry invisible to materialisation.
+# it would push onto the wrong mixin's spec, invisible to materialisation.
 function _check_decl_key(::Type{M}) where {M}
     M isa DataType && Base.typename(M).wrapper !== M && error(
         "component declarations attach to the mixin base — use `$(Base.typename(M).wrapper)`, not the instantiation `$(M)`")
@@ -82,9 +89,9 @@ function _check_decl_key(::Type{M}) where {M}
 end
 
 _add_param!(::Type{M}, p::ParamSpec) where {M} =
-    (_check_decl_key(M); @lock _MIXINS_LOCK (push!(get!(MixinSpec, _MIXINS, M).params, p); nothing))
+    (_check_decl_key(M); push!(mixin_spec(M).params, p); nothing)
 _add_port!(::Type{M}, p::PortSpec) where {M} =
-    (_check_decl_key(M); @lock _MIXINS_LOCK (push!(get!(MixinSpec, _MIXINS, M).ports, p); nothing))
+    (_check_decl_key(M); push!(mixin_spec(M).ports, p); nothing)
 
 # ── the per-instance runtime binding (the hidden `__rt__`, §3.5/§5) ─────────────
 # Each constructed mixin carries a back-ref to its node-core + its materialised
@@ -118,14 +125,25 @@ mutate its fields, so the struct holds only state — ports and parameters attac
 reached reflectively through [`entities`](@ref) / [`parameters`](@ref), never as
 fields.
 
-The macro injects a hidden `__rt__` runtime slot (defaulting to `nothing`), registers
-the type in the mixin spec registry, registers it as a loadable node kind by name (so
-a container's `load_node` can instantiate it, §4.3/§7), and installs the module's
-single load `__init__` hook. That hook both drains the module's authored types
-(`@ros_message` / inline `@serves`/`@runs`) and generates each mixin's parameter
-schema, so a module mixing `@mixin` with authored-type macros covers both under one
-hook. Every declared field needs a default unless [`construct`](@ref) is overridden to
-supply it; with all fields defaulted the mixin builds as `M()`.
+The macro injects a hidden `__rt__` runtime slot (defaulting to `nothing`), defines the
+mixin's spec store and its `mixin_spec`/`ismixin` dispatch in *this* module (so the
+declarations survive precompilation — see below), records the type as a loadable node
+kind by name (so a container's `load_node` can instantiate it, §4.3/§7), and installs
+ROSNode's single load hook [`ros_init!`](@ref) as the module's `__init__` unless the
+module defines its own. That hook drains the module's authored types (`@ros_message` /
+inline `@serves`/`@runs`), generates each mixin's parameter schema, and registers each
+kind — so a module mixing `@mixin` with authored-type macros initializes under one hook.
+If you write your own `__init__`, call `ROSNode.ros_init!(@__MODULE__)` from it to keep
+that setup running. Every declared field needs a default unless [`construct`](@ref) is
+overridden to supply it; with all fields defaulted the mixin builds as `M()`.
+
+The spec store is a `const` defined in the *defining* module and reached by dispatch
+(`mixin_spec(::Type{M})`), not a registry inside ROSNode — a mixin declared in a
+precompiled package would otherwise lose its parameters/ports, because a top-level
+mutation of ROSNode's global runs in the package's precompile process and is discarded
+before the package cache is written. Storing per-mixin in the defining module rides that
+module's own precompile image. Likewise the loadable-kind registration is deferred to
+`ros_init!` (immediate only in the REPL/script case).
 
 A mixin may be parametric (`struct M{B}`) for type-stable dependency injection: a
 free-type-parameter field with no default is filled by `construct`. Supply the DI form
@@ -150,18 +168,34 @@ macro mixin(structexpr)
     # Inject the hidden runtime slot, force mutable + a kwdef ctor, subtype Component.
     newbody = Expr(:block, body.args..., :(__rt__::$(Union{Nothing, MixinRuntime}) = nothing))
     newstruct = Expr(:struct, true, Expr(:(<:), name, :Component), newbody)
+    specsym = Symbol("__mixinspec_", base, "__")
     return esc(quote
         Base.@kwdef $newstruct
-        $(GlobalRef(@__MODULE__, :_register_mixin!))($base)
-        # Register the mixin as a loadable kind too (mixin-as-node, §4.3/§7), so a
-        # container's `load_node` can instantiate it by name.
-        $(GlobalRef(@__MODULE__, :register_node_kind!))(string(nameof($base)), $base)
-        # Generate the parameter schemas at module load (so `P_M`'s ctor exists before
-        # any frame uses it — the authored-types deferred pattern). The first `@mixin`
-        # in a module installs the hook; later ones see it defined and skip.
+        # Spec storage + dispatch: the `MixinSpec` is a `const` in THIS module, so it
+        # rides this module's precompile image; `mixin_spec(::Type{$base})` reaches it.
+        # `@param`/`@publishes`/… push onto it (they run as later top-level statements,
+        # so this method is already visible to them).
+        const $specsym = $(MixinSpec)()
+        $(GlobalRef(@__MODULE__, :mixin_spec))(::$(Type){$base}) = $specsym
+        $(GlobalRef(@__MODULE__, :ismixin))(::$(Type){$base}) = true
+        # The module's own roster of mixin bases, drained by `ros_init!` at load to
+        # generate each schema and register each as a loadable kind. Module-local, so it
+        # too survives precompile.
+        if !isdefined(@__MODULE__, :__mixin_bases__)
+            global __mixin_bases__ = $(Any)[]
+        end
+        push!(__mixin_bases__, $base)
+        # Register the loadable kind (mixin-as-node, §4.3/§7). Immediate for the
+        # REPL/script case; deferred to `ros_init!` for a precompiled package (a
+        # top-level mutation of ROSNode's registry would not survive precompile).
+        if ccall(:jl_generating_output, Cint, ()) == 0
+            $(GlobalRef(@__MODULE__, :register_node_kind!))(string(nameof($base)), $base)
+        end
+        # Install ROSNode's single load hook unless the module brings its own `__init__`
+        # (then call `ROSNode.ros_init!(@__MODULE__)` from it — see `ros_init!`).
         if !isdefined(@__MODULE__, :__init__)
             function __init__()
-                $(GlobalRef(@__MODULE__, :_finalize_mixins!))(@__MODULE__)
+                $(GlobalRef(@__MODULE__, :ros_init!))(@__MODULE__)
             end
         end
         $base
@@ -679,11 +713,11 @@ entities(m::Component) = _ports_value(m)
 const _ENTITIES_DONE = Base.IdSet{Type}()
 
 function _ensure_entities_accessor!(::Type{M}, ports) where {M}
-    @lock _MIXINS_LOCK (M in _ENTITIES_DONE && return nothing)
+    @lock _CACHE_LOCK (M in _ENTITIES_DONE && return nothing)
     Core.eval(parentmodule(M),
         :( $(GlobalRef(@__MODULE__, :entities))(m::$M) =
              $(GlobalRef(@__MODULE__, :_ports_value))(m)::$(typeof(ports)) ))
-    @lock _MIXINS_LOCK push!(_ENTITIES_DONE, M)
+    @lock _CACHE_LOCK push!(_ENTITIES_DONE, M)
     return nothing
 end
 
@@ -859,29 +893,54 @@ Generate (once, cached) the typed parameter schema `P_M` for mixin `M` from its
 `P_M`. New-world: callers touching `P_M` right after must go through `invokelatest`.
 """
 function _ensure_schema!(::Type{M}) where {M}
-    @lock _MIXINS_LOCK (haskey(_SCHEMAS, M) && return _SCHEMAS[M])
+    @lock _CACHE_LOCK (haskey(_SCHEMAS, M) && return _SCHEMAS[M])
     P = _gen_schema(parentmodule(M), Symbol("__P_", nameof(M), "__"), mixin_spec(M).params, M)
-    @lock _MIXINS_LOCK (_SCHEMAS[M] = P)
+    @lock _CACHE_LOCK (_SCHEMAS[M] = P)
     return P
 end
 
-# The mixin types defined in `mod`, and the load-time finalizer the `@mixin` `__init__`
-# hook calls — generate every such mixin's schema so `P_M` exists at module-load world
-# (before `run`/transactions touch its ctor).
-_mixins_of(mod::Module) =
-    @lock _MIXINS_LOCK Type[M for M in keys(_MIXINS) if parentmodule(M) === mod]
+"""
+    ros_init!(mod::Module) -> nothing
 
-function _finalize_mixins!(mod::Module)
-    # Also drain any authored types (`@ros_message`/inline `@serves`) registered in this
-    # module: the component `__init__` is the one hook, so it covers both — resolving the
-    # `@mixin`-vs-authored `__init__` collision.
+ROSNode's module-load initialization — the single hook the framework's macros install as
+`__init__`. Idempotent and safe to call repeatedly: it drains the module's authored types
+(`@ros_message`/`@ros_service`/`@ros_action`), generates each `@mixin`'s parameter schema
+`P_M`, and registers every `@mixin`/`@node` kind by name (§7).
+
+`@mixin`/`@node`/the authored macros auto-install `__init__() = ros_init!(@__MODULE__)`
+**only when the module has no `__init__` of its own**. If you bring your own `__init__`,
+call this from it so ROSNode keeps initializing:
+
+```julia
+function __init__()
+    ROSNode.ros_init!(@__MODULE__)   # keep ROSNode's load-time setup running
+    my_own_setup()
+end
+```
+
+Skipping it in a *precompiled* package leaves authored types unresolved and `@mixin`/
+`@node` kinds unregistered, so `load_node`-by-name and dynamic wire-type resolution fail;
+a direct `run(MyMixin)` still works (the schema generates lazily at `run`).
+"""
+function ros_init!(mod::Module)
+    # One hook covers both layers: drain authored types AND finalize mixins/nodes, so a
+    # module mixing `@mixin` with `@ros_message` initializes fully whichever macro
+    # installed `__init__` — resolving the prior install-order collision.
     try
         absorb_static_types!(mod)
     catch err
-        @debug "component: absorb_static_types! in _finalize_mixins! skipped" mod exception=err
+        @debug "ros_init!: absorb_static_types! skipped" mod exception=err
     end
-    for M in _mixins_of(mod)
-        _ensure_schema!(M)
+    if isdefined(mod, :__mixin_bases__)
+        for M in getfield(mod, :__mixin_bases__)
+            _ensure_schema!(M)                          # `P_M` exists at the load world
+            register_node_kind!(string(nameof(M)), M)   # loadable kind (mixin-as-node, §7)
+        end
+    end
+    if isdefined(mod, :__node_kinds__)
+        for (nm, K) in getfield(mod, :__node_kinds__)
+            register_node_kind!(nm, K)
+        end
     end
     return nothing
 end

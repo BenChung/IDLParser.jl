@@ -98,6 +98,9 @@ try
         # registration/accessors, zero-dep vs injected construct, guard errors, live
         # standalone/composed/parametric-provider injection.
         _section("component_parametric_di", "model/component_parametric_di.jl")
+        # §2–§7: a precompiled package's @mixin/@node/authored declarations survive to
+        # runtime (per-mixin spec store + ros_init! load hook), incl. a BYO __init__.
+        _section("component_precompile", "model/component_precompile.jl")
     end
 finally
     _kill_router!()

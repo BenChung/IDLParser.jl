@@ -11,9 +11,11 @@
 export register_node_kind!, node_kind, node_kinds, load_node, unload_node, list_nodes
 
 # ── the node-kind registry (rclcpp_components_register_nodes analog, §7) ─────────
-# Process-global name → kind. Like the component layer's `_register_mixin!`, registration
-# is a top-level statement (not deferred to `__init__`); see `register_node_kind!` for
-# the precompile caveat.
+# Process-global name → kind. Inherently a runtime registry (string → kind can't
+# dispatch), so unlike the per-mixin spec store it can't move into the defining module.
+# `@mixin`/`@node` therefore register a kind via the dual path — immediately in the
+# REPL/script case, and through `ros_init!` (the load hook) for a precompiled package,
+# where a top-level mutation of this dict would not survive precompile.
 
 const _NODE_KINDS = Dict{String, Any}()
 const _NODE_KINDS_LOCK = ReentrantLock()
@@ -28,14 +30,12 @@ instantiable by name, so a container's [`load_node`](@ref) (and the
 request.
 
 `K` is a `NodeKind` (from `@node N = […]`) or a `@mixin` type used directly as
-a node. `@node` and `@mixin` emit this call as a top-level statement in the defining
-module, so a kind registers when that module's body is evaluated — covering scripts,
-the REPL, `Main`, and `include`d modules. The call is thread-safe (guarded by the
-registry lock), and a repeated `name` is last-writer-wins.
-
-A kind defined inside a *precompiled* package must be registered from that package's
-runtime initialization (`__init__`): the top-level registration runs during precompile,
-and its mutation of ROSNode's global registry does not survive into the cached image.
+a node. `@node`/`@mixin` register a kind via the dual path that survives precompilation:
+immediately at module-body evaluation in the REPL/script/`Main` case, and through the
+module's load hook ([`ros_init!`](@ref)) for a precompiled package — where a top-level
+mutation of this registry would be discarded with ROSNode's deserialized state before
+the package cache is written. The call is thread-safe (guarded by the registry lock),
+and a repeated `name` is last-writer-wins.
 """
 function register_node_kind!(name::AbstractString, @nospecialize(K))
     @lock _NODE_KINDS_LOCK (_NODE_KINDS[String(name)] = K)

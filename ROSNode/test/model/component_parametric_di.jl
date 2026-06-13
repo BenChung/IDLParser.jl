@@ -200,8 +200,9 @@ _dyn_call(ci)  = any(stmt -> stmt isa Expr && stmt.head === :call &&
         @test err4 !== nothing && occursin("attach to the mixin base", sprint(showerror, err4))
         # … and no concrete-instantiation shadow entry was registered by any of them
         @test !ROSNode.ismixin(_ParamDI.Guard{Int})
-        # instance-keyed lookups stay base-keyed by design — call sites normalize
-        @test_throws KeyError ROSNode.mixin_spec(_ParamDI.Guard{_ParamDI.Sensor})
+        # instance-keyed lookups stay base-keyed by design — `mixin_spec` dispatches on
+        # the base only, so an instantiation hits no method; call sites normalize first
+        @test_throws MethodError ROSNode.mixin_spec(_ParamDI.Guard{_ParamDI.Sensor})
         # a value-level instantiation at the run entry gets the friendly redirect
         @test_throws "name the base mixin" ROSNode._check_runnable(_ParamDI.Guard{Int}, "run")
         # load-by-name registers the base

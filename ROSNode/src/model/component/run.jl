@@ -172,11 +172,25 @@ macro node(assign)
     memexprs = [:( $(NodeMember)($(QuoteNode(nm)), $(esc(mx)),
                                  $(Pair{Symbol, Any})[$(rms...)]) )
                 for (nm, mx, rms) in members]
-    # Also register the kind by name (the `rclcpp_components_register_nodes` analog, §7)
-    # so a container's `load_node` can instantiate it from a `ros2 component load` request.
+    modu = __module__
+    # Register the kind by name (the `rclcpp_components_register_nodes` analog, §7) so a
+    # container's `load_node` can instantiate it from a `ros2 component load` request.
+    # Immediate for the REPL/script case; deferred to `ros_init!` for a precompiled
+    # package (a top-level mutation of ROSNode's registry would not survive precompile).
     return quote
         const $(esc(N)) = $(NodeKind)($(QuoteNode(N)), $(NodeMember)[$(memexprs...)])
-        $(register_node_kind!)($(string(N)), $(esc(N)))
+        if ccall(:jl_generating_output, Cint, ()) == 0
+            $(register_node_kind!)($(string(N)), $(esc(N)))
+        end
+        if !isdefined($modu, :__node_kinds__)
+            $(esc(:__node_kinds__)) = $(Tuple{String, Any})[]
+        end
+        push!($(esc(:__node_kinds__)), ($(string(N)), $(esc(N))))
+        # Install ROSNode's load hook unless the module brings its own `__init__` (then
+        # call `ROSNode.ros_init!(@__MODULE__)` from it).
+        if !isdefined($modu, :__init__)
+            $(esc(:__init__))() = $(ros_init!)($modu)
+        end
         $(esc(N))
     end
 end

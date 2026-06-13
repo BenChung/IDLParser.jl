@@ -107,9 +107,13 @@ function _authored_register_stmts(pairs)
         :(if ccall(:jl_generating_output, Cint, ()) == 0
               ROSNode.absorb_static_types!(@__MODULE__)
           end),
+        # The load hook routes through `ros_init!` (a superset of `absorb_static_types!`)
+        # so a module also carrying `@mixin`/`@node` initializes fully no matter which
+        # macro installed `__init__`. A user `__init__` steps in front; it should call
+        # `ROSNode.ros_init!(@__MODULE__)` itself.
         :(if !$(Expr(:isdefined, :__init__))
               function __init__()
-                  ROSNode.absorb_static_types!(@__MODULE__)
+                  ROSNode.ros_init!(@__MODULE__)
               end
           end),
     ]
