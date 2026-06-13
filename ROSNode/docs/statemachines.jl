@@ -198,8 +198,49 @@ function recovery()
         "meta"    => obj("states" => smeta))
 end
 
-all_machines() = obj("lifecycle" => lifecycle(), "goal" => goal(),
-                     "threeway" => threeway(), "recovery" => recovery())
+# A static Mermaid `stateDiagram-v2` for the same machine — the at-a-glance
+# schematic the docs render alongside the interactive stepper. Built from the same
+# states/edges/kinds, so it can't drift. classDef colors mirror the widget's kinds.
+function mermaid_spec(machine, meta)
+    initial = first(p.second for p in machine if p.first == "initial")
+    states  = first(p.second for p in machine if p.first == "states")
+    smeta   = first(p.second for p in meta if p.first == "states")
+    io = IOBuffer()
+    println(io, "stateDiagram-v2")
+    println(io, "    [*] --> ", initial)
+    for (name, cfg) in states
+        on  = nothing
+        fin = false
+        for p in cfg
+            p.first == "on"   && (on = p.second)
+            p.first == "type" && p.second == "final" && (fin = true)
+        end
+        on === nothing || for (ev, tgt) in on
+            println(io, "    ", name, " --> ", tgt, " : ", ev)
+        end
+        fin && println(io, "    ", name, " --> [*]")
+    end
+    println(io, "    classDef primary fill:#2f6feb18,stroke:#2f6feb,color:#2f6feb;")
+    println(io, "    classDef transient fill:#b8860b18,stroke:#b8860b,color:#9a6f08;")
+    println(io, "    classDef error fill:#d1242f18,stroke:#d1242f,color:#d1242f;")
+    println(io, "    classDef terminal fill:#6e778118,stroke:#6e7781,color:#6e7781;")
+    for (name, m) in smeta
+        kind = first(p.second for p in m if p.first == "kind")
+        println(io, "    class ", name, " ", kind)
+    end
+    return String(take!(io))
+end
+
+function all_machines()
+    ms = obj("lifecycle" => lifecycle(), "goal" => goal(),
+             "threeway" => threeway(), "recovery" => recovery())
+    for p in ms                                  # inject the source-derived Mermaid schematic
+        machine = first(q.second for q in p.second if q.first == "machine")
+        meta    = first(q.second for q in p.second if q.first == "meta")
+        push!(p.second, "mermaid" => mermaid_spec(machine, meta))
+    end
+    return ms
+end
 
 "Write the machines as a JS asset that sets `window.ROSNODE_MACHINES`."
 function write_js(path::AbstractString)
