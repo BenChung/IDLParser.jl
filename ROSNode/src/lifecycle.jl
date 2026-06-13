@@ -23,7 +23,7 @@
 using ROSZenoh: ROSZenoh, QosProfile, default_qos
 
 export LifecycleNode, LifecycleState, Unconfigured, Inactive, Active, Finalized,
-       state, isactive, inner_node,
+       state, isactive, inner_node, NodeInactiveError,
        configure!, activate!, deactivate!, cleanup!, shutdown!
 
 # ── state machine ──────────────────────────────────────────────────────────────
@@ -149,7 +149,7 @@ const TRANSITION_ON_ERROR_FAILURE     = 0x3d
                   autostart=false, on_configure=…, on_activate=…, on_deactivate=…,
                   on_cleanup=…, on_shutdown=…, on_error=…, msgs=nothing) -> LifecycleNode
 
-A ROS 2 managed node: a distinct node type that wraps a plain [`Node`] and adds the
+A ROS 2 managed node: a distinct node type that wraps a plain [`Node`](@ref) and adds the
 managed-node state machine an external orchestrator drives (`~/change_state`) and
 observes (`~/get_state`, `~/transition_event`). Construction starts the node in
 [`Unconfigured`](@ref). See the ROS 2 [managed-node
@@ -160,7 +160,11 @@ three-way settlement: returning normally is SUCCESS (land in the target state);
 returning the [`failure`](@ref) token is FAILURE (a clean "can't right now" that
 reverts to the origin state); throwing is ERROR (`on_error` runs — its SUCCESS
 recovers to [`Unconfigured`](@ref), any other outcome — or any `on_shutdown` error —
-drops the node to [`Finalized`](@ref)). Each callback defaults to a no-op, so a node
+drops the node to [`Finalized`](@ref)). On the recovery edge, `on_cleanup` runs after
+a successful `on_error`, so recovery to `Unconfigured` is a true reset (ports close,
+cleanup hooks run) rather than leaving acquired resources stale. `on_error` should
+therefore be advisory; put resource release in `on_cleanup`, which now runs on both
+the error and the normal teardown paths. Each callback defaults to a no-op, so a node
 with no behavior still transitions cleanly. A thrown `ShutdownException` propagates
 unchanged — it signals context shutdown, not a callback error.
 
@@ -275,7 +279,7 @@ _lc_noop(::LifecycleNode) = nothing
 """
     inner_node(ln::LifecycleNode) -> Node
 
-The plain [`Node`] wrapped by a managed node. Create application entities
+The plain [`Node`](@ref) wrapped by a managed node. Create application entities
 against it — `Publisher(inner_node(ln), "image", T)`,
 `Timer(inner_node(ln), period) do … end`,
 `Subscription(inner_node(ln), "cmd", T) do msg … end` — so they register on the node
@@ -329,7 +333,7 @@ state(ln::LifecycleNode) = @atomic ln._state
 
 The dispatch gate predicate: whether an entity fires right now. A
 [`LifecycleNode`](@ref) is active only in the [`Active`](@ref) state. A plain
-[`Node`] is active unless it is the wrapped node of some `LifecycleNode`, found
+[`Node`](@ref) is active unless it is the wrapped node of some `LifecycleNode`, found
 through an identity-keyed registry (one lock-guarded lookup; an unmanaged node is
 absent and always active). An [`Entity`] follows its node's state, with one
 exception: the control surface of a managed node (the `lifecycle_msgs` services and
@@ -358,6 +362,21 @@ function isactive(e::Entity)
     e in (g::LifecycleNode)._control && return true   # control surface exempt
     return isactive(g::LifecycleNode)
 end
+
+"""
+    NodeInactiveError(msg)
+
+Raised by an outbound client call — service [`call`](@ref), action [`send`](@ref),
+`fetch`, `cancel` — issued from a client owned by a managed node that is not
+[`Active`](@ref). A node administratively brought down should not address a remote
+peer, so the call is gated at entry (an already in-flight call completes under its
+own timeout). Probe liveness first with [`isactive`](@ref)`(node)`; a standalone
+client on an unmanaged node is always active and never gates.
+"""
+struct NodeInactiveError <: Exception
+    msg::String
+end
+Base.showerror(io::IO, e::NodeInactiveError) = print(io, "NodeInactiveError: ", e.msg)
 
 # Dispatch hooks ("gate everything, at dispatch"). The gate is a single
 # `isactive(e::Entity)` guard threaded into each data-plane dispatch site. This
@@ -535,9 +554,25 @@ _shutdown_transition_id(::LifecycleState) = TRANSITION_INACTIVE_SHUTDOWN
 #   2. runs `callback(ln)` under the three-way,
 #   3. on SUCCESS latches `target` + publishes the transition_event,
 #   4. on FAILURE leaves `origin` (publishes no event — nothing changed),
-#   5. on ERROR runs `on_error` and lands in Unconfigured (its SUCCESS) or Finalized;
-#      a shutdown's error lands Finalized either way (terminal path).
+#   5. on ERROR runs `on_error`, then (on its SUCCESS) the cleanup fan-out, and lands
+#      in Unconfigured; else (decline/throw) Finalized; a shutdown's error lands
+#      Finalized either way (terminal path).
 # Returns the `TransitionResult`. Closed node ⇒ the only hard error.
+#
+# Truth table — landed state by transition × callback outcome (the `:error` column
+# is `_handle_error!`: on_error SUCCESS recovers + cleans up, else Finalized):
+#
+#   transition  | return-ok    | return-failure | throw (→ on_error)
+#   ------------ | ------------ | -------------- | ----------------------------------
+#   configure    Inactive       Unconfigured     Unconfigured (recover) | Finalized
+#   activate      Active         Inactive         Unconfigured (recover) | Finalized
+#   deactivate    Inactive       Active           Unconfigured (recover) | Finalized
+#   cleanup       Unconfigured   Inactive         Unconfigured (recover) | Finalized
+#   shutdown      Finalized      Finalized        Finalized (terminal — both ways)
+#
+# return-failure stays in the origin (no `_land!`); for a component node it is a
+# *rollback* — the configure/activate member fan-out unwinds already-completed
+# members before returning the token (run.jl `_members_configure!`/`_members_activate!`).
 function _drive!(ln::LifecycleNode, origin::LifecycleState, target::LifecycleState,
                  callback::Function, transition_id::UInt8, label::AbstractString)
     isopen(ln) || throw(ArgumentError("transition on a closed LifecycleNode"))
@@ -593,15 +628,35 @@ end
 # rclcpp ERROR-processing contract. Shutdown (`target` Finalized) is the carve-out:
 # it is the terminal path in the managed-node spec, so it lands `Finalized` even
 # when `on_error` recovers (`on_error` is cleanup, not a way back to service).
+#
+# On the recovery edge, run `on_cleanup` after `on_error` so recovery to Unconfigured
+# is a true reset: ports close and member `cleanup` hooks run, leaving no stale state
+# to double-dispatch on a retry `configure!`. `on_cleanup` is the same member-cleanup
+# fan-out the `cleanup!` transition uses (idempotent — a later teardown is a no-op);
+# guarded so a throwing cleanup can't abort error processing.
 function _handle_error!(ln::LifecycleNode, origin::LifecycleState, target::LifecycleState,
                         label::AbstractString)
     recovered = _run_transition(ln, ln.on_error, "$(label):on_error")
     if recovered === :success && target !== Finalized()
+        _run_cleanup_fanout!(ln, "$(label):on_error")
         _land!(ln, origin, Unconfigured(), TRANSITION_ON_ERROR_SUCCESS)
     else
         _land!(ln, origin, Finalized(), TRANSITION_ON_ERROR_FAILURE)
     end
     return :error
+end
+
+# Run the member-cleanup fan-out (the `on_cleanup` callback) outside the transition
+# three-way: error recovery + teardown both need ports closed and member `cleanup`
+# hooks run, regardless of the callback's return. Guarded — a throw must not strand
+# the caller (error processing, or `close`).
+function _run_cleanup_fanout!(ln::LifecycleNode, context::AbstractString)
+    try
+        ln.on_cleanup(ln)
+    catch err
+        @error "lifecycle: cleanup fan-out threw" context=context node=ln.node.fqn exception=(err, catch_backtrace())
+    end
+    return nothing
 end
 
 # ── control surface ──────────────────────────────────────────────────────────────
@@ -798,8 +853,10 @@ end
 
 Finalize and tear down the managed node. Runs [`shutdown!`](@ref) (the
 lifecycle drain, normally landing in [`Finalized`](@ref)) if not already terminal,
-closes the wrapped [`Node`] — which undeclares every entity (control surface +
-application) and the node token — then drops the gate registration. Idempotent.
+closes the wrapped [`Node`](@ref) — which undeclares every entity (control surface +
+application) and the node token — then drops the gate registration. A node already
+`Finalized` (e.g. landed there by a throwing `on_error`) skips `shutdown!` but still
+runs the member-cleanup fan-out, so its resources don't leak. Idempotent.
 """
 function Base.close(ln::LifecycleNode)
     isopen(ln) || return nothing
@@ -808,8 +865,16 @@ function Base.close(ln::LifecycleNode)
     # entities vanish. Guard it — a throwing transition must not abort teardown.
     # (`shutdown!` is idempotent: a concurrent close finds Finalized and no-ops, and
     # the `@atomicswap` below is the single-winner latch.)
+    #
+    # An already-Finalized node skips `shutdown!` (its `on_shutdown` cleanup fan-out
+    # never ran — e.g. it landed Finalized via a throwing `on_error`), so run the
+    # cleanup fan-out directly here. Idempotent: a no-op if cleanup already ran.
     try
-        state(ln) === Finalized() || shutdown!(ln)
+        if state(ln) === Finalized()
+            _run_cleanup_fanout!(ln, "close")
+        else
+            shutdown!(ln)
+        end
     catch err
         @error "close(LifecycleNode): shutdown! failed" node=ln.node.fqn exception=(err, catch_backtrace())
     end

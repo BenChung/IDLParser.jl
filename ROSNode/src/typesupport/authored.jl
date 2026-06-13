@@ -627,10 +627,12 @@ send(client::ActionClient{A, G, R, F}; fields...) where {A, G, R, F} =
 # struct-returning methods, then converts.)
 function feedback(g::ClientGoal{A, G, R, F}) where {A<:Function, G, R, F}
     src = invoke(feedback, Tuple{ClientGoal}, g)         # the generic Channel{F}
-    out = Channel{NamedTuple}(32)
+    out = Channel{NamedTuple}(max(1, _fifo_capacity(g.client.qos)))
     errormonitor(Threads.@spawn begin
         try
-            for fb in src; put!(out, _to_nt(fb)); end
+            # Drop-oldest (KEEP_LAST ring): a consumer that breaks early no longer pins
+            # this task in a blocked `put!`; it still exits when `src` closes on settle.
+            for fb in src; _put_drop_oldest!(out, _to_nt(fb)); end
         finally
             close(out)
         end

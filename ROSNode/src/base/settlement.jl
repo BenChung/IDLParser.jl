@@ -35,6 +35,11 @@ second terminal `respond!`, which is the one hard error.
 
 The lock makes concurrent settlement safe: a detached cleanup task can race the
 fail-safe wrapper, and only one wins.
+
+The `detached` flag (set by the service `detach!`) tells [`settle_handler!`](@ref)'s
+fail-safe `finally` to *not* force-abort a still-empty cell at handler return —
+settlement ownership has transferred to a spawned task. `respond!`/`fill!`/
+`_settle!`/`wait_settled` stay detach-agnostic; only the at-return backstop reads it.
 """
 mutable struct ResultCell{H, R}
     const handle::H
@@ -49,11 +54,15 @@ mutable struct ResultCell{H, R}
     const cond::Threads.Condition
     @atomic filled::Bool
     status::Union{SettlementStatus, Nothing}   # the terminal token that filled it
+    # Set by `detach!` (service.jl) to transfer settlement ownership off the
+    # handler frame: a detached still-empty cell is not force-aborted at handler
+    # return — a spawned task settles it later, bounded by the detach deadline.
+    @atomic detached::Bool
 end
 
 function ResultCell{H, R}(handle::H, deliver) where {H, R}
     lk = ReentrantLock()
-    return ResultCell{H, R}(handle, deliver, lk, Threads.Condition(lk), false, nothing)
+    return ResultCell{H, R}(handle, deliver, lk, Threads.Condition(lk), false, nothing, false)
 end
 
 """
@@ -180,8 +189,10 @@ function settle_handler!(cell::ResultCell, body;
     try
         v = body()
         # `respond!` is authoritative: only fill from the return value if the
-        # handler didn't already settle.
-        isfilled(cell) || fill!(cell, success_status, v)
+        # handler didn't already settle. A detached handler hands settlement to a
+        # spawned task, so its return value (typically `nothing`) is ignored — the
+        # detach deadline/drain is the backstop, not the at-return fill.
+        isfilled(cell) || (@atomic cell.detached) || fill!(cell, success_status, v)
     catch e
         if !isfilled(cell)
             status = e isa Cancelled ? canceled : aborted
@@ -202,8 +213,9 @@ function settle_handler!(cell::ResultCell, body;
     finally
         # Infallible last resort: a non-defaultable result type or a delivery
         # error above can leave the cell empty — force a bare abort so the client
-        # cannot hang. Must never throw.
-        isfilled(cell) || force_abort!(cell)
+        # cannot hang. Must never throw. A detached cell skips this: ownership has
+        # transferred to a spawned task, bounded instead by the detach deadline.
+        isfilled(cell) || (@atomic cell.detached) || force_abort!(cell)
     end
     return outcome(cell)
 end

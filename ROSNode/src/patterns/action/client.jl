@@ -175,7 +175,9 @@ error reply (server inactive), no server discovered within the window, and a
 Context drain mid-window — so a caller that must tell them apart checks
 [`action_server_matched`](@ref) or `is_shutdown` separately.
 
-Throws `ArgumentError` if `client` is already closed.
+Throws `ArgumentError` if `client` is already closed, and [`NodeInactiveError`](@ref)
+if the client's node is a managed node that is not [`Active`](@ref) (probe
+[`isactive`](@ref)`(node)` first).
 
 ```julia
 goal = send(client, Fibonacci_Goal(; order = 10))
@@ -185,6 +187,10 @@ result = fetch(goal)
 """
 function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     isopen(client) || throw(ArgumentError("send on a closed ActionClient"))
+    # Outbound gate: a client on a non-Active managed node must not address a peer
+    # (entry-only — an in-flight call finishes). Unmanaged nodes are always active.
+    isactive(client.node) ||
+        throw(NodeInactiveError("send on a client of an inactive node; probe isactive(node) first"))
     id = _new_goal_id()
     ctx = client.node.context
     tk = _service_key(client, _send_goal_topic(client.name), _client_service_ti(client, :send_goal))
@@ -227,14 +233,16 @@ when the goal reaches a terminal state. The topic carries `<A>_FeedbackMessage`
 (goal_id + feedback), so the stream is filtered to *this* goal's id.
 """
 function feedback(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
-    # A bounded Channel fed by a Subscription on the feedback topic. The subscription
-    # decodes `<A>_FeedbackMessage`, drops messages for other goals, and forwards the
-    # unwrapped `Feedback`; the stream ends when the goal's result slot fills.
-    ch = Channel{F}(32)
+    # A bounded Channel (sized to the feedback QoS depth) fed by a Subscription on the
+    # feedback topic. The subscription decodes `<A>_FeedbackMessage`, drops messages for
+    # other goals, and forwards the unwrapped `Feedback`; the stream ends when the goal's
+    # result slot fills. Drop-oldest on enqueue so a slow or early-breaking consumer never
+    # blocks the subscription callback task (KEEP_LAST ring semantics).
     client = g.client
+    ch = Channel{F}(max(1, _fifo_capacity(client.qos)))
     sub = _make_subscription(client.node, _feedback_topic(client.name),
                              _feedback_message_type(A); qos=client.qos) do msg
-        _from_uuid(msg.goal_id) == g.id && isopen(ch) && put!(ch, msg.feedback)
+        _from_uuid(msg.goal_id) == g.id && isopen(ch) && _put_drop_oldest!(ch, msg.feedback)
     end
     g._feedback_sub = sub
     # The framework drives `get_result` (the single settlement signal), so the stream
@@ -291,6 +299,9 @@ end
 # while the route is still empty.
 function _get_result_once(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     client = g.client
+    # Outbound gate (entry-only): no get_result query from a non-Active managed node.
+    isactive(client.node) ||
+        throw(NodeInactiveError("fetch on a client of an inactive node; probe isactive(node) first"))
     ctx = client.node.context
     tk = _service_key(client, _get_result_topic(client.name), _client_service_ti(client, :get_result))
     req = _get_result_request_type(A)(; goal_id = _to_uuid(g.id))
@@ -327,7 +338,9 @@ slot filled from one `get_result` request — single-fill, like the server-side
 [`respond!`](@ref): the first `fetch`/`feedback` starts it, every `fetch` returns
 that result. Raises an error if the goal was rejected, the server reported a
 failure, or the result never arrived (a Context drain ends the `get_result` retry
-early, surfacing as a timed-out-result error).
+early, surfacing as a timed-out-result error), or [`NodeInactiveError`](@ref) if
+the client's node is a managed node that is not [`Active`](@ref) when the
+`get_result` query starts (probe [`isactive`](@ref)`(node)` first).
 """
 function Base.fetch(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     _ensure_result!(g)
@@ -361,9 +374,15 @@ The request targets this goal's id (a zeroed id would be the server-side
 cancel-all sentinel). The handle's local state moves to `:canceling` once the
 reply lands, unless the goal has already settled — a terminal `state(goal)` is
 kept; read the true terminal outcome through `fetch`, which is unaffected.
+
+Throws [`NodeInactiveError`](@ref) if the client's node is a managed node that is
+not [`Active`](@ref) (probe [`isactive`](@ref)`(node)` first).
 """
 function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     client = g.client
+    # Outbound gate (entry-only): no cancel_goal query from a non-Active managed node.
+    isactive(client.node) ||
+        throw(NodeInactiveError("cancel on a client of an inactive node; probe isactive(node) first"))
     ctx = client.node.context
     tk = _service_key(client, _cancel_goal_topic(client.name), _client_service_ti(client, :cancel_goal))
     # Request `action_msgs/CancelGoal_Request{goal_info{goal_id, stamp}}` targeting

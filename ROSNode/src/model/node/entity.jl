@@ -266,6 +266,11 @@ Returns the entity.
 
 `concurrency` is the per-sample handler scheduling: [`Serial`](@ref) (default) or
 [`Parallel`](@ref), defined by [`Concurrency`](@ref).
+
+`weak` is a keyexpr concern only: it widens the subscriber to a wildcard data
+keyexpr so off-type samples arrive for the per-sample backstop. It is unrelated to
+the `Context` `weak_types` type-revision trust flag, which governs whether a pinned
+type's RIHS01 is enforced against a diverging peer; the two are not coupled.
 """
 function declare_subscription!(e::Entity, msgtype::Type, handler;
                                view::Union{Bool, ViewMode}=Owned(),

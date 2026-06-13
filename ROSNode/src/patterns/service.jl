@@ -6,9 +6,10 @@
 # error reply, so the client's blocking `call` raises rather than returning a
 # plausible zeroed response. The cell settles within the handler's extent: a
 # still-empty cell is force-aborted when the handler returns, then the owned
-# `Query` is finalized. (Detached settlement — holding the query past handler
-# return until another task fills the cell — is an action-server feature via
-# `wait_settled`; the service path has no equivalent.)
+# `Query` is finalized. `detach!(req)` opts a handler out of that at-return
+# settlement, transferring the owned query + cell to a spawned task (the
+# action-server pattern, ported here); a per-service `detach_timeout` sweeper +
+# `close`-drain bound a forgotten reply so the client still can't hang.
 #
 # Client side: `call(client, req)` is a `Zenoh.get` whose handler we drain on the
 # *calling* task (it yields), raising on an error reply; `async=true` returns a
@@ -113,11 +114,30 @@ end
 # entity's lifecycle. `close(queryable)` disconnects the channel, ending the
 # consumer task's drain loop; the task is waited on so a closing service can't
 # leave a reply half-sent.
+#
+# `detached` is this service's registry of cells handed off by `detach!`: a
+# detached cell's owned `Query` is *not* finalized at handler return (ownership
+# transferred), so it lives here keyed to its force-abort deadline (`time()`
+# seconds, `Inf` ⇒ bounded only by drain). The `sweeper` Timer force-aborts +
+# finalizes cells past deadline; it is armed lazily on first detach and stopped
+# when the table empties (no perpetual idle timer). Per-service ownership: the
+# table dies with the service in `close`, draining outstanding cells.
 mutable struct _ServiceWire
     const queryable::Queryable
     consumer::Union{Task, Nothing}
     @atomic seq::Int64           # per-service reply sequence_number (rmw_zenoh attachment)
+    const detach_timeout::Float64
+    const detached::Dict{ResultCell, Float64}   # cell → force-abort deadline (time() s)
+    const detach_lock::ReentrantLock
+    sweeper::Union{Base.Timer, Nothing}
 end
+
+_ServiceWire(queryable::Queryable, consumer, seq::Int64, detach_timeout::Real) =
+    _ServiceWire(queryable, consumer, seq, Float64(detach_timeout),
+                 Dict{ResultCell, Float64}(), ReentrantLock(), nothing)
+
+# How often the sweeper scans for expired detached cells (seconds).
+const _DETACH_SWEEP_INTERVAL = 1.0
 
 function Base.close(w::_ServiceWire)
     # Closing the queryable disconnects its channel → the `take!` loop sees
@@ -133,13 +153,107 @@ function Base.close(w::_ServiceWire)
         t === nothing ||
             (try; timedwait(() -> istaskdone(t), 3.0; pollint=0.02); catch; end)
     end
+    _drain_detached!(w)
+    nothing
+end
+
+# Drain outstanding detached cells at service teardown: force-abort + finalize
+# every cell still registered (mirrors the action server's `_await_goals` bound,
+# but services are single-reply so there is no body to await — a forgotten
+# respond! is aborted outright). Stops the sweeper.
+function _drain_detached!(w::_ServiceWire)
+    cells = @lock w.detach_lock begin
+        w.sweeper === nothing || (try; close(w.sweeper); catch; end)
+        w.sweeper = nothing
+        cs = collect(keys(w.detached))
+        empty!(w.detached)
+        cs
+    end
+    for cell in cells
+        _abort_detached!(cell)
+    end
+    nothing
+end
+
+# Force-abort a detached cell and finalize its owned query (the final-ack
+# `_serve_query` skipped on the detach path). Both are infallible — a settled
+# cell's `force_abort!` is a no-op, finalize is idempotent.
+function _abort_detached!(cell::ResultCell)
+    try; force_abort!(cell); catch; end
+    q = cell.handle
+    q isa Query && (try; finalize(q.q); catch; end)
+    nothing
+end
+
+# Register a detached cell on its owning service, keyed to its force-abort
+# deadline, and arm the sweeper if it isn't already running.
+function _register_detached!(w::_ServiceWire, cell::ResultCell)
+    deadline = w.detach_timeout > 0 && isfinite(w.detach_timeout) ?
+               time() + w.detach_timeout : Inf
+    @lock w.detach_lock begin
+        w.detached[cell] = deadline
+        if w.sweeper === nothing && isfinite(deadline)
+            w.sweeper = Base.Timer(_ -> _sweep_detached!(w),
+                                   _DETACH_SWEEP_INTERVAL; interval=_DETACH_SWEEP_INTERVAL)
+        end
+    end
+    nothing
+end
+
+# Drop a detached cell from the registry (settled or aborted); stop the sweeper
+# once empty. Also finalizes the owned query — the final-ack `_serve_query`
+# skipped on the detach path.
+function _finalize_detached!(w::_ServiceWire, cell::ResultCell)
+    @lock w.detach_lock begin
+        delete!(w.detached, cell)
+        if isempty(w.detached) && w.sweeper !== nothing
+            try; close(w.sweeper); catch; end
+            w.sweeper = nothing
+        end
+    end
+    q = cell.handle
+    q isa Query && (try; finalize(q.q); catch; end)
+    nothing
+end
+
+# Sweeper tick: reap settled detached cells (finalizing their query) and
+# force-abort + finalize any past its deadline with an @error (a forgotten
+# respond!). Stops itself when the table empties.
+function _sweep_detached!(w::_ServiceWire)
+    now = time()
+    settled = ResultCell[]
+    expired = ResultCell[]
+    @lock w.detach_lock begin
+        for (cell, deadline) in w.detached
+            if isfilled(cell)
+                push!(settled, cell)
+            elseif now >= deadline
+                push!(expired, cell)
+            end
+        end
+        for cell in Iterators.flatten((settled, expired))
+            delete!(w.detached, cell)
+        end
+        if isempty(w.detached) && w.sweeper !== nothing
+            try; close(w.sweeper); catch; end
+            w.sweeper = nothing
+        end
+    end
+    for cell in settled
+        q = cell.handle
+        q isa Query && (try; finalize(q.q); catch; end)
+    end
+    for cell in expired
+        @error "detached service request exceeded detach_timeout; force-aborting" detach_timeout=w.detach_timeout
+        _abort_detached!(cell)
+    end
     nothing
 end
 
 """
     Service(node, name, SrvType; qos=default_qos(), view=false,
-            concurrency=Serial(), warmup=nothing, warmup_sync=nothing,
-            warmup_sample=nothing) do req … end -> ServiceHandle
+            concurrency=Serial(), detach_timeout=60.0, warmup=nothing,
+            warmup_sync=nothing, warmup_sample=nothing) do req … end -> ServiceHandle
 
 Declare a service `name` of service type `SrvType` on `node` and start serving it,
 returning a [`ServiceHandle`](@ref). `Service` is the `EndpointKind` enum
@@ -153,12 +267,19 @@ This domain's status mapping:
   - return the response message ⇒ reply-ok;
   - `respond!(req, failed, msg)` ⇒ a Zenoh query *error* reply, raising
     [`ServiceError`](@ref) in the client's [`call`](@ref);
-  - a throw or a return-without-responding ⇒ a synthesized error reply (logged
-    with a backtrace).
+  - a throw ⇒ a synthesized error reply (logged with a backtrace);
+  - a return that is not a valid response ⇒ a synthesized error reply.
 
-The cell settles within the handler's extent (no detached settlement, unlike an
-[`ActionServer`](@ref) goal): force-aborted if still empty when the handler
-returns, then the owned `Query` is finalized to send the final-ack.
+The cell settles within the handler's extent by default: force-aborted if still
+empty when the handler returns, then the owned `Query` is finalized to send the
+final-ack. A handler that calls [`detach!`](@ref)`(req)` instead transfers
+settlement to another task — the at-return abort is suppressed and the owned
+`Query` lives past handler return until that task settles via the returned handle
+(the action-server pattern, ported to services). `detach_timeout` (seconds,
+default `60.0`; `0`/`Inf` ⇒ bounded only by drain) caps how long a detached
+request may stay unsettled: a sweeper force-aborts + finalizes it past the
+deadline with an `@error`, so a forgotten `respond!` cannot hang a client. `close`
+drains outstanding detached requests the same way.
 
 The request is fully owned by default (storable, forwardable, spawnable past the
 handler). `view=true` decodes it as a `CDRView` aliasing a private owned
@@ -177,7 +298,7 @@ frees. `qos` maps onto the ROS 2 QoS policies for the route.
 [`response_type`](@ref) for a registered service marker. `warmup`, `warmup_sync`,
 and `warmup_sample` select the warm-up policy (precompile/execute/off, sync/async)
 that pre-JITs the request-decode → handler → response-encode dispatch chain,
-defaulting to the node's policy; see the warm-up layer (base/core.jl).
+defaulting to the node's policy.
 
 ```julia
 srv = Service(node, "add_two_ints", AddTwoInts_Request) do req
@@ -188,6 +309,7 @@ end
 function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
                        qos::QosProfile=default_qos(), view::Bool=false,
                        concurrency::Concurrency=Serial(),
+                       detach_timeout::Real=60.0,
                        warmup::Union{Symbol, Nothing}=nothing,
                        warmup_sync::Union{Bool, Nothing}=nothing,
                        warmup_sample=nothing) where {Srv}
@@ -204,7 +326,7 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
     qable = Queryable(ctx.session, Keyexpr(tk); channel=:fifo, complete=true)
-    wire = _ServiceWire(qable, nothing, 0)
+    wire = _ServiceWire(qable, nothing, Int64(0), detach_timeout)
     ent.wire = wire
     wire.consumer = _spawn_service_consumer(ent, Req, Resp, handler, view, concurrency)
 
@@ -273,6 +395,9 @@ end
 # spelling `respond!(req, status, payload)` can reach it — a handler holds the
 # decoded request, not the cell.
 const _ACTIVE_SERVICE_CELL = Base.ScopedValues.ScopedValue{Any}(nothing)
+# The owning service's wire, bound alongside the cell so `detach!` can register
+# the handed-off cell on the detach registry (the cell alone can't reach it).
+const _ACTIVE_SERVICE_WIRE = Base.ScopedValues.ScopedValue{Any}(nothing)
 
 """
     respond!(req, status::SettlementStatus, payload) -> Bool
@@ -306,6 +431,76 @@ function respond!(@nospecialize(req), status::SettlementStatus, payload)
     return respond!(cell::ResultCell, status, payload)
 end
 
+"""
+    ServiceRequestHandle
+
+A first-class handle to a detached service request, returned by [`detach!`](@ref).
+It carries the request's result cell (and its owning service) so a spawned task
+can settle the request via [`respond!`](@ref)`(handle, status, payload)` *without*
+the handler's `ScopedValue` — which is out of scope on the spawned task. It is the
+service analog of an action `GoalHandle`. Single-reply: the handle settles exactly
+once (services have no feedback stream).
+"""
+struct ServiceRequestHandle
+    cell::ResultCell
+    wire::_ServiceWire
+end
+
+"""
+    detach!(req) -> ServiceRequestHandle
+
+Transfer settlement of the current service request off the handler frame. By
+default a service handler must settle its request by the time it returns (a
+still-empty cell is force-aborted); `detach!` opts out: the at-return abort is
+suppressed and the owned `Query` is held past handler return, so another task can
+settle it later. Returns a [`ServiceRequestHandle`](@ref) to pass to that task,
+which settles via [`respond!`](@ref)`(handle, status, payload)`. Mirrors the
+action server's detached goal settlement.
+
+The detached request is bounded by the service's `detach_timeout` (and by drain):
+if it is not settled by the deadline a sweeper force-aborts it with an `@error`, so
+a forgotten `respond!` cannot hang the client. One-shot — `detach!` on an
+already-detached request returns the existing handle.
+
+`req` is the handler's argument; the cell and owning service are taken from the
+handler's dynamic scope. Throws `ArgumentError` when called outside a service
+handler.
+
+```julia
+Service(node, "plan", Plan_Request; detach_timeout = 30.0) do req
+    h = detach!(req)
+    Threads.@spawn respond!(h, success, solve(req))
+    nothing
+end
+```
+"""
+function detach!(@nospecialize(req))
+    cell = _ACTIVE_SERVICE_CELL[]
+    wire = _ACTIVE_SERVICE_WIRE[]
+    (cell === nothing || wire === nothing) && throw(ArgumentError(
+        "detach!(req) called outside a Service handler"))
+    c = cell::ResultCell
+    w = wire::_ServiceWire
+    # One-shot: a second detach! just hands back the handle (already registered).
+    (@atomicswap c.detached = true) || _register_detached!(w, c)
+    return ServiceRequestHandle(c, w)
+end
+
+"""
+    respond!(handle::ServiceRequestHandle, status::SettlementStatus, payload) -> Bool
+
+Settle a detached service request from a spawned task (see [`detach!`](@ref)).
+`status`/`payload` carry the same meaning as the in-handler `respond!`:
+`success` + a `Resp` replies-ok, `failed` + a message string error-replies. Settles
+the cell, then finalizes the owned `Query` (the final-ack) and drops the request
+from the detach registry. Returns `true`.
+"""
+function respond!(handle::ServiceRequestHandle, status::SettlementStatus, payload)
+    ok = respond!(handle.cell, status, payload)
+    _finalize_detached!(handle.wire, handle.cell)
+    return ok
+end
+
 # rcl-level infrastructure services (`~/get_type_description`, the parameter services)
 # sit BELOW the managed-node abstraction and must serve in every lifecycle state — a
 # manager resolves types / reads-and-sets parameters on an inactive node. Only
@@ -325,6 +520,7 @@ _is_infra_service(topic::AbstractString) =
 # delivery itself threw.
 function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
                       handler, view::Bool) where {Req, Resp}
+    cell = nothing                          # hoisted so the `finally` can read its detach state
     try
         req = _decode_request(query, Req, view)
         cell = ResultCell{Query, Resp}(query, _service_deliver(e, query, Resp))
@@ -336,8 +532,10 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
             (reply_err(query, "node inactive"); return)
         # Run the handler under the node logger so a plain `@info` inside it
         # routes to the node's /rosout (wherever `settle_handler!` runs the thunk).
+        # Bind the cell + owning wire in scope so `respond!`/`detach!` reach them.
         settle_handler!(cell,
-                        () -> Base.ScopedValues.with(_ACTIVE_SERVICE_CELL => cell) do
+                        () -> Base.ScopedValues.with(_ACTIVE_SERVICE_CELL => cell,
+                                                     _ACTIVE_SERVICE_WIRE => e.wire) do
                             _with_node_logger(() -> handler(req), e.node)
                         end;
                         success_status = success,
@@ -355,10 +553,17 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
         catch
         end
     finally
-        # The final-ack: drop the owned query exactly once, after any reply.
-        try
-            finalize(query.q)
-        catch
+        # The final-ack: drop the owned query exactly once, after any reply. A
+        # detached, still-empty cell is the exception — ownership of the query
+        # transferred to the detach registry, which finalizes it on settle/sweep —
+        # so we must NOT finalize it here. The attached path, and a detached cell
+        # already settled at return (its `respond!(handle, …)` finalized it), still
+        # finalize here (idempotent).
+        if !(cell isa ResultCell && (@atomic cell.detached) && !isfilled(cell))
+            try
+                finalize(query.q)
+            catch
+            end
         end
     end
     nothing
@@ -604,7 +809,7 @@ end
 Base.showerror(io::IO, e::ServiceError) = print(io, "ServiceError: ", e.msg)
 
 """
-    call(client::ServiceClient, req; async=false, timeout_ms=0) -> Resp | Task
+    call(client::ServiceClient, req; async=false, timeout_ms=60_000) -> Resp | Task
 
 Invoke the [service](https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html):
 serialize `req`, query the client's `Querier` on the service keyexpr with the
@@ -622,13 +827,15 @@ as a `TaskFailedException` wrapping the [`ServiceError`](@ref) — unwrap it (e.
 via `current_exceptions(task)`) to reach the original; the synchronous path does
 that unwrapping itself.
 
-`timeout_ms` bounds the wait by arming a cancellation timer on the in-flight get
-(`0` arms no timer). The synchronous path additionally applies a hard
-backstop — `timeout_ms/1000 + 2` seconds when set, 60 seconds when
-`timeout_ms == 0` — and when it elapses cancels the in-flight get and raises
-[`ServiceError`](@ref), so the caller can never hang even on a `Zenoh.get` that
-fails to honor its own timeout. The backstop is synchronous-only: an async call is
-bounded only by the cancellation timer and the transport's own query timeout.
+`timeout_ms` bounds the wait by arming a cancellation timer on the in-flight get;
+it defaults to `60_000` (60 s), so every call is bounded unless the caller opts
+out. Passing `0` is truly unbounded — no timer, no backstop — and the call waits
+until the reply arrives or the Context drains. The synchronous path additionally
+applies a hard backstop — `timeout_ms/1000 + 2` seconds — and when it elapses
+cancels the in-flight get and raises [`ServiceError`](@ref), so a bounded caller
+can never hang even on a `Zenoh.get` that fails to honor its own timeout. The
+backstop is synchronous-only: an async call is bounded only by the cancellation
+timer and the transport's own query timeout.
 
 Throws `ArgumentError` if `client` is closed or `req` is not the client's request
 type.
@@ -641,7 +848,7 @@ resp = call(cli, AddTwoInts_Request(; a = 2, b = 3); timeout_ms = 1000)
 ```
 """
 function call(client::ServiceClient{Req, Resp}, req::Req;
-              async::Bool=false, timeout_ms::Integer=0) where {Req, Resp}
+              async::Bool=false, timeout_ms::Integer=60_000) where {Req, Resp}
     isopen(client) ||
         throw(ArgumentError("call on a closed ServiceClient"))
     e = client.entity
@@ -661,9 +868,9 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     # A querier get carries no per-call timeout in libzenoh, so bound it with a
     # `CancellationToken`: cancel fires → the in-flight get ends → the drain
     # completes cleanly (no abandoned task). A deadline timer arms it when
-    # `timeout_ms > 0`; the sync backstop cancels it on its own deadline (so the
-    # token exists even at `timeout_ms == 0`); an unbounded async call leans on
-    # the transport's query timeout.
+    # `timeout_ms > 0`, and the sync backstop also cancels on its own deadline.
+    # `timeout_ms == 0` is truly unbounded: no timer, no backstop — the token
+    # lives only for drain/transport teardown.
     tok = CancellationToken()
     run = function ()
         # `Base.Timer` — ROSNode's own `Timer` (ROS timer, time.jl) shadows it here.
@@ -690,7 +897,8 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     # indefinitely, cancelling the token so the abandoned get/drain terminates
     # instead of leaking a blocked task per timed-out call.
     fut = Threads.@spawn run()
-    deadline = timeout_ms > 0 ? timeout_ms / 1000 + 2.0 : 60.0
+    # Explicit `timeout_ms == 0` is truly unbounded: wait forever for the reply.
+    deadline = timeout_ms == 0 ? Inf : timeout_ms / 1000 + 2.0
     if timedwait(() -> istaskdone(fut), deadline; pollint=0.01) === :ok
         # `fetch` on a failed task throws `TaskFailedException`; unwrap it so the
         # caller sees the `ServiceError` (error reply / no reply) the service contract
@@ -704,8 +912,10 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
         end
     end
     try; Zenoh.cancel(tok); catch; end
-    throw(ServiceError("no reply from service $(e.endpoint.topic) within \
-                        $(round(deadline; digits=1))s (timeout, no server, or transport contention)"))
+    throw(ServiceError("service $(e.endpoint.topic) did not reply within \
+                        $(round(deadline; digits=1))s (timeout_ms=$(timeout_ms), default 60000); \
+                        no server, slow handler, or transport contention. \
+                        Raise timeout_ms, or pass 0 to wait unbounded."))
 end
 
 # A non-`Req` payload is the common "wrong request type for this service"

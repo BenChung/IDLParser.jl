@@ -252,6 +252,38 @@ function _await_goals(server::ActionServer)
     nothing
 end
 
+"""
+    cancel_all!(server::ActionServer; timeout = drain_timeout)
+
+Cooperatively cancel every live goal: transition each `ACCEPTED`/`EXECUTING` goal
+to `CANCELING` (arming the [`checkpoint`](@ref)/[`feedback!`](@ref) `Cancelled`
+throw) and wait up to `timeout` seconds for the bodies to settle. The administrative
+counterpart of a client `cancel` — it skips `on_cancel` since the server is being
+brought down. A goal body that ignores cancellation past the budget is left running
+detached with an `@warn` (same ceiling as `close`: Julia tasks can't be hard-killed).
+Drives [`deactivate!`](@ref) of a managed action server (nav2 `terminate_all`).
+"""
+function cancel_all!(server::ActionServer{A, G, R, F};
+                     timeout::Real = server.node.context.drain_timeout) where {A, G, R, F}
+    # Snapshot under `server.lock`, then `_transition!` (takes `g.lock`) outside it —
+    # the lock order is `g.lock → server.lock` (`_deliver_result!`), so server.lock
+    # must not be held across a `g.lock` acquire (same shape as `_handle_cancel_goal`).
+    live = @lock server.lock GoalHandle{A, G, R, F}[g for g in values(server.goals)
+        if (@atomic g.status) in (GOAL_ACCEPTED, GOAL_EXECUTING)]
+    canceling = GoalHandle{A, G, R, F}[g for g in live if _transition!(g, GOAL_CANCELING)]
+    isempty(canceling) && return nothing
+    _publish_status(server)
+    # Bounded join on settlement: the body sees `Cancelled` at its next checkpoint and
+    # fills the result cell (settles CANCELED). A body with no checkpoint can't settle
+    # in time — leave it running, like `close`'s detached-goal ceiling.
+    done = Base.timedwait(Float64(timeout); pollint=0.02) do
+        all(g -> isfilled(g.cell), canceling)
+    end
+    done === :ok ||
+        @warn "cancel_all!: goals ignored cancellation past the budget; continuing" server=server.name n=count(g -> !isfilled(g.cell), canceling)
+    nothing
+end
+
 # ── send_goal service ─────────────────────────────────────────────────────────
 # Decode the goal request (goal_id + goal), run `on_goal`, and reply
 # accepted/rejected. On accept (not defer) we fire `on_accepted` so execution

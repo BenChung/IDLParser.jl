@@ -22,8 +22,8 @@ using ROSNode
         seq = Int32[0, 1]
         for i in 1:goal.request.order
             push!(seq, seq[end] + seq[end-1])
-            feedback!(goal, Fibonacci.Feedback(partial_sequence = copy(seq)))
-            sleep(0.3)  # also a cancellation checkpoint
+            feedback!(goal, Fibonacci.Feedback(partial_sequence = copy(seq)))  # publishes feedback + checkpoints cancellation
+            sleep(0.3)  # simulate work
         end
         Fibonacci.Result(sequence = seq)
     end

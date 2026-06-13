@@ -253,8 +253,7 @@ reject() = Reject()
 The `on_goal` decision that accepts a goal but leaves it in the `ACCEPTED` state
 for the owner to run later with [`execute`](@ref) — the queue/orchestrator path.
 The server replies accepted but does not fire `on_accepted` for a deferred goal.
-Return it from an `on_goal(request)` callback, typically paired with
-[`SingleFlight`](@ref) wiring. One of the three goal-acceptance tokens with
+Return it from an `on_goal(request)` callback. One of the three goal-acceptance tokens with
 [`accept`](@ref) and [`reject`](@ref).
 """
 defer()  = Defer()

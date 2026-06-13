@@ -29,6 +29,41 @@
 using ROSZenoh: ROSZenoh, qos_compatible
 using Zenoh: Localities
 
+# ── drop-oldest backpressure ──────────────────────────────────────────────────
+# Julia's `Channel` has no overwrite mode, so this is the KEEP_LAST ring: a
+# non-blocking enqueue that evicts the oldest item(s) when the buffer is full.
+# Operates under the channel lock and touches the same fields/conditions Base's
+# buffered `put!`/`take!` do (`data` deque, `sz_max` capacity, `cond_take`), so a
+# concurrent taker sees a consistent buffer and is woken. Shared by the
+# intra-process inbox and the lifecycle feedback channel (called by exact name).
+
+"""
+    _put_drop_oldest!(ch::Channel, x) -> Bool
+
+Non-blocking enqueue of `x` onto bounded `ch`, evicting the oldest item(s) to make
+room if it is full (KEEP_LAST ring semantics). Returns `true` if anything was
+dropped. Wakes a waiting taker. Throws if `ch` is closed (as `put!` would).
+"""
+function _put_drop_oldest!(ch::Channel, x)
+    x = convert(eltype(ch), x)                       # `put!` parity: coerce to the channel's eltype
+    lock(ch)
+    try
+        Base.check_channel_state(ch)
+        dropped = false
+        while length(ch.data) >= ch.sz_max          # full ⇒ evict oldest
+            popfirst!(ch.data)
+            Base._increment_n_avail(ch, -1)
+            dropped = true
+        end
+        Base._increment_n_avail(ch, 1)
+        push!(ch.data, x)
+        notify(ch.cond_take, nothing, true, false)   # wake taker(s)/fetcher(s)
+        return dropped
+    finally
+        unlock(ch)
+    end
+end
+
 # ── intra-process toggle ──────────────────────────────────────────────────────
 # Off by default (see the header); opt in process-wide. The design calls for a
 # per-Context `intra_process` flag; the `Context` struct doesn't carry one yet
@@ -268,9 +303,10 @@ end
 # read-only (true zero-copy). Immutable (`@cdr1_compat`) messages have no mutation
 # hazard, so `copy` of one is the identity and sharing is free either way.
 #
-# Delivery mirrors the dispatch runtime: `Serial()` runs the handler inline on the
-# publisher's task (preserving order; the publisher already owns the call), and
-# `Parallel(n)` spawns a task per message. A handler throw is logged, never fatal —
+# Delivery never runs the handler on the publisher's task: each sub has a per-endpoint
+# worker draining its inbox (the dispatch runtime). `Serial()` is one sticky worker on
+# the sub's declaring thread (ordered); `Parallel(n)` spawns a task per message (order
+# not preserved). A handler throw is logged, never fatal —
 # one bad delivery must not break the publisher (the dispatch runtime's contract).
 # Unlike the cross-process view path there is no `with_memory`/`BorrowError`: the
 # object is GC-backed, so escape is safe; only in-place mutation is shared state.
@@ -283,6 +319,10 @@ and QoS — the intra-process short-circuit. Each matching subscriber's
 handler runs with `msg` owned (a `copy`, the default) or shared read-only
 (`view=true`), per *that subscriber's* `view` flag, scheduled by its `concurrency`
 policy. The CDR serialize, the Zenoh hop, and the decode are all skipped.
+
+Each sub's inbox is a QoS-depth ring: a full inbox (a slow same-process subscriber)
+drops the oldest queued message rather than blocking `publish` ([`_put_drop_oldest!`](@ref)),
+so a slow local sub never delays the wire `put`.
 
 Returns `true` if at least one local subscriber was delivered to. The caller
 (`publish`) **still** issues the Zenoh `put` afterwards so any *remote*
@@ -310,11 +350,13 @@ function deliver_local(pub::PublisherHandle{T}, msg::T) where {T}
     isempty(targets) && return false
 
     # Hand off to each sub's per-endpoint worker — never run the handler on the
-    # publisher's task. A closed inbox (the sub is closing concurrently) is skipped.
+    # publisher's task. Drop-oldest (KEEP_LAST ring) so a slow same-process sub never
+    # blocks publish — and thus never delays the wire `put` (pubsub.jl, which runs
+    # after this). A closed inbox (the sub is closing concurrently) is skipped.
     delivered = false
     for ls in targets
         try
-            put!(ls.inbox, msg)
+            _put_drop_oldest!(ls.inbox, msg)
             delivered = true
         catch err
             err isa InvalidStateException || rethrow()   # inbox closed mid-flight

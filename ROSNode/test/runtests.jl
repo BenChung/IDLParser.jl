@@ -63,6 +63,7 @@ try
         _section("roszenoh_roundtrip", "base/roszenoh_roundtrip.jl") # keyexpr/attachment round-trips through ROSZenoh
         _section("dynamic_types", "typesupport/dynamic_types.jl") # §11/D5 dynamic type support (conversions, cache, macros)
         _section("resolution_d10b", "typesupport/resolution_d10b.jl") # D10B per-module resolution tables + cross-materialize
+        _section("hash_trust", "typesupport/hash_trust.jl") # D7 type-revision trust: pinned-hash enforcement + weak_types gate
         # Live D5 round-trips against the private router (§11/§13/D5 S2/S3/S5/S7).
         _section("dynamic_live", "typesupport/dynamic_live.jl")
         # Authored Julia types → ROS (@ros_package/@ros_message): registration + live round-trip.
@@ -75,6 +76,7 @@ try
         _section("type_mismatch", "discovery/type_mismatch.jl")
         # §8 services + §9 actions — live request/reply + full goal lifecycle.
         _section("services", "patterns/services.jl")
+        _section("service_detach", "patterns/service_detach.jl") # D1 detached settlement: detach!/handle + sweeper/drain bound
         _section("actions", "patterns/actions.jl")
         # §10 parameters — live remote ParameterClient round-trips (the §12 dual).
         _section("parameters_live", "patterns/parameters_live.jl")

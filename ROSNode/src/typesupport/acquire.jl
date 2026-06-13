@@ -311,6 +311,41 @@ end
 
 # ── unified resolution: the registry-first lookup with acquisition fallbacks ─
 
+# The RIHS01 placeholder (`TypeHash()`, version 01 + all-zero digest) the ament
+# path assigns a type with no single struct to hash (`_il_type_info`). It carries no
+# comparable identity, so a mismatch against it is not a real revision divergence.
+_is_placeholder_hash(h::TypeHash) = h == TypeHash()
+
+# The pinned (`:static`/`:authored`) registry entry for `name`, if one is registered
+# under a hash other than `other` — the type the user explicitly pinned whose RIHS01
+# a peer is now contradicting. `nothing` when no such conflict exists. Scans under the
+# registry lock (the registry is keyed on `(name, hash)`, so there is no by-name index).
+function _pinned_conflict(reg::TypeRegistry, name::AbstractString, other::TypeHash)
+    @lock reg.lock begin
+        for ((n, h), entry) in reg.entries
+            (n == name && h != other && entry isa RegistryEntry &&
+             entry.provenance in (:static, :authored)) && return entry
+        end
+    end
+    return nothing
+end
+
+# The friendly type-revision diagnostic: a peer advertises `name` under `got`, but the
+# local definition hashes to `expected`. Names the type, both RIHS strings, the likely
+# cause, and the remedies. `weak` softens it to a `@debug` (the user opted into
+# following the peer); otherwise a `@warn`, since the pin is being enforced.
+function _warn_revision_mismatch(name::AbstractString, expected::TypeHash,
+                                 got::TypeHash; weak::Bool)
+    msg = "type-revision mismatch for $(name): a peer advertises \
+           $(to_rihs_string(got)) but the locally pinned definition is \
+           $(to_rihs_string(expected)). Likely a differing interface-definition \
+           revision across distros/forks/dev workspaces. Regenerate the static type \
+           to match the peer, or pass weak_types=true to Context to follow the peer's \
+           revision."
+    weak ? (@debug msg) : (@warn msg)
+    return nothing
+end
+
 """
     resolve_type(node_or_ctx, info::TypeInfo; ament=true, cache=true) -> Union{RegistryEntry, Nothing}
 
@@ -325,6 +360,16 @@ it tries three sources in order:
 3. an ament/static lookup by name in the installed workspace, when `ament=true`
    (see [`load_ament_type`](@ref)).
 
+The ament lookup is name-only, so its result is re-validated against `info`'s
+RIHS01 before it is trusted (mirroring the cache path's revalidation): a real-hash
+mismatch is rejected with a diagnostic (the type-revision trust gate, D7) and
+returns `nothing` so the caller wire-discovers the peer's actual revision, while
+the all-zero placeholder hash (an uncomparable cross-package ref) is accepted with
+a `@debug` note. The diagnostic is loud (`@warn`) under the `Context`'s default
+pinned trust and quiet (`@debug`) under `weak_types=true`. When the ament path fires
+the diagnostic, `warned[]` (if given) is set `true`, so a wire-suppression site can
+own the no-ament-file pinned-conflict case without double-warning.
+
 Returns `nothing` when none of the local sources resolves the type. The dynamic
 over-the-wire path (issuing a `GetTypeDescription` query) stays with the
 discovery layer, which holds the remote node identity and async
@@ -336,8 +381,10 @@ reached through it. A resolved entry stays unrealized (codegen deferred) — cal
 `realize!` or `registered_type` at first use to obtain its
 concrete type.
 """
-function resolve_type(ctxlike, info::TypeInfo; ament::Bool=true, cache::Bool=true)
-    reg = registry(_ctx(ctxlike))
+function resolve_type(ctxlike, info::TypeInfo; ament::Bool=true, cache::Bool=true,
+                      warned::Union{Nothing,Ref{Bool}}=nothing)
+    ctx = _ctx(ctxlike)
+    reg = registry(ctx)
 
     hit = lookup_type(reg, info)
     hit isa RegistryEntry && return hit
@@ -352,8 +399,26 @@ function resolve_type(ctxlike, info::TypeInfo; ament::Bool=true, cache::Bool=tru
     end
 
     if ament
-        entry = load_ament_type(reg, info.name)
-        entry === nothing || return entry
+        # Name-only lookup: defer registration until its hash is validated against
+        # `info`, so a revision-mismatched entry never lands under the registry.
+        entry = load_ament_type(reg, info.name; register=false)
+        if entry !== nothing
+            h = entry.info.hash
+            if h == info.hash
+                return register_type!(reg, entry.info, entry)
+            elseif _is_placeholder_hash(h)
+                @debug "typesupport: ament entry for $(info.name) carries the RIHS01 \
+                        placeholder hash; accepting (uncomparable cross-package ref)"
+                return register_type!(reg, entry.info, entry)
+            else
+                # Real-hash mismatch: reject so the wire path fetches the peer's
+                # revision (and so weak mode can bind it). Diagnostic either way;
+                # signal it so the wire-suppression site does not warn twice.
+                _warn_revision_mismatch(info.name, h, info.hash; weak=ctx.weak_types)
+                warned === nothing || (warned[] = true)
+                return nothing
+            end
+        end
     end
 
     return nothing

@@ -63,8 +63,7 @@ declaring it is logged and construction continues.
 
 `warmup`/`warmup_sync` set the node-default `WarmupPolicy` — the warm-up policy
 (precompile/execute/off, sync/async) that pre-JITs the encode/decode dispatch
-chain — for entities created on the node; the warm-up layer (base/core.jl) owns
-the policy and its modes. Each entity constructor's own `warmup`/`warmup_sync`
+chain — for entities created on the node. Each entity constructor's own `warmup`/`warmup_sync`
 keywords override per-endpoint.
 
 Every entity created against the node is tracked and dies with it: `close(node)`
@@ -107,7 +106,7 @@ mutable struct Node
     # form `Node(ctx, name, P)`, else `nothing`. A plain field, so `node.parameters`
     # and atomic `open` reads go through Julia's default `getproperty`.
     parameters::Any
-    # Node-default `WarmupPolicy` (warm-up layer, base/core.jl) for entities on this
+    # Node-default `WarmupPolicy` for entities on this
     # node; an entity ctor's own `warmup`/`warmup_sync` kwargs override per-endpoint.
     const warmup::WarmupPolicy
     @atomic open::Bool

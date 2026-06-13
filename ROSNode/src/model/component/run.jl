@@ -557,20 +557,52 @@ function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     return nothing
 end
 
-# configure: materialise the member's ports, then run its `configure` hook.
+# configure: materialise the member's ports, then run its `configure` hook. Returns
+# the hook's value (the `failure` token aborts + rolls back the fan-out below).
 function _member_configure!(cnode::ComponentNode, nm::Symbol)
     _member_materialize!(cnode, nm)
-    configure(cnode.members[nm])
-    return nothing
+    return configure(cnode.members[nm])
 end
 
-# activate: start the member's (paused) timers, then run its `activate` hook.
+# activate: start the member's (paused) timers, then run its `activate` hook. Returns
+# the hook's value (the `failure` token aborts + rolls back the fan-out below).
 function _member_activate!(cnode::ComponentNode, nm::Symbol)
     rt = getfield(cnode.members[nm], :__rt__)::MixinRuntime
     for t in rt.timers
         _start!(t)
     end
-    activate(cnode.members[nm])
+    return activate(cnode.members[nm])
+end
+
+# Cancel-on-deactivate: cooperatively cancel every live goal on the member's action
+# servers and bounded-wait for settle (budget = the Context drain timeout). Runs
+# before the member `deactivate` hook so a goal body unwinds against state still
+# valid (nav2 `terminate_all`). Guarded — a stuck server can't strand the fan-out.
+# A no-op for a member with no materialised ports (never configured / already cleaned).
+function _member_cancel_goals!(cnode::ComponentNode, nm::Symbol)
+    rt = getfield(cnode.members[nm], :__rt__)::MixinRuntime
+    rt.ports === nothing && return nothing
+    budget = cnode.node.context.drain_timeout
+    for h in values(rt.ports)
+        h isa ActionServer || continue
+        try
+            cancel_all!(h; timeout = budget)
+        catch err
+            @error "component: cancel_all! threw" member = nm exception = (err, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
+# deactivate: run the member's `deactivate` hook, guarded — this is also the
+# rollback step for a failed `activate` fan-out, where one member's throw must not
+# strand the rest's unwind (log-and-continue, like `_member_cleanup!`).
+function _member_deactivate!(cnode::ComponentNode, nm::Symbol)
+    try
+        deactivate(cnode.members[nm])
+    catch err
+        @error "component: deactivate threw" member = nm exception = (err, catch_backtrace())
+    end
     return nothing
 end
 
@@ -612,6 +644,35 @@ function _members_on_error!(cnode::ComponentNode, order::Vector{Symbol})
     return failed ? failure : nothing
 end
 
+# configure fan-out: forward in DI order. A member `configure` returning `failure`
+# aborts the fan-out at that member (first-failure-wins) and unwinds the members that
+# already configured — reverse order, `cleanup` + close ports — before returning the
+# `failure` token (the lifecycle driver maps it to `:failure`, staying Unconfigured).
+# A member throw propagates out (the lifecycle driver maps it to `:error`).
+function _members_configure!(cnode::ComponentNode, order::Vector{Symbol})
+    for (i, nm) in enumerate(order)
+        if _member_configure!(cnode, nm) === failure
+            foreach(j -> _member_cleanup!(cnode, order[j]), i:-1:1)
+            return failure
+        end
+    end
+    return nothing
+end
+
+# activate fan-out: forward in DI order. A member `activate` returning `failure`
+# aborts at that member and unwinds the already-activated members — reverse order,
+# guarded `deactivate` — before returning `failure` (lifecycle driver → `:failure`,
+# staying Inactive). Ports stay materialised (a failed activate is still Inactive).
+function _members_activate!(cnode::ComponentNode, order::Vector{Symbol})
+    for (i, nm) in enumerate(order)
+        if _member_activate!(cnode, nm) === failure
+            foreach(j -> _member_deactivate!(cnode, order[j]), (i - 1):-1:1)
+            return failure
+        end
+    end
+    return nothing
+end
+
 # ── assembly (the one path) ──────────────────────────────────────────────────────
 
 function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
@@ -627,9 +688,12 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
 
     if managed
         ln = LifecycleNode(ctx, name; namespace = namespace,
-            on_configure  = _ -> (foreach(nm -> _member_configure!(cnref[], nm), order); nothing),
-            on_activate   = _ -> (foreach(nm -> _member_activate!(cnref[], nm), order); nothing),
-            on_deactivate = _ -> (foreach(nm -> deactivate(cnref[].members[nm]), reverse(order)); nothing),
+            on_configure  = _ -> _members_configure!(cnref[], order),
+            on_activate   = _ -> _members_activate!(cnref[], order),
+            on_deactivate = _ -> (foreach(reverse(order)) do nm
+                                      _member_cancel_goals!(cnref[], nm)   # cancel live goals before the hook
+                                      _member_deactivate!(cnref[], nm)
+                                  end; nothing),
             on_cleanup    = _ -> (foreach(nm -> _member_cleanup!(cnref[], nm), reverse(order)); nothing),
             on_shutdown   = _ -> (foreach(nm -> _member_cleanup!(cnref[], nm), reverse(order)); nothing),
             on_error      = _ -> _members_on_error!(cnref[], order))

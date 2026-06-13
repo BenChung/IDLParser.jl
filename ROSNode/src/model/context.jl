@@ -188,7 +188,8 @@ lookup_type(reg::TypeRegistry, info::TypeInfo) =
 """
     Context(; domain_id=nothing, namespace=nothing, enclave=nothing,
             config=nothing, format=RmwZenoh(), localhost_only=false,
-            peers=String[], drain_timeout=5.0, shm_clients=nothing, home=nothing)
+            peers=String[], drain_timeout=5.0, shm_clients=nothing, home=nothing,
+            weak_types=false)
     Context(f::Function; kwargs...)
 
 The process-level container shared by every node in a program — one
@@ -217,6 +218,16 @@ whose baked `__ros_resolve__` table this Context resolves wire types through,
 so every keyexpr-only subscription sees one consistent picture; leave it
 `nothing` for content-canonical resolution only. `format` selects the keyexpr
 dialect (`RmwZenoh()` for rmw_zenoh, the primary target).
+
+`weak_types` sets the process-wide type-revision trust. Left `false` (the
+default), a pinned type (registered via `@ros_import`/`@ros_cache` or authored
+with `@ros_message`/`@ros_service`/`@ros_action`) enforces its RIHS01: a peer
+advertising the same name with a different hash is reported with a diagnostic
+and not bound, so a definition-revision skew surfaces instead of silently
+rebinding. Set `weak_types=true` to opt into the dynamic fallback — the
+mismatched local pin is set aside and the peer's actual revision is
+wire-discovered and bound for that endpoint. This is independent of the
+per-subscription `weak` keyexpr flag, which only widens keyexpr matching.
 
 The constructor opens the session, registers the canonical bootstrap and
 statically-generated types, and starts the discovery consumer task before
@@ -282,6 +293,12 @@ mutable struct Context
     # Context looks through, so every node/sub on it sees one consistent, deterministic
     # picture. `nothing` ⇒ content-canonical resolution only.
     const home::Union{Module, Nothing}
+    # Type-revision trust. `false` (default): a pinned (`:static`/`:authored`) type
+    # enforces its RIHS01 — a peer advertising the same name with a different hash is
+    # rejected with a diagnostic, never silently rebound. `true` (weak mode): the
+    # dynamic fallback may bind the peer's wire-discovered revision past a pinned
+    # mismatch. Orthogonal to the per-subscription `weak` keyexpr flag (entity.jl).
+    const weak_types::Bool
 end
 
 # Render the session's `z_id_t` into ROSZenoh's canonical lowercase-hex form.
@@ -327,7 +344,8 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
                    peers::AbstractVector{<:AbstractString}=String[],
                    drain_timeout::Real=5.0,
                    shm_clients=nothing,
-                   home::Union{Module, Nothing}=nothing)
+                   home::Union{Module, Nothing}=nothing,
+                   weak_types::Bool=false)
     dom = domain_id === nothing ? _env_domain_id() : Int(domain_id)
     ns  = _normalize_namespace(namespace === nothing ? _env_namespace() : String(namespace))
     enc = enclave === nothing ? _env_enclave() : String(enclave)
@@ -345,7 +363,8 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
                   Dict{DataType, Any}(), nothing,
                   nothing, nothing, Set{Any}(), ReentrantLock(),
                   ReentrantLock(), running, Any[], Threads.Condition(),
-                  Threads.Condition(), Float64(drain_timeout), Any[], home)
+                  Threads.Condition(), Float64(drain_timeout), Any[], home,
+                  weak_types)
 
     # Register the statically-compiled bootstrap types (type_description_interfaces)
     # so the type-description server can serve them and discovery can use them, plus any

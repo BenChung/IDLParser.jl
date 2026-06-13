@@ -12,11 +12,12 @@ An action orchestrator that runs one accepted goal at a time behind a bounded
 queue of `queue` pending goals — the common single-actuator pattern. It layers
 over the low-level [`ActionServer`](@ref) API.
 
-Wire it by having `on_goal` return [`defer`](@ref) and setting
-`on_accepted = g -> submit!(sched, g)`, then drive execution with
-`execute!(sched) do goal … end`. The orchestrator methods:
+Wire it by setting `on_accepted = g -> submit!(sched, g)` (with the default
+`on_goal`, which accepts — `on_accepted` does not fire for a [`defer`](@ref)red
+goal), then drive execution with `execute!(sched) do goal … end`. The
+orchestrator methods:
 
-- `submit!` enqueues a deferred goal (blocking when the queue is full, applying
+- `submit!` enqueues an accepted goal (blocking when the queue is full, applying
   backpressure).
 - `execute!` spawns a loop task that pulls one goal at a time, runs it through
   [`execute`](@ref) (the same cancellation + settlement wrapper), and waits for
@@ -34,8 +35,7 @@ qualified: `ROSNode.submit!`, `ROSNode.execute!`, `ROSNode.pause`,
 ```julia
 sched = SingleFlight(queue = 8)
 server = ActionServer(node, "dock", Dock;
-                      on_goal = _ -> defer(),
-                      on_accepted = g -> ROSNode.submit!(sched, g))
+                      on_accepted = g -> ROSNode.submit!(sched, g))   # default on_goal accepts
 ROSNode.execute!(sched) do goal
     # one goal at a time …
 end
@@ -54,7 +54,7 @@ SingleFlight(; queue::Integer = 4) =
 """
     submit!(sched::SingleFlight, goal)
 
-Enqueue an accepted (deferred) goal for the orchestrator to run; this is the
+Enqueue an accepted goal for the orchestrator to run; this is the
 target of the `on_accepted = g -> submit!(sched, g)` wiring. Blocks when the
 queue is full (backpressure); the goal stays `ACCEPTED` until [`execute!`](@ref)
 picks it up.

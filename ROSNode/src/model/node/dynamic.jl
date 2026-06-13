@@ -54,8 +54,8 @@ Keyword arguments:
   drains the buffer in arrival order across world-age re-entries, so [`Serial`](@ref)
   preserves total order even through first-sight `realize!` codegen.
 - `warmup::WarmupPolicy`: the warm-up policy (precompile/execute/off, sync/async)
-  that pre-JITs the encode/decode dispatch chain; owned by the warm-up layer
-  (base/core.jl), defaulting to the node default. Here it also replays this node's
+  that pre-JITs the encode/decode dispatch chain, defaulting to the node default.
+  Here it also replays this node's
   interaction manifest to warm prior-run types ahead of the first message. The
   handler can branch on [`is_warming`](@ref) to skip side effects during a warm pass.
 

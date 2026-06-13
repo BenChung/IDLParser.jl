@@ -433,11 +433,14 @@ mutable struct _Detectors
     qos_listeners::Vector{Any}
     # signature → last-warned monotonic seconds, for log throttling + dedupe.
     seen::Dict{Any, Float64}
+    # signatures whose listeners have already fired — edge-trigger, no time
+    # component, so a hot per-sample mismatch fans out once, never time-debounced.
+    fired::Set{Any}
     installed::Bool                 # the umbrella on_graph_change is registered
     throttle_s::Float64             # min seconds between repeat warnings per signature
 end
 _Detectors() = _Detectors(ReentrantLock(), Any[], Any[], Dict{Any, Float64}(),
-                          false, 5.0)
+                          Set{Any}(), false, 5.0)
 
 # One detector-state per Context, keyed by `objectid(ctx.graph)` so we don't extend
 # the Context struct. The GraphIndex object's identity is stable for its lifetime.
@@ -487,6 +490,63 @@ function _run_detectors(ctx::Context, d::_Detectors, added::Vector{EndpointInfo}
     nothing
 end
 
+# Retroactive scan for one just-registered listener (D8 `scan=true`): walk the
+# standing snapshot once, pairing local↔remote complementary endpoints exactly as
+# `_run_detectors` does, and deliver each pre-existing mismatch to `f` alone. The
+# D6 `fired` edge-trigger set is honoured so a later change does not double-fire,
+# and a signature already fired by a change is skipped here.
+function _scan_for_listener!(ctx::Context, d::_Detectors, f::Function, kind::Symbol)
+    snapshot = endpoints_snapshot(ctx)
+    locals = filter(e -> e.is_local, snapshot)
+    remotes = filter(e -> !e.is_local, snapshot)
+    for local_e in locals, remote in remotes
+        local_e.topic == remote.topic || continue
+        _complementary(local_e.kind, remote.kind) || continue
+        kind === :type ? _scan_type_mismatch(d, f, local_e, remote) :
+                         _scan_qos_incompat(d, f, local_e, remote)
+    end
+    nothing
+end
+
+# Scan variant of `_check_type_mismatch`/`_emit_type_mismatch`: same comparison and
+# signature, but mark-fired-then-deliver only to `f` (no full fan-out, no `@warn`).
+function _scan_type_mismatch(d::_Detectors, f::Function, local_e::EndpointInfo, remote::EndpointInfo)
+    lt = local_e.type
+    rt = remote.type
+    (lt === nothing || rt === nothing) && return nothing
+    reason, suggestion = if lt.name != rt.name
+        (:name, "endpoints on $(local_e.topic) carry different types ($(lt.name) vs \
+                 $(rt.name)); check the topic name and message type")
+    elseif lt.hash != rt.hash
+        (:hash, "type $(lt.name) on $(local_e.topic) has mismatched RIHS01 versions; \
+                 regenerate against the same message definition")
+    else
+        return nothing
+    end
+    sig = (:type, local_e.topic, local_e.kind, remote.kind, reason)
+    _mark_fired!(d, sig) || return nothing
+    _fire(d.lock, Any[f], TypeMismatch(local_e, remote, reason, suggestion), "on_type_mismatch")
+    nothing
+end
+
+# Scan variant of `_check_qos_incompat`/`_emit_qos_incompat`: same RxO check and
+# signature, delivered only to `f`.
+function _scan_qos_incompat(d::_Detectors, f::Function, local_e::EndpointInfo, remote::EndpointInfo)
+    requested, offered = if local_e.kind === Subscription || local_e.kind === Client
+        (local_e.qos, remote.qos)
+    else
+        (remote.qos, local_e.qos)
+    end
+    issues = qos_compatible(requested, offered)
+    isempty(issues) && return nothing
+    sig = (:qos, local_e.topic, local_e.kind, remote.kind, Tuple(i.policy for i in issues))
+    _mark_fired!(d, sig) || return nothing
+    suggestion = "QoS incompatible on $(local_e.topic): " *
+        join(("offered $(i.policy)=$(i.offered) < requested $(i.requested)" for i in issues), ", ")
+    _fire(d.lock, Any[f], QosIncompatible(local_e, remote, issues, suggestion), "on_qos_incompatible")
+    nothing
+end
+
 # Endpoints "match" for compatibility when one publishes what the other consumes.
 _complementary(a::EndpointKind, b::EndpointKind) =
     (a === Publisher && b === Subscription) ||
@@ -529,42 +589,49 @@ function _check_qos_incompat(d::_Detectors, local_e::EndpointInfo, remote::Endpo
         join(("offered $(i.policy)=$(i.offered) < requested $(i.requested)" for i in issues), ", "))
 end
 
-# Dedupe + throttle, then fan to user listeners. The signature collapses repeats
-# of the same (topic, kinds, reason) so a flapping endpoint doesn't spam; the
-# throttle bounds even distinct re-appearances. One `_mark_seen!` gate covers
-# both the warning and the listener fan-out: a signature inside the throttle
-# window fires neither.
+# Two-gate split: `@warn` is throttled (`_mark_seen!`, 5 s/signature) as log-spam
+# control; the listener fan-out is edge-triggered (`_mark_fired!`, once per
+# distinct (topic, kinds, reason)) so a listener sees every distinct mismatch but
+# is never time-debounced.
 function _emit_type_mismatch(d::_Detectors, local_e, remote, reason, suggestion)
     sig = (:type, local_e.topic, local_e.kind, remote.kind, reason)
-    fresh = _mark_seen!(d, sig)
-    fresh || return nothing
-    @warn "type mismatch detected" topic=local_e.topic reason=reason suggestion=suggestion
-    ev = TypeMismatch(local_e, remote, reason, suggestion)
-    _fire(d.lock, d.type_listeners, ev, "on_type_mismatch")
+    _mark_seen!(d, sig) &&
+        @warn "type mismatch detected" topic=local_e.topic reason=reason suggestion=suggestion
+    if _mark_fired!(d, sig)
+        ev = TypeMismatch(local_e, remote, reason, suggestion)
+        _fire(d.lock, d.type_listeners, ev, "on_type_mismatch")
+    end
+    nothing
 end
 
 # Route a pre-built `TypeMismatch` — from the per-sample weak-static backstop
-# (`check_sample_type`) — through the SAME dedupe/throttle + listener
-# fan-out as the graph-match detector, so one logical mismatch reports once across
-# both the on-the-wire and graph paths (signature mirrors `_emit_type_mismatch`).
+# (`check_sample_type`) — through the SAME two-gate split as `_emit_type_mismatch`
+# (signature mirrors it), so one logical mismatch reports once across both the
+# on-the-wire and graph paths. This fires per mismatched SAMPLE: the throttled
+# `@warn` bounds the log, and the edge-triggered fan-out (`_mark_fired!`) keeps a
+# hot mismatched topic from flooding listeners.
 function report_type_mismatch!(ctx::Context, tm::TypeMismatch)
     d = _detectors(ctx)
     sig = (:type, tm.local_endpoint.topic, tm.local_endpoint.kind,
            tm.remote_endpoint.kind, tm.reason)
-    _mark_seen!(d, sig) || return nothing
-    @warn "type mismatch detected (on the wire)" topic=tm.local_endpoint.topic reason=tm.reason suggestion=tm.suggestion
-    _fire(d.lock, d.type_listeners, tm, "on_type_mismatch")
+    _mark_seen!(d, sig) &&
+        @warn "type mismatch detected (on the wire)" topic=tm.local_endpoint.topic reason=tm.reason suggestion=tm.suggestion
+    _mark_fired!(d, sig) && _fire(d.lock, d.type_listeners, tm, "on_type_mismatch")
     nothing
 end
 
+# Two-gate split mirrors `_emit_type_mismatch`: throttled `@warn`, edge-triggered
+# listener fan-out.
 function _emit_qos_incompat(d::_Detectors, local_e, remote, issues, suggestion)
     sig = (:qos, local_e.topic, local_e.kind, remote.kind,
            Tuple(i.policy for i in issues))
-    fresh = _mark_seen!(d, sig)
-    fresh || return nothing
-    @warn "QoS incompatibility detected" topic=local_e.topic suggestion=suggestion
-    ev = QosIncompatible(local_e, remote, issues, suggestion)
-    _fire(d.lock, d.qos_listeners, ev, "on_qos_incompatible")
+    _mark_seen!(d, sig) &&
+        @warn "QoS incompatibility detected" topic=local_e.topic suggestion=suggestion
+    if _mark_fired!(d, sig)
+        ev = QosIncompatible(local_e, remote, issues, suggestion)
+        _fire(d.lock, d.qos_listeners, ev, "on_qos_incompatible")
+    end
+    nothing
 end
 
 # Record a signature; return true if it's the first time (or the throttle window
@@ -579,6 +646,13 @@ function _mark_seen!(d::_Detectors, sig)
         end
         return false
     end
+end
+
+# Edge-trigger: return true only the first time a signature stands up (no time
+# component), so the listener fan-out fires once per distinct mismatch and never
+# floods on a per-sample backstop hitting a hot mismatched topic.
+function _mark_fired!(d::_Detectors, sig)
+    @lock d.lock (sig in d.fired ? false : (push!(d.fired, sig); true))
 end
 
 # Snapshot listeners under the lock, then fire outside it (their handlers may
@@ -596,7 +670,7 @@ function _fire(lock::ReentrantLock, listeners::Vector{Any}, ev, what::AbstractSt
 end
 
 """
-    on_type_mismatch(f, node_or_ctx) -> f
+    on_type_mismatch(f, node_or_ctx; scan=false) -> f
 
 Register `f(::TypeMismatch)` to fire when one of our endpoints and a remote
 endpoint on the same topic carry incompatible types — a different type name, or
@@ -607,15 +681,23 @@ Detection runs as a listener on the discovery change stream: when an endpoint
 is added, it is compared against standing endpoints of the complementary kind
 (our subscription versus their publisher, and vice versa) on the same topic —
 a new remote against our locals, a new local endpoint against the remotes
-already discovered. Each distinct mismatch reports once per throttle window,
-keyed by a (topic, kinds, reason) signature, so a flapping endpoint does not spam
-listeners. The per-sample backstop for wildcard subscriptions
-(`check_sample_type`) feeds the same dedupe, so a mismatch seen both on
-the wire and in the graph reports once. Listeners run outside the detector
-lock; a throwing listener is logged and the others still run.
+already discovered. `f` fires once per distinct mismatch — keyed by a
+(topic, kinds, reason) signature, edge-triggered with no time throttle — so a
+flapping or hot-per-sample topic fans out exactly once per signature. The
+internal `@warn` is separately throttled (a logging concern only) and does not
+gate `f`. The per-sample backstop for wildcard subscriptions
+(`check_sample_type`) shares the signature, so a mismatch seen both on the wire
+and in the graph fires `f` once. Listeners run outside the detector lock; a
+throwing listener is logged and the others still run.
 
-Detection covers endpoints that appear after registration. A mismatch already
-standing in the graph when `f` is registered does not fire retroactively.
+By default detection is change-driven and covers only endpoints that appear
+after registration: a mismatch already standing in the graph when `f` is
+registered does not fire retroactively, so register before the endpoints exist
+to catch them. Pass `scan=true` to also walk the standing graph snapshot once at
+registration and fire `f` for pre-existing mismatches (the watchdog/dashboard
+use case); the same per-signature edge-trigger applies, so a scanned mismatch is
+not fired again by a later change, and only the just-registered `f` receives the
+retroactive events.
 
 ```julia
 on_type_mismatch(node) do tm
@@ -623,16 +705,17 @@ on_type_mismatch(node) do tm
 end
 ```
 """
-function on_type_mismatch(f::Function, node_or_ctx)
+function on_type_mismatch(f::Function, node_or_ctx; scan::Bool=false)
     ctx = _ctx(node_or_ctx)
     d = _detectors(ctx)
     @lock d.lock push!(d.type_listeners, f)
     _ensure_detectors_installed!(ctx, d)
+    scan && _scan_for_listener!(ctx, d, f, :type)
     f
 end
 
 """
-    on_qos_incompatible(f, node_or_ctx) -> f
+    on_qos_incompatible(f, node_or_ctx; scan=false) -> f
 
 Register `f(::QosIncompatible)` to fire when one of our endpoints shares a
 topic with a remote endpoint whose QoS is incompatible with ours — under the
@@ -640,18 +723,26 @@ DDS Request-vs-Offered rule, the offered profile ranks below the requested one
 on some policy. Return `f`. The ROS 2 incompatible-QoS event surface,
 covering reliability, durability, deadline, and liveliness (kind and lease).
 
-Detection runs on the discovery change stream and is deduplicated by signature
-and throttled, the same way [`on_type_mismatch`](@ref) is. The requester side is
+Detection runs on the discovery change stream and fires once per distinct
+signature, the same way [`on_type_mismatch`](@ref) does — edge-triggered, not
+time-throttled (only the internal `@warn` is throttled). The requester side is
 the subscription (or client) and the offered side is the publisher (or service);
 the check runs in the correct direction for whichever role is local. Listeners
-run outside the detector lock, and a mismatch already standing in the graph at
-registration does not fire retroactively.
+run outside the detector lock.
+
+By default detection is change-driven: an incompatibility already standing in
+the graph at registration does not fire retroactively, so register before the
+endpoints exist to catch them. Pass `scan=true` to also walk the standing graph
+snapshot once at registration and fire `f` for pre-existing incompatibilities;
+as in [`on_type_mismatch`](@ref) the per-signature edge-trigger applies and only
+the just-registered `f` receives the retroactive events.
 """
-function on_qos_incompatible(f::Function, node_or_ctx)
+function on_qos_incompatible(f::Function, node_or_ctx; scan::Bool=false)
     ctx = _ctx(node_or_ctx)
     d = _detectors(ctx)
     @lock d.lock push!(d.qos_listeners, f)
     _ensure_detectors_installed!(ctx, d)
+    scan && _scan_for_listener!(ctx, d, f, :qos)
     f
 end
 

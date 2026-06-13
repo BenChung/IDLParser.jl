@@ -164,7 +164,7 @@ end
 
 The `TypeInfo` (name + RIHS01) for a type. A dynamically-generated type returns
 its registry-verified hash; a statically-included type falls back to
-serialization.jl's reflective [`type_info`](@ref) (zero-hash placeholder). This is
+the reflective [`type_info`](@ref) (zero-hash placeholder). This is
 the registry's specialization of type identity: a registered type carries its true hash,
 so its keyexprs and liveliness match the wire across versions.
 """

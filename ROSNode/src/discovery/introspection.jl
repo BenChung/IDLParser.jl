@@ -274,6 +274,12 @@ preferring a remote advertiser over a local one. `ament`/`cache`/`wire` switch o
 corresponding source; `hash` is a `TypeHash` or RIHS string (a malformed string
 returns `nothing`).
 
+Type-revision trust (the `Context`'s `weak_types`): when a *pinned*
+(`:static`/`:authored`) type is registered under `name` with a different hash, that
+pin is enforced — the wire step is suppressed and the diverging peer revision is
+*not* bound (the mismatch is already reported by `resolve_type`). `weak_types=true`
+opts into the dynamic fallback: the wire step runs and binds the peer's revision.
+
 The first sample of a type pays for discovery and codegen; subsequent samples are fast
 registry lookups, and across runs the cache (or a baked `@ros_cache` static type) skips
 re-discovery. The returned type lives in a newer world age than the compiled dispatch
@@ -287,13 +293,26 @@ function resolve_or_discover(node, name::AbstractString, hash;
     th === nothing && return nothing
     info = TypeInfo(String(name), th)
 
-    # 1–3: registry → cache → ament (resolve_type's order).
-    entry = resolve_type(ctx, info; ament = ament, cache = cache)
-    # 4: wire — ask whoever advertises it on the graph.
+    # 1–3: registry → cache → ament (resolve_type's order). `warned` flags whether the
+    # ament path already surfaced the revision diagnostic, so we don't warn twice.
+    warned = Ref(false)
+    entry = resolve_type(ctx, info; ament = ament, cache = cache, warned = warned)
+    # 4: wire — ask whoever advertises it on the graph. Type-revision trust (D7): a
+    # pinned (`:static`/`:authored`) local type under a different hash enforces its
+    # RIHS01 — the wire bind of the peer's diverging revision is suppressed unless the
+    # Context opted into weak mode.
     if entry === nothing && wire
-        remote = _find_remote_for(ctx, info)
-        remote === nothing ||
-            (entry = fetch_type_description(node, remote, name, th; timeout_ms = timeout_ms))
+        conflict = ctx.weak_types ? nothing : _pinned_conflict(registry(ctx), info.name, th)
+        if conflict === nothing
+            remote = _find_remote_for(ctx, info)
+            remote === nothing ||
+                (entry = fetch_type_description(node, remote, name, th; timeout_ms = timeout_ms))
+        elseif !warned[]
+            # Pinned entry under a different hash and no local ament file to trip the
+            # acquire-path diagnostic: surface the mismatch here so the suppression is
+            # not silent (D7's user-facing contract).
+            _warn_revision_mismatch(info.name, conflict.info.hash, th; weak = false)
+        end
     end
 
     entry isa RegistryEntry || return nothing
