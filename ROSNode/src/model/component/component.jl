@@ -758,9 +758,10 @@ parameters(m::Component) = _param_value(m)
 
 Build a mixin instance during node assembly. The default
 `construct(::Type{M}, node)` returns `M()` for a plain mixin (every field defaulted).
-Override it to inject dependencies: a mixin that `requires` interfaces receives the
-resolved sibling providers as `deps…`, positionally in `requires` order, and stores
-them — typically into a free type parameter for type-stable access.
+Override it to inject dependencies: a mixin that `requires` interfaces or sibling
+mixins receives the resolved providers as `deps…`, positionally in `requires` order,
+and stores them — an interface dep typically into a free type parameter for type-stable
+access, a direct mixin dep into a field typed by that mixin.
 
 `node` is the node-core handle. An injected provider is constructed-but-unconfigured
 at this point (its `configure` runs later, in dependency-first order), so store it and
@@ -770,8 +771,11 @@ without one the default raises a clear error directing you to define it or compo
 via `@node`.
 
 ```julia
-requires(::Type{Detector}) = (PoseSource,)
+requires(::Type{Detector}) = (PoseSource,)               # depend on an interface
 construct(::Type{Detector}, node, src) = Detector(src = src)
+
+requires(::Type{Watch}) = (Sensor,)                      # …or a sibling mixin directly
+construct(::Type{Watch}, node, s::Sensor) = Watch(sensor = s)
 ```
 """
 construct(::Type{M}, node) where {M <: Component} = _zero_dep_construct(M)
@@ -833,18 +837,24 @@ provides(::Type) = ()
 """
     requires(::Type{M}) -> Tuple
 
-The interfaces mixin `M` depends on. Defaults to the empty tuple `()`; override
-it to declare dependencies. At assembly the node resolver maps each required interface
-to the single sibling member that provides it (excluding `M` itself, so a mixin cannot
-satisfy its own requirement), forms a dependency edge, toposorts the members, and
-injects the resolved providers positionally into `construct(::Type{M}, node, deps…)`
-in `requires` order.
+The dependencies mixin `M` declares. Defaults to the empty tuple `()`; override it to
+declare them. Each entry is either an `@interface` marker — resolved against sibling
+members' [`@provides`](@ref) evidence — or a concrete `@mixin` type, resolved against
+the sibling member that *is* that mixin (matched on its base, so a parametric mixin is
+named by its base too). At assembly the node resolver maps each requirement to the
+single matching sibling (excluding `M` itself, so a mixin cannot satisfy its own
+requirement), forms a dependency edge, toposorts the members, and injects the resolved
+providers positionally into `construct(::Type{M}, node, deps…)` in `requires` order.
 
-Zero providers is an unsatisfied-dependency error; more than one is an ambiguity
-error. Known gap: the pin-pair disambiguation (an entry
-`I => :member` or `I => MixinType`) is not yet honored — the resolver treats every
-entry as a bare interface type, so a `Pair` entry raises the unsatisfied-dependency
-error. Resolve an ambiguity by restructuring which members provide the interface.
+A direct mixin requirement types the injected dependency concretely (the consuming
+`construct` can annotate `deps…` with the mixin type, no free type parameter needed);
+an interface requirement is consumed through its methods and is typically stored in a
+free parameter for type-stable access.
+
+Zero matches is an unsatisfied-dependency error; more than one is an ambiguity error
+(restructure so a single sibling satisfies it). Known gap: the pin-pair disambiguation
+(an entry `I => :member` or `I => MixinType`) is not yet honored — a `Pair` entry
+raises an error directing you to restructure.
 """
 requires(::Type) = ()
 

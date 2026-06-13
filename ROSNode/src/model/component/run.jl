@@ -426,25 +426,42 @@ end
 # ── DI resolution + toposort ──────────────────────────────────────────────────
 
 # Resolve each member's `requires` to a single providing sibling (excluding self),
-# returning `member-name => [provider names]` in `requires` order. Errors on an
-# unsatisfied or ambiguous interface.
+# returning `member-name => [provider names]` in `requires` order. A requirement is
+# either an `@interface` marker — matched against members' `@provides` evidence — or a
+# concrete `@mixin` type, matched against the sibling that IS that mixin (on its base,
+# so a parametric mixin is named by its base too). Errors on an unsatisfied or
+# ambiguous requirement.
 function _resolve_di(members::Vector{NodeMember})
-    providers = Dict{Type, Vector{Symbol}}()
+    providers = Dict{Type, Vector{Symbol}}()           # interface  => members that provide it
     for mem in members, I in provides(mem.mixin)
         push!(get!(Vector{Symbol}, providers, I), mem.name)
+    end
+    by_mixin = Dict{Type, Vector{Symbol}}()            # mixin base => members of that mixin
+    for mem in members
+        push!(get!(Vector{Symbol}, by_mixin, _base(mem.mixin)), mem.name)
     end
     edges = Dict{Symbol, Vector{Symbol}}()
     for mem in members
         deps = Symbol[]
         for I in requires(mem.mixin)
-            cands = filter(!=(mem.name), get(providers, I, Symbol[]))
+            cands = if I isa Type && I <: ComponentInterface
+                filter(!=(mem.name), get(providers, I, Symbol[]))
+            elseif I isa Type && ismixin(_base(I))
+                filter(!=(mem.name), get(by_mixin, _base(I), Symbol[]))
+            elseif I isa Pair
+                error("@node: member `$(mem.name)` requires $(I): pin pairs " *
+                      "(`I => :member`) are not yet supported; restructure so a single " *
+                      "member provides the interface")
+            else
+                error("@node: member `$(mem.name)` requires `$(I)`, which is neither an " *
+                      "`@interface` nor a `@mixin` type")
+            end
             isempty(cands) &&
                 error("@node: member `$(mem.name)` ($(mem.mixin)) requires $(I), but no " *
-                      "other member provides it")
+                      "other member provides or is it")
             length(cands) == 1 ||
-                error("@node: member `$(mem.name)` requires $(I), provided by multiple " *
-                      "members $(cands) — pin pairs (`$(I) => :member`) are not yet " *
-                      "supported; restructure so a single member provides $(I)")
+                error("@node: member `$(mem.name)` requires $(I), matched by multiple " *
+                      "members $(cands) — restructure so a single member satisfies it")
             push!(deps, cands[1])
         end
         edges[mem.name] = deps

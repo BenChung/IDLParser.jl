@@ -84,12 +84,28 @@ module _ParamDI
     @provides PSensor BatterySource
     construct(::Type{PSensor}, node) = PSensor(v = 77.0)
 
+    # direct-mixin DI: require a concrete sibling mixin (no interface). The dep field is
+    # typed by the mixin itself — no free parameter — and `construct` annotates it.
+    @mixin struct Watch
+        sensor::Sensor
+    end
+    requires(::Type{Watch}) = (Sensor,)
+    construct(::Type{Watch}, node, s::Sensor) = Watch(sensor = s)
+
+    # bad requirement: an entry that is neither an @interface nor a @mixin type
+    @mixin struct BadReq
+        x::Int64 = 0
+    end
+    requires(::Type{BadReq}) = (Int64,)
+    construct(::Type{BadReq}, node, _d) = BadReq()
+
     const GuardInt = Guard{Int}        # value-level instantiation for the backstop test
 end
 using ._ParamDI
 
 @node PVehicle  = ["sensor" => _ParamDI.Sensor,  "guard" => _ParamDI.Guard]
 @node PProvider = ["sensor" => _ParamDI.PSensor, "guard" => _ParamDI.Guard]
+@node PWatch    = ["sensor" => _ParamDI.Sensor,  "watch" => _ParamDI.Watch]   # direct-mixin dep
 
 # DI-read probe: the headline inference subject, free of the (annotated) handler
 # return and of `parameters` (whose accessor carries one deliberate Any-typed
@@ -128,6 +144,34 @@ _dyn_call(ci)  = any(stmt -> stmt isa Expr && stmt.head === :call &&
 
         # monomorphic fallback untouched
         @test construct(_ParamDI.Sensor, nothing) isa _ParamDI.Sensor
+    end
+
+    @testset "direct-mixin requirement resolution (pure-unit)" begin
+        # a requirement naming a concrete sibling mixin resolves to that member
+        ms = ROSNode.NodeMember[
+            ROSNode.NodeMember(:sensor, _ParamDI.Sensor),
+            ROSNode.NodeMember(:watch,  _ParamDI.Watch)]
+        edges = ROSNode._resolve_di(ms)
+        @test edges[:watch]  == [:sensor]
+        @test edges[:sensor] == Symbol[]
+
+        # the injected dep is concretely typed — no free parameter, no Any
+        @test fieldtype(_ParamDI.Watch, :sensor) === _ParamDI.Sensor
+
+        # two members of the required mixin ⇒ ambiguous
+        amb = ROSNode.NodeMember[
+            ROSNode.NodeMember(:s1, _ParamDI.Sensor),
+            ROSNode.NodeMember(:s2, _ParamDI.Sensor),
+            ROSNode.NodeMember(:watch, _ParamDI.Watch)]
+        @test_throws "multiple" ROSNode._resolve_di(amb)
+
+        # zero members of the required mixin ⇒ unsatisfied (self does not count)
+        @test_throws "no other member" ROSNode._resolve_di(
+            ROSNode.NodeMember[ROSNode.NodeMember(:watch, _ParamDI.Watch)])
+
+        # a requirement that is neither an @interface nor a @mixin ⇒ clear error
+        @test_throws "neither" ROSNode._resolve_di(
+            ROSNode.NodeMember[ROSNode.NodeMember(:b, _ParamDI.BadReq)])
     end
 
     @testset "headline: the DI read is type-stable (pure-unit)" begin
@@ -248,6 +292,13 @@ _dyn_call(ci)  = any(stmt -> stmt isa Expr && stmt.head === :call &&
             pg = pv.members[:guard]
             @test pg isa _ParamDI.Guard{_ParamDI.PSensor{Float64}}
             @test _ParamDI.battery(pg.battery_src) == 77.0
+
+            # direct-mixin DI: Watch requires the concrete sibling Sensor (no interface);
+            # the injected dep is the very Sensor member instance, stored in a typed field
+            wn = run(PWatch; ctx = ctx, name = "pwatch", block = false)
+            @test wn.members[:watch] isa _ParamDI.Watch
+            @test wn.members[:watch].sensor === wn.members[:sensor]
+            @test _ParamDI.battery(wn.members[:watch].sensor) == 88.0
         end
     end
 end
