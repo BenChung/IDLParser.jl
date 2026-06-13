@@ -79,3 +79,29 @@ html.theme--documenter-dark .rosnode-statechart .sc-kind-transient { border-colo
   background: rgba(47,111,235,0.1);
 }
 .rosnode-statechart .sc-path-ev { opacity: 0.6; font-size: 0.82rem; }
+
+/* the static Mermaid schematic — a white panel (mermaid's neutral theme assumes a
+   light background) so it reads on both Documenter themes. */
+.rosnode-statechart .sc-schematic {
+  background: #ffffff;
+  border: 1px solid var(--sc-border, #d0d7de);
+  border-radius: 6px;
+  padding: 0.7rem 0.5rem;
+  margin: 0.5rem 0 0.9rem;
+  overflow-x: auto;
+}
+.rosnode-statechart .sc-schematic svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+/* the live-highlighted current state */
+.rosnode-statechart .sc-schematic g.sc-node-active rect,
+.rosnode-statechart .sc-schematic g.sc-node-active polygon,
+.rosnode-statechart .sc-schematic g.sc-node-active circle,
+.rosnode-statechart .sc-schematic g.sc-node-active path {
+  stroke-width: 3.5px !important;
+  filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.35));
+}
+.rosnode-statechart .sc-schematic g.sc-node-active text { font-weight: 700; }
+/* a state clicked to inspect (not the active one) */
+.rosnode-statechart .sc-schematic g.sc-node-inspect rect,
+.rosnode-statechart .sc-schematic g.sc-node-inspect polygon {
+  stroke-dasharray: 5 3 !important;
+}
