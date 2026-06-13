@@ -4,6 +4,18 @@ A component is a node authored as a collection of `@mixin`s — each a cohesive 
 
 This page assembles a `Vehicle` node from two mixins. A `Sensor` publishes telemetry on a timer and provides a battery reading; a `Guard` requires that reading and serves a "safe to fly?" query. `@node` composes them; `run` brings the node up. The full example lives in `examples/component.jl`.
 
+!!! warning "`import` the framework generics — a bare `using` silently shadows them"
+    The lifecycle hooks (`configure`, `activate`, `deactivate`, `cleanup`, `on_error`) and the assembly generics (`construct`, `requires`, `provides`) are **ROSNode functions you add methods to**. Bring them in with `import`, not plain `using`:
+
+    ```julia
+    using ROSNode
+    import ROSNode: configure, cleanup, construct, requires   # the generics you extend
+    ```
+
+    Under a bare `using ROSNode`, a definition like `configure(m::MyMixin) = …` creates a **new local `configure`** that shadows ROSNode's. Your method is never called: the framework dispatches its own generic, runs the default no-op, and there is **no error or warning** — the node simply comes up without your setup. (Equivalently, qualify the name at the definition: `ROSNode.configure(m::MyMixin) = …`.)
+
+    Members authored by the macros — `@hears`/`@serves`/`@every`/`@runs`/`@uses` reactions and `@param`/`@provides`/`@interface` — are macro-emitted and need no import.
+
 ## The mixin — state plus the entities authored onto it
 
 `@mixin` declares one chunk. The struct holds private state; entities attach to the mixin type itself, keeping the struct state-only:
@@ -80,7 +92,7 @@ construct(::Type{Guard}, node, src) = Guard(battery_src = src)   # injected ⇒ 
 
 `construct` dispatches on the mixin being built — the bare base `Guard`, which covers every `Guard{B}`; reactions annotate the base the same way (`safe(g::Guard, …)`). The dependency is used through its interface method — `battery(g.battery_src)` in the service handler above. Omitting a zero-dep `construct` makes the dependency required: the mixin loads only composed in a `@node`. Providing one makes it optional — `construct(::Type{Guard}, node) = Guard(battery_src = NullBattery())` picks a null-object default so `run(Guard)` works standalone.
 
-`requires`, `construct`, and the lifecycle hooks extend framework generics. A component module writes `import ROSNode: configure, requires, construct` so its method definitions extend ROSNode's. A bare definition under plain `using` defines a fresh local function the framework never calls. Reactions authored by `@hears`/`@serves`/`@every`, and `@param`/`@provides`, are macro-emitted and need no import.
+`requires` and `construct` are two of the ROSNode generics you extend, so they need the `import` (or a qualified `ROSNode.construct(…) = …`) from the warning at the top of the page — a bare `using`-shadowed definition is silently never called.
 
 `configure` is a lifecycle hook — a plain method run at startup; the lifecycle section below covers the full set:
 
