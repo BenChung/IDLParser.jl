@@ -14,13 +14,20 @@ over the low-level [`ActionServer`](@ref) API.
 
 Wire it by having `on_goal` return [`defer`](@ref) and setting
 `on_accepted = g -> submit!(sched, g)`, then drive execution with
-`execute!(sched) do goal … end`. `submit!` enqueues a deferred goal (blocking
-when the queue is full, applying backpressure); `execute!` spawns a loop task
-that pulls one goal at a time, runs it through [`execute`](@ref) (the same
-cancellation + settlement wrapper), and waits for it to finish before the next.
-`pause`/`resume` gate at the dispatch boundary — while paused the loop parks
-before dispatching the next goal — and `active_goal` reports the running goal or
-`nothing`. Only `SingleFlight` itself is exported; reach the orchestrator surface
+`execute!(sched) do goal … end`. The orchestrator methods:
+
+- `submit!` enqueues a deferred goal (blocking when the queue is full, applying
+  backpressure).
+- `execute!` spawns a loop task that pulls one goal at a time, runs it through
+  [`execute`](@ref) (the same cancellation + settlement wrapper), and waits for
+  it to finish before the next.
+- `pause`/`resume` gate at the dispatch boundary — while paused the loop parks
+  before dispatching the next goal.
+- `active_goal` reports the running goal or `nothing`.
+
+This is a per-goal admission gate over one orchestrator, distinct from
+the node-lifecycle gate [`isactive`](@ref); the two are independent. Only
+`SingleFlight` itself is exported; reach the orchestrator surface
 qualified: `ROSNode.submit!`, `ROSNode.execute!`, `ROSNode.pause`,
 `ROSNode.resume`, `ROSNode.active_goal`.
 
@@ -62,10 +69,12 @@ end
     execute!(sched::SingleFlight) do goal … end
 
 Run the orchestrator loop: pull one goal at a time off the queue and `execute` it
-with `body(goal)` (the same `Cancelled` + settlement wrapper), waiting for each to
-finish before the next (single-flight). [`pause`](@ref) gates at the dispatch
-boundary: while paused the loop holds the next goal undispatched. Spawned on its
-own task; returns the task.
+with `body(goal)`, waiting for each to finish before the next (single-flight).
+Each goal runs through [`execute`](@ref) — the same cancellation + settlement
+wrapper — so its `body` exit settles via the exactly-once handler-exit contract
+owned by [`respond!`](@ref). [`pause`](@ref) gates at the dispatch boundary:
+while paused the loop holds the next goal undispatched. Spawned on its own task;
+returns the task.
 """
 function execute!(body::Function, sched::SingleFlight)
     Threads.@spawn begin

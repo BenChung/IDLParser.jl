@@ -1,4 +1,4 @@
-# The write-once result cell and fail-safe settlement (§8 services, §9 actions).
+# The write-once result cell and fail-safe settlement for services and actions.
 #
 # A client always blocks on the result, so every handler exit must settle: the
 # cell is filled exactly once before the task is reaped. This file is
@@ -16,7 +16,7 @@
 """
     ResultCell{H, R}
 
-Write-once settlement slot shared by services (§8) and actions (§9). `H` is the
+Write-once settlement slot shared by services and actions. `H` is the
 handle type (a service request or an action `GoalHandle`) carried so the deliver
 closure can reach it; `R` is the user result type.
 
@@ -31,7 +31,7 @@ Filled exactly once: the first terminal write — explicit [`respond!`](@ref), t
 handler's return value, or the fail-safe wrapper — wins and runs `deliver`. The
 status it was filled with is observable via [`outcome`](@ref); later attempts are
 ignored ([`isfilled`](@ref) guards the return-value path) except an *explicit*
-second terminal `respond!`, which is the one hard error (DESIGN §respond!).
+second terminal `respond!`, which is the one hard error.
 
 The lock makes concurrent settlement safe: a detached cleanup task can race the
 fail-safe wrapper, and only one wins.
@@ -44,7 +44,7 @@ mutable struct ResultCell{H, R}
     const deliver
     const lock::ReentrantLock
     # Settlement signal, built on `lock`. A waiter (the action `get_result` request
-    # task, §9) parks here and is woken the instant the cell fills, instead of
+    # task) parks here and is woken the instant the cell fills, instead of
     # polling. The settle paths already hold `lock`, so they `notify` it directly.
     const cond::Threads.Condition
     @atomic filled::Bool
@@ -79,7 +79,7 @@ outcome(cell::ResultCell) = cell.status
 """
     respond!(cell, status::SettlementStatus, payload) -> Bool
 
-The single settlement verb (DESIGN §respond!). The terminal tokens — service
+The single settlement verb. The terminal tokens — service
 [`success`](@ref)/[`failure`](@ref), action [`succeeded`](@ref)/[`canceled`](@ref)/
 [`aborted`](@ref) — perform the *authoritative* write: the first one wins, runs
 `deliver`, and latches the cell. Returns `true` if this call filled it.
@@ -145,13 +145,13 @@ function _settle!(cell::ResultCell, status::SettlementStatus, payload)
     return true
 end
 
-# ── fail-safe settlement wrapper (the §8/§9 invariant) ──────────────────────
+# ── fail-safe settlement wrapper (the service/action fill-exactly-once invariant) ──
 
 """
     settle_handler!(cell, body; success_status, default_result, log_id=nothing)
 
 Run a user handler `body()` and guarantee `cell` is filled exactly once before
-the task is reaped (DESIGN §fail-safe settlement). Collapses the three exits:
+the task is reaped. Collapses the three exits:
 
 | Handler exit                         | Cell empty ⇒ filled with        | Log              |
 |--------------------------------------|---------------------------------|------------------|
@@ -167,9 +167,9 @@ typed payload for the synthesized error/cancel reply (the user result type's
 zero/default). On the catch path it's wrapped so that a throwing `default_result`
 can't defeat the guarantee — [`force_abort!`](@ref) is the infallible backstop.
 
-Layered exactly as DESIGN prescribes so the guarantee holds even if recovery
-itself fails: `try` settles the normal exit, `catch` synthesizes the error/cancel
-outcome, and an infallible `finally` force-aborts a still-empty cell.
+Layered so the guarantee holds even if recovery itself fails: `try` settles the
+normal exit, `catch` synthesizes the error/cancel outcome, and an infallible
+`finally` force-aborts a still-empty cell.
 
 Returns the cell's final [`outcome`](@ref).
 """
@@ -195,7 +195,7 @@ function settle_handler!(cell::ResultCell, body;
                 @error "fail-safe settlement fill failed" exception=(fe, catch_backtrace()) status handle=log_id
             end
         end
-        # Cancelled is the cooperative cancel signal, not an error (§9); anything
+        # Cancelled is the cooperative cancel signal, not an error; anything
         # else is a genuine handler failure worth surfacing with a backtrace.
         e isa Cancelled ||
             @error "handler failed; settled fail-safe" exception=(e, catch_backtrace()) handle=log_id
@@ -219,7 +219,7 @@ even the synthesized default failed (a non-defaultable result type, a throwing
 It must not throw, so it swallows any delivery error: it latches the cell as
 aborted with a `nothing` payload and lets the Service/Action `deliver` closure
 recognize that as "send the status enum + zero-filled result bytes directly,
-not via the message constructor" (DESIGN §force_abort!). A delivery that still
+not via the message constructor". A delivery that still
 fails is logged, not raised — at that point the cell is latched and the client's
 own result timeout is the remaining guard.
 """
@@ -246,7 +246,7 @@ end
 
 Block the calling task until `cell` is filled, returning `true` once it is. Parks
 on the cell's settlement condition, so it wakes the *instant* `respond!`/`fill!`/
-`force_abort!` latches the cell — no poll latency (§9 `get_result`).
+`force_abort!` latches the cell — no poll latency on the action `get_result` path.
 
 `should_abandon()` is the cooperative bail-out, re-checked at most every `recheck`
 seconds: when it returns true the wait is abandoned and `wait_settled` returns

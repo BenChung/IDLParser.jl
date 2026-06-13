@@ -1,9 +1,9 @@
-# ── ActionServer (§9) ──────────────────────────────────────────────────────────
+# ── ActionServer ─────────────────────────────────────────────────────────────
 # The long-lived server: three Zenoh queryables (send_goal / cancel_goal /
 # get_result), a feedback publisher, a status publisher, a goal table (the result
 # cache + live goals), and the user callbacks. Each sub-endpoint is a generic
-# `Entity` (node.jl) so it gets a liveliness token + graph injection + close-on-
-# node-close for free; the queryable/publisher routes hang off `entity.wire`.
+# `Entity` (its id, liveliness token, data route, and graph lifecycle live there);
+# the queryable/publisher routes hang off `entity.wire`.
 
 """
     ActionServer(node, name, A; on_goal=accept-all, on_cancel=accept-all, on_accepted, qos=default_qos())
@@ -20,9 +20,9 @@ Two construction forms share one constructor:
 
 - High-level (`do`-block): the body is the goal's execution. The framework spawns
   it wrapped in the cancellation + fail-safe settlement machinery, scheduled per
-  `concurrency` — `Serial()` (the default) runs one goal at a time on a sticky
-  cooperative task in acceptance order, `Parallel(n)` runs each body on its own
-  OS thread, at most `n` in flight (`Inf` = unbounded).
+  [`Concurrency`](@ref). [`Serial`](@ref) (the default) holds goal bodies on the
+  server's `serial_lock` so they run one at a time in acceptance order;
+  [`Parallel`](@ref)`(n)` runs each body on its own OS thread, at most `n` in flight.
 - Low-level: supply `on_accepted=callback`; you own when, whether, and where each
   accepted goal runs (the `GoalHandle` is handed to you). Pair this with
   [`SingleFlight`](@ref) or your own orchestrator.
@@ -40,11 +40,15 @@ the type+hash segments of each data keyexpr — matching a real ROS 2 peer;
 `@ros_msgs` so the protocol-wrapper structs exist; a bare `@ros_msg` raises
 `ArgumentError`.
 
-`close`-able and idempotent; closing awaits outstanding goal tasks (including
-detached post-cancel cleanup) up to the Context drain timeout before withdrawing
-each sub-endpoint's liveliness token and Zenoh route — a goal task that overruns
-the timeout is left running detached (close warns and proceeds) — and the server
-dies with its node.
+`close`-able and idempotent. Closing:
+
+- awaits outstanding goal tasks (including detached post-cancel cleanup) up to the
+  Context drain timeout before withdrawing each sub-endpoint's liveliness token and
+  Zenoh route;
+- leaves a goal task that overruns the timeout running detached (close warns and
+  proceeds).
+
+The server also dies with its node.
 
 ```julia
 server = ActionServer(node, "fibonacci", Fibonacci) do goal
@@ -83,10 +87,10 @@ mutable struct ActionServer{A, G, R, F}
     const goals::Dict{GoalId, GoalHandle{A, G, R, F}}
     const lock::ReentrantLock
     # Serializes goal-body execution under `concurrency = Serial()` (one goal at a
-    # time, §4). Dedicated to goal bodies so the node-wide lock (guarding cross-
+    # time). Dedicated to goal bodies so the node-wide lock (guarding cross-
     # entity state) stays free while a long mission runs.
     const serial_lock::ReentrantLock
-    # Per-endpoint attachment sequence_numbers (§3.4), one per published topic.
+    # Per-endpoint attachment sequence_numbers, one per published topic.
     @atomic feedback_seq::Int64
     @atomic status_seq::Int64
     @atomic open::Bool
@@ -117,7 +121,7 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
         on_accepted
     else
         throw(ArgumentError("ActionServer requires execution: a `do goal … end` \
-                             body or an `on_accepted=` callback (§9)"))
+                             body or an `on_accepted=` callback"))
     end
 
     # Five sub-endpoints. Each of the three services keys off its own SERVICE-level
@@ -134,8 +138,8 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
     get_result_ent  = make_entity(node, Service,      _get_result_topic(fqn),  gr_ti; qos=qos)
     # Feedback/status carry their OWN wire types (FeedbackMessage / GoalStatusArray),
     # not the action type — the data keyexpr embeds type+hash, so a publisher must match
-    # what its subscriber declares (the §11 per-section refinement, applied here for the
-    # two topics that have live subscribers; the services stay action-typed for now).
+    # what its subscriber declares (the per-section wire-type refinement, applied here for
+    # the two topics that have live subscribers; the services stay action-typed for now).
     feedback_ent    = make_entity(node, Publisher,    _feedback_topic(fqn),
                                   type_info_of(_feedback_message_type(A)); qos=qos)
     status_ent      = make_entity(node, Publisher,    _status_topic(fqn),
@@ -164,8 +168,8 @@ _default_on_goal(_request)  = accept()
 _default_on_cancel(_goal)   = accept()
 
 # Declare the data routes: a Queryable per service, a Zenoh.Publisher per topic.
-# Each queryable's callback runs on its own Julia task (Zenoh trampoline, §2.3),
-# so a blocking accept decision never stalls the I/O thread.
+# Each queryable's callback runs on its own Julia task (the Zenoh callback
+# trampoline), so a blocking accept decision never stalls the I/O thread.
 function _wire_action_server!(server::ActionServer)
     sess = server.node.context.session
 
@@ -181,7 +185,7 @@ end
 
 # Declare a callback-form Queryable on a Service `Entity` and stash it in `.wire`
 # so it shares the entity's close lifecycle (node.jl closes `entity.wire`). The
-# topic keyexpr is the service's data route (`topic_keyexpr`, §2.2). A handler
+# topic keyexpr is the service's data route (`topic_keyexpr`). A handler
 # throw is logged, never fatal — one bad request can't kill the queryable.
 function _declare_queryable!(e::Entity, handler)
     ctx = e.node.context
@@ -203,7 +207,7 @@ Base.show(io::IO, server::ActionServer{A}) where {A} =
     print(io, "ActionServer(", server.name, ", ", nameof(A),
           isopen(server) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref)s (one per sub-endpoint, §6)."
+"This server's five sub-endpoint handles, one per [`Entity`](@ref)."
 entities(server::ActionServer) = (server.send_goal_ent, server.cancel_goal_ent,
                                   server.get_result_ent, server.feedback_ent,
                                   server.status_ent)
@@ -211,16 +215,16 @@ entities(server::ActionServer) = (server.send_goal_ent, server.cancel_goal_ent,
 """
     close(server::ActionServer)
 
-Undeclare the action server (§9/§14): close its five sub-endpoints (each
-withdraws its liveliness token + Zenoh route), after awaiting outstanding goal
-tasks so a settle-then-detached-cleanup goal (DESIGN §drain) finishes rather than
-being dropped mid-flight. Idempotent.
+Undeclare the action server: close its five sub-endpoints (each withdraws its
+liveliness token + Zenoh route), after awaiting outstanding goal tasks so a
+settle-then-detached-cleanup goal finishes rather than being dropped mid-flight.
+Idempotent.
 """
 function Base.close(server::ActionServer)
     (@atomicswap server.open = false) || return nothing
     # Await outstanding goal tasks (incl. detached post-cancel cleanup) up to the
     # Context drain timeout, so `close(server)` mid-"descend and disarm" doesn't
-    # drop the vehicle (DESIGN §drain).
+    # drop the vehicle.
     _await_goals(server)
     for e in entities(server)
         try
@@ -248,15 +252,15 @@ function _await_goals(server::ActionServer)
     nothing
 end
 
-# ── send_goal service (§9) ─────────────────────────────────────────────────────
+# ── send_goal service ─────────────────────────────────────────────────────────
 # Decode the goal request (goal_id + goal), run `on_goal`, and reply
 # accepted/rejected. On accept (not defer) we fire `on_accepted` so execution
 # starts. The reply is the `SendGoal_Response` (accepted::Bool + stamp).
 
 function _handle_send_goal(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
     isopen(server) || return _reply_inactive(q)
-    # §14.2 gate: an inactive managed node's action services error-reply, like
-    # service.jl's `_serve_query`. Unmanaged nodes are always active.
+    # Managed-node dispatch gate: an inactive managed node's action services
+    # error-reply, like service.jl's `_serve_query`. Unmanaged nodes are always active.
     isactive(server.send_goal_ent) || return _reply_inactive(q)
     id, goal_req = _decode_send_goal(server, q)
 
@@ -363,15 +367,15 @@ function _deliver_result!(server::ActionServer{A, G, R, F}, g::GoalHandle{A, G, 
     nothing
 end
 
-# ── cancel_goal service (§9) ───────────────────────────────────────────────────
+# ── cancel_goal service ───────────────────────────────────────────────────────
 # Decode the cancel request (a goal_info: goal_id + stamp; zero id ⇒ cancel-all),
 # run `on_cancel` per matched goal, and on accept move it to CANCELING. This arms
 # the `checkpoint`/`feedback!` cancellation throw; execution keeps running until the
-# handler observes the token (§9).
+# handler observes the token.
 
 function _handle_cancel_goal(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
     isopen(server) || return _reply_inactive(q)
-    isactive(server.cancel_goal_ent) || return _reply_inactive(q)   # §14.2 gate
+    isactive(server.cancel_goal_ent) || return _reply_inactive(q)   # managed-node dispatch gate
     target = _decode_cancel(server, q)            # GoalId, or nothing ⇒ cancel-all
 
     canceling = GoalHandle{A, G, R, F}[]
@@ -396,15 +400,15 @@ function _handle_cancel_goal(server::ActionServer{A, G, R, F}, q::Query) where {
     nothing
 end
 
-# ── get_result service (§9) ────────────────────────────────────────────────────
+# ── get_result service ────────────────────────────────────────────────────────
 # The client's `fetch` blocks on a `get_result` request. The reply lands only once
 # the goal is terminal, so the queryable handler waits on the result cell
-# (a task per request, the Zenoh trampoline gives us that, §2.3) then replies with
-# the cached status + result. An unknown goal id is an error reply.
+# (a task per request, which the Zenoh callback trampoline gives us) then replies
+# with the cached status + result. An unknown goal id is an error reply.
 
 function _handle_get_result(server::ActionServer{A, G, R, F}, q::Query) where {A, G, R, F}
     isopen(server) || return _reply_inactive(q)
-    isactive(server.get_result_ent) || return _reply_inactive(q)   # §14.2 gate
+    isactive(server.get_result_ent) || return _reply_inactive(q)   # managed-node dispatch gate
     id = _decode_get_result(server, q)
     g = @lock server.lock get(server.goals, id, nothing)
     if g === nothing
@@ -422,10 +426,10 @@ function _handle_get_result(server::ActionServer{A, G, R, F}, q::Query) where {A
     nothing
 end
 
-# ── high-level on_accepted: the do-block sugar (§9) ─────────────────────────────
+# ── high-level on_accepted: the do-block sugar ──────────────────────────────────
 # Spawn the body wrapped in `settle_handler!` (settlement.jl): a normal return →
 # SUCCEEDED, a thrown `Cancelled` → CANCELED, anything else → ABORTED + log, and a
-# never-responded exit → ABORTED. Scheduling is `concurrency` (§4): each body runs
+# never-responded exit → ABORTED. Scheduling is `concurrency`: each body runs
 # on its own task (so the send_goal handler can reply accepted promptly); `Serial()`
 # bodies are sticky and serialize on the server's dedicated `serial_lock` (one goal
 # at a time, order-of-acceptance preserved), `Parallel(n)` bodies run on spawned
@@ -458,7 +462,7 @@ function _spawn_body(c::Concurrency, run)
 end
 
 # Execute one goal body under the settlement wrapper. `Serial()` serializes bodies
-# on the server's dedicated `serial_lock` (§4 one-at-a-time), leaving the node-wide
+# on the server's dedicated `serial_lock` (one-at-a-time), leaving the node-wide
 # lock free during a long mission; `Parallel(n)` admits at most `n` bodies at once
 # via `sem` (`nothing` = unbounded).
 function _run_goal_body(g::GoalHandle{A, G, R, F}, body::Function, concurrency::Concurrency,
@@ -482,25 +486,28 @@ function _run_goal_body(g::GoalHandle{A, G, R, F}, body::Function, concurrency::
     nothing
 end
 
-# ── execute(goal): the low-level / deferred run entry (§9) ──────────────────────
+# ── execute(goal): the low-level / deferred run entry ───────────────────────────
 
 """
     execute(goal) do goal … end
     execute(goal, body)
 
 Run `body(goal)` as this goal's execution, wrapped in the cancellation +
-fail-safe settlement machinery — the low-level and `defer` counterpart of the
-high-level `do`-block server. Spawns the body on its own OS-thread task (tracked
-so `close(server)` joins it on drain); the task transitions the goal to
-`EXECUTING` and publishes the status change before running the body. Returns
-`nothing` immediately; the body runs concurrently.
+settlement machinery — the low-level and `defer` counterpart of the high-level
+`do`-block server. Spawns the body on its own OS-thread task (tracked so
+`close(server)` joins it on drain); the task transitions the goal to `EXECUTING`
+and publishes the status change before running the body. Returns `nothing`
+immediately; the body runs concurrently.
 
 Use it from an `on_accepted` callback that chose to defer, or from an
 orchestrator such as [`SingleFlight`](@ref). Each call spawns a fresh task, so
 two `execute` calls on different goals run simultaneously — the caller owns any
-one-at-a-time policy. The body's normal return settles `SUCCEEDED`, a thrown
-[`Cancelled`](@ref) settles `CANCELED`, any other throw settles `ABORTED` and
-logs.
+one-at-a-time policy.
+
+The body's exit maps to a goal terminal status: normal return settles `succeeded`,
+a thrown [`Cancelled`](@ref) settles `canceled`, any other throw (or a body that
+exits without responding) settles `aborted` and logs. [`respond!`](@ref) owns the
+exactly-once settlement that guarantees this mapping fires exactly once.
 """
 function execute(body::Function, g::GoalHandle{A, G, R, F}) where {A, G, R, F}
     g._task = Threads.@spawn _run_goal_body(g, body, Parallel(Inf))
@@ -560,11 +567,11 @@ function _zero_result_field(::Type{S}) where {S}
     end
 end
 
-# ── feedback / status publication (§9) ──────────────────────────────────────────
+# ── feedback / status publication ───────────────────────────────────────────────
 # Feedback rides the `_action/feedback` topic as a `<A>_FeedbackMessage` (goal_id
 # + feedback); status rides `_action/status` as an `action_msgs/GoalStatusArray`.
 # Both `put` through the topic Entity's Zenoh publisher with the per-message
-# attachment (§3.4).
+# attachment.
 
 const _GoalInfo        = Interfaces.action_msgs.msg.GoalInfo
 const _GoalStatus      = Interfaces.action_msgs.msg.GoalStatus
@@ -577,7 +584,7 @@ _goal_status_byte(s::GoalState) = Int8(s)
 function _publish_feedback(server::ActionServer{A, G, R, F}, id::GoalId, fb::F) where {A, G, R, F}
     e = server.feedback_ent
     isopen(e) || return nothing
-    isactive(e) || return nothing                 # §14.2: gated (inactive) node ⇒ drop
+    isactive(e) || return nothing                 # gated (inactive) managed node ⇒ drop
     route = e._route
     route === nothing && return nothing
     msg = _feedback_message_type(A)(; goal_id = _to_uuid(id), feedback = fb)
@@ -596,7 +603,7 @@ end
 function _publish_status(server::ActionServer)
     e = server.status_ent
     isopen(e) || return nothing
-    isactive(e) || return nothing                 # §14.2: gated (inactive) node ⇒ drop
+    isactive(e) || return nothing                 # gated (inactive) managed node ⇒ drop
     route = e._route
     route === nothing && return nothing
     stamp = to_msg(_Time, Dates.now(server.node))
@@ -611,7 +618,7 @@ function _publish_status(server::ActionServer)
     nothing
 end
 
-# ── send_goal / cancel / get_result wire framing (§9) ───────────────────────────
+# ── send_goal / cancel / get_result wire framing ────────────────────────────────
 # Bridge the Zenoh `Query`/`reply` to the action protocol wrapper messages: the
 # per-action `<A>_SendGoal_Request/_Response` + `<A>_GetResult_Request/_Response`
 # (generated siblings of `A`) and `action_msgs/CancelGoal_Request/_Response`. Each

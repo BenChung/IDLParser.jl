@@ -1,13 +1,13 @@
-# ── the six standard parameter services + /parameter_events (§10) ───────────────
+# ── the six standard parameter services + /parameter_events ─────────────────────
 # All generic over `P` via reflection (`fieldnames`/`fieldtypes` + `descriptors`),
 # reflecting over the union of declared fields + dynamic dict so a ROS client sees
 # one flat namespace. The handlers below are the schema-independent core; the wire
 # binding (a `Service(node, …)` per service + the `/parameter_events` publisher)
-# is the §8 Service-layer's job and is staged behind a precompile-safe stub.
+# is the Service layer's job and is staged behind a precompile-safe stub.
 
 """
 The six standard ROS 2 parameter service base names, under the node's private
-namespace (§10). Every node exposes these so any parameter client can introspect
+namespace. Every node exposes these so any parameter client can introspect
 and mutate its parameters: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
 """
 const PARAMETER_SERVICE_NAMES = (
@@ -25,7 +25,7 @@ const PARAMETER_SERVICE_NAMES = (
     describe_parameters(client::ParameterClient, names; timeout_ms=2000) -> Vector{ParameterDescriptor}
 
 The ROS 2 `DescribeParameters` service: a [`ParameterDescriptor`](@ref) per
-requested name (§10). A declared name returns its schema descriptor; a live
+requested name. A declared name returns its schema descriptor; a live
 dynamic name returns a synthesized descriptor (its runtime type, no constraint,
 not read-only); an unknown name returns a `PARAMETER_NOT_SET` descriptor. The
 [`ParameterServer`](@ref) and [`CompositeParameterServer`](@ref) forms reflect
@@ -59,7 +59,7 @@ end
     get_parameter_types(client::ParameterClient, names; timeout_ms=2000) -> Vector{ParameterType}
 
 The ROS 2 `GetParameterTypes` service: the [`ParameterType`](@ref) tag of each
-requested name (§10), flat over both tiers. An unknown name reads back as
+requested name, flat over both tiers. An unknown name reads back as
 `PARAMETER_NOT_SET`. The [`ParameterServer`](@ref) form reflects locally (the
 declared field type, or the runtime type of a dynamic value); the
 [`ParameterClient`](@ref) form is the remote dual over the wire, raising
@@ -83,8 +83,8 @@ end
     get_parameters(server::CompositeParameterServer, names) -> Vector
     get_parameters(client::ParameterClient, names; timeout_ms=2000) -> Vector{Any}
 
-The ROS 2 `GetParameters` service: the current value of each requested name
-(§10). Reads flat over both tiers; an unset or unknown name reads back as
+The ROS 2 `GetParameters` service: the current value of each requested name.
+Reads flat over both tiers; an unset or unknown name reads back as
 `nothing` (which the service maps to a `PARAMETER_NOT_SET` `ParameterValue`).
 The [`ParameterServer`](@ref) form reads locally — declared fields from the
 live atomic struct, dynamic ones from the side dict. The
@@ -110,7 +110,7 @@ end
     list_parameters(client::ParameterClient; prefixes=String[], depth=0, timeout_ms=2000) -> Vector{Symbol}
 
 The ROS 2 `ListParameters` service: the flat union of parameter names,
-optionally kept to those starting with one of `prefixes` (§10). The
+optionally kept to those starting with one of `prefixes`. The
 [`ParameterServer`](@ref) form lists declared names then dynamic names; the
 [`CompositeParameterServer`](@ref) form lists every member's `<member>.<field>`;
 the [`ParameterClient`](@ref) form is the remote dual, raising
@@ -146,8 +146,8 @@ end
     set_parameters_atomically(server::CompositeParameterServer, pairs) -> (successful::Bool, reason::String)
     set_parameters_atomically(client::ParameterClient, params; timeout_ms=2000) -> (successful::Bool, reason::String)
 
-The ROS 2 `SetParametersAtomically` service: apply all pairs as one transaction
-(§10). Either every pair commits and the result is `(true, "")`, or the first
+The ROS 2 `SetParametersAtomically` service: apply all pairs as one transaction.
+Either every pair commits and the result is `(true, "")`, or the first
 rejection aborts the whole set and the result is `(false, reason)`. A
 constraint, read-only, or `validate` rejection (and an `ArgumentError`, e.g. an
 undeclared name) maps to the `(false, reason)` result; a value that fails to
@@ -186,7 +186,7 @@ end
 
 The ROS 2 `SetParameters` service: apply each `name => value` pair as its own
 independent transaction, yielding one `(successful, reason)`
-`SetParametersResult` per pair (§10). A pair that violates a constraint, hits
+`SetParametersResult` per pair. A pair that violates a constraint, hits
 the read-only gate, or fails `validate` fails on its own while the others may
 succeed; a value that fails to coerce to its declared field type throws instead
 of producing a per-pair result (a wire caller sees [`ServiceError`](@ref), with
@@ -200,7 +200,7 @@ function set_parameters(s::ParameterServer{P}, pairs) where {P}
     end
 end
 
-# ── wire types (§10) ──────────────────────────────────────────────────────────
+# ── wire types ──────────────────────────────────────────────────────────────────
 # The `rcl_interfaces` generated structs the parameter services marshal over.
 # Vendored under `Interfaces`; aliased here for readability. The generated keyword
 # constructors require every field (no defaults), so each build below is exhaustive.
@@ -215,7 +215,7 @@ const _ListParametersResult = _RCL_MSG.ListParametersResult
 const _WireDescriptor       = _RCL_MSG.ParameterDescriptor
 const _Time                 = Interfaces.builtin_interfaces.msg.Time
 
-# ── value marshalling (§10) ─────────────────────────────────────────────────────
+# ── value marshalling ───────────────────────────────────────────────────────────
 # A Julia parameter value ⇄ the `ParameterValue` tagged union. The `type` byte
 # selects the live arm; because the union is flat on the wire, every field is
 # present, so the other ten carry zeroed placeholders.
@@ -284,13 +284,13 @@ _to_set_result((ok, reason)) = _SetParametersResult(; successful = ok, reason = 
     wire_parameter_services!(server) -> server
 
 Declare the six standard parameter services + the `/parameter_events` publisher on
-the server's node (§10/§13), each bound to the reflection handlers above. Generic
+the server's node, each bound to the reflection handlers above. Generic
 over `P` — one implementation serves every schema. The services are node-private
 (`~/…`); `/parameter_events` is absolute (every node publishes the same topic).
 Service handles are tracked on the node (closed with it) and held on the server.
 
-Generic over any [`AbstractParameterServer`](@ref): both `ParameterServer{P}` and
-the multi-schema [`CompositeParameterServer`](@ref) (§4.4) supply the six reflection
+Generic over any `AbstractParameterServer`: both `ParameterServer{P}` and
+the multi-schema [`CompositeParameterServer`](@ref) supply the six reflection
 handlers + `parameter_names`, so one wiring serves a plain node and a composed
 (member-prefixed) one alike.
 """
@@ -362,7 +362,7 @@ function _publish_parameter_event(s::ParameterServer, batch::ParameterEventBatch
     return nothing
 end
 
-# ── node integration (§10) ──────────────────────────────────────────────────────
+# ── node integration ─────────────────────────────────────────────────────────────
 # `Node(ctx, name, P)` bakes a `@parameters` schema `P` into the node: build the
 # base node, attach a `ParameterServer{P}` (reached as `node.parameters`), and wire
 # the six standard services + `/parameter_events` so the node is driveable by any
@@ -372,7 +372,7 @@ end
     Node(ctx, name, ::Type{P}; overrides=(;), allow_undeclared=false, kwargs...) -> Node
 
 Construct a node with a declared parameter schema `P` (a [`@parameters`](@ref)
-struct), §10. Equivalent to `Node(ctx, name; kwargs...)` plus a `ParameterServer{P}`
+struct). Equivalent to `Node(ctx, name; kwargs...)` plus a `ParameterServer{P}`
 attached at `node.parameters`, with the six standard parameter services and
 `/parameter_events` wired (`wire_parameter_services!`). `overrides` overlays
 startup values (CLI/launch/YAML) onto the schema defaults; `allow_undeclared` opens
@@ -386,7 +386,7 @@ function Node(ctx::Context, name::AbstractString, ::Type{P};
     wire_parameter_services!(server)
     node.parameters = server
     # Startup overrides commit through the ctor, NOT a transaction, so the `use_sim_time`
-    # event hook never fires for them (§7). Activate sim explicitly if the committed value
+    # event hook never fires for them. Activate sim explicitly if the committed value
     # is true, so a node started with `use_sim_time=true` follows `/clock` from the start.
     if hasfield(P, :use_sim_time) && getfield((@atomic server.value), :use_sim_time) === true
         set_use_sim_time!(ctx, node, true)

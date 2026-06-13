@@ -1,4 +1,4 @@
-# §9 Actions. Two layers over the ROS2 action wire protocol — three services
+# Actions. Two layers over the ROS2 action wire protocol — three services
 # (`send_goal`, `cancel_goal`, `get_result`) plus two topics (`feedback`,
 # `status`), all derived from the action type's sub-messages:
 #
@@ -12,7 +12,7 @@
 # `get_result` is answered), status publication, and the fail-safe settlement
 # backstop (settlement.jl); *you* own execution & scheduling. The high-level
 # `do`-block is sugar — an `on_accepted` that spawns the body wrapped in the
-# `Cancelled` + settlement machinery, scheduled by `concurrency` (§4).
+# `Cancelled` + settlement machinery, scheduled by `concurrency`.
 #
 # The settlement core (write-once `ResultCell`, `respond!`/`fill!`/`force_abort!`,
 # `settle_handler!`) is shared with services verbatim — a `GoalHandle` *is* the
@@ -36,27 +36,27 @@ export ActionServer, ActionClient, GoalHandle,
        accept, reject, defer,
        SingleFlight
 
-# ── action type support (§9/§11) ────────────────────────────────────────────
+# ── action type support ──────────────────────────────────────────────────────
 # The ROS2 action protocol is built from sub-messages of the action definition:
 # the user-facing `Goal`/`Result`/`Feedback`, plus the protocol wrappers
 # (`SendGoal_Request/_Response`, `GetResult_Request/_Response`, the
 # `FeedbackMessage` goal_id+feedback pair, `action_msgs/CancelGoal` and
 # `GoalStatusArray`). `@ros_msg` on a `.action` today generates only the three
-# bare sub-types (`<A>_Goal`/`_Result`/`_Feedback`, §ROSMessages); the protocol
+# bare sub-types (`<A>_Goal`/`_Result`/`_Feedback`); the protocol
 # wrappers + `action_msgs`/`unique_identifier_msgs` types are a typesupport gap.
 #
 # `ActionTypeSupport` carries the three sub-types so the server/client speak in
 # them and centralizes the topic-suffix naming. The protocol wrappers
 # (`<A>_SendGoal_Request/_Response`, `<A>_GetResult_Request/_Response`,
-# `<A>_FeedbackMessage`) are generated as siblings of `A` (§ROSMessages
-# `action_protocol_decls`) and resolved reflectively off `A` (`_action_wrapper`),
+# `<A>_FeedbackMessage`) are generated as siblings of `A` by ROSMessages'
+# action-protocol declarations and resolved reflectively off `A` (`_action_wrapper`),
 # so the wire framing is built through the generated ctors.
 
 """
     ActionTypeSupport{A, G, R, F}
 
 Type-level handle on an action type `A` and its three sub-message structs:
-`Goal` (`G`), `Result` (`R`), and `Feedback` (`F`) (§9). The sub-types drive the
+`Goal` (`G`), `Result` (`R`), and `Feedback` (`F`). The sub-types drive the
 data-route key expressions and the handler signatures. Built from the action
 type argument to `ActionServer`/`ActionClient`. The protocol wrappers
 (`SendGoal`/`GetResult` request/response, `FeedbackMessage`) are generated
@@ -72,8 +72,8 @@ feedback_type(::ActionTypeSupport{A, G, R, F}) where {A, G, R, F} = F
 action_type(::ActionTypeSupport{A})            where {A}          = A
 
 # The five protocol-wrapper structs rosidl derives from a `.action` are emitted
-# as siblings of `A` in its `.action` module (`<A>_SendGoal_Request`, etc. —
-# §ROSMessages `action_protocol_decls`). Resolve them by suffix off `A`'s name,
+# as siblings of `A` in its `.action` module (`<A>_SendGoal_Request`, etc., by
+# ROSMessages' action-protocol declarations). Resolve them by suffix off `A`'s name,
 # the same reflection `ActionTypeSupport` does for the `_Goal`/`_Result`/`_Feedback`
 # triple; a missing wrapper means the action was generated without the protocol
 # set (an `@ros_msg` on the bare `.action` text, not `@ros_msgs`).
@@ -94,7 +94,7 @@ _get_result_response_type(::Type{A})where {A} = _action_wrapper(A, "_GetResult_R
 _feedback_message_type(::Type{A})   where {A} = _action_wrapper(A, "_FeedbackMessage")
 
 # Reflectively resolve `<A>_Goal`/`_Result`/`_Feedback` from `A`'s defining
-# module (the `<pkg>.action` submodule, §ROSMessages codegen). `A` is named by
+# module (the `<pkg>.action` submodule emitted by ROSMessages codegen). `A` is named by
 # its bare action name; the triple lives beside it. A missing sub-type is the
 # "this isn't an action type" mistake, named rather than left as an `UndefVar`.
 function ActionTypeSupport(::Type{A}) where {A}
@@ -119,7 +119,7 @@ _send_goal_topic(name)   = string(name, "/_action/send_goal")
 _cancel_goal_topic(name) = string(name, "/_action/cancel_goal")
 _get_result_topic(name)  = string(name, "/_action/get_result")
 
-# rmw_zenoh action-protocol service keyexpr identity (§9). The three services key
+# rmw_zenoh action-protocol service keyexpr identity. The three services key
 # off SERVICE-level type hashes computed from the FIXED action-protocol type
 # descriptions (ROSMessages.{send_goal,get_result,cancel_goal}_service_rihs01) — the
 # same form a real ROS2 peer keys them on. send_goal/get_result depend on the
@@ -169,7 +169,7 @@ _from_uuid(u)::GoalId = ntuple(i -> u.uuid[i], 16)
 # A zeroed UUID (16 NUL bytes) is the action_msgs "cancel-all" sentinel.
 _is_zero_uuid(id::GoalId) = all(==(0x00), id)
 
-# ── goal state machine (§9) ───────────────────────────────────────────────────
+# ── goal state machine ─────────────────────────────────────────────────────────
 # rclcpp's status enum (action_msgs/GoalStatus): the values are wire-stable —
 # they ride the `status` topic and the `get_result` reply. Modeled as a sealed
 # `@enum` so the state transitions are exhaustive and an unknown code is caught.
@@ -195,7 +195,7 @@ See the ROS 2 actions concept: https://docs.ros.org/en/rolling/Concepts/Basic/Ab
     GOAL_ABORTED   = 6
 end
 
-# Public `state(goal)` surface (§9): Symbols at the API edge keep the wire enum
+# Public `state(goal)` surface: Symbols at the API edge keep the wire enum
 # internal and read naturally (`state(goal) === :executing`).
 _state_symbol(s::GoalState) =
     s === GOAL_ACCEPTED  ? :accepted  :
@@ -215,12 +215,12 @@ _terminal_state(::Aborted)   = GOAL_ABORTED
 _is_terminal_state(s::GoalState) =
     s === GOAL_SUCCEEDED || s === GOAL_CANCELED || s === GOAL_ABORTED
 
-# ── on_goal decisions (§9) ─────────────────────────────────────────────────────
+# ── on_goal decisions ──────────────────────────────────────────────────────────
 # `on_goal` returns one of three tokens. `accept` starts execution immediately
 # (via `on_accepted`); `defer` accepts but leaves the goal in ACCEPTED for the
 # owner to `execute` later (the queue/orchestrator path); `reject` declines.
 
-"`on_goal` decision tokens — `accept()`/`reject()`/`defer()` (§9)."
+"`on_goal` decision tokens — `accept()`/`reject()`/`defer()`."
 abstract type GoalResponse end
 struct Accept <: GoalResponse end
 struct Reject <: GoalResponse end

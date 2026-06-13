@@ -1,4 +1,4 @@
-# §8 services: one callback and a write-once result cell. Under rmw_zenoh a
+# Services: one callback and a write-once result cell. Under rmw_zenoh a
 # service is a Zenoh queryable — the request rides the query payload, the response
 # the reply. The fail-safe settlement core (settlement.jl) guarantees every handler
 # exit fills the cell exactly once: `return resp` → reply-ok; an explicit
@@ -23,7 +23,7 @@ using ROSZenoh: ROSZenoh
 export Service, ServiceClient, ServiceHandle, call, request_type, response_type,
        service_matched
 
-# ── service-type reflection (§8/§11) ─────────────────────────────────────────
+# ── service-type reflection ──────────────────────────────────────────────────
 
 """
     request_type(SrvType) -> Type
@@ -34,7 +34,7 @@ is no umbrella `Foo` type), so the service is named by its request struct: the
 default treats `SrvType` as that request struct (its name ends in `_Request`) and
 returns it unchanged.
 
-The §11 type registry specializes this for service markers: `@ros_service` emits a
+The [`TypeRegistry`](@ref) specializes this for service markers: `@ros_service` emits a
 `request_type` method mapping the marker to its generated request type, so a
 registered service value resolves through the same call.
 
@@ -58,7 +58,7 @@ The response message type paired with [`request_type`](@ref)`(SrvType)`. The
 default resolves [`request_type`](@ref) first, strips the `_Request` suffix from
 its name, and looks up the `_Response` sibling struct in the same module.
 
-The §11 type registry specializes this for service markers alongside
+The [`TypeRegistry`](@ref) specializes this for service markers alongside
 [`request_type`](@ref), so a registered service value resolves directly.
 
 Throws `ArgumentError` if the request type is unrecognizable, or if the
@@ -82,7 +82,7 @@ end
 _strip_suffix(s::AbstractString, suffix::AbstractString) =
     endswith(s, suffix) ? s[1:end-length(suffix)] : s
 
-# ── ServiceHandle (the server, §8) ───────────────────────────────────────────
+# ── ServiceHandle (the server) ───────────────────────────────────────────────
 # An `Entity` (node.jl) carrying a channel-form Zenoh `Queryable` plus its
 # consumer task. Draining with `take!` (not the callback form) lets the consumer
 # own the `Query` lifetime: it holds the owned `Query` across the handler and
@@ -94,11 +94,10 @@ _strip_suffix(s::AbstractString, suffix::AbstractString) =
     ServiceHandle{Req, Resp}
 
 A running [service](https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html)
-server for request type `Req` / response type `Resp` (§8). Under rmw_zenoh a
+server for request type `Req` / response type `Resp`. Under rmw_zenoh a
 service is a Zenoh queryable: the request rides the query payload and the response
-rides the reply. The handle wraps the generic [`Entity`](@ref) (id, liveliness
-token, graph lifecycle) and owns the queryable route plus the consumer task that
-drains it.
+rides the reply. The handle wraps an [`Entity`](@ref) and owns the queryable route
+plus the consumer task that drains it.
 
 Construct one with the do-block spelling `Service(node, name, SrvType) do req … end`.
 `isopen` reports whether it is still serving; `close`
@@ -117,7 +116,7 @@ end
 mutable struct _ServiceWire
     const queryable::Queryable
     consumer::Union{Task, Nothing}
-    @atomic seq::Int64           # per-service reply sequence_number (attachment, §3.4)
+    @atomic seq::Int64           # per-service reply sequence_number (rmw_zenoh attachment)
 end
 
 function Base.close(w::_ServiceWire)
@@ -142,41 +141,43 @@ end
             concurrency=Serial(), warmup=nothing, warmup_sync=nothing,
             warmup_sample=nothing) do req … end -> ServiceHandle
 
-Declare a service `name` of service type `SrvType` on `node` and start serving it
-(§8), returning a [`ServiceHandle`](@ref). `Service` is the `EndpointKind` enum
+Declare a service `name` of service type `SrvType` on `node` and start serving it,
+returning a [`ServiceHandle`](@ref). `Service` is the `EndpointKind` enum
 value given a call-method; the do-block desugars function-first, so the handler
 becomes the first argument.
 
-The handler runs once per request. Every handler exit settles the request's
-write-once cell exactly once (fail-safe settlement, settlement.jl), so the
-framework always delivers exactly one reply. Returning the response message
-replies-ok; `respond!(req, failed, msg)` fails the request as a Zenoh query
-*error* reply, which raises [`ServiceError`](@ref) in the client's [`call`](@ref);
-a throw or a return-without-responding becomes a synthesized error reply (logged
-with a backtrace). The cell settles within the handler's extent: it is
-force-aborted if still empty when the handler returns, then the owned `Query` is
-finalized to send the final-ack. (Detached settlement — handing the request to
-another task to settle after the handler returns — is an action-server feature;
-in a service handler a late settle hits the already-aborted cell and the client
-has the synthesized error reply.)
+The handler runs once per request, settling the request's write-once `ResultCell`
+through [`respond!`](@ref) (which owns the exactly-once handler-exit contract).
+This domain's status mapping:
+
+  - return the response message ⇒ reply-ok;
+  - `respond!(req, failed, msg)` ⇒ a Zenoh query *error* reply, raising
+    [`ServiceError`](@ref) in the client's [`call`](@ref);
+  - a throw or a return-without-responding ⇒ a synthesized error reply (logged
+    with a backtrace).
+
+The cell settles within the handler's extent (no detached settlement, unlike an
+[`ActionServer`](@ref) goal): force-aborted if still empty when the handler
+returns, then the owned `Query` is finalized to send the final-ack.
 
 The request is fully owned by default (storable, forwardable, spawnable past the
-handler, §3.1). `view=true` decodes it as a `CDRView` aliasing a private owned
+handler). `view=true` decodes it as a `CDRView` aliasing a private owned
 copy of the payload — variable-length fields stay views over that copy, and the
 view remains valid for as long as it is reachable, since the copy is owned
-(zero-copy over the borrowed wire buffer itself is a pending §3.2 refinement).
+(zero-copy over the borrowed wire buffer itself is a pending refinement).
 
-`concurrency` is [`Serial`](@ref)`()` (the default: one request at a time on a
-single sticky cooperative thread, matching rclcpp's single-threaded executor) or
-[`Parallel`](@ref)`(n)` (up to `n` handlers on OS threads, rclcpp's multi-threaded
-executor); when a finite pool is full, further queries buffer in the queryable
-FIFO until a slot frees. `qos` maps onto the ROS 2 QoS policies for the route.
+`concurrency` (a [`Concurrency`](@ref): [`Serial`](@ref)`()`, the default, or
+[`Parallel`](@ref)`(n)`) schedules the handler bodies: `Serial` serves on the
+node's one sticky cooperative thread, `Parallel(n)` on up to `n` OS threads. When
+a finite pool is full, further queries buffer in the queryable FIFO until a slot
+frees. `qos` maps onto the ROS 2 QoS policies for the route.
 
 `SrvType` is the generated `*_Request` struct (the response type is its
-`*_Response` sibling); the §11 registry can specialize [`request_type`](@ref) /
+`*_Response` sibling); the [`TypeRegistry`](@ref) can specialize [`request_type`](@ref) /
 [`response_type`](@ref) for a registered service marker. `warmup`, `warmup_sync`,
-and `warmup_sample` select the §D8 precompilation policy for the
-decode→handler→encode chain, defaulting to the node's policy.
+and `warmup_sample` select the warm-up policy (precompile/execute/off, sync/async)
+that pre-JITs the request-decode → handler → response-encode dispatch chain,
+defaulting to the node's policy; see the warm-up layer (base/core.jl).
 
 ```julia
 srv = Service(node, "add_two_ints", AddTwoInts_Request) do req
@@ -207,7 +208,7 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
     ent.wire = wire
     wire.consumer = _spawn_service_consumer(ent, Req, Resp, handler, view, concurrency)
 
-    # §D8: precompile request-decode → handler → response-encode (and, under
+    # Warm-up: precompile request-decode → handler → response-encode (and, under
     # :execute, serve a default request once, its outbound `call`s null-routed).
     pol = _resolve_warmup(node, warmup, warmup_sync)
     _warmup!(pol, () -> _warm_service(pol, ent, Req, Resp, handler, warmup_sample))
@@ -223,7 +224,7 @@ end
 # A per-service scheduler: `Serial()` serves inline on the (sticky) consumer
 # task — one request at a time on one OS thread; `Parallel(n)` serves on spawned
 # threads bounded to `n` in flight by a semaphore; `Parallel(Inf)` is unbounded.
-# (D2's "busy error-reply on saturation" for services is a pending refinement;
+# (A "busy error-reply on saturation" for services is a pending refinement;
 # today a full pool blocks the consumer, buffering queries in the queryable FIFO.)
 _service_scheduler(::Serial, e, ::Type{Req}, ::Type{Resp}, h, v) where {Req, Resp} =
     query -> _serve_query(e, query, Req, Resp, h, v)
@@ -248,7 +249,7 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
                                  view::Bool, concurrency::Concurrency) where {Req, Resp}
     qable = (e.wire::_ServiceWire).queryable
     serve = _service_scheduler(concurrency, e, Req, Resp, handler, view)
-    # Sticky consumer: Serial handlers run on the node's one cooperative thread (D3).
+    # Sticky consumer: Serial handlers run on the node's one cooperative thread.
     t = Task() do
         try
             while true
@@ -276,21 +277,19 @@ const _ACTIVE_SERVICE_CELL = Base.ScopedValues.ScopedValue{Any}(nothing)
 """
     respond!(req, status::SettlementStatus, payload) -> Bool
 
-Settle the in-flight service request from inside its handler. `respond!(req,
-failed, msg)` (`failed` aliases [`failure`](@ref)) fails the request — a Zenoh
-query *error* reply carrying `msg`, so the client's [`call`](@ref) raises
-[`ServiceError`](@ref); `respond!(req, success, resp)` replies `resp`. `req` is
-the handler's argument: the result cell is taken from the handler's dynamic scope
-(a `ScopedValue` bound for the handler's extent).
+The service-handler spelling of the settlement verb [`respond!`](@ref) (an action
+goal settles via `respond!(goal, …)`). This domain's two statuses:
 
-Returns `true` (the explicit `respond!` is the authoritative settle and always
-wins the cell when it returns). Throws `ArgumentError` when called outside a
-service handler, or on a request that is already settled — a second explicit
-`respond!` is the double-settle error (settlement.jl); the return-value and
-fail-safe paths instead yield silently to an earlier `respond!`.
+  - `respond!(req, failed, msg)` (`failed` aliases [`failure`](@ref)) — a Zenoh
+    query *error* reply carrying `msg`, so the client's [`call`](@ref) raises
+    [`ServiceError`](@ref);
+  - `respond!(req, success, resp)` — replies `resp`.
 
-This is the service-handler spelling of the settlement verb [`respond!`](@ref);
-an action goal settles via `respond!(goal, …)`.
+`req` is the handler's argument; the result cell is taken from the handler's
+dynamic scope (a `ScopedValue` bound for the handler's extent).
+
+Returns `true`. Throws `ArgumentError` when called outside a service handler, or
+on an already-settled request (the double-settle error owned by [`respond!`](@ref)).
 
 ```julia
 Service(node, "validate", Validate_Request) do req
@@ -310,8 +309,8 @@ end
 # rcl-level infrastructure services (`~/get_type_description`, the parameter services)
 # sit BELOW the managed-node abstraction and must serve in every lifecycle state — a
 # manager resolves types / reads-and-sets parameters on an inactive node. Only
-# *application* services follow the §14.2 gate; matched by the resolved topic basename
-# so it holds however/whenever the service was wired.
+# *application* services follow the `isactive` dispatch gate; matched by the resolved
+# topic basename so it holds however/whenever the service was wired.
 const _INFRA_SERVICE_NAMES = ("get_type_description", "describe_parameters",
     "get_parameter_types", "get_parameters", "list_parameters",
     "set_parameters", "set_parameters_atomically")
@@ -329,13 +328,13 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
     try
         req = _decode_request(query, Req, view)
         cell = ResultCell{Query, Resp}(query, _service_deliver(e, query, Resp))
-        # §14.2 gate: an inactive managed node's application services don't run their
-        # handler — the caller gets an error reply, not a fabricated response. The
-        # control surface is exempt (isactive), so lifecycle services still serve.
+        # Dispatch gate (`isactive`): an inactive managed node's application services
+        # don't run their handler — this site replies an error rather than a fabricated
+        # response. The control surface is exempt, so lifecycle services still serve.
         # The owned query's final-ack rides the `finally` below.
         isactive(e) || _is_infra_service(e.endpoint.topic) ||
             (reply_err(query, "node inactive"); return)
-        # D7: run the handler under the node logger so a plain `@info` inside it
+        # Run the handler under the node logger so a plain `@info` inside it
         # routes to the node's /rosout (wherever `settle_handler!` runs the thunk).
         settle_handler!(cell,
                         () -> Base.ScopedValues.with(_ACTIVE_SERVICE_CELL => cell) do
@@ -381,7 +380,7 @@ end
 # `view=true` then returns a `CDRView` aliasing that *owned* copy — safe to use
 # and escape for as long as the view is reachable, since the copy outlives the
 # query.
-# TODO(view §3.2): zero-copy directly over the borrowed query payload.
+# TODO(view): zero-copy directly over the borrowed query payload.
 function decode_request(p, ::Type{Req}, view::Bool) where {Req}
     mem = Zenoh.as_memory(p, UInt8)
     # Branch on the runtime `view` Bool so each arm calls a single-return-type
@@ -398,7 +397,7 @@ end
 #   success + a `Resp` payload ⇒ reply-ok with the encoded Response
 #   failure (a message string) ⇒ reply_err (client `call` raises)
 #   aborted / force_abort! with `nothing` payload ⇒ a bare error reply (no ctor) —
-#     the §8 fail-safe outcome for a non-defaultable result or delivery failure.
+#     the fail-safe outcome for a non-defaultable result or delivery failure.
 #
 # Delivery does *not* finalize the query — `_serve_query`'s `finally` does, once,
 # after the handler returns and the cell has settled, separating the reply (here)
@@ -408,7 +407,7 @@ function _service_deliver(e::Entity, query::Query, ::Type{Resp}) where {Resp}
         if status === success && payload isa Resp
             bytes = encode(payload)
             seq = (@atomic (e.wire::_ServiceWire).seq += 1)
-            ts = nanoseconds(Dates.now(e.node, System()))   # reply-time wall ns (§3.4)
+            ts = nanoseconds(Dates.now(e.node, System()))   # reply-time wall ns
             reply(query, bytes; attachment=encode_attachment(seq, ts, gid(e)))
         else
             # Non-success (explicit `failed`, a thrown handler, or a synthesized
@@ -451,10 +450,10 @@ Base.show(io::IO, s::ServiceHandle{Req}) where {Req} =
     print(io, "Service(", s.entity.endpoint.topic, ", ", _strip_suffix(string(nameof(Req)), "_Request"),
           isopen(s) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle, §6)."
+"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle)."
 entity(s::ServiceHandle) = s.entity
 
-# ── ServiceClient + call (§8) ─────────────────────────────────────────────────
+# ── ServiceClient + call ──────────────────────────────────────────────────────
 # The client is an `Entity` of kind `Client` (it announces a matching liveliness
 # token so servers discover it); the request itself is a one-shot `Zenoh.get` on
 # the service keyexpr, not a long-lived route. `call` blocks the *calling* task
@@ -506,7 +505,7 @@ end
     ServiceClient(node, name, SrvType; qos=default_qos()) -> ServiceClient
 
 A [service](https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html)
-client for request type `Req` / response type `Resp` (§8). Constructing one
+client for request type `Req` / response type `Resp`. Constructing one
 materializes a `Client` [`Entity`](@ref) (a liveliness token so servers discover
 it, plus graph tracking) and a long-lived Zenoh `Querier` on the service keyexpr.
 That querier is the transport every [`call`](@ref) queries through, and the handle
@@ -531,7 +530,7 @@ resp = call(cli, AddTwoInts_Request(; a = 2, b = 3))
 """
 mutable struct ServiceClient{Req, Resp}
     const entity::Entity
-    @atomic seq::Int64           # per-client request sequence (attachment, §3.4)
+    @atomic seq::Int64           # per-client request sequence (rmw_zenoh attachment)
 end
 
 function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
@@ -559,14 +558,14 @@ Base.show(io::IO, c::ServiceClient{Req}) where {Req} =
           _strip_suffix(string(nameof(Req)), "_Request"),
           isopen(c) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle, §6)."
+"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle)."
 entity(c::ServiceClient) = c.entity
 
 """
     service_matched(client::ServiceClient) -> Bool
 
 Whether the client's `Querier` is routing-matched to at least one service server
-right now — i.e. a [`call`](@ref) would actually reach a server (§12). Reads the
+right now — i.e. a [`call`](@ref) would actually reach a server. Reads the
 live Zenoh matching status of the querier; returns `false` on a closed client
 (its wire has been reaped).
 
@@ -594,7 +593,7 @@ end
 
 Thrown by [`call`](@ref) when a service invocation fails: the server replied with
 a Zenoh query *error* (ROSNode signals a handler failure over Zenoh's query
-`reply_err`, §8), no matching server replied, or the call timed out. A failed
+`reply_err`), no matching server replied, or the call timed out. A failed
 invocation always surfaces as this exception — a real reply is the only way `call`
 returns a response. `msg` carries the server's error string when there is one,
 otherwise a description of the missing or timed-out reply.
@@ -610,7 +609,7 @@ Base.showerror(io::IO, e::ServiceError) = print(io, "ServiceError: ", e.msg)
 Invoke the [service](https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html):
 serialize `req`, query the client's `Querier` on the service keyexpr with the
 per-request rmw_zenoh attachment (sequence number, request-time wall clock,
-client gid, §3.4), and resolve the single reply (§8).
+client gid), and resolve the single reply.
 
 Synchronously (`async=false`, the default) this blocks the calling task — it
 yields while the reply is in flight — and returns the decoded `Resp`. A failed
@@ -627,10 +626,9 @@ that unwrapping itself.
 (`0` arms no timer). The synchronous path additionally applies a hard
 backstop — `timeout_ms/1000 + 2` seconds when set, 60 seconds when
 `timeout_ms == 0` — and when it elapses cancels the in-flight get and raises
-[`ServiceError`](@ref), covering even a `Zenoh.get` that fails to honor its own
-timeout. The backstop is
-synchronous-only: an async call is bounded only by the cancellation timer and the
-transport's own query timeout.
+[`ServiceError`](@ref), so the caller can never hang even on a `Zenoh.get` that
+fails to honor its own timeout. The backstop is synchronous-only: an async call is
+bounded only by the cancellation timer and the transport's own query timeout.
 
 Throws `ArgumentError` if `client` is closed or `req` is not the client's request
 type.
@@ -649,7 +647,7 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     e = client.entity
 
     bytes = encode(req)
-    # §D8 :execute warm-up null-routes the wire op: `encode` above still compiles and
+    # The :execute warm-up null-routes the wire op: `encode` above still compiles and
     # runs, but there is no server during warm-up, so hand back a default `Resp` (the
     # handler's continuation still compiles/runs) instead of issuing the query.
     if _WARMUP[]
@@ -657,7 +655,7 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     end
     querier = (e.wire::_ClientWire).querier
     seq = (@atomic client.seq += 1)
-    ts = nanoseconds(Dates.now(e.node, System()))      # request-time wall ns (§3.4)
+    ts = nanoseconds(Dates.now(e.node, System()))      # request-time wall ns
     attach = encode_attachment(seq, ts, gid(e))
 
     # A querier get carries no per-call timeout in libzenoh, so bound it with a
@@ -684,8 +682,8 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
 
     async && return Threads.@spawn run()
 
-    # Synchronous, but **hard-bounded** so the caller can never hang forever (§8
-    # fail-safe extends to the client). We run the reply-drain on a task and wait at
+    # Synchronous, but **hard-bounded** so the caller can never hang forever (the
+    # fail-safe contract extends to the client). We run the reply-drain on a task and wait at
     # most a deadline past `timeout_ms`; if the underlying `Zenoh.get` doesn't honor
     # its own timeout (e.g. wedged, or its I/O thread starved under transport/
     # multicast-discovery contention), we raise `ServiceError` rather than block
@@ -695,7 +693,7 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     deadline = timeout_ms > 0 ? timeout_ms / 1000 + 2.0 : 60.0
     if timedwait(() -> istaskdone(fut), deadline; pollint=0.01) === :ok
         # `fetch` on a failed task throws `TaskFailedException`; unwrap it so the
-        # caller sees the `ServiceError` (error reply / no reply) the §8 contract
+        # caller sees the `ServiceError` (error reply / no reply) the service contract
         # promises, not the task wrapper.
         try
             return fetch(fut)
@@ -718,7 +716,7 @@ call(client::ServiceClient{Req}, req; kwargs...) where {Req} =
 # Drain the GetHandler for the (single) reply. The first reply settles the call:
 # ok → decode the Response (owned — it outlives the handler), error → raise
 # ServiceError. No reply at all (timeout / no matching server) is also an error,
-# since a blocked caller must not return a fabricated response (§8).
+# since a blocked caller must not return a fabricated response.
 function _resolve_reply(gh, ::Type{Resp}, service::AbstractString) where {Resp}
     for r in gh
         if is_ok(r)
@@ -735,7 +733,7 @@ function _resolve_reply(gh, ::Type{Resp}, service::AbstractString) where {Resp}
     throw(ServiceError("no reply from service $(service) (timeout or no server)"))
 end
 
-# ── enum-instance call-method: the §6/§8 do-block spelling ────────────────────
+# ── enum-instance call-method: the do-block spelling ──────────────────────────
 # `Service`/`Subscription` are `EndpointKind` *values* (core.jl re-export); the
 # do-block `Service(node, name, T) do req … end` desugars function-first, so both
 # route through one handler-form call-method dispatched on the kind. This is the
@@ -751,13 +749,13 @@ end
         -> SubscriptionHandle{T}
 
 Declare a subscription for ROS 2 message type `T` on `topic` and start its dispatch
-runtime (§4), returning a `SubscriptionHandle{T}`. The `do`-block handler runs once per
+runtime, returning a `SubscriptionHandle{T}`. The `do`-block handler runs once per
 received message.
 
 `Subscription` is the `EndpointKind` enum value (re-exported from ROSZenoh); this
 call-method gives it the constructor spelling. The `do`-block desugars to a
 function-first call, so the handler leads the argument list. Construction resolves the
-name, builds the endpoint, declares the liveliness token and graph entry (§12), then
+name, builds the endpoint, declares the liveliness token and graph entry, then
 opens a FIFO-channel Zenoh subscriber sized to the QoS history depth and spawns the
 consumer task. The handle is tracked on `node` (reaped by `close(node)`); `close(sub)`
 tears down the route and consumer.
@@ -775,7 +773,7 @@ tears down the route and consumer.
 
 `view=true`/`view=false` are shorthand for `Checked()`/`Owned()`.
 
-`concurrency` is `Serial()` (default, D3 — one handler at a time on a single sticky task,
+`concurrency` is `Serial()` (default — one handler at a time on a single sticky task,
 preserving message order with no handler-side locks; the rclcpp single-threaded-executor
 model) or `Parallel(n)`, which runs up to `n` handlers across OS threads (order not
 preserved). A handler throw is logged, never fatal.
@@ -785,18 +783,18 @@ only matching-type samples. `match=:weak` declares `T` in the graph but wildcard
 the topic, routing an off-type sample to a per-sample backstop: a wire type or version
 other than `T` fires `on_type_mismatch` and the sample is dropped.
 
-`force_relatch=true` is the transient-local (durability) escape hatch (D4): re-deliver
+`force_relatch=true` is the transient-local (durability) escape hatch: re-deliver
 the latched history on every managed-node Active transition regardless of novelty, for
 idempotent handlers that rebuild state from latched inputs. The default deduplicates
 re-latch replays by payload novelty.
 
 `qos` carries the ROS 2 QoS profile; `durability=:transient_local` opens an Advanced
 subscriber that replays the publisher's latched history on join. `warmup`/`warmup_sync`/
-`warmup_sample` drive §D8 precompilation of the decode + handler-dispatch chain, so it is
+`warmup_sample` drive precompilation of the decode + handler-dispatch chain, so it is
 already compiled when the first real message arrives.
 
-While a managed node is outside the `Active` lifecycle state, the handler does not fire
-(the §14.2 dispatch gate).
+While a managed node is outside the [`Active`](@ref) lifecycle state, the handler does
+not fire — this is the delivery point of the [`isactive`](@ref) dispatch gate.
 
 ```julia
 sub = Subscription(node, "/chatter", std_msgs.msg.String) do msg

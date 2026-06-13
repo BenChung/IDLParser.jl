@@ -219,7 +219,7 @@ function JumpCallback(f::Function; min_forward=nothing, min_backward=nothing,
         on_clock_change)
 end
 
-# whether a jump passes a callback's thresholds (used by the §14 jump dispatch)
+# whether a jump passes a callback's thresholds (used by the jump dispatch)
 function _triggers(cb::JumpCallback, j::TimeJump)
     (cb.on_clock_change && (j.kind === sim_activated || j.kind === sim_deactivated)) && return true
     if j.delta.ns >= 0
@@ -242,7 +242,7 @@ A node-bound clock handle. Read it with `now(clock)`, wait on it with
 `clock(node)` / `clock(node, Steady())`.
 """
 struct Clock{C<:ClockSource}
-    node::Any              # duck-typed; the Node type lands later (§6/§14)
+    node::Any              # duck-typed; the Node type lands later
     source::C
     jumps::Vector{JumpCallback}
 end
@@ -296,7 +296,7 @@ register!(f::Function, c::Clock; kwargs...) = register!(c, JumpCallback(f; kwarg
 _read_ns(::Steady) = Int64(Base.time_ns() & typemax(Int64))   # monotonic, ns
 _read_ns(::System) = round(Int64, time() * 1e9)               # wall, ns since unix epoch
 
-# ROS clock (§7): sim time from the owning Context's `/clock` source when this clock's
+# ROS clock: sim time from the owning Context's `/clock` source when this clock's
 # node opted into `use_sim_time`, else system time. The common (non-sim) path is
 # lock-free: `sim_time_ns === nothing` short-circuits before the per-node opt-in check
 # (which takes `_sim_lock`). The Context's own ROS clock (`c.node === ctx`) is never a
@@ -386,7 +386,7 @@ function _clock_ctx(node)
     nothing
 end
 
-# The actual blocking wall sleep, interruptible on Context shutdown (§14). Parks
+# The actual blocking wall sleep, interruptible on Context shutdown. Parks
 # on the Context's `_shutdown_wake` condition, which the drain notifies as step 1;
 # a one-shot `Base.Timer` bounds the wait to the requested span (a `Threads.Condition`
 # has no timed wait). Re-checks `is_shutdown` under the condition lock so a drain that
@@ -446,7 +446,7 @@ end
 Timer(node, period; clock::ClockSource=ROS()) =
     error("Timer requires a callback: `Timer(node, period; clock) do … end`")
 
-# §14.2 dispatch gate for a timer tick: a Timer on a non-Active managed node must
+# The dispatch gate for a timer tick: a Timer on a non-Active managed node must
 # not fire. The gate keys on the owning node (`clk.node`); `isactive(::Node)` folds
 # in the LifecycleNode lookup (and is always `true` for an unmanaged node). A
 # context-level clock has no node to gate, so it always ticks. `isactive`/`Node`

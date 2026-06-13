@@ -1,4 +1,4 @@
-# §12 Discovery, the graph & QoS — all views over one change stream. The Context
+# Discovery, the graph & QoS — all views over one change stream. The Context
 # already owns the discovery index (`GraphIndex`), the liveliness subscriber that
 # feeds it, and the inject/remove seam for our own entities (context.jl). This
 # file is everything built *on top* of that one stream:
@@ -6,17 +6,17 @@
 #   - graph queries (endpoints / publishers_info / count_* / topic_names_and_types
 #     / node_names) over the index snapshot;
 #   - graph waits (service_is_ready / wait_for_service / wait_for_graph_change),
-#     parking on the index's `changed` condition, shutdown-interruptible (§14);
+#     parking on the index's `changed` condition, shutdown-interruptible;
 #   - the mismatch detectors (type-mismatch, QoS-incompat) as `on_graph_change`
 #     listeners — deduped + throttled — firing `on_type_mismatch` /
-#     `on_qos_incompatible` events (§12.2);
+#     `on_qos_incompatible` events;
 #   - the QoS event surface sourced from the same stream + the attachment:
 #     liveliness-changed (from the stream) and message-lost (attachment `seq`
 #     gaps). deadline/lifespan enforcement is a per-endpoint concern left as
-#     TODO(§12.3) — the events feed off the data plane, not the graph.
+#     a TODO — the events feed off the data plane, not the graph.
 #
-# Everything here keys off `EndpointInfo` (context.jl): node identity, kind,
-# resolved topic, `TypeInfo` (name + RIHS01 hash), `QosProfile`, gid, `is_local`.
+# Everything here keys off the `EndpointInfo` records the context owns: one per
+# discovered endpoint, the unit every query and detector below filters and pairs.
 
 using Zenoh: Zenoh
 using ROSZenoh: ROSZenoh, EndpointKind, Publisher, Subscription, Service, Client,
@@ -32,7 +32,7 @@ export endpoints, publishers_info, subscriptions_info,
        TypeMismatch, QosIncompatible, MessageLost,
        qos_compatible, QosIncompatibility
 
-# ── graph queries (§12.1) ───────────────────────────────────────────────────
+# ── graph queries ───────────────────────────────────────────────────────────
 # Symmetric self+remote queries over the index snapshot. Each filters
 # `endpoints_snapshot(ctx)` (a consistent instant, copied under the lock by
 # context.jl) — never the live dict, so a query can't race a discovery update.
@@ -42,9 +42,9 @@ export endpoints, publishers_info, subscriptions_info,
               namespace=nothing) -> Vector{EndpointInfo}
 
 Return every endpoint in the discovery graph matching the given filters, the
-primary entry into the ROS 2 graph as this stack sees it (§12.1). Each result is
-an `EndpointInfo` carrying node identity, `kind`, resolved topic, `TypeInfo`
-(type name + RIHS01 hash), `QosProfile`, gid, and an `is_local` flag.
+primary entry into the ROS 2 graph as this stack sees it. Each result is
+an [`EndpointInfo`](@ref) — the owning node, `kind`, topic, type, QoS, gid, and
+locality of one discovered endpoint.
 
 Filters combine conjunctively, and a `nothing` filter matches anything. `topic`
 matches the resolved fully-qualified name: a relative name resolves against the
@@ -92,11 +92,10 @@ end
     publishers_info(node, topic) -> Vector{EndpointInfo}
 
 Return the publishers currently advertised on `topic` (resolved to its
-fully-qualified name). Each `EndpointInfo` carries the publisher's `TypeInfo`
-(type name + RIHS01 hash), `QosProfile`, and gid, enough for a caller to run its
-own type and QoS compatibility check (§12.2) against its local endpoint. The
-ROS 2 `get_publishers_info_by_topic` equivalent; [`subscriptions_info`](@ref) is
-the dual.
+fully-qualified name), each an [`EndpointInfo`](@ref) — enough for a caller to
+run its own type and QoS compatibility check against its local endpoint.
+The ROS 2 `get_publishers_info_by_topic` equivalent; [`subscriptions_info`](@ref)
+is the dual.
 """
 publishers_info(node, topic::AbstractString) =
     endpoints(node; topic=topic, kind=Publisher)
@@ -105,8 +104,8 @@ publishers_info(node, topic::AbstractString) =
     subscriptions_info(node, topic) -> Vector{EndpointInfo}
 
 Return the subscriptions currently present on `topic` (resolved to its
-fully-qualified name), each carrying the subscriber's `TypeInfo`, `QosProfile`,
-and gid. The ROS 2 `get_subscriptions_info_by_topic` equivalent and the dual of
+fully-qualified name), each an [`EndpointInfo`](@ref). The ROS 2
+`get_subscriptions_info_by_topic` equivalent and the dual of
 [`publishers_info`](@ref).
 """
 subscriptions_info(node, topic::AbstractString) =
@@ -135,12 +134,12 @@ count_subscribers(node, topic::AbstractString) = length(subscriptions_info(node,
 
 Map each topic (resolved fully-qualified name) to the distinct `TypeInfo`s
 advertised on it across the graph, the ROS 2 `get_topic_names_and_types`
-equivalent (§12.1). By default the map covers pub/sub topics; pass
+equivalent. By default the map covers pub/sub topics; pass
 `include_services=true` to fold in service and client endpoints as well.
 
 Two or more `TypeInfo` entries for one topic signal a type mismatch on the wire:
 endpoints differ either in type name or in RIHS01 hash (a version skew).
-Endpoints whose type is the `EMPTY_TOPIC_TYPE` token (`type === nothing`) are
+Endpoints with no declared type (`type === nothing`) are
 omitted, since they carry no type to report.
 
 ```julia
@@ -165,7 +164,7 @@ end
     node_names(node_or_ctx) -> Vector{NodeInfo}
 
 Return the distinct nodes seen in the graph, the ROS 2
-`get_node_names_and_namespaces` equivalent (§12.1). Identity is recovered from
+`get_node_names_and_namespaces` equivalent. Identity is recovered from
 the owning-node fields carried on each endpoint (a node advertises its own
 presence as a topic-less endpoint shell), deduplicated by `(namespace, name)`.
 
@@ -191,7 +190,7 @@ function node_names(node_or_ctx)
     out
 end
 
-# ── graph waits (§12.1) — park on the change stream, shutdown-interruptible ──
+# ── graph waits — park on the change stream, shutdown-interruptible ──────────
 # Every wait re-checks a predicate over the snapshot, then blocks on the index's
 # `changed` condition until the next discovery event re-checks. The Context's
 # drain notifies the same condition (`all=true`, context.jl step 1), so a blocked
@@ -199,7 +198,7 @@ end
 
 # Block until `pred()` holds or the deadline/shutdown fires. Returns true if the
 # predicate became true; false on timeout. Raises ShutdownException if the Context
-# drains while we wait (the cooperative unwind signal, §14). `timeout` is seconds;
+# drains while we wait (the cooperative unwind signal). `timeout` is seconds;
 # `nothing` waits forever.
 function _wait_on_graph(ctx::Context, pred; timeout::Union{Real, Nothing})
     pred() && return true
@@ -234,8 +233,8 @@ end
     service_is_ready(node, service_name) -> Bool
 
 Return `true` when a service server is present in the graph on the resolved
-service name, the ROS 2 `Client.service_is_ready` equivalent (§12.1). The client
-form reads the resolved name and owning node from the client handle's `Entity`;
+service name, the ROS 2 `Client.service_is_ready` equivalent. The client
+form reads the resolved name and owning node off the handle's [`Entity`](@ref);
 the name form resolves `service_name` against the node. Readiness means a
 `Service`-kind endpoint exists on that name; local entities count, so our own
 service reads as ready the instant it is declared.
@@ -267,7 +266,7 @@ end
     wait_for_service(node, service_name; timeout=nothing) -> Bool
 
 Block the calling task until a matching service server is reachable, the ROS 2
-`Client.wait_for_service` equivalent (§12.1). Return `true` once ready, or
+`Client.wait_for_service` equivalent. Return `true` once ready, or
 `false` if `timeout` seconds elapse first (`nothing` waits forever). Raises
 [`ShutdownException`](@ref) if the Context begins draining while the task is
 parked, so a blocked wait cooperatively unwinds and lets the drain proceed.
@@ -317,7 +316,7 @@ end
     wait_for_action_server(client::ActionClient; timeout=nothing) -> Bool
 
 Block the calling task until the action client is routing-matched to a server,
-the ROS 2 `ActionClient.wait_for_server` equivalent (§9). Matching requires both
+the ROS 2 `ActionClient.wait_for_server` equivalent. Matching requires both
 the client's `send_goal` and `get_result` Queriers to have matched the server's
 queryables. Return `true` once matched, or `false` if `timeout` seconds elapse
 (`nothing` waits forever). Raises [`ShutdownException`](@ref) if the Context
@@ -345,9 +344,9 @@ function _service_present(ctx::Context, want::AbstractString)
     false
 end
 
-# Recover the generic `Entity` from a client handle. Pattern handles (pubsub.jl's
-# `PublisherHandle`/`SubscriptionHandle`, service.jl's `ServiceClient`) all *hold*
-# an `Entity` in a `.entity` field — accept that shape directly, or an `Entity`.
+# Recover the [`Entity`](@ref) a client handle wraps. The pattern handles
+# ([`PublisherHandle`](@ref), [`SubscriptionHandle`](@ref), [`ServiceClient`](@ref))
+# all hold one in a `.entity` field — accept that shape directly, or a bare Entity.
 _client_entity(e::Entity) = e
 _client_entity(client) = hasproperty(client, :entity) ? client.entity::Entity :
     throw(ArgumentError("wait_for_service expects a service client (or node + name)"))
@@ -357,7 +356,7 @@ _client_entity(client) = hasproperty(client, :entity) ? client.entity::Entity :
 
 Block the calling task until the set of endpoints in the graph differs from the
 set observed at entry — an endpoint appeared or disappeared — the low-level wait
-behind the polling forms of the graph queries (§12.1). Return `true` when a
+behind the polling forms of the graph queries. Return `true` when a
 change is observed, or `false` if `timeout` seconds elapse (`nothing` waits
 forever). Raises [`ShutdownException`](@ref) if the Context begins draining
 while parked.
@@ -376,7 +375,7 @@ end
 
 _graph_keyset(ctx::Context) = @lock ctx.graph.lock Set(keys(ctx.graph.endpoints))
 
-# ── mismatch detection (§12.2) — views on the change stream ─────────────────
+# ── mismatch detection — views on the change stream ─────────────────────────
 # Both detectors are `on_graph_change` listeners: when an endpoint appears, they
 # compare it to the standing endpoints on the other side of the local/remote
 # divide on the same topic and, on a violation, fire a programmatic event and
@@ -391,8 +390,8 @@ _graph_keyset(ctx::Context) = @lock ctx.graph.lock Set(keys(ctx.graph.endpoints)
     TypeMismatch(local_endpoint, remote_endpoint, reason, suggestion)
 
 A detected type incompatibility between one of our endpoints and a remote
-endpoint on the same topic, delivered to [`on_type_mismatch`](@ref) listeners
-(§12.2). `local_endpoint` and `remote_endpoint` are the two `EndpointInfo`s
+endpoint on the same topic, delivered to [`on_type_mismatch`](@ref) listeners.
+`local_endpoint` and `remote_endpoint` are the two `EndpointInfo`s
 involved. `reason` is `:name` (the two carry entirely different types —
 typically a wrong topic wiring) or `:hash` (same type name, different RIHS01
 hash — a version skew that makes the remote's bytes decode-unsafe against our
@@ -409,8 +408,8 @@ end
     QosIncompatible(local_endpoint, remote_endpoint, issues, suggestion)
 
 A detected QoS incompatibility between one of our endpoints and a remote
-endpoint on the same topic, delivered to [`on_qos_incompatible`](@ref) listeners
-(§12.2). The two `EndpointInfo`s are `local_endpoint` and `remote_endpoint`.
+endpoint on the same topic, delivered to [`on_qos_incompatible`](@ref) listeners.
+The two `EndpointInfo`s are `local_endpoint` and `remote_endpoint`.
 `issues::Vector{QosIncompatibility}` lists the offending policies under the DDS
 Request-vs-Offered rule (computed by `qos_compatible`), and `suggestion`
 is a human-facing fix hint naming each offered-versus-requested gap.
@@ -545,7 +544,7 @@ function _emit_type_mismatch(d::_Detectors, local_e, remote, reason, suggestion)
 end
 
 # Route a pre-built `TypeMismatch` — from the per-sample weak-static backstop
-# (`check_sample_type`, §12.2/A2) — through the SAME dedupe/throttle + listener
+# (`check_sample_type`) — through the SAME dedupe/throttle + listener
 # fan-out as the graph-match detector, so one logical mismatch reports once across
 # both the on-the-wire and graph paths (signature mirrors `_emit_type_mismatch`).
 function report_type_mismatch!(ctx::Context, tm::TypeMismatch)
@@ -601,7 +600,7 @@ end
 
 Register `f(::TypeMismatch)` to fire when one of our endpoints and a remote
 endpoint on the same topic carry incompatible types — a different type name, or
-the same name with a different RIHS01 version (§12.2). Return `f`. The ROS 2
+the same name with a different RIHS01 version. Return `f`. The ROS 2
 incompatible-type event surface.
 
 Detection runs as a listener on the discovery change stream: when an endpoint
@@ -638,7 +637,7 @@ end
 Register `f(::QosIncompatible)` to fire when one of our endpoints shares a
 topic with a remote endpoint whose QoS is incompatible with ours — under the
 DDS Request-vs-Offered rule, the offered profile ranks below the requested one
-on some policy (§12.2). Return `f`. The ROS 2 incompatible-QoS event surface,
+on some policy. Return `f`. The ROS 2 incompatible-QoS event surface,
 covering reliability, durability, deadline, and liveliness (kind and lease).
 
 Detection runs on the discovery change stream and is deduplicated by signature
@@ -659,15 +658,15 @@ end
 """
     check_sample_type(sub, sample) -> Union{TypeMismatch, Nothing}
 
-Per-sample type backstop (§12.2): for a wildcard subscription, the concrete remote
+Per-sample type backstop: for a wildcard subscription, the concrete remote
 type only appears on the wire, not in a graph match — so on receipt, parse the
-sample's topic keyexpr (`parse_topic_keyexpr`) and compare its `TypeInfo` to the
+sample's topic keyexpr and compare its `TypeInfo` to the
 subscription's. Returns a `TypeMismatch` (and lets the caller decide to drop/warn)
 or `nothing` when types agree or the key carries no type (ros2dds, EMPTY).
 
 The subscription dispatch path (`_predispatch`, dispatch.jl) calls this before
-decoding for weak-static subscriptions and routes a mismatch through
-`report_type_mismatch!`; a hash mismatch means the bytes are
+decoding for weak-static subscriptions and routes a mismatch to the
+type-mismatch listeners; a hash mismatch means the bytes are
 decode-unsafe against the local struct.
 """
 function check_sample_type(sub, sample)
@@ -700,13 +699,13 @@ _remote_shell(local_endpoint, got::TypeInfo) =
     EndpointInfo("", "", Publisher, local_endpoint.topic, got,
                  local_endpoint.qos, ntuple(_ -> 0x00, 16), false)
 
-# ── QoS event surface: liveliness-changed & message-lost (§12.3) ────────────
+# ── QoS event surface: liveliness-changed & message-lost ────────────────────
 
 """
     liveliness_changed(node_or_ctx, topic) -> (; alive, not_alive)
 
 A snapshot of the liveliness of *remote* publishers on `topic` (resolved FQN),
-sourced from the discovery stream (§12.3): `alive` is the count currently present
+sourced from the discovery stream: `alive` is the count currently present
 in the graph. There is no separate liveliness protocol — a Zenoh liveliness token
 present ⇒ alive, withdrawn (DELETE) ⇒ not alive, which the index already tracks.
 For change *events*, register an [`on_graph_change`](@ref) listener filtered to
@@ -727,13 +726,13 @@ end
 
 A detected gap in a publisher's per-message sequence numbers, delivered to
 [`on_message_lost`](@ref) listeners — the ROS 2 `MessageLost` event reconstructed
-from the rmw_zenoh per-message sequence number (§12.3). `topic` is the resolved
+from the rmw_zenoh per-message sequence number. `topic` is the resolved
 topic; `source_gid` is the publisher whose stream gapped; `expected_seq` is the
 next sequence number we expected from it; `got_seq` is the one that arrived; and
 `count` is the number of messages lost in between (`got_seq - expected_seq`).
 
 ROS 2 inherits this event from DDS; here it is reconstructed from the
-`sequence_number` the rmw_zenoh put attachment carries per message (§3.4) rather
+`sequence_number` the rmw_zenoh put attachment carries per message rather
 than from a DDS-native lost count.
 """
 struct MessageLost
@@ -765,7 +764,7 @@ _lost_tracker(e::Entity) = @lock _LOST_LOCK get!(() -> _LostTracker(), _LOST, ob
 
 Register `f(::MessageLost)` to fire when a gap opens in a publisher's
 per-message sequence numbers on subscription `sub` — one publisher's sequence
-number jumping by more than one between consecutive received messages (§12.3).
+number jumping by more than one between consecutive received messages.
 Return `f`. The ROS 2 message-lost event surface.
 
 Registering the first listener flips a per-subscription gate so the dispatch
@@ -796,7 +795,7 @@ end
 """
     note_sequence!(sub, sample) -> Union{MessageLost, Nothing}
 
-Feed one received sample to the message-lost detector for `sub` (§12.3): decode
+Feed one received sample to the message-lost detector for `sub`: decode
 `(seq, _, gid)` and, if `seq` skipped ahead of the last value seen from that
 `gid`, fire the `on_message_lost` listeners and return the `MessageLost`. Returns
 `nothing` when in-order (or the very first message from a gid, or the sample
@@ -847,7 +846,7 @@ end
 # deadline-missed (per-endpoint Timer) and lifespan (drop on attachment-ts age)
 # enforcement are data-plane concerns, not graph views; they hang off the
 # subscription's dispatch + a per-endpoint clock.
-# TODO(§12.3): deadline-missed Timer (notify-only, matches ROS2) and lifespan
+# TODO: deadline-missed Timer (notify-only, matches ROS2) and lifespan
 # drop (compare `source_timestamp` to `now` against `qos.lifespan`). Both want
-# the §7 clock + the subscription dispatch hook; left as a stub here so this file
+# the node clock + the subscription dispatch hook; left as a stub here so this file
 # stays a pure view over the graph + attachment stream and precompiles standalone.

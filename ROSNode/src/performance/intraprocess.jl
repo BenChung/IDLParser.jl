@@ -1,10 +1,10 @@
-# §15.1 Intra-process short-circuit. When a publisher and a subscriber share a
+# Intra-process short-circuit. When a publisher and a subscriber share a
 # Context, the publisher hands the message object to the subscriber's handler
 # directly — skipping the CDR serialize, the Zenoh hop, and the decode. Wired into
 # publish/declare/close and tested, but **off by default** for now (opt in with
 # `set_intra_process!(true)`) pending broad-suite validation before flipping the
 # design's on-by-default; with it off, same-Context delivery rides Zenoh's loopback.
-# The realization that keeps it API-minimal (DESIGN §Intra-process):
+# The realization that keeps it API-minimal:
 # *intra-process is the same receive model with an in-heap Julia object as the
 # buffer instead of a Zenoh payload*, so the existing knobs carry it:
 #
@@ -23,14 +23,14 @@
 #     message to each local sub's per-endpoint worker (not inline on the publisher's
 #     task), then `put` still runs once for any remote subscribers.
 #
-# Scope is same-Context (§15.2): two Contexts in one process have separate Zenoh
+# Scope is same-Context: two Contexts in one process have separate Zenoh
 # sessions, so cross-Context-same-process is a cross-registry match, deferred.
 
 using ROSZenoh: ROSZenoh, qos_compatible
 using Zenoh: Localities
 
 # ── intra-process toggle ──────────────────────────────────────────────────────
-# Off by default (see the header); opt in process-wide. The DESIGN names a
+# Off by default (see the header); opt in process-wide. The design calls for a
 # per-Context `intra_process` flag; the `Context` struct doesn't carry one yet
 # (context.jl is a lower layer), so the switch is process-global here. When the
 # flag lands on `Context`, `intra_process_enabled(ctx)` is the single seam to
@@ -40,13 +40,13 @@ const _INTRA_PROCESS = Ref(false)
 """
     set_intra_process!(on::Bool) -> Bool
 
-Enable/disable the intra-process short-circuit (§15.1) process-wide. **Off by
+Enable/disable the intra-process short-circuit process-wide. **Off by
 default** for now (the mechanism is wired + tested but not yet flipped to the
 design's on-by-default, pending broad-suite validation); opt in with
 `set_intra_process!(true)`. Returns the previous setting. Affects only
 same-Context delivery; the Zenoh data path is unchanged.
 
-TODO(§5): when the `Context` carries a per-Context `intra_process` flag this
+TODO: when the `Context` carries a per-Context `intra_process` flag this
 becomes its default; [`intra_process_enabled`](@ref) is the seam to read it.
 """
 function set_intra_process!(on::Bool)
@@ -58,7 +58,7 @@ end
 """
     intra_process_enabled(ctx) -> Bool
 
-Whether the intra-process short-circuit is active for `ctx` (§15.1). The single
+Whether the intra-process short-circuit is active for `ctx`. The single
 predicate the publish and subscription paths consult. Process-global today (see
 [`set_intra_process!`](@ref)); per-Context when the flag lands on `Context`.
 """
@@ -66,10 +66,10 @@ intra_process_enabled(::Context) = _INTRA_PROCESS[]
 
 # ── the per-Context local-subscription registry ───────────────────────────────
 # Each registered subscription records exactly what direct delivery needs: the
-# owning `Entity` (for liveness/topic/QoS/lifecycle gating), the message type and
-# the QoS (for type+RxO matching), the user handler, and the `view`/`concurrency`
-# policies (delivery mirrors the §4 dispatch). Keyed by `Entity` so close/dispose
-# remove it by identity.
+# owning [`Entity`](@ref), the message type and the QoS (for type+RxO matching),
+# the user handler, and the `view`/`concurrency` policies (delivery mirrors the
+# subscription dispatch runtime). Keyed by `Entity` so close/dispose remove it by
+# identity.
 #
 # The `Context` struct (a lower layer) has no slot for this, so the registry lives
 # module-side, keyed by Context. A `WeakKeyDict` lets a dropped-but-not-closed
@@ -79,11 +79,17 @@ intra_process_enabled(::Context) = _INTRA_PROCESS[]
 """
     LocalSubscription{T}
 
-A same-Context subscription as the intra-process path sees it (§15.1): the backing
-[`Entity`](@ref) plus the typed surface direct delivery needs — message type `T`,
-QoS (for RxO matching), the user `handler`, and the `view`/`concurrency` policies
-(delivery mirrors the §4 dispatch runtime exactly). Held in the Context's local
-registry; one per intra-process-eligible `Subscription`.
+A same-Context subscription as the intra-process short-circuit sees it. Wraps the
+backing [`Entity`](@ref) — which owns the id, liveliness token, data route, and
+graph lifecycle — adding the typed surface direct delivery needs:
+
+  - `T`, the message type, and the QoS, for type + RxO matching;
+  - the user `handler`;
+  - the `view`/`concurrency` policies (delivery mirrors the subscription dispatch
+    runtime exactly).
+
+Held in the Context's local registry; one per intra-process-eligible
+[`SubscriptionHandle`](@ref).
 """
 struct LocalSubscription{T}
     entity::Entity
@@ -93,13 +99,13 @@ struct LocalSubscription{T}
     concurrency::Concurrency
     # Per-endpoint local-delivery queue. `deliver_local` `put!`s the publisher's
     # message here (so the publisher's task is never the one running the handler);
-    # a worker task drains it and dispatches (D3-safe, see `register_local_subscription!`).
+    # a worker task drains it and dispatches (see `register_local_subscription!`).
     inbox::Channel{Any}
 end
 
 # The type name + RIHS01 hash of the subscription's type (for matching). Recovered
 # from the entity's `EndpointEntity.type_info` so it carries whatever the registry
-# specialized `type_info(T)` to (§2.1).
+# specialized `type_info(T)` to.
 _local_type(ls::LocalSubscription) = ls.entity.endpoint.type_info
 
 mutable struct _LocalRegistry
@@ -125,16 +131,16 @@ end
 """
     register_local_subscription!(entity, ::Type{T}, handler; view, concurrency) -> Entity
 
-Register a `Subscription` `entity` in its Context's intra-process registry (§15.1)
+Register a `Subscription` `entity` in its Context's intra-process registry
 so same-Context publishers can deliver to its `handler` directly. Records the
 message type, QoS, and the `view`/`concurrency` policies so direct delivery
-mirrors the §4 dispatch runtime. The subscription's Zenoh subscriber should be
+mirrors the subscription dispatch runtime. The subscription's Zenoh subscriber should be
 opened with `allowed_origin = local_origin(ctx)` so the loopback of a local
 publication is suppressed (no double-delivery).
 
 A no-op when the short-circuit is disabled ([`intra_process_enabled`](@ref)) —
 in that case the subscription receives every publication over Zenoh as usual.
-Called by the §6 subscription declaration; [`unregister_local_subscription!`](@ref)
+Called by the subscription declaration; [`unregister_local_subscription!`](@ref)
 is the close-side inverse.
 """
 function register_local_subscription!(e::Entity, ::Type{T}, handler;
@@ -149,11 +155,11 @@ function register_local_subscription!(e::Entity, ::Type{T}, handler;
         subs = get!(() -> LocalSubscription[], reg.by_topic, e.endpoint.topic)
         push!(subs, ls)
     end
-    # The per-endpoint local-delivery worker (the "endpoint worker", D6). Serial ⇒ one
+    # The per-endpoint local-delivery worker (the "endpoint worker"). Serial ⇒ one
     # task pinned `sticky` to the SAME declaring thread as this sub's Zenoh consumer
     # (_spawn_consumer): two sticky tasks on one thread are cooperative, never
     # concurrent, so the handler still runs single-threaded on its declaring thread —
-    # the §4/D3 guarantee — across BOTH local and remote deliveries. Parallel ⇒ a
+    # the dispatch runtime's guarantee — across BOTH local and remote deliveries. Parallel ⇒ a
     # non-sticky drainer that spawns a task per message (order not preserved, as on the
     # Zenoh path). The worker ends when `inbox` is closed (unregister, on close).
     w = Task(() -> _local_consume_loop(ls))
@@ -162,7 +168,7 @@ function register_local_subscription!(e::Entity, ::Type{T}, handler;
     return e
 end
 
-# Drain the local inbox and dispatch each message exactly as the §4 runtime would.
+# Drain the local inbox and dispatch each message exactly as the dispatch runtime would.
 # `_with_node_logger` mirrors the Zenoh consumer so a handler's `@info` still routes to
 # the node's /rosout. A closed inbox ends the loop (clean shutdown).
 function _local_consume_loop(ls::LocalSubscription)
@@ -214,8 +220,8 @@ end
 """
     local_origin(ctx) -> Zenoh.Locality
 
-The `allowed_origin` an intra-process subscriber's Zenoh subscriber should use
-(§15.1): `REMOTE` while the short-circuit is on (the loopback of a same-session
+The `allowed_origin` an intra-process subscriber's Zenoh subscriber should use:
+`REMOTE` while the short-circuit is on (the loopback of a same-session
 publication is ignored — the data arrives via the direct path only), `ANY`
 otherwise (every publication arrives over Zenoh). The `Subscription` declaration
 threads this into `Base.open(session, …; allowed_origin = local_origin(ctx))`.
@@ -223,12 +229,12 @@ threads this into `Base.open(session, …; allowed_origin = local_origin(ctx))`.
 local_origin(ctx::Context) =
     intra_process_enabled(ctx) ? Localities.REMOTE : Localities.ANY
 
-# ── matching (type + RxO QoS, §12.2) ──────────────────────────────────────────
+# ── matching (type + RxO QoS) ─────────────────────────────────────────────────
 # A publisher may deliver to a local sub iff their types are the same name+version
 # and the QoS is RxO-compatible (offered ≥ requested; the sub requests, the pub
 # offers — the same direction graph.jl's detector uses). `EMPTY_TOPIC_TYPE`
 # (`type_info === nothing`) on either side can't be type-checked, so we match on
-# topic alone (the user opted out of a typed topic). Lifecycle gating (§14.2) and
+# topic alone (the user opted out of a typed topic). Lifecycle gating and
 # liveness are checked at delivery, not here.
 
 function _types_match(pub_t, sub_t)
@@ -242,10 +248,10 @@ _qos_match(pub_qos::QosProfile, sub_qos::QosProfile) =
 
 # Deliver iff the endpoints carry the same *wire* type (`_types_match`: same name +
 # RIHS01) and the QoS is RxO-compatible — *regardless* of whether the publisher's and
-# subscriber's Julia structs are the identical alias. Under D10B two modules may hold
+# subscriber's Julia structs are the identical alias. Two modules may hold
 # distinct same-`(name,hash)` structs for one wire type; `_invoke_local` cross-materializes
 # the publisher's `msg` into the subscriber's declared type. A genuinely *different* wire
-# type (different name or hash) fails `_types_match` and is dropped here — graph.jl's §12.2
+# type (different name or hash) fails `_types_match` and is dropped here — graph.jl's
 # detector flags that mismatch. (Same-session loopback is suppressed via `local_origin`, so
 # a matched local sub is served *only* by this direct path — every matching sub, sibling
 # aliases included, must be delivered here or the message is lost.)
@@ -256,16 +262,16 @@ function _deliverable(pub::PublisherHandle, ls::LocalSubscription)
 end
 
 # ── direct delivery ───────────────────────────────────────────────────────────
-# Hand `msg` to each matching local sub. The `view` flag is the share/copy choice
-# (DESIGN §Intra-process): owned (default) hands a `copy` so a sub may mutate
+# Hand `msg` to each matching local sub. The `view` flag is the share/copy choice:
+# owned (default) hands a `copy` so a sub may mutate
 # freely without aliasing siblings or the publisher; `view=true` shares the object
 # read-only (true zero-copy). Immutable (`@cdr1_compat`) messages have no mutation
 # hazard, so `copy` of one is the identity and sharing is free either way.
 #
-# Delivery mirrors the §4 dispatch: `Serial()` runs the handler inline on the
+# Delivery mirrors the dispatch runtime: `Serial()` runs the handler inline on the
 # publisher's task (preserving order; the publisher already owns the call), and
 # `Parallel(n)` spawns a task per message. A handler throw is logged, never fatal —
-# one bad delivery must not break the publisher (the §4 dispatch runtime's contract).
+# one bad delivery must not break the publisher (the dispatch runtime's contract).
 # Unlike the cross-process view path there is no `with_memory`/`BorrowError`: the
 # object is GC-backed, so escape is safe; only in-place mutation is shared state.
 
@@ -273,7 +279,7 @@ end
     deliver_local(pub::PublisherHandle, msg) -> Bool
 
 Deliver `msg` to every same-Context subscriber that matches `pub`'s topic, type,
-and QoS (§15.1) — the intra-process short-circuit. Each matching subscriber's
+and QoS — the intra-process short-circuit. Each matching subscriber's
 handler runs with `msg` owned (a `copy`, the default) or shared read-only
 (`view=true`), per *that subscriber's* `view` flag, scheduled by its `concurrency`
 policy. The CDR serialize, the Zenoh hop, and the decode are all skipped.
@@ -303,7 +309,7 @@ function deliver_local(pub::PublisherHandle{T}, msg::T) where {T}
     end
     isempty(targets) && return false
 
-    # Hand off to each sub's per-endpoint worker (D6) — never run the handler on the
+    # Hand off to each sub's per-endpoint worker — never run the handler on the
     # publisher's task. A closed inbox (the sub is closing concurrently) is skipped.
     delivered = false
     for ls in targets
@@ -320,9 +326,9 @@ end
 # Hand the message to the handler *as the subscriber's declared type* `S`, with the
 # share/copy semantics the sub's `view` flag selects. Owned (default) yields an
 # independent value (mutate-freely); `view` shares read-only. When the publisher's
-# struct is a sibling alias of `S` (same wire type, different Julia struct — D10B), the
-# value is cross-materialized into `S` (`_ipc_own`/`_ipc_share`). A handler throw is
-# logged, never fatal.
+# struct is a sibling alias of `S` (same wire type, different Julia struct), the
+# value is cross-materialized into `S` (`_ipc_own`/`_ipc_share`; same wire type, distinct
+# Julia struct). A handler throw is logged, never fatal.
 function _invoke_local(ls::LocalSubscription{S}, msg) where {S}
     try
         payload = ls.view ? _ipc_share(S, msg) : _ipc_own(S, msg)
@@ -334,7 +340,7 @@ function _invoke_local(ls::LocalSubscription{S}, msg) where {S}
     nothing
 end
 
-# The owned-delivery copy. The contract (DESIGN §Intra-process) is "mutate freely":
+# The owned-delivery copy. The contract is "mutate freely":
 # a sub must be able to mutate its message without aliasing the publisher's object
 # or a sibling sub's. Generated messages are *immutable* structs (gen.jl emits
 # `@cdr1_compat`/`@kwdef struct`, no `mutable`), so the only mutable substructure
@@ -346,10 +352,10 @@ end
 # `deepcopy` (not `copy`) because immutable generated structs carry no `Base.copy`
 # method; `deepcopy` is the universally-defined, mutation-isolating copy. It is
 # heavier than the `view=true` share — which is exactly why `view=true` is the
-# opt-in for large arrays (§3.1 / the share/copy table).
+# opt-in for large arrays (the share/copy table).
 _ipc_copy(msg::T) where {T} = isbitstype(T) ? msg : deepcopy(msg)
 
-# Produce the subscriber's declared type `S` from the publisher's `msg` (§15.1, D10B).
+# Produce the subscriber's declared type `S` from the publisher's `msg`.
 # Same-alias (`S === typeof(msg)`) keeps today's behavior; a *sibling* alias of the same
 # wire type — distinct Julia struct, equal RIHS01 ⇒ identical CDR form — is
 # cross-materialized: owned (`view=false`) owes an independent value, shared (`view=true`)

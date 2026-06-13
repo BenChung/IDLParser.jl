@@ -1,10 +1,11 @@
-# ── the generic Entity handle (§6) ────────────────────────────────────────────
-# One close-able handle backing every pattern (publisher/subscription/service/
-# client). It allocates the entity id, builds the `ROSZenoh.EndpointEntity`,
+# ── the generic Entity handle ─────────────────────────────────────────────────
+# One close-able handle backing every endpoint pattern (publisher/subscription/
+# service/client). It allocates the entity id, builds the `ROSZenoh.EndpointEntity`,
 # declares the liveliness token, and — for the data-plane kinds — declares the
 # data route (a `Zenoh.Publisher` for Publisher, a FIFO-channel subscriber +
 # consumer task for Subscription). Service/Client carry the entity + token only;
-# their Zenoh queryable/querier wiring is the §8 layer's, attached via `wire`.
+# their Zenoh queryable/querier wiring is the service/client pattern layer's,
+# attached via `wire`.
 #
 # Pattern files hold an `Entity` and add their typed surface (message type,
 # handler, result cells), keeping the id/token/route/graph lifecycle in one place.
@@ -12,48 +13,51 @@
 """
     Entity
 
-The generic close-able endpoint handle behind every §6 pattern (publisher,
+The generic close-able endpoint handle behind every endpoint pattern (publisher,
 subscription, service, client). It owns the wire entity (`ROSZenoh.EndpointEntity`:
 id, kind, topic, type info, QoS), the entity's liveliness token, the 16-byte
-`source_gid` stamped on its attachments (§3.4), and its data route — a Zenoh
-publisher for a Publisher; a FIFO-channel Zenoh subscriber (the advanced variant
-for transient_local, whose declaration issues the latched-history query, D4) plus
-a consumer task for a Subscription; or `nothing` for a Service/Client, whose
-queryable/querier is wired by the pattern layer into the `wire` slot.
+`source_gid` stamped on its attachments, and its data route:
+
+- Publisher: a Zenoh publisher.
+- Subscription: a FIFO-channel Zenoh subscriber (the advanced variant for
+  transient_local, whose declaration issues the latched-history query) plus a
+  consumer task.
+- Service/Client: `nothing` — its queryable/querier is wired by the pattern
+  layer into the `wire` slot.
 
 An `Entity` is built and registered by `make_entity`, which allocates the
 id, declares the liveliness token, and tracks the entity on its node; the pattern
 layer then attaches the data route. Pattern types (the user-facing publisher/
-subscription/service/client objects) hold an `Entity` so the id/token/route/graph
+subscription/service/client objects) hold an [`Entity`](@ref) so the id/token/route/graph
 lifecycle lives in one place.
 
 `close(entity)` undeclares the route (which terminates a Subscription's consumer
 task), detaches any pattern-layer wiring in `wire`, withdraws the liveliness
 token, and drops the endpoint from the discovery index; it is idempotent, and
 `isopen(entity)` reports liveness. A transient_local subscription's Entity also
-carries a re-latch thunk, fired on a managed node's Inactive→Active transition
-to re-run its latched-history query, deduplicated against already-delivered
-samples (D4).
+carries a re-latch thunk, fired on a managed node's [`Inactive`](@ref)→[`Active`](@ref)
+transition to re-run its latched-history query, deduplicated against
+already-delivered samples.
 
-Dispatch on a Subscription Entity is gated by the node's lifecycle state (§14.2):
-samples are delivered while the node is Active and dropped otherwise; a
-LifecycleNode's control surface is exempt. Use [`dispose`](@ref) to release a
-single entity before its node closes.
+A Subscription Entity's per-sample delivery is the skip-delivery point of the
+managed-node dispatch gate ([`isactive`](@ref)): a sample is dropped unless the
+[`Node`](@ref) is [`Active`](@ref). Use [`dispose`](@ref) to release a single
+entity before its node closes.
 """
 mutable struct Entity
     const node::Node
     const endpoint::EndpointEntity       # the wire entity (id, kind, topic, …)
     const lv_key::String                 # liveliness keyexpr (graph index key)
-    const gid::NTuple{16, UInt8}         # source_gid for attachments (§3.4)
+    const gid::NTuple{16, UInt8}         # source_gid for attachments
     _lv_token::Any                       # Zenoh LivelinessToken
     # The data route: a `Zenoh.Publisher` (Publisher), a FIFO-channel subscriber
     # handler — advanced variant under transient_local — (Subscription), or
-    # `nothing` (Service/Client — their queryable/querier is wired by §8 and
-    # stored in `wire`).
+    # `nothing` (Service/Client — their queryable/querier is wired by the
+    # service/client pattern layer and stored in `wire`).
     _route::Any
     # The subscription consumer task (Subscription only); `nothing` otherwise.
     _consumer::Union{Task, Nothing}
-    # D4 re-latch thunk (transient_local Subscription only): undeclare + redeclare
+    # Re-latch thunk (transient_local Subscription only): undeclare + redeclare
     # the advanced subscriber (re-runs the history query), novelty-gated. Called by
     # `_relatch!(e)` on a managed node's Inactive→Active transition; `nothing` for
     # every other entity (volatile subs, publishers, services).
@@ -61,12 +65,12 @@ mutable struct Entity
     # Slot for the pattern layer to stash its kind-specific wiring (queryable,
     # querier, pending-reply table) so it shares this handle's lifecycle.
     wire::Any
-    # A2 weak-static Subscription: a typed sub that wildcard-matches the topic and
+    # Weak-static Subscription: a typed sub that wildcard-matches the topic and
     # runs the per-sample `check_sample_type` backstop (drop + `on_type_mismatch` on a
     # name/hash mismatch). Set by `declare_subscription!` (match=:weak); false for every
     # other entity. Written once before the consumer starts, so no atomic is needed.
     _weak_static::Bool
-    # §12.3 message-lost: set true the first time an `on_message_lost` listener
+    # message-lost: set true the first time an `on_message_lost` listener
     # registers (graph.jl). The consumer hot path reads it per sample to decide
     # whether to do the attachment-sequence bookkeeping (`note_sequence!`); the
     # common no-listener case is one atomic load, no decode, no alloc.
@@ -77,14 +81,14 @@ end
 """
     make_entity(node, kind, topic, type_info=nothing; qos=default_qos()) -> Entity
 
-Build and register an endpoint on `node` (§6). Allocates an entity id from the
-Context, constructs the `ROSZenoh.EndpointEntity`, declares its liveliness token,
-injects it into the discovery index (authoritative, §12), and tracks it on the
-node so `close(node)` reaps it. The caller (a §6 pattern) attaches the data route
-afterward via [`declare_publisher!`](@ref) / [`declare_subscription!`](@ref) or
+Build and register an endpoint on `node`. Allocates an entity id from the
+[`Context`](@ref), constructs the `ROSZenoh.EndpointEntity`, declares its liveliness
+token, injects it into the discovery index (authoritative), and tracks it on the
+node so `close(node)` reaps it. The caller (an endpoint pattern) attaches the data
+route afterward via [`declare_publisher!`](@ref) / [`declare_subscription!`](@ref) or
 its own queryable/querier into `entity.wire`.
 
-`type_info` may be `nothing` (the `EMPTY_TOPIC_TYPE` token form). `qos` defaults
+`type_info` may be `nothing` (a type-less endpoint). `qos` defaults
 to `default_qos()`.
 """
 function make_entity(node::Node, kind::EndpointKind, topic::AbstractString,
@@ -101,7 +105,7 @@ function make_entity(node::Node, kind::EndpointKind, topic::AbstractString,
     ent = Entity(node, endpoint, lv_key, gid, nothing, nothing, nothing,
                  nothing, nothing, false, false, true)
     # Declare liveliness first (peers discover us), then inject locally so our own
-    # graph queries are immediately authoritative (§12).
+    # graph queries are immediately authoritative.
     ent._lv_token = LivelinessToken(ctx.session, Keyexpr(lv_key))
     inject_endpoint!(ctx, lv_key, endpoint)
 
@@ -114,10 +118,10 @@ Base.show(io::IO, e::Entity) =
     print(io, "Entity(", e.endpoint.kind, " ", e.endpoint.topic,
           isopen(e) ? "" : ", closed", ")")
 
-"The 16-byte `source_gid` to stamp on this entity's `put`/`reply` attachments (§3.4)."
+"The 16-byte `source_gid` to stamp on this entity's `put`/`reply` attachments."
 gid(e::Entity) = e.gid
 
-# ── data routes (§6) + transient_local advanced pub/sub (D4) ───────────────────
+# ── data routes + transient_local advanced pub/sub ────────────────────────────
 # `DURABILITY_TRANSIENT_LOCAL` (latched/cached delivery to late joiners) rides
 # Zenoh's advanced pub/sub, byte/protocol-compatible with rmw_zenoh/hiroz: the
 # publisher keeps a sample cache, the subscriber issues a history query on join.
@@ -166,15 +170,15 @@ function _advanced_sub_kwargs(qos::QosProfile)
         base
 end
 
-# ── D4 novelty gate (transient_local re-latch dedup) ───────────────────────────
+# ── novelty gate (transient_local re-latch dedup) ──────────────────────────────
 # A latched `transient_local` subscription that re-runs its history query (on a
 # managed node's Inactive→Active, `_do_relatch!`) is redelivered cached samples it
 # may already have processed. Replaying an effectful handler (replan, re-arm) on an
-# unchanged value is the hazard D4 names. The gate suppresses it.
+# unchanged value is the hazard. The gate suppresses it.
 #
 # The gate keys on the payload content-hash because Zenoh's advanced-pubsub cache
 # serves history replies as bare payloads: `z_sample_attachment`/`z_sample_timestamp`
-# are null on replays, so the §3.4 attachment `(gid, seq)` and the sample timestamp
+# are null on replays, so the attachment `(gid, seq)` and the sample timestamp
 # are both gone, and the payload is all that survives the cache round-trip. For a
 # latched state topic the payload is exactly the right key: an unchanged value is
 # identical bytes (suppress), an updated value is different bytes (deliver).
@@ -191,7 +195,7 @@ end
 #   • `force` — escape hatch: deliver on every activation regardless, for idempotent
 #     handlers that deliberately rebuild state from latched inputs.
 #
-# Invariant (D4): after reactivation the node's view is indistinguishable from one
+# Invariant: after reactivation the node's view is indistinguishable from one
 # that stayed Active, save a gap where it processed nothing — effects fire once,
 # possibly later, never twice. (Edge case, accepted: two publishers emitting byte-
 # identical state are deduped across sources, and a live re-send of a byte-identical
@@ -229,10 +233,10 @@ _payload_hash(sample::AbstractSample) = hash(Zenoh.as_memory(Zenoh.payload(sampl
     declare_publisher!(entity; kwargs...) -> AbstractPublisher
 
 Declare the publish-side data route for a Publisher `entity`: a long-lived Zenoh
-publisher on the topic keyexpr (`topic_keyexpr`, §2.2), with QoS mapped onto the
+publisher on the topic keyexpr (`topic_keyexpr`), with QoS mapped onto the
 Zenoh publisher options (reliability; `transient_local` ⇒ an `AdvancedPublisher`
-with a sample cache, D4). Stored on the entity and returned (its concrete type
-flows into `PublisherHandle{T,R}` for a type-stable `put`). The §6 publisher
+with a sample cache). Stored on the entity and returned (its concrete type
+flows into [`PublisherHandle`](@ref){T,R} for a type-stable `put`). The publisher
 pattern calls this, then publishes via `put(route, payload; attachment=…)`.
 """
 function declare_publisher!(e::Entity; congestion_control=nothing, priority=nothing)
@@ -250,17 +254,18 @@ end
     declare_subscription!(entity, msgtype, handler; view=Owned(), concurrency=Serial())
 
 Declare the subscribe-side data route for a Subscription `entity` and start its
-dispatch runtime (§4). Opens a FIFO-channel Zenoh subscriber on the topic keyexpr
+dispatch runtime. Opens a FIFO-channel Zenoh subscriber on the topic keyexpr
 sized to the QoS history depth (`KeepLast(N)`→capacity N, the backpressure buffer
-that lets a blocking handler keep buffering, §2.3), then spawns the consumer task
-that decodes each sample to `msgtype` and runs `handler(msg)` per the concurrency
-policy. Returns the entity.
+that lets a blocking handler keep buffering), then spawns the consumer task that
+decodes each sample to `msgtype` and runs `handler(msg)` under `concurrency`.
+Returns the entity.
 
-`view` is the [`ViewMode`](@ref): `Owned()` (default) materializes an owned
-message; `Checked()`/`Unchecked()` deliver a zero-copy `CDRView` aliasing the
-payload (valid for the handler's duration only, §3.2), `Checked` guarded and
-`Unchecked` bare. `true` (⇒ `Checked()`) and `false` (⇒ `Owned()`) are accepted
-as shorthand.
+`view` selects the [`ViewMode`](@ref) the consumer threads into each delivery:
+[`Owned`](@ref) (default), [`Checked`](@ref), or [`Unchecked`](@ref). `true`
+(⇒ `Checked()`) and `false` (⇒ `Owned()`) are accepted as shorthand.
+
+`concurrency` is the per-sample handler scheduling: [`Serial`](@ref) (default) or
+[`Parallel`](@ref), defined by [`Concurrency`](@ref).
 """
 function declare_subscription!(e::Entity, msgtype::Type, handler;
                                view::Union{Bool, ViewMode}=Owned(),
@@ -269,7 +274,7 @@ function declare_subscription!(e::Entity, msgtype::Type, handler;
                                weak::Bool=false)
     view = _view_mode(view)
     ctx = e.node.context
-    # A2: a weak-static sub wildcard-matches the topic so off-type samples arrive for
+    # A weak-static sub wildcard-matches the topic so off-type samples arrive for
     # the per-sample backstop, while still advertising its declared type in liveliness
     # /graph (make_entity set type_info); an exact sub uses its concrete type keyexpr.
     e._weak_static = weak
@@ -278,8 +283,8 @@ function declare_subscription!(e::Entity, msgtype::Type, handler;
     cap = _fifo_capacity(e.endpoint.qos)
     qos = e.endpoint.qos
     # transient_local ⇒ an AdvancedSubscriber whose declaration issues a history
-    # query (latched delivery); volatile ⇒ the plain FIFO subscriber. The D4
-    # novelty gate is created only for the latched case (deduplicates re-latch
+    # query (latched delivery); volatile ⇒ the plain FIFO subscriber. The novelty
+    # gate is created only for the latched case (deduplicates re-latch
     # replays); a `nothing` gate is the volatile fast path (no per-sample work).
     sub = Base.open(ctx.session, Keyexpr(tk); channel=:fifo, capacity=cap,
                     allowed_origin = local_origin(ctx), _advanced_sub_kwargs(qos)...)
@@ -287,12 +292,12 @@ function declare_subscription!(e::Entity, msgtype::Type, handler;
         _NoveltyGate(_cache_depth(qos); force=force_relatch) : nothing
     e._route = sub
     e._consumer = _spawn_consumer(e, msgtype, handler, view, concurrency, sub, gate)
-    # §15.1: register for the intra-process short-circuit (a no-op when disabled). The
-    # Zenoh sub above was opened with `allowed_origin = local_origin(ctx)`, so when the
-    # short-circuit is on, the loopback of a same-Context publish is suppressed and the
-    # data arrives via the direct path only — no double-delivery.
+    # Register for the intra-process short-circuit: same-Context publisher↔subscriber
+    # pairs bypass serialize/Zenoh/decode (mechanism in performance/intraprocess.jl).
+    # The `allowed_origin = local_origin(ctx)` on the sub above is what lets it coexist
+    # with the short-circuit without double-delivery.
     register_local_subscription!(e, msgtype, handler; view = _is_view(view), concurrency = concurrency)
-    # The re-latch thunk (D4): a managed node's Inactive→Active redeclares the
+    # The re-latch thunk: a managed node's Inactive→Active redeclares the
     # advanced subscriber to re-run the history query, novelty-gated. Only meaningful
     # for transient_local — volatile subs leave `_relatch` nothing.
     if gate !== nothing
@@ -301,10 +306,10 @@ function declare_subscription!(e::Entity, msgtype::Type, handler;
     return e
 end
 
-# D4 re-latch: redeclare the advanced subscriber so its history query re-fires,
+# Re-latch: redeclare the advanced subscriber so its history query re-fires,
 # recovering latched state the node missed while inactive. The novelty gate makes the
 # redundant redelivery safe — a replayed value already delivered is dropped, only
-# genuine updates fire (D4 effectful-replay fix).
+# genuine updates fire (the effectful-replay fix).
 #
 # Order matters: tear down + **join** the old consumer *first*, so any sample it was
 # about to deliver (e.g. the declaration-time history reply that arrived once the gate
@@ -342,16 +347,16 @@ end
 """
     _relatch!(e::Entity)
 
-Re-run a transient_local subscription's latched-history fetch (D4), if it has one.
+Re-run a transient_local subscription's latched-history fetch, if it has one.
 A no-op for any entity without a re-latch thunk (volatile subs, publishers,
-services). Called on a managed node's Inactive→Active transition (lifecycle.jl).
+services). Called on a managed node's [`Inactive`](@ref)→[`Active`](@ref) transition (lifecycle.jl).
 """
 _relatch!(e::Entity) = (e._relatch === nothing ? nothing : (e._relatch(); nothing))
 
-"The data-route keyexpr for a pub/sub entity (`topic_keyexpr`, §2.2)."
+"The data-route keyexpr for a pub/sub entity (`topic_keyexpr`)."
 topic_key(e::Entity) = topic_keyexpr(e.node.context.format, e.endpoint)
 
-# Map QoS history → FIFO subscriber capacity (§2.3): KeepLast(N)→N, KeepAll→a
+# Map QoS history → FIFO subscriber capacity: KeepLast(N)→N, KeepAll→a
 # large bound (libzenohc has no true unbounded channel; size generously so the
 # common burst doesn't drop). Depth ≤ 0 is coerced to 1.
 function _fifo_capacity(qos::QosProfile)
@@ -361,7 +366,7 @@ end
 
 # QoS reliability → Zenoh reliability singleton. The other policies (durability/
 # deadline/lifespan/liveliness) are not Zenoh-transport concepts; they ride the
-# liveliness token (QoS encoding) and are enforced at our layer (§12.3).
+# liveliness token (QoS encoding) and are enforced at our layer.
 _zenoh_reliability(qos::QosProfile) =
     qos.reliability === :best_effort ? Reliabilities.BEST_EFFORT : Reliabilities.RELIABLE
 

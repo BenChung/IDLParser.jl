@@ -22,7 +22,7 @@ end
 
 Those four pieces — Context, Node, the entities, and spin — appear in every program. Topics, services, and actions each fill in the entity step with their own constructors.
 
-## Context
+## Contexts
 
 A `Context` owns the Zenoh session, discovery, and shutdown. The `@context do ctx … end` form drains in-flight work and closes the session on exit, and binds the calling module as the type-resolution home so wire types resolve against that module's imported structs.
 
@@ -34,7 +34,7 @@ end
 
 The resolution-home binding is what lets a type-less subscription decode a message into the right Julia struct; see [Runtime Type Discovery](../advanced/discovery.md) for how that resolution proceeds.
 
-## Node
+## Nodes
 
 A `Node(ctx, "name")` groups the entities you create under it: publishers, subscriptions, servers, and clients. The name is the node's identity on the graph, and every entity built against the node inherits it.
 

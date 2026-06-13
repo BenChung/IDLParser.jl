@@ -55,9 +55,9 @@ The server settles every request exactly once, and the handler reaches that sett
 |---|---|
 | **returns** a response | reply-ok — the client's [`call`](@ref) returns it |
 | **declines** — `respond!(req, failed, msg)` | a `ServiceError` reply, raised at the client's [`call`](@ref) |
-| **throws** | an error reply, so the call still resolves rather than hanging |
+| **throws** | a synthesized error reply, raised at the client's [`call`](@ref) as a `ServiceError` |
 
-The same three branches settle an [action goal](actions.md) (`succeeded` / `canceled` / `aborted`) and drive a [lifecycle transition](../composition/components.md) (land the target state / revert / error processing).
+The same three branches drive a [lifecycle transition](../composition/components.md) — land the target state / revert to origin / error processing. An [action goal](actions.md) settles through the same shape, except its `canceled` outcome comes from a thrown [`Cancelled`](@ref) (the *throws* branch), not a decline.
 
 ## Next
 

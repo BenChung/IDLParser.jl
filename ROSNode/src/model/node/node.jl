@@ -1,10 +1,10 @@
-# §6 Nodes & entities + §4 runtime. A `Node(ctx, "name"; namespace)` inherits the
-# Context's shared state, materializes a `ROSZenoh.NodeEntity`, and declares its
+# Nodes, entities, and the subscription dispatch runtime. A `Node(ctx, "name"; namespace)`
+# inherits the Context's shared state, materializes a `ROSZenoh.NodeEntity`, and declares its
 # node liveliness token. Entities (pub/sub/service/client) are created with
-# type-constructors following the `Timer(f,…)` precedent (§6): a registered
+# type-constructors following the `Timer(f,…)` precedent: a registered
 # callback that lives until `close` and dies with the node. This file owns the
-# Node type and the generic close-able `Entity` base the §6 pattern files plug
-# into, plus the §4 subscription dispatch runtime.
+# Node type and the generic close-able `Entity` base the entity pattern files plug
+# into, plus the subscription dispatch runtime.
 #
 # Naming: `Publisher`/`Subscription`/`Service`/`Client` here are the `EndpointKind`
 # enum instances re-exported by core.jl; the pattern layer (separate files) owns the
@@ -23,28 +23,28 @@ using ROSZenoh: ROSZenoh, NodeEntity, EndpointEntity, EndpointKind, QosProfile,
                 parse_topic_keyexpr, entity_gid, to_rihs_string,
                 RmwZenoh, KeyExprFormat
 # `Subscription` here doubles as the node-presence shell's kind tag and the
-# dynamic-sub graph match; the same-spelled §6 pattern-layer constructors plug into
+# dynamic-sub graph match; the same-spelled pattern-layer constructors plug into
 # this file's `make_entity`.
 using ROSZenoh: Subscription, Publisher
 
 export Node, Entity, dispose
 
 # ── Node ────────────────────────────────────────────────────────────────────
-# A Node is the §6 identity object: it inherits the Context's session/z_id/domain
-# and adds a name + namespace (the ROS naming root for relative/private resolution,
-# §5). It builds a `ROSZenoh.NodeEntity` and declares the node's own liveliness
-# token (`NN` kind, §2.2) so peers discover it. Every entity created on the node
-# is tracked here and dies with it (close-on-close, §6).
+# A Node is the identity object: it inherits the Context's session/z_id/domain
+# and adds a name + namespace (the ROS naming root for relative/private resolution).
+# It builds a `ROSZenoh.NodeEntity` and declares the node's own liveliness
+# token (`NN` node-liveliness kind) so peers discover it. Every entity created on the node
+# is tracked here and dies with it (close-on-close).
 
 """
     Node(ctx, name; namespace=nothing, enclave=nothing, serve_type_description=true,
          warmup=:precompile, warmup_sync=false)
 
-A ROS 2 node sharing Context `ctx`'s Zenoh session (§6). The node is the identity
+A ROS 2 node sharing Context `ctx`'s Zenoh session. The node is the identity
 under which publishers, subscriptions, services, clients, timers, and parameters
 are created, and the naming root for relative/private name resolution; see
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Nodes.html. The parameter
-server itself is attached by the schema form `Node(ctx, name, P)` (§10), reached
+server itself is attached by the schema form `Node(ctx, name, P)`, reached
 as `node.parameters`; this two-positional-arg form leaves `node.parameters ===
 nothing`.
 
@@ -54,25 +54,25 @@ construction. `enclave` defaults to the Context's enclave (SROS2 security enclav
 
 Construction allocates an entity id from `ctx`, builds the wire identity
 (`ROSZenoh.NodeEntity`), declares the node's liveliness token so peers discover it
-(the `NN` node-liveliness kind, §2.2), and injects the node into the local
-discovery index so self-queries see it immediately (§12). The node is registered
-with `ctx`, so a Context drain (§14) closes it. `serve_type_description=true` also
+(the `NN` node-liveliness kind), and injects the node into the local
+discovery index so self-queries see it immediately. The node is registered
+with `ctx`, so a Context drain closes it. `serve_type_description=true` also
 declares the `~/get_type_description` service (matching real ROS 2 nodes on Jazzy
 and later) so peers can resolve the types this node advertises; a failure
 declaring it is logged and construction continues.
 
-`warmup`/`warmup_sync` set the default warm-up policy for entities created on the
-node (see `WarmupPolicy`, §D8); each entity constructor's own
-`warmup`/`warmup_sync` keywords override per-endpoint. `warmup=:precompile`
-anchors the dispatch chain side-effect-free at construction; `warmup_sync=true`
-blocks each entity constructor until warm.
+`warmup`/`warmup_sync` set the node-default `WarmupPolicy` — the warm-up policy
+(precompile/execute/off, sync/async) that pre-JITs the encode/decode dispatch
+chain — for entities created on the node; the warm-up layer (base/core.jl) owns
+the policy and its modes. Each entity constructor's own `warmup`/`warmup_sync`
+keywords override per-endpoint.
 
 Every entity created against the node is tracked and dies with it: `close(node)`
 leaves the Context's sim-time set, closes each owned entity in reverse creation
 order (failures logged, teardown continues), withdraws the node liveliness token,
 and drops the node from the discovery index. `close` is idempotent and
 `isopen(node)` reports liveness. Clock access (`clock(node)`, `now(node)`,
-`Timer(node, …)`, §7) reads through the node's per-source clock table, routed to
+`Timer(node, …)`) reads through the node's per-source clock table, routed to
 the Context's session or sim time source.
 
 ```julia
@@ -92,23 +92,23 @@ mutable struct Node
     _lv_token::Any                       # Zenoh LivelinessToken; nothing once closed
     # Entities owned by this node (Entity handles). Closed in reverse on `close`.
     const entities::Vector{Any}
-    # Per-node clock handles by source (§7): `clock(node, C())` populates lazily.
+    # Per-node clock handles by source: `clock(node, C())` populates lazily.
     const clocks::Dict{DataType, Any}
-    # Cross-entity mutual exclusion (§4): a shared `ReentrantLock` for handlers
+    # Cross-entity mutual exclusion: a shared `ReentrantLock` for handlers
     # that touch shared node state. The callback-group abstraction is deferred.
     const lock::ReentrantLock
-    # Static remap table (§5): empty until `--ros-args` parsing lands.
+    # Static remap table: empty until `--ros-args` parsing lands.
     const remaps::Vector{Pair{String, String}}
-    # /rosout + logging (§13, D7), lazily populated on first use (introspection.jl):
+    # /rosout + logging, lazily populated on first use (introspection.jl):
     _rosout_pub::Any                     # node-owned /rosout publisher, shared by every node logger
     _logger::Any                         # the default node `RosoutLogger`
-    const _log_levels::Dict{String, Int32}  # §7 per-logger-name min levels (LogLevel.level)
-    # §10 parameters: a `ParameterServer{P}` when the node is built via the schema
+    const _log_levels::Dict{String, Int32}  # per-logger-name min levels (LogLevel.level)
+    # parameters: a `ParameterServer{P}` when the node is built via the schema
     # form `Node(ctx, name, P)`, else `nothing`. A plain field, so `node.parameters`
     # and atomic `open` reads go through Julia's default `getproperty`.
     parameters::Any
-    # Default warm-up policy (§D8) for entities on this node; an entity ctor's own
-    # `warmup`/`warmup_sync` kwargs override per-endpoint.
+    # Node-default `WarmupPolicy` (warm-up layer, base/core.jl) for entities on this
+    # node; an entity ctor's own `warmup`/`warmup_sync` kwargs override per-endpoint.
     const warmup::WarmupPolicy
     @atomic open::Bool
 end
@@ -134,15 +134,15 @@ function Node(ctx::Context, name::AbstractString;
                 Dict{String, Int32}(), nothing, WarmupPolicy(warmup, warmup_sync), true)
 
     # Declare the node's liveliness token (peers discover the node), then inject
-    # it into our own index so self-queries see it immediately (§12 authoritative).
+    # it into our own index so self-queries see it immediately.
     node._lv_token = LivelinessToken(ctx.session, Keyexpr(lv_key))
     inject_endpoint!(ctx, lv_key, _node_endpoint(ent))
 
-    # Track with the Context so a drain undeclares us (§14, step 4).
+    # Track with the Context so a drain undeclares us.
     register_resource!(ctx, node)
 
     # Serve `~/get_type_description` so peers can resolve the types we advertise
-    # (§13 / D5 S3) — real ROS2 nodes (Jazzy+) serve it by default too. Best-effort:
+    # — real ROS2 nodes (Jazzy+) serve it by default too. Best-effort:
     # a failure here must not abort node creation. Forward reference into
     # introspection.jl (included later in the module).
     if serve_type_description
@@ -158,7 +158,7 @@ end
 # The graph index keys on `EndpointInfo`, and a node token (`NN`) carries no
 # endpoint (the wire side's `_ingest_liveliness!` skips `NodeEntity`). Our own
 # node's presence is therefore a topic-less endpoint shell carrying just the node
-# identity; `node_names` (§12) recovers (name, namespace) from it, with the kind
+# identity; `node_names` recovers (name, namespace) from it, with the kind
 # immaterial (`Subscription` is an arbitrary tag).
 _node_endpoint(ent::NodeEntity) =
     EndpointEntity(; id=ent.id, node=ent, kind=Subscription, topic="",
@@ -169,7 +169,7 @@ Base.isopen(node::Node) = @atomic node.open
 Base.show(io::IO, node::Node) =
     print(io, "Node(", node.fqn, isopen(node) ? "" : ", closed", ")")
 
-"The Context backing this node (§5/§6)."
+"The Context backing this node."
 context(node::Node) = node.context
 
 # `_ctx`/`_node_clock` from context.jl/time.jl are duck-typed on `.context`/
@@ -179,14 +179,14 @@ context(node::Node) = node.context
 """
     close(node::Node)
 
-Undeclare everything the node owns (§6/§14): close each entity in reverse
+Undeclare everything the node owns: close each entity in reverse
 creation order, withdraw the node liveliness token, and drop the node from the
 discovery index. Idempotent — a second close is a no-op. Entity `close` failures
 are logged and teardown continues to the remaining entities.
 """
 function Base.close(node::Node)
     (@atomicswap node.open = false) || return nothing
-    # §7: leave the Context's sim-time set (idempotent; tears down the `/clock` source
+    # Leave the Context's sim-time set (idempotent; tears down the `/clock` source
     # if this was the last user). Runs after marking the node closed so `_fire_jumps_to!`
     # (which guards on `isopen`) skips the deactivation jump — close delivers no callbacks.
     try
@@ -216,7 +216,7 @@ function Base.close(node::Node)
     nothing
 end
 
-# ── concurrency policy (§4, D2/D3) ────────────────────────────────────────────
+# ── concurrency policy ────────────────────────────────────────────────────────
 # The `Concurrency` type (core.jl) selects the dispatch strategy. A scheduler is a
 # `thunk -> nothing` closure built once per subscription that decides where the
 # per-sample work runs: `Serial()` runs it inline on the (sticky) consumer task —

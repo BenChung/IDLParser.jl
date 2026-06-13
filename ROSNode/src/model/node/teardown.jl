@@ -1,9 +1,9 @@
-# ── entity teardown (§6/§14) ──────────────────────────────────────────────────
+# ── entity teardown ───────────────────────────────────────────────────────────
 
 """
     close(entity::Entity)
 
-Undeclare the entity (§6): close the data route (which stops the consumer task's
+Undeclare the entity: close the data route (which stops the consumer task's
 iteration for a Subscription), withdraw the liveliness token, drop it from the
 discovery index, and detach any pattern-layer wiring (`entity.wire`). Idempotent.
 """
@@ -42,8 +42,8 @@ function Base.close(e::Entity)
         e._lv_token = nothing
     end
     remove_endpoint!(ctx, e.lv_key)
-    _forget_lost_tracker!(e)        # §12.3: drop any message-lost state (no-op if none)
-    unregister_local_subscription!(e)   # §15.1: drop from the intra-process registry + stop its worker (no-op if not registered)
+    _forget_lost_tracker!(e)        # drop any message-lost state (no-op if none)
+    unregister_local_subscription!(e)   # drop from the intra-process registry + stop its worker (no-op if not registered)
     nothing
 end
 

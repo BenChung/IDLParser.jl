@@ -36,13 +36,28 @@ end
 _wildcard_data_keyexpr(fmt::KeyExprFormat, ep::EndpointEntity) = topic_keyexpr(fmt, ep)
 
 """
-    declare_subscription!(entity, handler; concurrency=Serial())
+    declare_subscription!(entity, handler; view=Owned(), concurrency=Serial())
 
 Declare a type-less (dynamic) subscription route: a FIFO Zenoh subscriber on the
 topic's wildcard data keyexpr, accepting samples of every type published on the
 topic, plus a consumer that resolves each sample's type at runtime and dispatches
 it through `invokelatest`. The typed method `declare_subscription!(entity, msgtype,
 handler; …)` decodes a fixed `T` directly for the min-copy fast path.
+
+Keyword arguments:
+- `view::Union{Bool,ViewMode}`: how each sample reaches the handler — see
+  [`ViewMode`](@ref) ([`Owned`](@ref)/[`Checked`](@ref)/[`Unchecked`](@ref)).
+  Every mode applies as in the typed form; resolution crosses the world-age
+  boundary first, then `_dispatch_decoded` honors the mode unchanged.
+- `concurrency::Concurrency`: how decode+handler are scheduled per sample — see
+  [`Concurrency`](@ref) ([`Serial`](@ref)/[`Parallel`](@ref)). A single worker
+  drains the buffer in arrival order across world-age re-entries, so [`Serial`](@ref)
+  preserves total order even through first-sight `realize!` codegen.
+- `warmup::WarmupPolicy`: the warm-up policy (precompile/execute/off, sync/async)
+  that pre-JITs the encode/decode dispatch chain; owned by the warm-up layer
+  (base/core.jl), defaulting to the node default. Here it also replays this node's
+  interaction manifest to warm prior-run types ahead of the first message. The
+  handler can branch on [`is_warming`](@ref) to skip side effects during a warm pass.
 
 ROS 2 topic/subscription model:
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html
@@ -129,7 +144,7 @@ function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency
                     pool === nothing || put!(pool, h)         # recycle, don't enqueue
                     continue
                 end
-                _note_lost(e, h)                              # §12.3, only when a listener is registered
+                _note_lost(e, h)                              # report dropped samples, only when a listener is registered
                 # No `string(keyexpr(h))` here: the owned holder carries the keyexpr,
                 # so the worker reads it by borrowing (hash + memcmp cache hit), and
                 # only a cold first-sight miss materializes the String.
@@ -225,9 +240,9 @@ end
 const _DYNAMIC_REENTRIES = Threads.Atomic{Int}(0)
 
 # Keyexpr cache key: a hash of the borrowed keyexpr bytes, so the hot path never
-# allocates a `String` (§3 alloc cleanup). FNV-1a over the raw bytes — allocation-
-# free, no `unsafe_wrap`. Collisions are resolved by a `memcmp` against the stored
-# bytes (`_ke_bytes_eq`), so the hash needn't be cryptographic, only well-spread.
+# allocates a `String`. FNV-1a over the raw bytes — allocation-free, no `unsafe_wrap`.
+# Collisions are resolved by a `memcmp` against the stored bytes (`_ke_bytes_eq`), so
+# the hash needn't be cryptographic, only well-spread.
 @inline function _ke_fnv1a(ptr::Ptr{UInt8}, len::Int)
     h = 0xcbf29ce484222325 % UInt
     for i in 1:len
@@ -290,7 +305,7 @@ function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
         end
         # First sight of this keyexpr by this worker: materialize the String (cold,
         # once per type) and resolve (the first sample of a new type pays discovery +
-        # codegen here, off the receiver, D8 — HOL-blocking this sub only). Then hand
+        # codegen here, off the receiver — HOL-blocking this sub only). Then hand
         # the item back so the outer loop re-enters in the post-`realize!` world, where
         # `T` is directly callable for every later message.
         ke = string(Zenoh.keyexpr(h))
@@ -319,9 +334,9 @@ function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
             kebytes = Vector{UInt8}(codeunits(ke))
             cache[GC.@preserve kebytes _ke_fnv1a(pointer(kebytes), length(kebytes))] = (Tnew, kebytes)
             _log_discovered_once(e, info, source, logged, loglk)
-            # §D8/§D9: warm this runtime type's codec once (off the recv thread); `T`
-            # is runtime-born so reach the warm anchor via `invokelatest`. `warmed` is
-            # shared with the Tier-1 replay task, so the once-guard is under `warmlk`.
+            # Warm this runtime type's codec once (off the recv thread); `T` is
+            # runtime-born so reach the warm anchor via `invokelatest`. `warmed` is
+            # shared with the manifest replay task, so the once-guard is under `warmlk`.
             if warmup.mode !== :off
                 isnew = @lock warmlk (Tnew in warmed ? false : (push!(warmed, Tnew); true))
                 if isnew
@@ -389,8 +404,8 @@ function _graph_type_for_topic(ctx, topic::AbstractString)
     return nothing
 end
 
-# Log a discovered (name, hash) once per subscription (§S6): tell the user what to
-# write to graduate to the static fast path.
+# Log a discovered (name, hash) once per subscription: tell the user what to write
+# to graduate to the static fast path.
 function _log_discovered_once(e::Entity, info::TypeInfo, source::Symbol, logged, loglk)
     isnew = @lock loglk (info.name, info.hash) in logged ? false :
                         (push!(logged, (info.name, info.hash)); true)

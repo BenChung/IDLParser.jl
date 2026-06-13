@@ -1,4 +1,4 @@
-# ── the @parameters macro (§10) ───────────────────────────────────────────────
+# ── the @parameters macro ─────────────────────────────────────────────────────
 # Generates: (1) an immutable struct of the declared fields; (2) a keyword
 # constructor that overlays overrides onto the defaults and coerces to field
 # types; (3) a `descriptors(::Type{P})` method returning the ordered descriptor
@@ -16,7 +16,7 @@
         …
     end
 
-Declare a typed parameter schema (ROS 2 node parameters, §10). Generates an
+Declare a typed parameter schema (ROS 2 node parameters). Generates an
 immutable `struct P` so declared reads are type-stable, a keyword constructor
 `P(; field=default, …)` that overlays startup overrides (CLI/launch/YAML) onto
 the defaults and coerces each to its field type, and a `descriptors(::Type{P})`
@@ -177,14 +177,14 @@ _coerce_param(::Type{Symbol}, v::Symbol) = v
 _coerce_param(::Type{String}, v::Symbol) = String(v)
 _coerce_param(::Type{Vector{T}}, v::AbstractVector) where {T} = collect(T, v)
 
-# ── descriptors / validate fallbacks (§10) ──────────────────────────────────────
+# ── descriptors / validate fallbacks ────────────────────────────────────────────
 
 """
     descriptors(::Type{P}) -> Vector{ParameterDescriptor}
     descriptors(value) -> Vector{ParameterDescriptor}
 
 The ordered per-field metadata for a [`@parameters`](@ref) schema `P` — the
-reflection root the parameter services read (§10). [`@parameters`](@ref)
+reflection root the parameter services read. [`@parameters`](@ref)
 generates the `::Type{P}` method; the value form forwards to
 `descriptors(typeof(value))`. A type with no generated method (a plain struct
 used as a schema) gets an empty descriptor list.
@@ -197,7 +197,7 @@ descriptors(p) = descriptors(typeof(p))
 
 User hook for cross-field parameter rules — ROS 2's
 `add_on_set_parameters_callback`, expressed as a method on the whole candidate
-value (§10). The default is a no-op. Define `ROSNode.validate(p::PlannerParams) = …`
+value. The default is a no-op. Define `ROSNode.validate(p::PlannerParams) = …`
 to override, throwing [`ParameterRejection`](@ref) (or any exception) to reject
 the candidate. The hook runs inside the commit, against the fully-assembled
 candidate, after the per-field read-only and constraint checks. A local internal
@@ -209,7 +209,7 @@ validate(_) = nothing
 """
     ParameterRejection(reason::AbstractString)
 
-Exception signaling a rejected parameter set (§10), raised by a per-field
+Exception signaling a rejected parameter set, raised by a per-field
 constraint violation, a `read_only` runtime set, or a user [`validate`](@ref).
 Carries the human `reason` string that becomes the wire
 `SetParametersResult.reason`. A local caller of
@@ -230,7 +230,7 @@ Base.showerror(io::IO, e::ParameterRejection) =
     setproperties(base::P, overrides::P) -> P
 
 The value-level rebuild primitive the transaction commit and the
-[`setproperties!`](@ref) sugar build on (§10): a pure rebuild of an immutable
+[`setproperties!`](@ref) sugar build on: a pure rebuild of an immutable
 schema value with `overrides` applied. A NamedTuple is a partial overlay — its
 named fields change, the rest copy from `base` — rebuilt through `P`'s keyword
 constructor, so each field is re-coerced to its declared type. A full `P` value

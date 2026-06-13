@@ -1,17 +1,17 @@
-# ── the multi-schema parameter façade (§4.4) ─────────────────────────────────────
+# ── the multi-schema parameter façade ────────────────────────────────────────────
 # A composed node (`@node N = [ … ]`) has one node-core but several member mixins,
 # each with its own typed `ParameterServer{P_M}`. To a ROS2 parameter client the
 # node must still look like ONE node: a single flat namespace, one set of the six
 # standard services, one `/parameter_events`. `CompositeParameterServer` is that
 # façade — it aggregates the member servers behind member-prefixed names
-# (`<member>.<field>`, the §4.3 prefix generalised, dot-separated as ROS2 nests
+# (`<member>.<field>`, the per-member name prefix, dot-separated as ROS2 nests
 # parameters) and reuses the schema-independent service core (services.jl) verbatim
 # by implementing the same six reflection handlers + `parameter_names`.
 #
 # Each member keeps its own `ParameterServer{P_M}`, so `parameters(m)` stays
-# mixin-local and type-stable (§3.5); the façade is only the node-level view. It is
+# mixin-local and type-stable; the façade is only the node-level view. It is
 # wired for a composed node, while a single mixin promoted to a node (`run(M)`)
-# keeps the un-prefixed plain server (§4.3) — the prefix tracks the construction
+# keeps the un-prefixed plain server — the prefix tracks the construction
 # path, not the member count.
 
 export CompositeParameterServer
@@ -19,7 +19,7 @@ export CompositeParameterServer
 """
     CompositeParameterServer(node, members) -> CompositeParameterServer
 
-The node-level parameter view of a composed node (§4.4): a façade over the
+The node-level parameter view of a composed node: a façade over the
 members' per-mixin [`ParameterServer`](@ref)s that presents one flat,
 member-prefixed `ros2 param` namespace (`<member>.<field>`, dot-separated as
 ROS 2 nests parameters), one `/parameter_events` stream, and one set of the six
@@ -88,7 +88,7 @@ function _resolve_member_field(s::CompositeParameterServer, name)
     (srv !== nothing && field in declared_names(srv)) ? (srv, field) : nothing
 end
 
-# ── the six reflection handlers, flat over `<member>.<field>` (§4.4) ─────────────
+# ── the six reflection handlers, flat over `<member>.<field>` ─────────────────────
 # Each mirrors its `ParameterServer` counterpart (services.jl) but splits the
 # prefixed name and delegates to the owning member server; outputs re-prefix.
 
@@ -215,7 +215,7 @@ function set_parameters_atomically(s::CompositeParameterServer, pairs)
     return failure === nothing ? (true, "") : failure
 end
 
-# ── node-level /parameter_events (§4.4) ──────────────────────────────────────────
+# ── node-level /parameter_events ──────────────────────────────────────────────────
 # The façade owns the one `/parameter_events` publisher (created by the wiring); the
 # member servers have none. A forwarding listener on each member republishes that
 # member's post-commit batch on the node's publisher with prefixed names — so a

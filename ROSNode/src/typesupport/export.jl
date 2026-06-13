@@ -1,5 +1,5 @@
 # ── export_typesupport: write a discovered type into durable form ────────────
-# Writes a registered type to disk in one of three formats (§11): `:msg`
+# Writes a registered type to disk in one of three formats: `:msg`
 # (interface-package layout from `IL.unparse`), `:julia` (`generate_code` output
 # as static `.jl` source), and `:typedesc` (the raw wire blob, language-agnostic).
 # RIHS01 is the roundtrip invariant across all three.
@@ -8,7 +8,7 @@
     export_typesupport(node_or_ctx, names; to=pwd(), format=:msg) -> Vector{String}
 
 Write registered (typically discovered) types out of the in-memory registry
-into durable, user-owned files (§11), returning the paths written. `names` is a
+into durable, user-owned files, returning the paths written. `names` is a
 single type name or any iterable of names; `format` selects the layout (the
 ROS 2 interface concept:
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html):
@@ -138,7 +138,7 @@ _il_qualifier_ext(::IL.RService) = ("srv", ".srv")
 _il_qualifier_ext(::IL.RAction)  = ("action", ".action")
 _il_qualifier_ext(_)             = ("msg", ".msg")
 
-# ── type_info specialization for registered (dynamic) types (§11) ───────────
+# ── type_info specialization for registered (dynamic) types ─────────────────
 # serialization.jl's `type_info(::Type{T})` returns the zero hash for a generated
 # type (the Humble placeholder): correct for keyexpr structure, wrong for
 # cross-version matching. A registered type knows its real hash (its registry
@@ -165,7 +165,7 @@ end
 The `TypeInfo` (name + RIHS01) for a type. A dynamically-generated type returns
 its registry-verified hash; a statically-included type falls back to
 serialization.jl's reflective [`type_info`](@ref) (zero-hash placeholder). This is
-the §11 specialization of type identity: a registered type carries its true hash,
+the registry's specialization of type identity: a registered type carries its true hash,
 so its keyexprs and liveliness match the wire across versions.
 """
 function type_info_of(::Type{T}) where {T}
@@ -178,7 +178,7 @@ end
 _entry_of(::Type{T}) where {T} =
     @lock _TYPE_TO_ENTRY_LOCK get(_TYPE_TO_ENTRY, T, nothing)
 
-# ── service-level type identity (rmw_zenoh service/client keyexpr, §8) ──────────
+# ── service-level type identity (rmw_zenoh service/client keyexpr) ──────────────
 # rmw_zenoh keys a service/client off the service type (`pkg::srv::dds_::Base_`
 # plus the service RIHS01); a keyexpr built from the request message's info never
 # matches a peer. `service_type_info_of` synthesizes the rosidl service type
@@ -206,10 +206,10 @@ end
 """
     service_type_info_of(Req, Resp) -> Union{TypeInfo, Nothing}
 
-The rmw_zenoh *service-level* [`TypeInfo`](@ref) for a service whose request /
+The rmw_zenoh *service-level* `TypeInfo` for a service whose request /
 response message types are `Req` / `Resp`: the service type name (`pkg/srv/Base`,
 keyed on the wire as `pkg::srv::dds_::Base_`) and the ROS2 service RIHS01 the
-service/client keyexpr must carry to match a peer (§8). Built by stripping the
+service/client keyexpr must carry to match a peer. Built by stripping the
 `_Request` suffix off the request's qualified name and hashing the synthesized
 service type description. Returns `nothing` unless both message types are
 registered with their wire `TypeDescription`s and the vendored

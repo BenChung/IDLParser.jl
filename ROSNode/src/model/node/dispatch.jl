@@ -6,17 +6,18 @@
 # OS threads. A handler throw is logged, never fatal: one bad message must not kill
 # the subscription.
 
-# Per-sample gating before delivery; returns whether to deliver. Applies the
-# lifecycle gate (drop while the node is inactive, with no novelty side effect, so
-# the delivered stream reflects only what the handler saw) then the novelty gate
-# (suppress re-latch replays). Volatile subs pass `gate === nothing` and take the
-# fast path that skips the attachment decode.
+# Per-sample gating before delivery; returns whether to deliver. This is the
+# skip-delivery point of the lifecycle gate owned by [`isactive`](@ref): an inactive
+# node drops the sample with no novelty side effect, so the delivered stream reflects
+# only what the handler saw. Then applies the novelty gate (suppress re-latch
+# replays). Volatile subs pass `gate === nothing` and take the fast path that skips
+# the attachment decode.
 @inline function _predispatch(e::Entity, sample::AbstractSample, gate::Union{_NoveltyGate, Nothing})
     isactive(e) || return false               # lifecycle gate: drop while inactive (no novelty record)
-    # Weak-static backstop: a wildcard-matching typed sub can receive an off-type
-    # sample, and a wire (name,hash) that differs from our declared type is
-    # decode-unsafe, so fire on_type_mismatch (deduped with the graph detector) and
-    # drop before decode.
+    # Weak-static subs (wildcard-matched) run `check_sample_type`, the discovery
+    # layer's per-sample type backstop: an off-type sample is decode-unsafe, so drop
+    # it before decode. Mismatch reports are deduped/throttled
+    # against the graph detector via `report_type_mismatch!`.
     if e._weak_static
         tm = check_sample_type(e, sample)
         tm === nothing || (report_type_mismatch!(e.node.context, tm); return false)

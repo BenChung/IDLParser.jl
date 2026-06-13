@@ -1,4 +1,4 @@
-# Statically-compiled bootstrap interfaces (§11/§13).
+# Statically-compiled bootstrap interfaces for type support and introspection serving.
 #
 # Dynamic discovery fetches an unknown type's definition by calling a remote's
 # `~/get_type_description` (`type_description_interfaces/srv/GetTypeDescription`).
@@ -18,8 +18,8 @@
 #     speaks the wire form.
 #
 # The well-known types are also registered into every Context's registry on
-# creation (`_register_wellknown_types!`) so the §13 server can answer for them and
-# `type_info_of` reports their real RIHS01.
+# creation (`_register_canonical_types!`) so the `~/get_type_description` server can
+# answer for them and `type_info_of` reports their real RIHS01.
 
 using ROSMessages: message_il, service_il
 
@@ -79,7 +79,7 @@ to_wire_individual(td::TypeDescription) =
 
 Convert ROSMessages' internal hashing `TypeDescriptionMsg` (main + referenced
 closure) into the generated wire `type_description_interfaces/msg/TypeDescription`
-for serving over `~/get_type_description` (§13). Field-for-field; preserves RIHS01
+for serving over `~/get_type_description`. Field-for-field; preserves RIHS01
 (constants/defaults are RIHS-excluded).
 
 See the [IDL type-description design](https://design.ros2.org/articles/idl_interface_definition.html).
@@ -113,7 +113,7 @@ from_wire_td(w) =
         TypeDescription[from_wire_individual(t)
                         for t in w.referenced_type_descriptions])
 
-# ── well-known registry entries (bootstrap, §11) ──────────────────────────────
+# ── well-known registry entries (bootstrap) ───────────────────────────────────
 # Build the registry entries for the vendored types: parse each source → IL, recover
 # its RIHS01 (with the referenced closure, so referencing types hash exactly), and
 # point the entry's `mod`/`type` at the *already-compiled* WellKnown struct so
@@ -133,8 +133,9 @@ function _wellknown_source(name::AbstractString, fallback_path::AbstractString)
 end
 
 # Transitively collect the referenced `TypeDescription`s for `main` from `pool`
-# (keyed by qualified name), sorted by `type_name` — the canonical closure §13
-# requires for hash parity and for a peer to codegen a referencing type.
+# (keyed by qualified name), sorted by `type_name` — the canonical closure the
+# `~/get_type_description` server requires for hash parity and for a peer to codegen
+# a referencing type.
 function _collect_td_closure(main::TypeDescription,
                              pool::AbstractDict{String, TypeDescription})
     seen = Set{String}()
@@ -209,7 +210,7 @@ const _WELLKNOWN_ENTRIES = Ref{Union{Nothing, Vector{RegistryEntry}}}(nothing)
 const _WELLKNOWN_LOCK = ReentrantLock()
 
 # The memoized well-known entries (computed once per process). Shared, read-only.
-# A view of the §13 bootstrap subset (`type_description_interfaces`); the broader
+# A view of the bootstrap subset (`type_description_interfaces`); the broader
 # canonical set below is a superset.
 function _wellknown_entries()
     @lock _WELLKNOWN_LOCK begin
@@ -219,7 +220,7 @@ function _wellknown_entries()
 end
 
 # ── canonical type index: every vendored type, bound to its compiled `Interfaces`
-# struct — the single-copy home (§11) ─────────────────────────────────────────
+# struct — the single-copy home ───────────────────────────────────────────────
 # `@ros_import`/`@ros_cache` consult [`canonical_type`](@ref) and *alias* a hit
 # (`const Name = Interfaces.<pkg>.<qual>.<Name>`) instead of re-generating, so a
 # given wire type (name + RIHS01) has exactly one Julia struct process-wide. Built
@@ -304,9 +305,9 @@ end
 """
     _register_canonical_types!(ctx) -> ctx
 
-Register every canonical vendored type (the §11/§13 `type_description_interfaces`
+Register every canonical vendored type (the `type_description_interfaces`
 bootstrap among them) into `ctx`'s registry, binding each to its compiled
-`Interfaces` struct + real RIHS01 — so the §13 `~/get_type_description` server can
+`Interfaces` struct + real RIHS01 — so the `~/get_type_description` server can
 answer for them and keyexpr-only resolution uses them directly. Best-effort: a
 failure is logged, never fatal (the generated types are compiled and usable).
 """
@@ -322,7 +323,7 @@ function _register_canonical_types!(ctx)
     return ctx
 end
 
-# ── single-copy guard: clear error for the residual duplicate case (§11) ──
+# ── single-copy guard: clear error for the residual duplicate case ──
 # Aliasing (`@ros_import`) collapses vendored types to one `Interfaces` copy, but a
 # stray copy can still arise — e.g. `@ros_msgs` run directly on the vendored sources,
 # which doesn't alias. Passing such a stray where a canonical type is expected hits a

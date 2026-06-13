@@ -1,4 +1,4 @@
-# §10 Parameters. Declared parameters are typed and baked into the node: a
+# The parameters layer. Declared parameters are typed and baked into the node: a
 # `@parameters` macro generates an immutable struct (type-stable reads) plus a
 # `descriptors(::Type)` method, and the live value sits behind an atomic `Ref{P}`
 # inside a `ParameterServer{P}`. Mutation is transactional — `transaction(server)
@@ -12,7 +12,7 @@
 # the union of declared fields and the dynamic dict so a ROS client sees one flat
 # namespace. The reflection handlers return plain Julia values; the wire binding
 # (`wire_parameter_services!`) marshals them to/from the `rcl_interfaces` generated
-# request/response types over the §8 Service layer.
+# request/response types over the Service layer.
 
 import Dates
 
@@ -23,7 +23,7 @@ export @parameters, ParameterServer, ParameterClient, ParameterDescriptor, Param
        list_parameters, describe_parameters,
        on_parameter_event, readonly, ParameterRejection
 
-# ── legal value types (§10) ───────────────────────────────────────────────────
+# ── legal value types ─────────────────────────────────────────────────────────
 # The closed set ROS2's `ParameterValue` tagged union can carry: bool, int64,
 # float64, string, byte arrays, and `Vector` of {bool,int64,float64,string}.
 # `Symbol` is accepted as sugar over string-with-choices. An illegal type is
@@ -35,7 +35,7 @@ const _ARRAY_ELT_TYPES    = (Bool, Int64, Float64, String, UInt8)
 
 # Supertype of every node-level parameter surface: the single-schema
 # `ParameterServer{P}` (server.jl) and the multi-schema `CompositeParameterServer`
-# façade (composite.jl, §4.4). `wire_parameter_services!` and `node.parameters`
+# façade (composite.jl). `wire_parameter_services!` and `node.parameters`
 # are written against this so a composed node exposes one member-prefixed `ros2
 # param` namespace over its members' servers.
 abstract type AbstractParameterServer end
@@ -43,7 +43,7 @@ abstract type AbstractParameterServer end
 """
     ParameterType
 
-The `rcl_interfaces/msg/ParameterType` tag enum (§10), `UInt8`-backed so it
+The `rcl_interfaces/msg/ParameterType` tag enum, `UInt8`-backed so it
 marshals straight onto the wire `type` byte. `PARAMETER_NOT_SET` (0) is the
 unset/unknown sentinel — never stored for a declared field, and what an unknown
 parameter name or unrecognized wire tag reads back as. The remaining arms mirror
@@ -117,13 +117,13 @@ _is_legal_param_type(::Type{T}) where {T} =
     (T in _SCALAR_PARAM_TYPES) ||
     (T <: Vector && eltype(T) in _ARRAY_ELT_TYPES)
 
-# ── descriptors (§10) ───────────────────────────────────────────────────────────
+# ── descriptors ─────────────────────────────────────────────────────────────────
 
 """
     ParameterDescriptor
 
 Per-field metadata for one declared parameter (ROS 2
-`rcl_interfaces/msg/ParameterDescriptor`, §10): its `name::Symbol`, Julia `type`,
+`rcl_interfaces/msg/ParameterDescriptor`): its `name::Symbol`, Julia `type`,
 [`ParameterType`](@ref) tag `ptype`, human `description`, optional `constraint`,
 `read_only` flag, and schema `default`. Built by [`@parameters`](@ref) and
 reflected over by the parameter services (`describe_parameters`,
@@ -167,7 +167,7 @@ function _check_constraint(d::ParameterDescriptor, value)
     return nothing
 end
 
-# ── readonly marker (§10) ───────────────────────────────────────────────────────
+# ── readonly marker ───────────────────────────────────────────────────────────
 # `field = default |> readonly` tags a field read-only. The macro detects the pipe
 # syntactically at parse time (`_parse_param_field`) and strips it, so the stored
 # default is the bare value. `readonly`/`_ReadOnly` exist only as a harmless
@@ -181,7 +181,7 @@ end
     readonly(default)
 
 Mark a [`@parameters`](@ref) field read-only inside the schema DSL:
-`field::T = default |> readonly` (§10). Read-only blocks runtime sets — a
+`field::T = default |> readonly`. Read-only blocks runtime sets — a
 runtime set raises [`ParameterRejection`](@ref) internally and returns a
 rejected `SetParametersResult` on the wire — while still permitting a startup
 override (CLI/launch/YAML), which goes through the constructor rather than a

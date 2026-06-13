@@ -1,18 +1,18 @@
-# Node assembly + run/container (DESIGN-COMPONENTS.md §4/§5/§7). `@node` names a
+# Node assembly + run/container. `@node` names a
 # collection of members; `run(K)` builds a node-core, constructs each member (in DI
-# dependency order, §4.2), and drives the lifecycle; `container` composes nodes into
-# one process (§7).
+# dependency order), and drives the lifecycle; `container` composes nodes into
+# one process.
 #
-# One assembly path serves both flavours (§5 "vocabulary always, surface opt-in"):
+# One assembly path serves both flavours ("vocabulary always, surface opt-in"):
 #   - unmanaged (default): the node-core is a plain `Node`; assembly autostarts
 #     (configure → activate) and there is no control surface or gating cost.
 #   - managed (`managed=true`): the node-core is a `LifecycleNode` (the five
-#     lifecycle_msgs services + ~/transition_event + dispatch gating, §14.2); its
+#     lifecycle_msgs services + ~/transition_event + the managed-node dispatch gate); its
 #     transitions fan out to the members' `configure`/`activate`/… hooks. Ports
 #     materialise at the configure transition, so an inactive node's entities are
 #     gated/silent until `activate`.
 #
-# Deferred: a §D8 warm-up hook (first-run JIT latency).
+# Deferred: a warm-up hook (first-run JIT latency).
 
 export @node
 
@@ -21,7 +21,7 @@ export @node
 """
     ComponentNode
 
-A live component node (DESIGN §4/§5): the node-core (a `Node`, or the inner `Node` of
+A live component node: the node-core (a `Node`, or the inner `Node` of
 a `LifecycleNode` when managed) shared by the node's member mixins, the constructed
 member instances by name, and the `LifecycleNode` handle (`lifecycle`) when managed.
 Returned by `run` / held by a [`Container`](@ref).
@@ -30,10 +30,10 @@ mutable struct ComponentNode
     const node::Node
     const members::Dict{Symbol, Any}
     const order::Vector{Symbol}     # member names in DI construction (toposort) order — drives
-                                    # lifecycle fan-out + reverse-order teardown (§4.2/§5)
-    const wires::Dict{Symbol, Dict{Symbol, String}}  # member => (port => resolved wire name), §4.4 remaps
+                                    # lifecycle fan-out + reverse-order teardown
+    const wires::Dict{Symbol, Dict{Symbol, String}}  # member => (port => resolved wire name), remaps
     lifecycle::Any                  # the LifecycleNode (managed) or nothing
-    owned_ctx::Union{Context, Nothing}  # the Context `run` opened for this node (§5), closed by
+    owned_ctx::Union{Context, Nothing}  # the Context `run` opened for this node, closed by
                                         # `close`; `nothing` when the caller supplied one
     @atomic open::Bool              # single-winner close latch (unmanaged path)
 end
@@ -45,17 +45,19 @@ Base.show(io::IO, c::ComponentNode) =
 """
     parameters(node::ComponentNode) -> NamedTuple
 
-The node-level, member-namespaced parameter aggregation (§3.5/§4.4):
+The node-level, member-namespaced parameter aggregation:
 `parameters(node).camera` is member `camera`'s live snapshot. Heterogeneous (one
 entry per member, keyed by member name in declared order) — for iterating a whole
-node, where `parameters(m)` is the type-stable per-mixin view.
+node, where `parameters(m)` is the type-stable per-mixin view. The flat
+`<member>.<field>` wire namespace these views live under is owned by
+[`CompositeParameterServer`](@ref).
 """
 parameters(c::ComponentNode) = (; (nm => parameters(c.members[nm]) for nm in c.order)...)
 
 """
     entities(node::ComponentNode) -> NamedTuple
 
-The node-level, member-namespaced handle aggregation (§3.5/§4.4):
+The node-level, member-namespaced handle aggregation:
 `entities(node).camera.image` is member `camera`'s `image` port (so two members'
 `image` handles don't collide). Member ports must be materialised first (after the
 node is configured), like the per-mixin [`entities`](@ref).
@@ -66,7 +68,7 @@ inner_node(c::ComponentNode) = c.node
 "The `LifecycleNode` driving a managed component node, or `nothing` (unmanaged)."
 lifecycle(c::ComponentNode) = c.lifecycle
 
-# Closing a node tears it down (§5): run each member's `cleanup` in reverse DI order,
+# Closing a node tears it down: run each member's `cleanup` in reverse DI order,
 # then undeclare its entities + node token. Unmanaged closes here directly, behind a
 # single-winner `@atomicswap` latch — an `unload_node` service task and the Context
 # drain hook can close concurrently, and `_member_cleanup!`'s materialised-ports guard
@@ -94,7 +96,7 @@ end
 
 """
 A member of a `@node`: a name within the node, the mixin type filling it, and its
-per-member wire-topic **remaps** (§4.4). Each remap is `port => target`, where `target`
+per-member wire-topic **remaps**. Each remap is `port => target`, where `target`
 is a `String` (an explicit wire name, ROS `-r`-style) or a `(member, port)` pair
 pointing at another member's resolved wire name. Topics resolve in the node namespace
 as authored unless remapped here.
@@ -109,7 +111,7 @@ NodeMember(name::Symbol, mixin::Type) = NodeMember(name, mixin, Pair{Symbol, Any
 """
     NodeKind
 
-A named collection of [`NodeMember`](@ref)s (DESIGN §4) — the result of `@node N =
+A named collection of [`NodeMember`](@ref)s — the result of `@node N =
 […]`. `run(N)` / `add!(c, N)` instantiate it.
 """
 struct NodeKind
@@ -124,13 +126,13 @@ Base.show(io::IO, k::NodeKind) =
     @node N = ["name" => Mixin, …]
     @node N = ["name" => Mixin{port => "wire", port2 => other.port, …}, …]
 
-Assemble a node kind from member mixins (DESIGN-COMPONENTS §4). A node is one node in
-the ROS graph whose entities are contributed by several mixin members sharing one
-node-core. Each member is `"name" => Mixin`, where the string `name` is that member's
-namespace within the node — the prefix for its parameters (`name.field`) and its slice
-of the node-level entity view (`entities(node).name`, §4.3/§4.4). The name is always
-written out, so the namespace is explicit and two members of the same mixin type stay
-distinct instances.
+Assemble a node kind from member mixins. A node is one node in the ROS graph whose
+entities are contributed by several mixin members sharing one node-core. Each member
+is `"name" => Mixin`, where the string `name` is that member's namespace within the
+node: it prefixes the member's parameters in the flat `<member>.<field>` scheme of
+[`CompositeParameterServer`](@ref), and keys its slice of the node-level entity view
+(`entities(node).name`). The name is always written out, so the namespace is explicit
+and two members of the same mixin type stay distinct instances.
 
 Binds `N` to a `NodeKind` and registers it by name in the process-global
 node-kind registry (the `rclcpp_components_register_nodes` analog), so a container's
@@ -173,7 +175,7 @@ macro node(assign)
                                  $(Pair{Symbol, Any})[$(rms...)]) )
                 for (nm, mx, rms) in members]
     modu = __module__
-    # Register the kind by name (the `rclcpp_components_register_nodes` analog, §7) so a
+    # Register the kind by name (the `rclcpp_components_register_nodes` analog) so a
     # container's `load_node` can instantiate it from a `ros2 component load` request.
     # Immediate for the REPL/script case; deferred to `ros_init!` for a precompiled
     # package (a top-level mutation of ROSNode's registry would not survive precompile).
@@ -195,8 +197,8 @@ macro node(assign)
     end
 end
 
-# Each member is `"name" => Mixin` (string name — the namespace, §4.4), optionally with
-# wire-topic remaps `"name" => Mixin{port => "wire", port2 => other.port, …}` (§4.4). A
+# Each member is `"name" => Mixin` (string name — the namespace), optionally with
+# wire-topic remaps `"name" => Mixin{port => "wire", port2 => other.port, …}`. A
 # bare identifier name (`name => Mixin`) is accepted too, but the type is never
 # auto-named: an explicit name is required, so a member's namespace is always written.
 # Returns `(name, mixin_expr, remap_exprs)` per member, where each remap_expr is a
@@ -213,13 +215,13 @@ function _parse_members(rhs)
         name = nm isa AbstractString ? Symbol(nm) :
                nm isa Symbol ? nm :
                error("@node: a member name must be a string, e.g. `\"sensor\" => Sensor` (got `$(nm)`)")
-        # The member name is the §4.4 namespace prefix (`<member>.<field>`), so it must be
+        # The member name is the namespace prefix (`<member>.<field>`), so it must be
         # a single dotless segment — a dot would mis-split the prefixed parameter name —
         # and unique, or two members would share one prefix / clobber in the member Dict.
         occursin('.', String(name)) &&
-            error("@node: member name `$(name)` must not contain a dot — it is the `<member>.<field>` parameter prefix (§4.4)")
+            error("@node: member name `$(name)` must not contain a dot — it is the `<member>.<field>` parameter prefix")
         name in seen &&
-            error("@node: duplicate member name `$(name)` — member names must be unique within a node (§4.4)")
+            error("@node: duplicate member name `$(name)` — member names must be unique within a node")
         push!(seen, name)
         mixin, remaps = _parse_member_rhs(name, el.args[3])
         push!(out, (name, mixin, remaps))
@@ -227,7 +229,7 @@ function _parse_members(rhs)
     return out
 end
 
-# A member's right-hand side: a bare mixin `K`, or `K{port => target, …}` (the §4.4
+# A member's right-hand side: a bare mixin `K`, or `K{port => target, …}` (the
 # remap form — Julia parses the braces as a `:curly`). Returns `(mixin_expr, remap_exprs)`.
 function _parse_member_rhs(name::Symbol, rhs)
     (rhs isa Expr && rhs.head === :curly) || return (rhs, Any[])
@@ -271,7 +273,7 @@ _default_name(::Type{M}) where {M} = _snake(String(nameof(M)))
 
 # Create each declared port's runtime handle against the node-core. Returns the
 # handle NamedTuple (`entities(m)`) and the paused timers to start at activate.
-# `wiremap` is the member's resolved §4.4 remap (port => wire name); a port not in it
+# `wiremap` is the member's resolved remap (port => wire name); a port not in it
 # uses its authored `_wire(p)`.
 function _materialize_ports!(node::Node, m, member::Symbol, specs::Vector{PortSpec}, pvalue,
                              wiremap::Dict{Symbol, String} = Dict{Symbol, String}())
@@ -317,14 +319,14 @@ function _materialize_ports!(node::Node, m, member::Symbol, specs::Vector{PortSp
     return (NamedTuple(handles), timers)
 end
 
-# A port's wire name: its explicit `on \"…\"` override, else the identifier (§3).
+# A port's wire name: its explicit `on \"…\"` override, else the identifier.
 _wire(p::PortSpec) = p.wire === nothing ? String(p.name) : p.wire
 
-# A port's wire name under a member's resolved remap map (§4.4): the remapped name if
+# A port's wire name under a member's resolved remap map: the remapped name if
 # present, else the authored `_wire(p)`.
 _wire(p::PortSpec, wiremap::Dict{Symbol, String}) = get(wiremap, p.name, _wire(p))
 
-# ── wire-topic remap resolution + clobber detection (§4.4) ───────────────────────
+# ── wire-topic remap resolution + clobber detection ──────────────────────────────
 
 # Resolve every member port's wire name: the remap target if any, else the authored
 # `_wire(p)`. A cross-member remap (`port => (member, port)`) resolves to the referenced
@@ -387,7 +389,7 @@ _clobber_channel(kind::Symbol) =
     kind === :service   ? (:service, :service) :
     kind === :action    ? (:action,  :service) : nothing
 
-# Error on an unintended clobber (§4.4): two members' same-channel output ports
+# Error on an unintended clobber: two members' same-channel output ports
 # resolving to one wire name, unless at least one was explicitly remapped (a deliberate
 # share). Resolves against the node namespace (so `~/x` vs `/ns/node/x` compare equal).
 function _check_clobbers(k::NodeKind, node::Node, wires, remapped)
@@ -421,11 +423,11 @@ function _paused_timer(node::Node, period::Duration, f)
     Timer{ROS}(c, period, f, true, nothing)
 end
 
-# ── DI resolution + toposort (§4.2) ─────────────────────────────────────────────
+# ── DI resolution + toposort ──────────────────────────────────────────────────
 
 # Resolve each member's `requires` to a single providing sibling (excluding self),
 # returning `member-name => [provider names]` in `requires` order. Errors on an
-# unsatisfied or ambiguous interface (§4.2).
+# unsatisfied or ambiguous interface.
 function _resolve_di(members::Vector{NodeMember})
     providers = Dict{Type, Vector{Symbol}}()
     for mem in members, I in provides(mem.mixin)
@@ -482,7 +484,7 @@ function _members_plan(k::NodeKind)
     return (order, Dict{Symbol, Type}(m.name => m.mixin for m in k.members), edges)
 end
 
-# Filter run/add! overrides to this member (§4.3): a mixin-local key (`fps`) applies
+# Filter run/add! overrides to this member: a mixin-local key (`fps`) applies
 # to every member that declares it; a prefixed key (`var"camera.fps"` — the form a
 # composed node's wire `Parameter.name` carries, and the disambiguator when two
 # members share a field name) targets one member and wins over the mixin-local form.
@@ -506,7 +508,7 @@ end
 _build_pserver(node::Node, ::Type{P}, overrides::NamedTuple) where {P} =
     ParameterServer{P}(node; overrides = overrides)
 
-# ── per-member lifecycle steps (run at the matching transition, §5) ─────────────
+# ── per-member lifecycle steps (run at the matching transition) ──────────────────
 
 # The base for instance-keyed lookups: `Guard{Sensor} → Guard`, identity for plain
 # types. Registries and generated accessors are keyed on the registered base, so
@@ -531,7 +533,7 @@ function _member_materialize!(cnode::ComponentNode, nm::Symbol)
                                         get(cnode.wires, nm, Dict{Symbol, String}()))
     rt.ports = ports
     rt.timers = timers
-    # type-stable `entities(m)::PortsNT` (§3.5) — the base goes in as BOTH the generated
+    # type-stable `entities(m)::PortsNT` — the base goes in as BOTH the generated
     # signature and the dedup key, so one method covers every instantiation (a concrete
     # signature here would silently strand other instantiations on the untyped generic).
     _ensure_entities_accessor!(_base(typeof(m)), ports)
@@ -556,9 +558,9 @@ function _member_activate!(cnode::ComponentNode, nm::Symbol)
 end
 
 # cleanup: run the member's `cleanup` hook, then close + drop its materialised ports
-# (so a re-configure rematerialises). Gating (§14.2) already silenced them. A no-op
+# (so a re-configure rematerialises). The managed-node dispatch gate already silenced them. A no-op
 # when the member has no materialised ports — never configured, or already cleaned —
-# so cleanup runs exactly once per configure (idempotent across teardown triggers, §5).
+# so cleanup runs exactly once per configure (idempotent across teardown triggers).
 function _member_cleanup!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
     rt = getfield(m, :__rt__)::MixinRuntime
@@ -593,15 +595,15 @@ function _members_on_error!(cnode::ComponentNode, order::Vector{Symbol})
     return failed ? failure : nothing
 end
 
-# ── assembly (the one path; §4/§5) ──────────────────────────────────────────────
+# ── assembly (the one path) ──────────────────────────────────────────────────────
 
 function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
                    managed::Bool, autostart::Bool,
                    log_level::Union{LogLevel, Nothing} = nothing)
     order, bytype, edges = _members_plan(K)
-    composed = K isa NodeKind            # the construction path drives prefixing (§4.3), not member count
+    composed = K isa NodeKind            # the construction path drives prefixing, not member count
     declared = composed ? Symbol[m.name for m in K.members] : copy(order)  # listing/view order
-    # §4.4 wire-topic remaps: resolve every member port's wire name (mixin-as-node has none).
+    # wire-topic remaps: resolve every member port's wire name (mixin-as-node has none).
     wires, remapped = composed ? _resolve_wires(K) :
                       (Dict{Symbol, Dict{Symbol, String}}(), Set{Tuple{Symbol, Symbol}}())
     cnref = Ref{Any}(nothing)            # the managed callbacks reach the cnode through this
@@ -631,11 +633,11 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
     # shared) Context. Tear it down before rethrowing; `close` is a no-op on the parts
     # not yet built.
     try
-        # §4.4 assembly-time clobber check: two members' same-channel outputs landing on
+        # assembly-time clobber check: two members' same-channel outputs landing on
         # one wire name (without an explicit remap) is a hard error you fix by remapping.
         composed && _check_clobbers(K, node, wires, remapped)
 
-        # construct members in dependency order, injecting resolved siblings (§4.2); attach
+        # construct members in dependency order, injecting resolved siblings; attach
         # each member's typed ParameterServer{P_M}. No materialise/configure here — that
         # happens at the configure step (immediately for unmanaged, at the transition for managed).
         for nm in order
@@ -647,11 +649,11 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
             cnode.members[nm] = m
         end
 
-        # node-level `ros2 param` surface (§4.3/§4.4): a mixin promoted to a node wires its
+        # node-level `ros2 param` surface: a mixin promoted to a node wires its
         # single server un-prefixed; a composed `@node` (even with one member) wires a
         # member-prefixed `CompositeParameterServer` over all members' servers, in declared
         # order (the `ros2 param list` order). Either way each member's `parameters(m)`
-        # reads its own server, mixin-local (§3.5).
+        # reads its own server, mixin-local.
         if composed
             members = Pair{Symbol, ParameterServer}[
                 nm => (getfield(cnode.members[nm], :__rt__)::MixinRuntime).pserver for nm in declared]
@@ -683,7 +685,7 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
             foreach(nm -> _member_activate!(cnode, nm), order)
         end
 
-        # §5: the node tears down on the node-core's close. The dominant teardown is a
+        # the node tears down on the node-core's close. The dominant teardown is a
         # Context drain (a `container`/`run` shutdown closes the Context, not each
         # ComponentNode), so register a drain hook that fully closes the node — running
         # member `cleanup` in reverse DI order and, for a managed node, driving
@@ -705,26 +707,27 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
     return cnode
 end
 
-# ── run (standalone, §5/§7) ──────────────────────────────────────────────────────
+# ── run (standalone) ─────────────────────────────────────────────────────────────
 
 """
     run(M::Type{<:Component}; …) -> ComponentNode
     run(N::NodeKind; …) -> ComponentNode
 
-Instantiate a node standalone (DESIGN §5/§7): open a `Context` (unless `ctx` is
+Instantiate a node standalone: open a `Context` (unless `ctx` is
 given), build the node-core, construct the mixin(s) in DI order, autostart
 (configure → activate), and — when `block` (default) — `spin` until shutdown, closing
 an owned Context on exit. With `block=false` the returned node holds any owned
 Context, and `close` on the node closes it after member teardown; a caller-supplied
-`ctx` is never closed. `overrides` is a NamedTuple of mixin-local parameter values
-(§4.3). `log_level` (a `LogLevel`, default `nothing` = the node default) sets the
+`ctx` is never closed. `overrides` is a NamedTuple of mixin-local parameter values.
+`log_level` (a `LogLevel`, default `nothing` = the node default) sets the
 node's logger level ([`set_logger_level!`](@ref)) before any member code runs, so
 records from the construct/configure/activate hooks already honor it.
 
-`managed=true` makes the node-core a `LifecycleNode` (the lifecycle control surface +
-dispatch gating, §5/§14.2); it then starts `Unconfigured` and is driven externally
-(`ros2 lifecycle`) unless `autostart=true`. Unmanaged (default) autostarts and has no
-control surface.
+`managed=true` makes the node-core a [`LifecycleNode`](@ref): the lifecycle control
+surface plus the managed-node dispatch gate ([`isactive`](@ref) — entities are silent
+unless the node is [`Active`](@ref)). It then starts `Unconfigured` and is driven
+externally (`ros2 lifecycle`) unless `autostart=true`. Unmanaged (default) autostarts
+and has no control surface or gate.
 """
 function Base.run(::Type{M}; name::AbstractString = _default_name(M),
                   namespace::Union{AbstractString, Nothing} = nothing,
@@ -784,17 +787,18 @@ function _run(ctx, @nospecialize(K), name, namespace, overrides, peers, localhos
     return cnode
 end
 
-# ── container: composing nodes into one process (§7) ────────────────────────────
+# ── container: composing nodes into one process ──────────────────────────────────
 
 """
     Container
 
-A set of nodes sharing one process and one `Context` (DESIGN-COMPONENTS §7) — the
+A set of nodes sharing one process and one `Context` — the
 deploy-time composition of `run`'s standalone form. Built by
 [`container`](@ref); [`add!`](@ref) instantiates each node on the shared Context, so
 the nodes share one session, discovery, type registry, and Julia scheduler, plus —
-when intra-process delivery is enabled (`container`'s default) — the §15.1 direct
-in-process path between same-Context publisher/subscriber pairs.
+when intra-process delivery is enabled (`container`'s default) — the intra-process
+short-circuit (same-Context publisher↔subscriber pairs bypass serialize/Zenoh/decode;
+owned by the intra-process delivery layer in `performance/intraprocess.jl`).
 
 The container is itself a ROS node (`inner_node(c)`, named after the container)
 hosting the `~/_container/{load_node,unload_node,list_nodes}` services over the
@@ -829,7 +833,7 @@ Base.close(c::Container) = close(c.ctx)
         …
     end -> Container
 
-Compose nodes into one process (DESIGN-COMPONENTS §7). Opens a single `Context` — one
+Compose nodes into one process. Opens a single `Context` — one
 shared Zenoh session, discovery, type registry, and Julia scheduler — runs `f(c)` to
 populate it via [`add!`](@ref), then parks on `spin` until the Context drains. The
 same node code runs standalone under `run` or composed here; only the
@@ -844,12 +848,13 @@ it; the Context stays open until then. An exception during `f(c)` closes the Con
 and propagates.
 
 The container is itself a node named `name` (optionally under `namespace`) exposing
-the `~/_container/{load_node,unload_node,list_nodes}` services (§7), so a running
+the `~/_container/{load_node,unload_node,list_nodes}` services, so a running
 container accepts `ros2 component load/unload/list` and the `ComposableNodeContainer`
 launch action.
 
-`intra_process=true` (default) enables the §15.1 direct in-process path for
-same-Context publisher/subscriber pairs through `set_intra_process!` — a
+`intra_process=true` (default) enables the intra-process short-circuit (same-Context
+publisher↔subscriber pairs bypass serialize/Zenoh/decode; owned by the intra-process
+delivery layer in `performance/intraprocess.jl`) through `set_intra_process!` — a
 process-global switch today.
 
 ```julia
@@ -871,7 +876,7 @@ function container(f::Function, name::AbstractString = "container";
         node = Node(ctx, name; namespace = namespace)
         c = Container(ctx, String(name), node, ComponentNode[], Dict{UInt64, ComponentNode}(),
                       UInt64(0), Any[], ReentrantLock())
-        _wire_container_services!(c)      # ~/_container/{load_node,unload_node,list_nodes} (§7)
+        _wire_container_services!(c)      # ~/_container/{load_node,unload_node,list_nodes}
         f(c)
     catch err
         close(ctx)
@@ -892,8 +897,8 @@ end
          autostart=!managed) -> ComponentNode
 
 Instantiate node kind `K` — a `@mixin` type promoted to a node (un-prefixed
-parameters, §4.3) or a `@node` composition (member-prefixed parameters) — on
-container `c`'s shared Context (§7), and track it under a container-unique id so it
+parameters) or a `@node` composition (member-prefixed parameters) — on
+container `c`'s shared Context, and track it under a container-unique id so it
 appears in `list_nodes` / `ros2 component list` and can be `unload_node`-ed. Returns
 the live `ComponentNode`. `name` defaults to the kind's name (a mixin's
 snake-cased type name).

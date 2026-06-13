@@ -33,7 +33,7 @@ size, matching the tightly-sized buffer this path allocates. (`write_all!` budge
 padding conservatively upfront for growable `IOBuffer`s and would overrun the
 exact `Memory` sized here.)
 
-The SHM-move publish path (`zref(session, WireOf{T})`, §3.3) is a transport-layer
+The SHM-move publish path (`zref(session, WireOf{T})`) is a transport-layer
 choice made by the publisher, not here; this is the heap-borrow form.
 """
 function encode(msg)
@@ -101,9 +101,9 @@ export as
 
 Materialize a `T` from a received `Sample`. Owned by default (`view=false`):
 every field is copied out, so the result is storable / forwardable / spawnable
-with no lifetime caveats (§3.1, correctness first). `view=true` returns a
+with no lifetime caveats (correctness first). `view=true` returns a
 `CDRView{T}` whose variable-length fields alias the payload bytes — only valid
-while the backing memory is live (§3.2); the subscription dispatcher runs the
+while the backing memory is live; the subscription dispatcher runs the
 view handler inside `with_memory` and hands us the borrowed memory through the
 `DenseVector{UInt8}` overload below.
 
@@ -142,7 +142,7 @@ end
     decode_owned(sample::AbstractSample, ::Type{T}) -> T
 
 Type-stable owned decode: always materializes a fully-owned `T` (one field walk),
-storable / forwardable / spawnable with no lifetime caveats (§3.1). The sample
+storable / forwardable / spawnable with no lifetime caveats. The sample
 overload copies the payload into freshly-owned `Memory{UInt8}` first, so the
 decode outlives the sample.
 """
@@ -154,7 +154,7 @@ decode outlives the sample.
     decode_view(mem::DenseVector{UInt8}, ::Type{T}) -> CDRView{T} | T
 
 Type-stable view decode: returns a `CDRView{T}` whose variable-length fields alias
-`mem` (valid only while the backing memory is live, §3.2), or — for a compact
+`mem` (valid only while the backing memory is live), or — for a compact
 (`@cdr1_compat`) `T` — an owned `T`, since a "view" of plain bits is already
 escapable. `iscompact` is `@generated` and constant-folds per concrete `T`, so the
 `?:` dead-branches away and each specialization has a single concrete return type
@@ -176,12 +176,12 @@ end
     decode_owned(view::CDRView{T}) -> T
 
 Copy a `CDRView` (from `decode(...; view=true)`) out into its fully-owned form —
-the escape hatch when a view must outlive its backing payload (§3.2). A no-op for
+the escape hatch when a view must outlive its backing payload. A no-op for
 fields already owned; copies `CDRArray`/`CDRString` aliases into `Vector`/`String`.
 """
 decode_owned(view::CDRView) = materialize(view)
 
-# ── per-message attachment (§3.4) ────────────────────────────────────────
+# ── per-message attachment ───────────────────────────────────────────────
 # The `(sequence_number::Int64, source_timestamp::Int64, source_gid::NTuple{16,
 # UInt8})` triple that rides every `put`/request/reply, byte-for-byte with hiroz.
 # Encode/decode, the fixed `[u8;16]` gid form, and `gid` derivation (`entity_gid`)
@@ -208,27 +208,24 @@ of [`encode_attachment`](@ref); wraps [`ROSZenoh.decode_attachment`](@ref).
 """
 decode_attachment(sample) = ROSZenoh.decode_attachment(sample)
 
-# ── type identity for a message type (§2.1) ──────────────────────────────
+# ── type identity for a message type ─────────────────────────────────────
 
 """
     type_info(::Type{T}) -> TypeInfo
 
-The `TypeInfo` (qualified ROS2 name + RIHS01 hash) for a generated message type,
-used to build the data-route and liveliness key expressions. The name and hash
-identify the .msg interface on the wire — see
+The `TypeInfo` — the (qualified name, RIHS01) wire identity — for a generated
+message type, used to build the data-route and liveliness key expressions. The
+name and hash identify the .msg interface on the wire — see
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html. The name is
 recovered reflectively from the type's module path: a generated type lives at
 `<package>.<qualifier>.<Name>` (e.g. `std_msgs.msg.String`), which maps to the
 ROS2 name `"<package>/<qualifier>/<Name>"`.
 
 The RIHS01 hash is a per-type value computed from the struct AST, which the
-generated Julia type does not carry — it belongs to the type registry, which
-`eval`s codegen from the IL and can stash the `type_info_from_struct` result keyed
-by `(name, hash)`. Until that registry lands, the hash is the zero placeholder
-(`TypeHash()`, the Humble sentinel): correct for keyexpr structure, but not for
-cross-version hash matching. The registry specializes this method per registered
-type with the real hash, so static specialized types are fast and dynamic ones go
-through `invokelatest`.
+generated Julia type does not carry — so this reflective method returns the zero
+placeholder (`TypeHash()`, the Humble sentinel): correct for keyexpr structure,
+but not for cross-version hash matching. A registered type carries its verified
+hash in its [`RegistryEntry`](@ref); recover it with `type_info_of`.
 """
 function type_info(::Type{T}) where {T}
     return TypeInfo(ros_type_name(T), TypeHash())

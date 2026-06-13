@@ -137,12 +137,13 @@ The struct lives at `pkg.msg.Name` inside the calling module, where service and 
 sections can reach it via `import ..msg: Name`. The define form also binds the bare `Name`
 in the caller as a `const` alias; the annotate form adds the `pkg.msg.Name` alias around
 the user's existing top-level struct, which stays usable under its original name. Field
-types map per the reflection table: the integer/float/Bool primitives and `String` map to
-their ROS scalars (`UInt8` → `uint8`), `Vector{T}` is an unbounded sequence, an
-`SVector`/`SArray`/`NTuple{N,T}` is a fixed array `[N]`, and a concrete nested struct
-becomes a reference whose own ROS name must already be registered (`@ros_message` or
-`@ros_import` it first) or be a vendored type with a `ros_type_name`. `Char`, `Dict`,
-abstract, and parametric types have no ROS image and are rejected.
+types map per the reflection table:
+
+- the integer/float/Bool primitives and `String` map to their ROS scalars (`UInt8` → `uint8`)
+- `Vector{T}` is an unbounded sequence
+- an `SVector`/`SArray`/`NTuple{N,T}` is a fixed array `[N]`
+- a concrete nested struct becomes a reference whose own ROS name must already be registered (`@ros_message` or `@ros_import` it first) or be a vendored type with a `ros_type_name`
+- `Char`, `Dict`, abstract, and parametric types have no ROS image and are rejected
 
 Registration happens at module load: the macro pushes `(Type, fqn)` onto a module global
 and drains it with `absorb_static_types!` — right after the declaration in a script/REPL
@@ -326,7 +327,7 @@ are specialized on `typeof(Name)`, so:
 
 Return the response named tuple for a reply-ok. To fail, `throw`: the exception is caught
 and turned into a `respond!(req, failed, message)`, which this package maps to a Zenoh
-query error reply under rmw_zenoh (§8). The client raises a `ServiceError` carrying that
+query error reply under rmw_zenoh. The client raises a `ServiceError` carrying that
 message, so a blocked call never returns a plausible zeroed response.
 
 ```julia
@@ -462,9 +463,9 @@ returned `@NamedTuple` is rebuilt into a `Name_Result`. `ActionClient(node, ke, 
 plus `send(client; field=…)` dispatches a goal by keyword. Inside the handler, `fb((ff=…,))`
 publishes one feedback message and acts as a cooperative cancellation checkpoint (it
 throws `Cancelled` if the goal is `CANCELING`); `goal_handle(fb)` recovers the server-side
-`GoalHandle`. A normal return settles the goal `SUCCEEDED`, a propagating `Cancelled`
-settles it `CANCELED`, and any other thrown exception settles it `ABORTED` (the goal-state
-machine of ROS 2 actions).
+`GoalHandle`. How the handler ends the goal follows the [`respond!`](@ref) settlement
+three-way, specialized to action goals: a normal return ⇒ `SUCCEEDED`, a propagating
+`Cancelled` ⇒ `CANCELED`, any other thrown exception ⇒ `ABORTED`.
 
 ```julia
 @ros_package "my_robot_msgs"

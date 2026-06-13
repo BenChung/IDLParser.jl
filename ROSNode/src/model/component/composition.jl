@@ -1,16 +1,16 @@
-# Dynamic composition — `ros2 component` parity (DESIGN-COMPONENTS.md §7). Two halves:
+# Dynamic composition — `ros2 component` parity. Two halves:
 #
 #   • a process-global **node-kind registry by name** (the `rclcpp_components_register_nodes`
 #     analog): `@node`/`@mixin` register their kind, so a name can be instantiated later;
 #   • a container's **`~/_container/{load_node,unload_node,list_nodes}` services** over the
 #     vendored `composition_interfaces` types, so `ros2 component load/unload/list` and the
 #     `ComposableNodeContainer` / `LoadComposableNodes` launch actions drive a running
-#     container. A runtime-loaded node is just one more node-core on the Context (§7) — the
+#     container. A runtime-loaded node is just one more node-core on the Context — the
 #     same `run`/assembly path as a launch-time `add!`, tracked under a container-unique id.
 
 export register_node_kind!, node_kind, node_kinds, load_node, unload_node, list_nodes
 
-# ── the node-kind registry (rclcpp_components_register_nodes analog, §7) ─────────
+# ── the node-kind registry (rclcpp_components_register_nodes analog) ─────────────
 # Process-global name → kind. Inherently a runtime registry (string → kind can't
 # dispatch), so unlike the per-mixin spec store it can't move into the defining module.
 # `@mixin`/`@node` therefore register a kind via the dual path — immediately in the
@@ -23,8 +23,8 @@ const _NODE_KINDS_LOCK = ReentrantLock()
 """
     register_node_kind!(name::AbstractString, K) -> K
 
-Register node kind `K` under `name` in the process-global kind registry, returning `K`
-(§7). This is the `rclcpp_components_register_nodes` analog: it makes a kind
+Register node kind `K` under `name` in the process-global kind registry, returning `K`.
+This is the `rclcpp_components_register_nodes` analog: it makes a kind
 instantiable by name, so a container's [`load_node`](@ref) (and the
 `~/_container/load_node` service behind `ros2 component load`) can build it from a load
 request.
@@ -46,7 +46,7 @@ end
     node_kind(name::AbstractString) -> Union{NodeKind, Type, Nothing}
 
 The node kind registered under `name` — the `NodeKind` or `@mixin` type passed
-to [`register_node_kind!`](@ref) — or `nothing` when no kind carries that name (§7).
+to [`register_node_kind!`](@ref) — or `nothing` when no kind carries that name.
 Thread-safe (guarded by the registry lock).
 
 The lookup is by the exact registered name; a container's load path additionally
@@ -58,7 +58,7 @@ node_kind(name::AbstractString) = @lock _NODE_KINDS_LOCK get(_NODE_KINDS, String
 """
     node_kinds() -> Vector{String}
 
-The names of every registered node kind, sorted ascending (§7). Each name resolves
+The names of every registered node kind, sorted ascending. Each name resolves
 through [`node_kind`](@ref) and is loadable by a container's [`load_node`](@ref) / the
 `~/_container/load_node` service. Thread-safe (guarded by the registry lock).
 """
@@ -86,7 +86,7 @@ end
 _kind_default_name(k::NodeKind) = String(k.name)
 _kind_default_name(::Type{M}) where {M} = _default_name(M)
 
-# ── container loaded-set bookkeeping (§7) ────────────────────────────────────────
+# ── container loaded-set bookkeeping ─────────────────────────────────────────────
 
 # Assign the next container-unique id (1-based, like rclcpp) to a freshly loaded node
 # and track it for `list_nodes`/`unload_node`. Returns the id.
@@ -107,14 +107,14 @@ function _overrides_from_wire(params)
     return (; (Symbol(p.name) => _from_param_value(p.value) for p in params)...)
 end
 
-# ── programmatic composition API (the verbs the services call, §7) ───────────────
+# ── programmatic composition API (the verbs the services call) ───────────────────
 
 """
     load_node(c::Container, package_name, plugin_name;
               name="", namespace="", parameters=(;)) -> (ComponentNode, unique_id::UInt64)
 
 Instantiate the registered kind named `plugin_name` on container `c`, returning the
-live `ComponentNode` and the container-unique id it is tracked under (§7).
+live `ComponentNode` and the container-unique id it is tracked under.
 This is the programmatic form of `ros2 component load`; the `~/_container/load_node`
 service (`composition_interfaces/srv/LoadNode`) drives the same path from the wire.
 
@@ -162,7 +162,7 @@ end
     unload_node(c::Container, unique_id::Integer) -> Bool
 
 Close and forget the loaded node tracked under `unique_id` on container `c`, returning
-`true` when a node carried that id and `false` otherwise (§7). This is the programmatic
+`true` when a node carried that id and `false` otherwise. This is the programmatic
 form of `ros2 component unload`; the `~/_container/unload_node` service
 (`composition_interfaces/srv/UnloadNode`) drives the same path.
 
@@ -192,7 +192,7 @@ end
     list_nodes(c::Container) -> Vector{Tuple{UInt64, String}}
 
 The nodes loaded on container `c` as `(unique_id, full_node_name)` pairs, ascending by
-id (§7). This is the programmatic form of `ros2 component list`; the
+id. This is the programmatic form of `ros2 component list`; the
 `~/_container/list_nodes` service (`composition_interfaces/srv/ListNodes`) returns the
 same pairs split into the response's parallel `unique_ids` / `full_node_names` arrays.
 `full_node_name` is the node's fully-qualified name (`namespace/name`). Thread-safe
@@ -205,7 +205,7 @@ function list_nodes(c::Container)
     end
 end
 
-# ── the wire control surface: ~/_container/{load,unload,list}_node (§7) ──────────
+# ── the wire control surface: ~/_container/{load,unload,list}_node ───────────────
 
 const _COMP_SRV = Interfaces.composition_interfaces.srv
 
@@ -225,7 +225,7 @@ _loglevel_from_ros(b::Integer) =
     _wire_container_services!(c::Container) -> c
 
 Declare the three `composition_interfaces` services under the container node's
-`~/_container/` namespace (§7), so `ros2 component load/unload/list` (and the
+`~/_container/` namespace, so `ros2 component load/unload/list` (and the
 `ComposableNodeContainer` launch action) drive the container. The handles are tracked
 on the container (closed with its Context).
 """
@@ -245,7 +245,7 @@ function _wire_container_services!(c::Container)
         # took effect.
         if !isempty(req.remap_rules)
             return _COMP_SRV.LoadNode_Response(; success = false,
-                error_message = "remap_rules not supported (§4.4 remap wiring is a follow-up); " *
+                error_message = "remap_rules not supported (remap wiring is a follow-up); " *
                     "load without remaps or remap at the @node member (`Mixin{port => target}`)",
                 full_node_name = "", unique_id = UInt64(0))
         end

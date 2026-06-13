@@ -1,9 +1,9 @@
-# §5 Contexts — the process-level container. One Context = one Zenoh session;
+# Contexts — the process-level container. One Context = one Zenoh session;
 # N nodes share it (hiroz's `ZContext`). It owns: the session (+ shared `z_id`),
 # an atomic entity-id counter, the domain id, default namespace/enclave, the
-# keyexpr formatter, the type registry (§11), the discovery index (§12) fed by a
-# single `@ros2_lv/<domain>/**` liveliness subscriber, a clock (§7), the
-# `on_shutdown` hooks, and the shutdown state machine + drain (§14).
+# keyexpr formatter, the type registry, the discovery index fed by a
+# single `@ros2_lv/<domain>/**` liveliness subscriber, a clock, the
+# `on_shutdown` hooks, and the shutdown state machine + drain.
 #
 # `# TODO(layer):` markers stub seams whose owning layer hasn't landed
 # (`--ros-args` remap parsing, the multi-Context signal manager, discovery-range
@@ -16,26 +16,31 @@ import Zenoh
 using ROSZenoh: ROSZenoh, ZenohId, RmwZenoh, KeyExprFormat, NodeEntity,
                 EndpointEntity, EndpointKind, parse_liveliness
 
-export Context, Node, # `Node` forward-declared here; the §6 layer defines it
+export Context, Node, # `Node` forward-declared here; the node layer defines it
        resolve_name, on_shutdown, request_shutdown, is_shutdown,
        spin, session, next_entity_id!, registry, graph,
        EndpointInfo, NodeInfo, GraphIndex
 
-# ── discovery index (§12) ────────────────────────────────────────────────
+# ── discovery index ────────────────────────────────────────────────
 
 """
     EndpointInfo
 
 A single discovered or locally-injected endpoint — the atom of the [discovery
-graph](https://docs.ros.org/en/rolling/Concepts/Basic/About-Discovery.html)
-(§12). Each record names the owning node (`node_name`, `namespace`), the
-endpoint `kind` (`Publisher`/`Subscription`/`Service`/`Client`), the resolved
-`topic` FQN, its `type` (a `TypeInfo`: ROS 2 name plus RIHS01 hash), the `qos`
-profile, the 16-byte `gid`, and `is_local`.
+graph](https://docs.ros.org/en/rolling/Concepts/Basic/About-Discovery.html).
+Each record names:
+
+- the owning node (`node_name`, `namespace`)
+- the endpoint `kind` (`Publisher`/`Subscription`/`Service`/`Client`)
+- the resolved `topic` FQN
+- its `type` (a `TypeInfo`: ROS 2 name plus RIHS01 hash)
+- the `qos` profile
+- the 16-byte `gid`
+- `is_local`
 
 Each record carries the RIHS01 hash and gid, so a caller can run its own type
-and QoS compatibility checks (§12.2) against the same data the auto-detectors
-use. `type === nothing` for an `EMPTY_TOPIC_TYPE` liveliness token. `is_local`
+and QoS compatibility checks against the same data the auto-detectors
+use. `type === nothing` for a type-less, liveliness-only endpoint. `is_local`
 true marks one of our own injected entities (authoritative, visible ahead of
 the liveliness round-trip); false marks a liveliness-discovered remote
 (eventually consistent).
@@ -59,7 +64,7 @@ end
     NodeInfo(name, namespace, enclave)
 
 Identity of a discovered node: its `name`, `namespace`, and security `enclave`.
-This is the shape `node_names` returns from a graph query (§12.1). `node_names`
+This is the shape `node_names` returns from a graph query. `node_names`
 currently reports `enclave` as `""` — the enclave is unrecoverable from
 rmw_zenoh liveliness tokens (always `%` on the wire).
 """
@@ -89,10 +94,10 @@ and a list of user `on_graph_change` listeners.
 
 The single `@ros2_lv/<domain>/**` liveliness subscriber drives it — a token PUT
 inserts or updates a record, a DELETE removes it by the same key — and our own
-entities are injected directly (§6). The `changed` condition is notified on
-every change so waiters (`wait_for_service`, `on_graph_change`) re-check their
-predicate. This is the one change stream every §12 detector and wait is a view
-over.
+entities are injected directly by the entity layer. The `changed` condition is
+notified on every change so waiters (`wait_for_service`, `on_graph_change`)
+re-check their predicate. This is the one change stream every discovery detector
+and wait is a view over.
 
 The no-argument constructor builds an empty index; the Context creates exactly
 one.
@@ -111,21 +116,20 @@ end
 GraphIndex() = GraphIndex(ReentrantLock(), Dict{String, EndpointInfo}(),
                           Threads.Condition(), Any[])
 
-# ── type registry (§11) ──────────────────────────────────────────────────
-# Keyed by (name, RIHS01-hash) so evolved versions of a type coexist. The value
-# is left `Any` (the §11 registry entry: IL + generated module + TypeDescription)
-# — that layer owns the entry shape; the Context only owns the table + lock so
-# all nodes share discovered types.
+# ── type registry ──────────────────────────────────────────────────────────
+# Keyed by (name, RIHS01 hash) so evolved versions of a type coexist. The value
+# is left `Any` (a typesupport-layer `RegistryEntry`) — that layer owns the entry
+# shape; the Context only owns the table + lock so all nodes share discovered types.
 
 """
     TypeRegistry
     TypeRegistry()
 
-The per-`Context` type table that backs runtime type support (§11). Keyed by
-`(type_name, RIHS01-hash)`, so several evolved versions of one interface coexist
-under distinct keys — the hash is the decode-safety identity, not just a version
-tag (the ROS Interface Hashing Standard, RIHS01, defined in REP 2011:
-https://ros.org/reps/rep-2011.html).
+The per-`Context` type table that backs runtime type support. Keyed by
+`(type_name, RIHS01 hash)`, so several evolved versions of one interface coexist
+under distinct keys — the hash (the ROS Interface Hashing Standard,
+[REP 2011](https://ros.org/reps/rep-2011.html)) is the decode-safety identity, not
+just a version tag (see [`RegistryEntry`](@ref) for the entry shape).
 
 The `Context` owns the storage and the guarding lock; the typesupport layer fills
 and reads it. Values are [`RegistryEntry`](@ref) records, held as `Any` so the
@@ -162,7 +166,7 @@ end
 
 Fetch the value stored under `(info.name, info.hash)`, or `nothing` when that
 exact name-and-version pair has not been registered. A `nothing` result is the
-§11 trigger to acquire the type (cache, ament, or dynamic over-the-wire
+trigger to acquire the type (cache, ament, or dynamic over-the-wire
 discovery). The lookup takes the registry lock for the read; the match is exact
 on both name and RIHS01 hash, so a peer advertising a different version of the
 same type misses and drives a fresh acquisition. The registry stores values as
@@ -173,7 +177,7 @@ puts in).
 lookup_type(reg::TypeRegistry, info::TypeInfo) =
     @lock reg.lock get(reg.entries, (info.name, info.hash), nothing)
 
-# ── shutdown state (§14) ──────────────────────────────────────────────────
+# ── shutdown state ──────────────────────────────────────────────────
 # `running → shutting_down → shutdown_done`. The transition is the one drain
 # path every trigger funnels through (close / request_shutdown / signal).
 
@@ -187,13 +191,13 @@ lookup_type(reg::TypeRegistry, info::TypeInfo) =
             peers=String[], drain_timeout=5.0, shm_clients=nothing, home=nothing)
     Context(f::Function; kwargs...)
 
-The process-level container (§5) shared by every node in a program — one
+The process-level container shared by every node in a program — one
 `Context` holds exactly one Zenoh `Session`, and N nodes draw on it (modeled on
 hiroz's `ZContext`). It owns the session and its hex `z_id`, an atomic
 entity-id counter, the `domain_id`, the default `namespace`/`enclave`, the
-keyexpr formatter, the type registry (§11), the discovery index with its
-`@ros2_lv/<domain>/**` liveliness subscriber (§12), a clock (§7), the
-`on_shutdown` hooks, and the shutdown state machine (§14). It is the
+keyexpr formatter, the type registry, the discovery index with its
+`@ros2_lv/<domain>/**` liveliness subscriber, a clock, the
+`on_shutdown` hooks, and the shutdown state machine. It is the
 RAII/shutdown root: `close(ctx)` runs the drain, undeclares entities, and
 closes the session (the `rclcpp::init`/`shutdown` bracket).
 
@@ -237,7 +241,7 @@ mutable struct Context
     const namespace::String              # default node namespace
     const enclave::String
     const format::KeyExprFormat
-    @atomic _next_id::Int                # atomic entity-id allocator (§5)
+    @atomic _next_id::Int                # atomic entity-id allocator
     const registry::TypeRegistry
     const graph::GraphIndex
     # The `@ros2_lv/<domain>/**` liveliness subscriber (channel form) feeding `graph`,
@@ -246,13 +250,13 @@ mutable struct Context
     # `Any` because Zenoh's handler type isn't in scope as a field constraint here and
     # `close` is duck-typed.
     _lv_sub::Any
-    # Clock handles by source — `clock(ctx, C())` returns/creates one. The §7
+    # Clock handles by source — `clock(ctx, C())` returns/creates one. The
     # `Clock` is duck-typed against `node.clocks`; the Context fills that role.
     const clocks::Dict{DataType, Any}
-    # Sim-time source (§7): the Context-hosted `/clock` value, atomically held.
+    # Sim-time source: the Context-hosted `/clock` value, atomically held.
     # `nothing` until any node sets `use_sim_time` and the sub lands.
     @atomic sim_time_ns::Union{Int64, Nothing}
-    # §7 sim-time wiring. `_sim_users` is the set of nodes that opted into
+    # Sim-time wiring. `_sim_users` is the set of nodes that opted into
     # `use_sim_time` (sim active iff non-empty — ONE process-level `/clock` source,
     # per-node opt-in). `_clock_node`/`_clock_sub` are the hidden internal node + its
     # `/clock` Subscription carrying that source. All guarded by `_sim_lock` (a
@@ -261,7 +265,7 @@ mutable struct Context
     _clock_sub::Any
     const _sim_users::Set{Any}
     const _sim_lock::ReentrantLock
-    # Shutdown state + drain machinery (§14).
+    # Shutdown state + drain machinery.
     const _state_lock::ReentrantLock
     @atomic _state::ShutdownState
     const _on_shutdown::Vector{Any}      # user cleanup hooks, run during the drain
@@ -300,7 +304,7 @@ _env_namespace() = get(ENV, "ROS_NAMESPACE", "")
 _env_enclave()   = get(ENV, "ROS_ENCLAVE", "")
 
 # Translate the ROS transport-shaping env vars into the Zenoh `Config` via its
-# `c[key]=value` JSON5 setter (§5). Only the unambiguous mappings: localhost-only
+# `c[key]=value` JSON5 setter. Only the unambiguous mappings: localhost-only
 # → scouting off + loopback connect; static peers → connect/endpoints. `domain_id`
 # deliberately does *not* go here — it lives in the keyexprs, not the transport.
 # TODO(layer): `ROS_AUTOMATIC_DISCOVERY_RANGE` → gossip/multicast scope once the
@@ -343,8 +347,8 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
                   ReentrantLock(), running, Any[], Threads.Condition(),
                   Threads.Condition(), Float64(drain_timeout), Any[], home)
 
-    # Register the statically-compiled bootstrap types (type_description_interfaces,
-    # §11 S1) so the §13 server can serve them and discovery can use them, plus any
+    # Register the statically-compiled bootstrap types (type_description_interfaces)
+    # so the type-description server can serve them and discovery can use them, plus any
     # @ros_import/@ros_cache statically-generated types (so keyexpr-only resolution
     # uses the precompiled type directly). Forward references into typesupport/
     # wellknown (included after this file).
@@ -408,7 +412,7 @@ Base.show(io::IO, ctx::Context) =
     print(io, "Context(domain=", ctx.domain_id, ", z_id=", ctx.z_id,
               ", state=", (@atomic ctx._state), ")")
 
-# ── accessors others need (§5) ─────────────────────────────────────────────
+# ── accessors others need ─────────────────────────────────────────────
 
 """
     session(ctx) -> Session
@@ -422,7 +426,7 @@ session(ctx::Context) = ctx.session
 """
     registry(ctx) -> TypeRegistry
 
-The Context's type registry (§11) — the per-Context table keyed by
+The Context's type registry — the per-Context table keyed by
 `(type_name, RIHS01 hash)` so evolved versions of a type coexist. The Context
 owns the storage and lock; the typesupport layer populates and reads entries
 (static bootstrap types at construction, dynamically-discovered types over the
@@ -433,7 +437,7 @@ registry(ctx::Context) = ctx.registry
 """
     graph(ctx) -> GraphIndex
 
-The Context's discovery index (§12): the live `EndpointInfo` set fed by the
+The Context's discovery index: the live `EndpointInfo` set fed by the
 `@ros2_lv/<domain>/**` liveliness subscriber and by our own injected entities.
 The graph-query and graph-wait surface (`endpoints`, `topic_names_and_types`,
 `wait_for_service`, `on_graph_change`) are views over this one index.
@@ -443,15 +447,15 @@ graph(ctx::Context) = ctx.graph
 """
     next_entity_id!(ctx) -> Int
 
-Allocate the next entity id from the Context's atomic counter and return it
-(§5). Nodes and endpoints draw from this one counter — the value populates a
+Allocate the next entity id from the Context's atomic counter and return it.
+Nodes and endpoints draw from this one counter — the value populates a
 ROSZenoh entity's `id` field, which must be unique within the session. The
 first allocation returns `1` (the counter starts at 0 and increments before
 reading). Thread-safe: the increment-and-fetch is a single atomic operation.
 """
 next_entity_id!(ctx::Context) = (@atomic ctx._next_id += 1)
 
-# The Context fills the §7 clock's `node`-role for context-level reads; the time
+# The Context fills the clock's `node`-role for context-level reads; the time
 # layer reads `node.clocks` duck-typed, so a Context works wherever a node would.
 function clock(ctx::Context, src::ClockSource)
     C = typeof(src)
@@ -461,7 +465,7 @@ function clock(ctx::Context, src::ClockSource)
 end
 clock(ctx::Context) = clock(ctx, ROS())
 
-# ── §7 sim-time: use_sim_time → /clock routing ──────────────────────────────────
+# ── sim-time: use_sim_time → /clock routing ──────────────────────────────────
 # ONE process-level `/clock` data source (a Subscription on a hidden internal node),
 # per-node opt-in: `_sim_users` holds the nodes whose ROS clock follows sim time, so
 # `now(node, ROS())` reads `sim_time_ns` only for an opted-in node (time.jl). Jump
@@ -483,7 +487,7 @@ _is_sim_user(ctx::Context, node) = @lock ctx._sim_lock (node in ctx._sim_users)
 """
     set_use_sim_time!(ctx, node, on::Bool) -> nothing
 
-(De)activate sim-time routing for `node` (§7). The first opt-in declares the Context's
+(De)activate sim-time routing for `node`. The first opt-in declares the Context's
 `/clock` Subscription; the last opt-out tears it down. Fires a per-node
 `sim_activated`/`sim_deactivated` jump on the node's ROS clock.
 """
@@ -606,7 +610,7 @@ function _fire_clock_jumps!(ctx::Context, j::TimeJump)
     nothing
 end
 
-# ── name resolution (§5) ────────────────────────────────────────────────────
+# ── name resolution ────────────────────────────────────────────────────
 # Turn a user name into a fully-qualified name *before* it reaches ROSZenoh:
 # absolute `/foo` as-is; relative `foo` → prepend namespace; private `~/foo` →
 # prepend the node FQN; then validate. Remap is a per-context rule table (the
@@ -625,7 +629,7 @@ end
 _ns_join(ns::AbstractString, name::AbstractString) =
     ns == "/" ? "/" * name : ns * "/" * name
 
-# A node's FQN = namespace + "/" + name. Duck-typed: the §6 Node has
+# A node's FQN = namespace + "/" + name. Duck-typed: the Node has
 # `namespace`/`name`; a bare Context resolves relative names against its default
 # namespace with no private (`~`) support.
 _resolver_namespace(node) = hasproperty(node, :namespace) ? node.namespace : "/"
@@ -655,7 +659,7 @@ end
 """
     resolve_name(node_or_ctx, name; kind=:topic) -> String
 
-Resolve a user-supplied `name` to a fully-qualified name (§5), the form the
+Resolve a user-supplied `name` to a fully-qualified name, the form the
 ROSZenoh keyexpr builders expect. Three name forms, following ROS 2 name
 resolution:
 
@@ -709,7 +713,7 @@ function _apply_remap(node, resolved::AbstractString, ::Symbol)
     resolved
 end
 
-# ── discovery: the @ros2_lv/<domain>/** liveliness subscriber (§12) ────────
+# ── discovery: the @ros2_lv/<domain>/** liveliness subscriber ────────
 # One channel-form subscriber per Context, drained by a Julia consumer task. Each
 # token PUT/DELETE updates the index and fans a `GraphChange` to listeners. Parse
 # failures are logged and skipped — a malformed/foreign token must not kill the task.
@@ -720,7 +724,7 @@ end
 # call JIT — acute when a process queries *itself*, both serving and calling) must
 # then halt that foreign thread, but it can be mid-Julia-callback and unable to reach
 # a safepoint → deadlock. Draining a FIFO on a Julia-managed (GC-safe) consumer task
-# keeps ALL Julia execution off foreign threads, so a GC can always complete (§12/D8).
+# keeps ALL Julia execution off foreign threads, so a GC can always complete.
 
 # The wildcard liveliness keyexpr. rmw_zenoh tokens carry the domain as their
 # first segment (`@ros2_lv/<domain>/...`), so the subscription itself scopes
@@ -732,14 +736,14 @@ _lv_wildcard(::KeyExprFormat, ::Integer) = "**/@ros2_lv/**"
 function _start_discovery!(ctx::Context)
     ke = Keyexpr(_lv_wildcard(ctx.format, ctx.domain_id))
     # `history=true` replays the live token set so a late-joining Context sees the
-    # existing graph (§12 eventual consistency). Capacity is generous: a discovery
+    # existing graph (eventual consistency). Capacity is generous: a discovery
     # burst (many tokens at once) buffers rather than drops, and the consumer drains
     # it fast (a locked index update per token, no user handler).
     sub = LivelinessSubscriberHandler(ctx.session, ke; channel=:fifo,
                                       capacity=1024, history=true)
     ctx._lv_sub = sub
     # Plain `@spawn` (migratable): the index update is lock-guarded, needs no thread
-    # affinity, and runs on any thread under `-t>=2`. Closing the handler (drain/§14)
+    # affinity, and runs on any thread under `-t>=2`. Closing the handler on drain
     # disconnects the channel → the `for` loop ends → the task exits.
     Threads.@spawn begin
         try
@@ -792,7 +796,7 @@ end
 
 # Wake graph waiters and fan a `GraphChange` to user listeners. Listeners run
 # outside the index lock (their handlers may query the graph). The condition is
-# how `wait_for_service`/`wait_for_matched` (§12) re-check on each change.
+# how `wait_for_service`/`wait_for_matched` re-check on each change.
 function _notify_graph_change!(ctx::Context, added::Vector{EndpointInfo},
                                removed::Vector{EndpointInfo})
     @lock ctx.graph.changed notify(ctx.graph.changed)
@@ -815,7 +819,7 @@ end
 """
     inject_endpoint!(ctx, key::AbstractString, e::EndpointEntity)
 
-Register one of *our own* entities in the discovery index immediately (§6/§12),
+Register one of *our own* entities in the discovery index immediately,
 authoritative ahead of the liveliness round-trip. `key` is the entity's
 liveliness keyexpr (its unique index key). The entity layer calls this when it
 declares an endpoint; `remove_endpoint!` is the close-side inverse.
@@ -842,8 +846,8 @@ end
 """
     endpoints_snapshot(ctx) -> Vector{EndpointInfo}
 
-An immutable snapshot of the index (copied out under the lock, §12.1) — a
-consistent instant, not a live alias. The §12 query layer (`endpoints`,
+An immutable snapshot of the index (copied out under the lock) — a
+consistent instant, not a live alias. The graph-query layer (`endpoints`,
 `topic_names_and_types`, …) filters over this.
 """
 endpoints_snapshot(ctx::Context) =
@@ -853,7 +857,7 @@ endpoints_snapshot(ctx::Context) =
     on_graph_change(f, node_or_ctx) -> f
 
 Register `f(change)` (`change.added` / `change.removed :: Vector{EndpointInfo}`)
-to fire on every discovery change (§12.3). Returns `f` so it can be removed.
+to fire on every discovery change. Returns `f` so it can be removed.
 """
 function on_graph_change(f::Function, ctx::Context)
     @lock ctx.graph.lock push!(ctx.graph.listeners, f)
@@ -861,13 +865,13 @@ function on_graph_change(f::Function, ctx::Context)
 end
 on_graph_change(f::Function, node) = on_graph_change(f, _ctx(node))
 
-# ── shutdown state machine + drain (§14) ────────────────────────────────────
+# ── shutdown state machine + drain ────────────────────────────────────
 
 """
     is_shutdown(ctx) -> Bool
 
 True once the Context has begun shutting down — state `shutting_down` or
-`shutdown_done` (§14). The loop-guard predicate behind patterns like
+`shutdown_done`. The loop-guard predicate behind patterns like
 `while !is_shutdown(ctx)`; `isopen(ctx)` is its positive complement. Reads the
 atomic shutdown state, so it is safe to poll from any task.
 """
@@ -881,7 +885,7 @@ Base.isopen(ctx::Context) = (@atomic ctx._state) === running
     on_shutdown(f, node) -> f
 
 Register a cleanup callback `f()` to run during the Context drain — after
-blocked waits are woken and before the session closes (§14.1, step 2; the
+blocked waits are woken and before the session closes (the
 `rclcpp::on_shutdown` analog). Each hook runs under its own `drain_timeout`
 bound: the drain moves on once a hook's timeout elapses, leaving the overrunning
 hook running detached (so N slow hooks can extend the drain to roughly
@@ -906,7 +910,7 @@ on_shutdown(f::Function, node) = on_shutdown(f, _ctx(node))
     register_resource!(ctx, handle) -> handle
 
 Track a `close`-able handle (node, endpoint, timer) so the drain undeclares it
-(§14.1, step 4). The entity layer calls this at construction; the drain walks the
+during teardown. The entity layer calls this at construction; the drain walks the
 list in reverse so dependents close before their dependencies.
 """
 function register_resource!(ctx::Context, handle)
@@ -917,7 +921,7 @@ end
 """
     request_shutdown(ctx; reason="") -> Bool
 
-Begin a graceful drain of the Context (§14). Idempotent and task-safe (safe to
+Begin a graceful drain of the Context. Idempotent and task-safe (safe to
 call from any task, including the Ctrl-C interrupt path): the first caller
 flips the state `running -> shutting_down` and spawns the drain task; later
 calls are no-ops. Returns `true` if this call initiated shutdown, `false` if a
@@ -944,11 +948,11 @@ function request_shutdown(ctx::Context; reason::AbstractString="")
     return true
 end
 
-# The one drain path (§14.1) every trigger funnels through. Ordered so peers see
+# The one drain path every trigger funnels through. Ordered so peers see
 # a clean exit and in-flight work finishes:
 #   1. (already flipped to :shutting_down) wake clock-waits / blocked calls
 #   2. run on_shutdown hooks
-#   3. await in-flight tasks up to drain_timeout  (TODO: task tracking, §8/§9)
+#   3. await in-flight tasks up to drain_timeout  (TODO: task tracking)
 #   4. undeclare entities (liveliness + routes)
 #   5. close the session  → :shutdown, notify spin/wait waiters
 function _drain!(ctx::Context)
@@ -959,7 +963,7 @@ function _drain!(ctx::Context)
     try
         # 1. Wake blocked clock-waits and the graph waits so they unwind with a
         # ShutdownException rather than hanging the drain. `_shutdown_wake` releases
-        # `_interruptible_sleep`/Rate/sleep_until (time.jl), `graph.changed` the §12
+        # `_interruptible_sleep`/Rate/sleep_until (time.jl), `graph.changed` the
         # graph waits; both re-check `is_shutdown` and raise.
         @lock ctx._shutdown_wake notify(ctx._shutdown_wake; all=true)
         @lock ctx.graph.changed notify(ctx.graph.changed; all=true)
@@ -973,7 +977,7 @@ function _drain!(ctx::Context)
         end
 
         # 3. Await in-flight goal/service handler tasks (incl. detached cleanup)
-        # up to drain_timeout. TODO(layer §8/§9): the Service/Action layers
+        # up to drain_timeout. TODO(layer): the Service/Action layers
         # register their handler tasks with the Context; until then there is
         # nothing to await and this is a no-op — the timeout still bounds the
         # whole drain via steps 2 and 5.
@@ -1002,7 +1006,7 @@ function _drain!(ctx::Context)
                 end
                 ctx._lv_sub = nothing
             end
-            # §7 sim-time: the `/clock` sub rides `_clock_node` (a registered resource,
+            # Sim-time: the `/clock` sub rides `_clock_node` (a registered resource,
             # already closed in the reverse walk above). Just clear the references + the
             # opt-in set so nothing dangles.
             @lock ctx._sim_lock begin
@@ -1028,7 +1032,7 @@ end
 # log on overrun (the task keeps running detached — we don't hard-kill a hook
 # mid-cleanup, the drain just moves on). Exceptions from `f` are logged, not
 # raised. `Base.timedwait` is the bound — note `Timer` here would resolve to
-# ROSNode's clock `Timer` (§7), so the wall-clock primitives are spelled `Base.`.
+# ROSNode's clock `Timer`, so the wall-clock primitives are spelled `Base.`.
 function _run_bounded(f, ::Context, what::AbstractString, secs::Real)
     t = @async try
         f()
@@ -1043,7 +1047,7 @@ end
 """
     close(ctx::Context)
 
-Synchronous shutdown (§14): request the drain (idempotent) and block the calling
+Synchronous shutdown: request the drain (idempotent) and block the calling
 task until it completes. Safe to call twice — a second `close` (e.g. a do-block
 block-exit after `spin` already drained) parks momentarily and returns.
 """
@@ -1073,7 +1077,7 @@ end
 """
     spin(ctx; handle_signals=false) -> nothing
 
-Park the calling (typically main) task until the Context shuts down (§14),
+Park the calling (typically main) task until the Context shuts down,
 keeping the process alive while Julia's scheduler delivers messages and runs
 callbacks on their own tasks (the scheduler fills the [executor](https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Executors.html)
 role). Returns once the drain has fully completed.
@@ -1131,7 +1135,7 @@ function _park_until_drained(ctx::Context)
     end
 end
 
-# Signal handling (§14.3): opt-in, scoped to the spin call. Installs handlers,
+# Signal handling: opt-in, scoped to the spin call. Installs handlers,
 # runs `f`, removes them on return. First signal → graceful `request_shutdown`;
 # a second SIGINT while draining → immediate `exit(130)`.
 # TODO(layer): a process-global manager that fans one signal to all opted-in
@@ -1163,7 +1167,7 @@ end
 _remove_signal_handlers!(::Context) = (Base.exit_on_sigint(true); nothing)
 
 # ── node ↔ context plumbing ────────────────────────────────────────────────
-# The §6 Node holds its Context; accept either a Context directly or anything
+# The Node holds its Context; accept either a Context directly or anything
 # exposing a `.context` field (the Node shape).
 
 "Recover the owning `Context` from a node-or-context argument."
@@ -1171,7 +1175,7 @@ _ctx(ctx::Context) = ctx
 _ctx(node) = hasproperty(node, :context) ? node.context :
              throw(ArgumentError("expected a Context or a Node holding one"))
 
-# `Node` is the §6 layer's type, defined in model/node/node.jl (included after
+# `Node` is the node layer's type, defined in model/node/node.jl (included after
 # this file); its `struct Node` replaces this binding. The forward declaration
 # lets the `Context`/`Node` vocabulary co-export cleanly and the duck-typed
 # accessors above name it.

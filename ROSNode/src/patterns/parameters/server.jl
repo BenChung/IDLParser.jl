@@ -1,4 +1,4 @@
-# ── the parameter server (§10) ──────────────────────────────────────────────────
+# ── the parameter server ──────────────────────────────────────────────────
 # Holds the live schema value behind an atomic field (whole-struct swap, so a
 # racing reader sees a complete old-or-new value), the descriptors (cached
 # once), the dynamic side dict + `allow_undeclared` gate, the mutation lock, the
@@ -12,7 +12,7 @@
     ParameterServer{P}(node; overrides=(;), allow_undeclared=false) -> ParameterServer{P}
 
 The parameter subsystem for one node, parameterized on a [`@parameters`](@ref)
-schema `P` (ROS 2 node parameters, §10). It owns the live schema value and
+schema `P` (ROS 2 node parameters). It owns the live schema value and
 applies sets directly; [`ParameterClient`](@ref) is its remote dual, driving
 another node's parameter services asynchronously and fallibly over the wire.
 
@@ -46,7 +46,7 @@ mutable struct ParameterServer{P} <: AbstractParameterServer
     const allow_undeclared::Bool
     const lock::ReentrantLock                        # the single parameter-mutation lock
     const listeners::Vector{Any}                     # on_parameter_event callbacks
-    _events_pub::Any                                 # /parameter_events publisher (§8 wire)
+    _events_pub::Any                                 # /parameter_events publisher
     const services::Vector{Any}                      # the six wired parameter-service handles
 end
 
@@ -64,7 +64,7 @@ Base.show(io::IO, s::ParameterServer{P}) where {P} =
     print(io, "ParameterServer{", nameof(P), "}(",
           length(s.descriptors), " declared, ", length(s.dynamic), " dynamic)")
 
-"The current (live) schema value (§10) — a complete, never half-applied, struct."
+"The current (live) schema value — a complete, never half-applied, struct."
 current(s::ParameterServer) = @atomic s.value
 
 "The declared schema type `P` of this server."
@@ -74,7 +74,7 @@ schema_type(::ParameterServer{P}) where {P} = P
     declared_names(server::ParameterServer{P}) -> NTuple{N,Symbol}
 
 The declared parameter names of a [`ParameterServer`](@ref), in schema order —
-`fieldnames(P)` (§10). [`parameter_names`](@ref) adds the dynamic tier for the
+`fieldnames(P)`. [`parameter_names`](@ref) adds the dynamic tier for the
 full flat namespace.
 """
 declared_names(s::ParameterServer{P}) where {P} = fieldnames(P)
@@ -83,7 +83,7 @@ declared_names(s::ParameterServer{P}) where {P} = fieldnames(P)
     dynamic_parameters(server::ParameterServer) -> Dict{Symbol,Any}
     dynamic_parameters(node::Node) -> Dict{Symbol,Any}
 
-The undeclared (dynamic) parameter side dict of a node's parameter server (§10)
+The undeclared (dynamic) parameter side dict of a node's parameter server
 — the `Any`-typed tier for parameters outside the [`@parameters`](@ref) schema.
 The dict is returned by reference, so a direct write
 (`dynamic_parameters(node)[:gain] = 2.0`) adds or changes an undeclared
@@ -100,7 +100,7 @@ function dynamic_parameters(s::ParameterServer)
     return s.dynamic
 end
 
-# ── reads (§10) ──────────────────────────────────────────────────────────────────
+# ── reads ──────────────────────────────────────────────────────────────────
 # `server.field` derefs the live struct (type-stable for a declared field).
 # Reserved struct members read through; any other name is a parameter, with
 # declared names taking priority over the dynamic dict.
@@ -135,7 +135,7 @@ Base.propertynames(s::ParameterServer{P}) where {P} = fieldnames(P)
     parameter(server::ParameterServer, name::Symbol)
     parameter(client::ParameterClient, name; timeout_ms=2000)
 
-Read one parameter by `name` across both tiers (§10). On a
+Read one parameter by `name` across both tiers. On a
 [`ParameterServer`](@ref) a declared field reads from the live atomic struct and
 a dynamic one from the side dict (when `allow_undeclared`); an undeclared name
 with the gate off raises `ArgumentError`. On a [`ParameterClient`](@ref) it is
@@ -157,7 +157,7 @@ end
     parameter_names(server::CompositeParameterServer) -> Vector{Symbol}
     parameter_names(client::ParameterClient; kwargs...) -> Vector{Symbol}
 
-The flat list of parameter names a node exposes (§10) — what `list` and
+The flat list of parameter names a node exposes — what `list` and
 `/parameter_events` reflect over. For a [`ParameterServer`](@ref) this is the
 union of declared field names (first, in schema order) and the live dynamic
 names (sorted, only when `allow_undeclared`). For a
@@ -171,7 +171,7 @@ function parameter_names(s::ParameterServer{P}) where {P}
     return names
 end
 
-# ── transactions: the mutation primitive (§10) ──────────────────────────────────
+# ── transactions: the mutation primitive ──────────────────────────────────
 # A `Draft` is a mutable overlay over the live base: `p.field = v` records a
 # pending override that later reads in the block observe, while the live value
 # stays untouched until commit. On clean block exit we build the candidate via
@@ -224,18 +224,23 @@ Base.propertynames(d::Draft{P}) where {P} = fieldnames(P)
     transaction(server::ParameterServer{P}) do p … end -> P
     transaction(f, client::ParameterClient{P}; timeout_ms=2000) -> P
 
-The parameter mutation primitive (§10). Runs `f(draft)` against a mutable draft
+The parameter mutation primitive. Runs `f(draft)` against a mutable draft
 of the current parameters: assignments record pending overrides that reads
 inside the block observe, while nothing live is touched and nothing is published
 until commit.
 
 For a [`ParameterServer`](@ref) the call holds the server's single mutation lock
 for the block's whole duration, so transactions serialize (the consistency
-boundary the foreign-thread dispatch relies on). On clean exit the candidate is
-assembled via [`setproperties`](@ref), validated as a whole (the per-field
-read-only gate and constraints, then the user [`validate`](@ref) hook), swapped
-in with one atomic whole-struct store, and one batched `/parameter_events` is
-published. Any throw aborts with free rollback — the live cell never held a
+boundary the foreign-thread dispatch relies on). On clean exit the commit
+pipeline runs in order:
+
+1. assemble the candidate via [`setproperties`](@ref);
+2. validate it as a whole (the per-field read-only gate and constraints, then
+   the user [`validate`](@ref) hook);
+3. swap it in with one atomic whole-struct store;
+4. publish one batched `/parameter_events`.
+
+Any throw aborts with free rollback — the live cell never held a
 partial state. Returns the committed schema value. A constraint, read-only, or
 `validate` violation raises [`ParameterRejection`](@ref), which unwinds the lock
 with nothing committed.
@@ -322,7 +327,7 @@ function _commit!(s::ParameterServer{P}, base::P,
     return candidate
 end
 
-# ── single-statement sugar (§10) ────────────────────────────────────────────────
+# ── single-statement sugar ────────────────────────────────────────────────
 # `server.field = v` and `setproperties!(server, …)` are implicit single-statement
 # transactions routed through the same commit path. A NamedTuple is a partial
 # overlay; a full `P` value is replace-all (every field).
@@ -339,7 +344,7 @@ end
     setproperties!(server::ParameterServer{P}, overrides::NamedTuple) -> P
     setproperties!(server::ParameterServer{P}, full::P) -> P
 
-Effectful multi-field set as one implicit transaction (§10). A NamedTuple is a
+Effectful multi-field set as one implicit transaction. A NamedTuple is a
 partial overlay — only the named fields change. A full `P` value is replace-all
 — every field is staged, and validation and the event batch consider only the
 fields whose value actually changes, so restating a read-only field at its
@@ -367,7 +372,7 @@ end
     set_parameter!(server::ParameterServer, name::Symbol, value) -> P
     set_parameter!(client::ParameterClient, name, value; timeout_ms=2000) -> value
 
-Set one parameter by name (§10), atomically. On a [`ParameterServer`](@ref) a
+Set one parameter by name, atomically. On a [`ParameterServer`](@ref) a
 declared field routes to the typed struct (value coerced to the field type) and
 an undeclared name to the dynamic dict (when `allow_undeclared`); it runs as a
 single-statement transaction and returns the whole committed schema struct `P`

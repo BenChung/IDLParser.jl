@@ -1,4 +1,4 @@
-# §11 Type support — the runtime type registry and its three acquisition paths.
+# Type support — the runtime type registry and its three acquisition paths.
 # The IL is the hub: every way a type enters (static `@ros_msgs`, ament scan of an
 # installed workspace, or dynamic GetTypeDescription over the wire) normalizes into
 # `ROSMessages.IL`, and codegen/hashing/persistence all read from it.
@@ -33,13 +33,13 @@ export TypeRegistry, RegistryEntry, register_type!, lookup_type,
        discover_ament_packages, load_ament_type,
        enable_project_cache!, disable_project_cache!, absorb_static_types!
 
-# ── registry entry shape (§11) ────────────────────────────────────────────
+# ── registry entry shape ───────────────────────────────────────────────────
 
 """
     RegistryEntry(info::TypeInfo, il; td=nothing, provenance::Symbol=:wire)
 
 One record in the [`TypeRegistry`](@ref), keyed there by `(type_name,
-RIHS01-hash)` (§11). Holds everything the runtime knows about a single ROS 2
+RIHS01-hash)`. Holds everything the runtime knows about a single ROS 2
 interface type
 (https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html):
 
@@ -49,7 +49,7 @@ interface type
   server) reads from.
 - `td::Union{TypeDescriptionMsg, Nothing}` — the wire type description (main
   type plus its referenced closure), the source of truth for persistence and
-  the `~/get_type_description` service (§15). Present for `:wire` and `:cache`
+  the `~/get_type_description` service. Present for `:wire` and `:cache`
   entries (the received blob) and for `:static` / `:authored` entries (the
   baked or reflected description they were generated from); `nothing` for an
   `:ament` entry, which is parsed straight from installed `.msg` / `.srv` /
@@ -105,7 +105,7 @@ function split_ros_name(name::AbstractString)
     end
 end
 
-# ── codegen: IL → generated module via the macro pipeline (§11) ─────────────
+# ── codegen: IL → generated module via the macro pipeline ───────────────────
 # The dynamic-type birth path. `lower(il; package)` → `resolve_constants` →
 # `generate_code` produces the same `Expr` vector `@ros_msgs` splices at macro
 # time; we `eval` it into a fresh anonymous module so a runtime type lives in a
@@ -171,7 +171,7 @@ end
 #
 # The bindings are younger than the running world, so `isdefined`/`getfield` go
 # through `invokelatest` (Julia 1.12+ rejects a prior-world binding access
-# otherwise). This is the realize-time half of the §11 "dynamic = invokelatest"
+# otherwise). This is the realize-time half of the "dynamic = invokelatest"
 # rule; the per-message decode/handler hop is the other half (the dispatch layer's).
 function _fetch_generated_type(mod::Module, name::AbstractString)
     package, qualifier, bare = split_ros_name(name)
@@ -194,7 +194,7 @@ end
 Run the codegen pipeline for `entry` (once) so its generated `Module`/`type` are
 available. Idempotent — a second call is a no-op once `entry.mod` is set. The
 generated type is reached by callers via `Base.invokelatest` (it is born in a
-newer world age than the compiled dispatcher, §11).
+newer world age than the compiled dispatcher).
 
 A codegen/eval failure is logged and leaves the entry unrealized (`mod`/`type`
 stay `nothing`) so a single bad type can't abort discovery; the subscription path

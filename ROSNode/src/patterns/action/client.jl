@@ -1,4 +1,4 @@
-# ── ActionClient (§9) ──────────────────────────────────────────────────────────
+# ── ActionClient ─────────────────────────────────────────────────────────────
 # `send` issues a send_goal request and returns a client-side goal handle that is
 # iterable over feedback, `fetch`-able for the result, and `cancel`-able. The
 # three services are reached with Zenoh `get` (one per call); feedback is a
@@ -34,7 +34,7 @@ mutable struct ActionClient{A, G, R, F}
     const name::String                   # resolved action FQN
     const support::ActionTypeSupport{A, G, R, F}
     const qos::QosProfile
-    # rmw_zenoh request attachment (§3.4): the three action services are `get`s, and a
+    # rmw_zenoh request attachment: the three action services are `get`s, and a
     # real rmw_zenoh queryable reads the request's `(sequence_number, source_timestamp,
     # source_gid)` attachment to stamp its reply — hiroz `.unwrap()`s it, so a request
     # without one panics the peer. Stable per-client gid + a per-request seq.
@@ -129,9 +129,10 @@ end
 """
     ClientGoal{A, G, R, F}
 
-A client-side handle for a dispatched goal (§9): iterable over feedback,
-`fetch`-able for the result, `cancel`-able, and `state`-queryable. Returned by
-[`send`](@ref) once the server has accepted or rejected.
+A client-side handle for a dispatched goal: iterable over feedback,
+`fetch`-able for the result, `cancel`-able, and `state`-queryable. The result is
+held in a write-once slot the framework fills from the server's `get_result`
+reply. Returned by [`send`](@ref) once the server has accepted or rejected.
 """
 mutable struct ClientGoal{A, G, R, F}
     const client::ActionClient{A, G, R, F}
@@ -220,7 +221,7 @@ end
 """
     feedback(goal) -> iterable
 
-Stream the goal's feedback messages (§9), each a `Feedback` struct. Lazily opens
+Stream the goal's feedback messages, each a `Feedback` struct. Lazily opens
 a subscription on the action's feedback topic on first iteration; the stream ends
 when the goal reaches a terminal state. The topic carries `<A>_FeedbackMessage`
 (goal_id + feedback), so the stream is filtered to *this* goal's id.
@@ -321,12 +322,12 @@ end
 """
     fetch(goal) -> result
 
-Block until the goal settles and return its `Result` (§9). The goal settles exactly
-once, so the result lives in a single write-once slot the framework fills via one
-`get_result` request — the first `fetch`/`feedback` starts it, and every `fetch`
-returns that same result. Raises an error if the goal was rejected, the server
-reported a failure, or the result never arrived (a Context drain ends the
-`get_result` retry early, surfacing as a timed-out-result error).
+Block until the goal settles and return its `Result`. Backed by a write-once
+slot filled from one `get_result` request — single-fill, like the server-side
+[`respond!`](@ref): the first `fetch`/`feedback` starts it, every `fetch` returns
+that result. Raises an error if the goal was rejected, the server reported a
+failure, or the result never arrived (a Context drain ends the `get_result` retry
+early, surfacing as a timed-out-result error).
 """
 function Base.fetch(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     _ensure_result!(g)
@@ -380,7 +381,7 @@ end
 # The Zenoh data-route keyexpr for a client-side service call: build the wire key
 # the server's queryable declared. We construct a transient `EndpointEntity` of
 # the matching kind so `topic_keyexpr` produces the same key — the client's own
-# id doesn't enter the topic key (only the topic + type + hash do, §2.2).
+# id doesn't enter the topic key (only the topic + type + hash do).
 function _service_key(client::ActionClient, topic::AbstractString, ti::TypeInfo)
     node = client.node
     e = ROSZenoh.EndpointEntity(; id=0, node=node.entity, kind=Service,

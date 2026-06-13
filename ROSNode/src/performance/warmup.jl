@@ -1,4 +1,4 @@
-# §D8 — precompilation / warm-up. The dispatch chain (foreign thread → Zenoh.jl
+# Precompilation / warm-up. The dispatch chain (foreign thread → Zenoh.jl
 # trampoline → consumer task → decode(sample,T) → handler(::T) → user callees) is
 # specialized on the message type, so the *first* publish/handler-on-`T` JITs the
 # whole chain — a startup spike, or worse a mid-operation stall on the first
@@ -125,8 +125,8 @@ function _warm_publisher(policy::WarmupPolicy, pub::PublisherHandle{T, R}, sampl
 end
 
 # Subscription: anchor decode + the innermost frame that calls `handler(msg)`
-# (`_invoke_owned`/`_invoke_view`) — inference specializes decode and the handler
-# call as one unit there. :execute encodes the sample to a plain buffer (no live
+# (`_invoke_owned` for an owned message; the view path runs the handler inline) —
+# inference specializes decode and the handler call as one unit there. :execute encodes the sample to a plain buffer (no live
 # Zenoh needed), decodes it (owned or view — the view aliases the buffer, which is
 # alive across the call), and runs the handler to full native depth.
 function _warm_subscription(policy::WarmupPolicy, e::Entity, ::Type{T}, handler::H,
@@ -161,7 +161,7 @@ end
 # Dynamic (keyexpr-only) subscription: no compile-time `T` at construction — warmed
 # at *first sight* of each runtime type (reached via `invokelatest` from
 # `_run_typed_dynamic`, since `T` is runtime-born). Owned-only, precompile-only
-# (running a discovered handler on a synthesized sample is the D9 manifest's job).
+# (running a discovered handler on a synthesized sample is the manifest's job).
 function _warm_dynamic(::Type{T}, handler::H) where {T, H}
     # The dynamic worker borrows a `Memory{UInt8}` (`with_payload_memory`) and
     # decodes via `decode_view`/`decode_owned` per the sub's `view` flag — warm both.

@@ -6,12 +6,12 @@
 # ── re-exports from the layer below ──────────────────────────────────────
 # These are the ROSZenoh seams ROSNode's public surface speaks in directly:
 # QoS policy, type identity, and the endpoint-kind tag (inferred from the
-# message type at entity construction, §6). `EndpointKind`'s instances
+# message type at entity construction). `EndpointKind`'s instances
 # (Publisher/Subscription/Service/Client) come along so dispatch on kind reads
 # naturally here too.
 using ROSZenoh: QosProfile, TypeInfo, EndpointKind, default_qos,
                 Publisher, Subscription, Service, Client
-# Borrowed-payload escape error: the view path (§3.2) lets it surface to user
+# Borrowed-payload escape error: the borrowed-view path lets it surface to user
 # code, so it belongs in ROSNode's exported vocabulary.
 using Zenoh: BorrowError
 
@@ -31,7 +31,7 @@ export QosProfile, TypeInfo, EndpointKind, default_qos,
     ShutdownException()
 
 Raised into every blocked wait — clock sleeps, `call`, `wait_for_service`, graph
-waits — when the owning Context begins to drain (§14). Catching it is the
+waits — when the owning [`Context`](@ref) begins to drain. Catching it is the
 cooperative signal to unwind that wait cleanly and let the Context tear down; the
 drain path treats it as an expected shutdown and logs it as such. A subscription
 dispatch loop that sees it returns quietly, treating it as teardown rather than a
@@ -50,7 +50,7 @@ Base.showerror(io::IO, ::ShutdownException) =
 
 Thrown by the action cancellation checkpoints — `checkpoint(goal)` and
 `feedback!(goal, …)` — when the goal has moved to the `CANCELING` action goal
-state (§9). A goal handler that lets it propagate settles cleanly: the fail-safe
+state. A goal handler that lets it propagate settles cleanly: the fail-safe
 settlement maps a thrown `Cancelled` to a `CANCELED` result (filling the result
 cell with `canceled(default_result())`), where any other exception maps to
 `ABORTED`. Cancellation then unwinds structurally through the handler's call
@@ -65,9 +65,9 @@ Base.showerror(io::IO, ::Cancelled) =
     print(io, "Cancelled: goal was canceled")
 
 # ── settlement status tokens ─────────────────────────────────────────────
-# The write-once-cell verbs of services (§8) and actions (§9): tags passed to
+# The write-once-cell verbs of services and actions: tags passed to
 # `respond!` to select an outcome. Singletons of a sealed abstract type (the
-# ClockSource §7 precedent). `respond!` dispatches on the abstract type and uses
+# same clock-source pattern). `respond!` dispatches on the abstract type and uses
 # `is_terminal` to reject `feedback` where a result is due.
 #
 #   service:  return resp                  ⇒ success
@@ -93,16 +93,16 @@ cell write).
 
 `respond!` dispatches on this abstract type, so it accepts any token; the
 non-terminal [`feedback`](@ref) passed where a result is due raises an
-`ArgumentError` from the `is_terminal` guard. The distinct service and action
+`ArgumentError` — only terminal tokens fill the result cell. The distinct service and action
 spellings document each call site rather than enforce a boundary.
 """
 abstract type SettlementStatus end
 
 "Service handler succeeded — the response is delivered as a reply-ok."
 struct Success     <: SettlementStatus end
-"Service handler failed — surfaces as a Zenoh query error reply so the client's `call` raises (§8)."
+"Service handler failed — surfaces as a Zenoh query error reply so the client's `call` raises."
 struct Failure     <: SettlementStatus end
-"Action goal ran to completion — fills the result cell as SUCCEEDED (§9)."
+"Action goal ran to completion — fills the result cell as SUCCEEDED."
 struct Succeeded   <: SettlementStatus end
 "Action goal was canceled — fills the result cell as CANCELED."
 struct Canceled    <: SettlementStatus end
@@ -173,7 +173,7 @@ Action feedback token — a stream verb. `respond!(goal, feedback, fb)` publishe
 one feedback message on the goal's feedback topic (the sugar behind
 `feedback!(goal, fb)`) and leaves the goal running. It never fills the result
 cell, so the settlement layer rejects it where a terminal result is due
-(`is_terminal(feedback)` is `false`).
+(feedback is not a terminal token).
 
 Mirrors ROS 2 action feedback, the progress stream published while a goal
 executes.
@@ -198,11 +198,11 @@ Base.show(io::IO, ::Aborted)   = print(io, "aborted")
 Base.show(io::IO, ::Feedback)  = print(io, "feedback")
 
 # Terminal tokens fill the write-once result cell; `feedback` is a stream verb.
-# §8/§9 settlement uses this to reject `feedback` where a result is due.
+# Service and action settlement uses this to reject `feedback` where a result is due.
 is_terminal(::SettlementStatus) = true
 is_terminal(::Feedback)         = false
 
-# ── concurrency policy (§4, D2/D3) ───────────────────────────────────────
+# ── concurrency policy ───────────────────────────────────────────────────
 # How an endpoint dispatches its handlers, as a sealed type (the SettlementStatus
 # / ClockSource precedent). The default `Serial()` runs handlers on one sticky
 # task: they interleave only at yield points, so node-local handler state needs no
@@ -294,7 +294,7 @@ abstract type ViewMode end
     Owned()
 
 Default [`ViewMode`](@ref): the handler receives a fully-owned message decoded out
-of the payload, with every field materialized (§3.1). The message is free to
+of the payload, with every field materialized. The message is free to
 store, forward, or pass to a spawned task beyond the handler's return — no borrow
 lifetime applies. `view=false` is shorthand for `Owned()`.
 """
@@ -350,10 +350,11 @@ macro unreachable(msg)
     :(error(string("unreachable: ", $(esc(msg)))))
 end
 
-# ── warm-up / precompilation (§D8) ─────────────────────────────────────────
+# ── warm-up / precompilation ───────────────────────────────────────────────
 # The dispatch chain is specialized on the message type, so the *first*
 # `publish(::T)` / first handler-on-`::T` JITs the whole chain — a startup spike.
-# D8 precompiles that chain at entity construction (warmup.jl). `is_warming()` +
+# The warm-up pass precompiles that chain at entity construction (warmup.jl).
+# `is_warming()` +
 # `@effectful` let user handlers stub their non-ROS effects during the `:execute`
 # warm-up (and during package precompilation) *without* specializing or folding
 # the wrong branch — it must be a runtime value flag, so both branches compile and
@@ -366,7 +367,7 @@ const _WARMUP = Base.ScopedValues.ScopedValue(false)
     is_warming() -> Bool
 
 `true` while the framework is running a handler purely to warm its code path —
-either D8 `:execute` warm-up (the `_WARMUP` scope) or package precompilation
+either `:execute` warm-up (the `_WARMUP` scope) or package precompilation
 (`jl_generating_output`). Lets handler code skip real side effects while the
 framework still *compiles* the handler at full native depth. Use
 [`@effectful`](@ref) for the common skip-this-effect-while-warming pattern.
@@ -408,7 +409,7 @@ end
 """
     WarmupPolicy(mode, sync)
 
-Per-entity warm-up policy (§D8). `mode` is `:precompile` (default — a
+Per-entity warm-up policy. `mode` is `:precompile` (default — a
 side-effect-free `precompile`-anchor of the dispatch chain), `:execute` (run the
 handler once on a sample message with side effects suppressed, reaching full
 native depth), or `:off` (no warm-up). `sync=false` (default) warms on a

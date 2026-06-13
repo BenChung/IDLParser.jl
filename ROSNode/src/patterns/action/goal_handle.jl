@@ -1,4 +1,4 @@
-# ── GoalHandle (§9) ────────────────────────────────────────────────────────────
+# ── GoalHandle ───────────────────────────────────────────────────────────────
 # The per-goal object: the thing you `feedback!`, settle, and observe
 # cancellation on. Holds the goal id, the goal request, the live state, the
 # write-once result cell (settlement.jl), and a back-reference to the server for
@@ -12,16 +12,23 @@
 A single accepted action goal, server-side. Carries the 16-byte
 `unique_identifier_msgs/UUID` goal id, the decoded goal request (a `Goal` struct,
 reachable as `goal.request`), the live goal state ([`state`](@ref)), and the
-write-once result cell the handler settles. This is the user-facing verb surface
-for one goal; the server owns the result cache and `status` publication.
+write-once result cell ([`respond!`](@ref)) the handler settles. This is the
+user-facing verb surface for one goal; the server owns the result cache and
+`status` publication.
 
 Cancellation is structured. Once an accepted cancel moves the goal to
 `CANCELING`, [`feedback!`](@ref) and [`checkpoint`](@ref) throw
 [`Cancelled`](@ref) at the next yield point, so a goal in `CANCELING` unwinds to
-a `CANCELED` result on the default path with no manual polling. Settle explicitly
-with [`succeed`](@ref)/[`abort`](@ref) (or `respond!(goal, canceled, result)`),
-or just `return` a `Result` (settles `SUCCEEDED`) or throw (settles `ABORTED`) —
-the fail-safe wrapper guarantees the cell is filled exactly once.
+a `CANCELED` result on the default path with no manual polling. This domain's
+handler-exit status mapping:
+
+- `return` a `Result` ⇒ `SUCCEEDED`
+- throw [`Cancelled`](@ref) ⇒ `CANCELED`
+- throw anything else (or fall through with no settle) ⇒ `ABORTED`
+
+Settle explicitly with [`succeed`](@ref)/[`abort`](@ref) (or
+`respond!(goal, canceled, result)`); the exactly-once handler-exit contract is
+owned by [`respond!`](@ref).
 
 Constructed by the framework on goal acceptance, never directly. A handle lives
 from acceptance until the result-cache TTL evicts it after settlement.
@@ -34,30 +41,30 @@ mutable struct GoalHandle{A, G, R, F}
     const id::GoalId
     const request::G
     const cell::ResultCell               # ResultCell{GoalHandle, R}; concrete elided
-    const accepted_at::Int64             # acceptance stamp (wall ns, §3.4/§7)
+    const accepted_at::Int64             # acceptance stamp (wall ns)
     const lock::ReentrantLock
     @atomic status::GoalState
     # The settled result, cached for `get_result` replay so a late or repeated
-    # fetch is answered without re-running the goal. The cell delivers the payload
-    # through `deliver` without retaining it, so the first terminal fill captures
+    # fetch is answered without re-running the goal. The ResultCell delivers the
+    # payload through `deliver` without retaining it, so the terminal fill captures
     # it here. `nothing` until settled; written under `g.lock` before the cell
     # flips `filled` (single-writer, in `_deliver_result!`), so a waiter waking on
     # `wait_settled` always sees the result by the time it reads it.
     result::Union{R, Nothing}
     # Terminal stamp (wall ns) — when the goal settled; `0` while live. Drives
     # TTL eviction of the result cache (the goal table holds settled goals only
-    # long enough for a late `get_result`, §9).
+    # long enough for a late `get_result`).
     @atomic settled_at::Int64
     # Set once a `get_result` has replayed this goal's result; `_publish_status`
     # then drops it from the status array (rclcpp prunes fetched terminal goals).
     # Eviction keys on the TTL alone — a repeated fetch must still replay.
     @atomic fetched::Bool
     # The execution task (set when scheduled); tracked so `close(server)` joins
-    # outstanding goals incl. detached post-cancel cleanup (§14 / DESIGN §drain).
+    # outstanding goals incl. detached post-cancel cleanup (server drain).
     _task::Union{Task, Nothing}
 end
 
-"The goal's 16-byte `unique_identifier_msgs/UUID` (§9)."
+"The goal's 16-byte `unique_identifier_msgs/UUID`."
 goal_id(g::GoalHandle) = g.id
 
 """
@@ -73,6 +80,10 @@ registered.
 
 The Symbol surface keeps the wire `GoalStatus` enum internal and reads naturally
 at a call site (`state(goal) === :executing`).
+
+This is the action-goal `state`, distinct from the same-named accessor for
+managed-node lifecycle: a managed node's lifecycle state is [`state`](@ref) on a
+[`LifecycleNode`](@ref).
 """
 state(g::GoalHandle) = _state_symbol(@atomic g.status)
 
@@ -92,7 +103,7 @@ function _transition!(g::GoalHandle, to::GoalState)
     end
 end
 
-# ── cancellation checkpoints (§9) ──────────────────────────────────────────────
+# ── cancellation checkpoints ───────────────────────────────────────────────────
 # The structured-cancellation surface. `iscancelled` is the predicate;
 # `checkpoint` throws `Cancelled` at a yield point if canceling; `feedback!`
 # publishes a feedback message *and* checkpoints (so a normal progress-report loop
@@ -133,7 +144,7 @@ function checkpoint(g::GoalHandle)
     nothing
 end
 
-# ── feedback (§9) ──────────────────────────────────────────────────────────────
+# ── feedback ─────────────────────────────────────────────────────────────────
 
 """
     feedback!(goal, fb)
@@ -164,21 +175,26 @@ function respond!(g::GoalHandle{A, G, R, F}, ::Feedback, fb::F) where {A, G, R, 
     feedback!(g, fb)
 end
 
-# ── settle verbs (§9) ──────────────────────────────────────────────────────────
-# `respond!` is the authoritative settle (settlement.jl); `succeed`/`abort` read
-# better at the call site (DESIGN §respond!), same write underneath. `canceled`
-# is spelled via the token directly (`respond!(goal, canceled, r)`) — no
-# dedicated verb, mirroring services' `failed`.
+# ── settle verbs ───────────────────────────────────────────────────────────────
+# `respond!` is the authoritative settle; `succeed`/`abort` read better at the
+# call site, same write underneath. `canceled` is spelled via the token directly
+# (`respond!(goal, canceled, r)`) — no dedicated verb, mirroring services'
+# `failed`.
 
 """
     respond!(goal, status, payload) -> Bool
 
-Settle the goal's write-once result cell with a terminal `status`
-([`succeeded`](@ref)/[`canceled`](@ref)/[`aborted`](@ref)) and the result
-`payload` (§9). The first terminal `respond!` wins, runs the result-cache
-delivery + status publication, and releases the client's `get_result`; a second
-explicit terminal `respond!` is the one hard error (settlement.jl). Returns
-`true` if this call filled the cell.
+Settle the goal with a terminal `status` and the result `payload`. The action
+status set:
+
+- [`succeeded`](@ref) — the goal completed
+- [`canceled`](@ref) — an accepted cancel unwound the goal
+- [`aborted`](@ref) — the goal failed
+
+Filling the goal's write-once result `ResultCell` (the first-wins latch, cache
+delivery, `status` publication, and `get_result` release) is the shared
+single-fill contract of [`respond!`](@ref). Returns `true` if this call filled
+the cell.
 
 `respond!(goal, feedback, fb)` is the stream form (`feedback!` sugar), dispatched
 separately — it never touches the cell. The service tokens
@@ -204,9 +220,8 @@ shorthand for `respond!(goal, succeeded, result)`. Use it when the handler
 computes its result before its final expression; a plain `return result` from a
 `do`-block body reaches the same outcome.
 
-The first terminal settle wins, runs the result-cache delivery and `status`
-publication, and releases the client's blocked `get_result`. Returns `true`; a
-second explicit terminal settle raises `ArgumentError` (the double-settle guard).
+Settlement is single-fill via [`respond!`](@ref); returns `true` if this call
+filled the cell.
 """
 succeed(g::GoalHandle{A, G, R, F}, result::R) where {A, G, R, F} = respond!(g, succeeded, result)
 
@@ -218,8 +233,8 @@ shorthand for `respond!(goal, aborted, result)`. The explicit failure verb; a
 thrown non-`Cancelled` exception from the handler reaches the same `ABORTED`
 outcome through fail-safe settlement.
 
-The first terminal settle wins. Returns `true`; a second explicit terminal settle
-raises `ArgumentError` (the double-settle guard).
+Settlement is single-fill via [`respond!`](@ref); returns `true` if this call
+filled the cell.
 """
 abort(g::GoalHandle{A, G, R, F}, result::R) where {A, G, R, F} = respond!(g, aborted, result)
 

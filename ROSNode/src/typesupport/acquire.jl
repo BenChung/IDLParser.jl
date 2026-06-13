@@ -1,17 +1,18 @@
-# ── dynamic acquisition: TypeDescription → registry entry (§11) ─────────────
+# ── dynamic acquisition: TypeDescription → registry entry ───────────────────
 # A GetTypeDescription reply (`TypeDescriptionMsg`) is verified against its wire
-# `TypeInfo`, lifted to IL, and turned into a registry entry. The §12/§15 discovery
-# layer issues the GetTypeDescription call (it holds the `ServiceClient` and remote
+# `TypeInfo`, lifted to IL, and turned into a registry entry. The discovery layer
+# issues the GetTypeDescription call (it holds the `ServiceClient` and remote
 # node identity) and hands the reply here.
 
 """
     verify_type_description(td::TypeDescriptionMsg, info::TypeInfo) -> Bool
 
-The integrity gate (§11): recompute `calculate_rihs01_hash` over the raw received
-`TypeDescriptionMsg` and require it to equal `info`'s wire RIHS01. A mismatch means
-the remote's definition disagrees with the hash it advertised, so the type is unsafe
-to decode. Hashing the raw `td` keeps the gate exact, since RIHS01 ignores the
-constants and defaults that `lift` would drop.
+The RIHS01 integrity gate: recompute `calculate_rihs01_hash` over the raw received
+`TypeDescriptionMsg` and require it to equal `info`'s advertised RIHS01 (the
+type-identity hash carried on every [`RegistryEntry`](@ref)). A mismatch means the
+remote's definition disagrees with the hash it advertised, so the type is unsafe to
+decode. Hashing the raw `td` keeps the gate exact, since RIHS01 ignores the constants
+and defaults that `lift` would drop.
 """
 function verify_type_description(td::TypeDescriptionMsg, info::TypeInfo)
     expected = to_rihs_string(info.hash)
@@ -23,7 +24,7 @@ end
     entry_from_type_description(td::TypeDescriptionMsg, info::TypeInfo;
                                 provenance=:wire, verify=true) -> RegistryEntry
 
-Build a [`RegistryEntry`](@ref) from a wire `TypeDescriptionMsg` (§11). With
+Build a [`RegistryEntry`](@ref) from a wire `TypeDescriptionMsg`. With
 `verify=true` (the default) the hash gate runs first and a mismatch throws — a
 discovered type must hash-match the name it travels under. `lift` reconstructs the
 main IL; nested types survive as `RRef`s in its fields, and codegen resolves them
@@ -47,7 +48,7 @@ end
     register_type_description!(reg, td::TypeDescriptionMsg, info; kwargs...) -> RegistryEntry
 
 Build (with the hash gate) and register a wire type description under
-`(info.name, info.hash)`, returning the entry (§11). The dynamic-discovery
+`(info.name, info.hash)`, returning the entry. The dynamic-discovery
 landing point: a GetTypeDescription reply is verified, lifted, and registered in
 one call.
 
@@ -165,7 +166,7 @@ const _IFACE_EXTS = (".msg", ".srv", ".action")
 Scan the [`search_prefixes`](@ref) install roots for installed ROS 2 interface
 packages, mapping each package name to the absolute paths of its
 `.msg` / `.srv` / `.action` files, grouped by qualifier (`msg`, then `srv`,
-then `action`) and name-sorted within each group (§11 ament acquisition). A
+then `action`) and name-sorted within each group. A
 package counts as an interface package when its `share/<pkg>` directory holds
 at least one such file.
 
@@ -215,7 +216,7 @@ end
     load_ament_type(reg::TypeRegistry, name; register=true) -> Union{RegistryEntry, Nothing}
 
 Resolve a fully-qualified ROS 2 type `name` (`"<pkg>/<qualifier>/<Name>"`)
-against the installed ament workspace (§11): locate its `.msg` / `.srv` /
+against the installed ament workspace: locate its `.msg` / `.srv` /
 `.action` file across [`search_prefixes`](@ref) (overlay order, first match
 wins), parse it to IL, compute the RIHS01 hash from the parsed definition, and
 — with `register=true` (the default) — register the resulting
@@ -223,14 +224,17 @@ wins), parse it to IL, compute the RIHS01 hash from the parsed definition, and
 the entry, or `nothing` when the type is not installed.
 
 The hash is computed locally from the parsed AST so an ament-acquired type keys
-identically to a wire-discovered one — RIHS01 is the shared identity. For a
-self-contained message type the hash is exact; a type that references other
-packages keys correctly by name but its hash may differ from a remote's until
-its referenced siblings are co-registered, at which point the wire/cache path
-supplies the exact hash. When lowering yields no struct declaration at all to
-hash, the entry is keyed with the RIHS01 placeholder hash (version `01`,
-all-zero digest) — correct for keyexpr structure, with the wire/cache path
-supplying the exact hash for cross-version matching.
+identically to a wire-discovered one — RIHS01 is the shared identity. The three
+hash outcomes:
+
+- Self-contained message type: the hash is exact.
+- Type that references other packages: keys correctly by name but its hash may
+  differ from a remote's until its referenced siblings are co-registered, at
+  which point the wire/cache path supplies the exact hash.
+- No struct declaration at all to hash (lowering yields none): the entry is
+  keyed with the RIHS01 placeholder hash (version `01`, all-zero digest) —
+  correct for keyexpr structure, with the wire/cache path supplying the exact
+  hash for cross-version matching.
 
 The entry is left unrealized (codegen deferred); nested references resolve once
 the package's siblings are co-registered, the usual whole-package acquisition
@@ -261,7 +265,7 @@ end
 # + `calculate_rihs01_hash`). The walk recovers structs via ROSMessages' `lift(decls)`
 # seam to avoid the Moshi `@match` macro, which ROSNode does not depend on.
 #
-# TODO(§11): collect nested-ref `references` for byte-parity hashing of cross-package
+# TODO: collect nested-ref `references` for byte-parity hashing of cross-package
 # types (needs resolved + sorted sibling TypeDescriptions). Today the hash is exact
 # for self-contained types; a referencing type keys correctly by name but its hash
 # may differ from a remote's until refs are co-registered, where the exact wire/`td`
@@ -311,7 +315,7 @@ end
     resolve_type(node_or_ctx, info::TypeInfo; ament=true, cache=true) -> Union{RegistryEntry, Nothing}
 
 Return the [`RegistryEntry`](@ref) for `info`, acquiring it from a local source
-when it is not yet registered (§11). This is the local acquisition front door;
+when it is not yet registered. This is the local acquisition front door;
 it tries three sources in order:
 
 1. a registry hit (already known to this `Context`);
@@ -323,7 +327,7 @@ it tries three sources in order:
 
 Returns `nothing` when none of the local sources resolves the type. The dynamic
 over-the-wire path (issuing a `GetTypeDescription` query) stays with the
-§12/§15 discovery layer, which holds the remote node identity and async
+discovery layer, which holds the remote node identity and async
 `ServiceClient`; on a `nothing` result the caller either kicks off that
 discovery or delivers raw bytes for the topic.
 
@@ -360,7 +364,7 @@ end
 
 The concrete (generated) Julia type for `info`, realizing its codegen on first use.
 Returns `nothing` when the type fails to resolve or generate — the signal to deliver
-raw bytes (§11 until-ready). The decode/handler path reaches the returned type via
+raw bytes until the type is ready. The decode/handler path reaches the returned type via
 `Base.invokelatest`, since codegen runs in a newer world age.
 """
 function registered_type(ctxlike, info::TypeInfo)
