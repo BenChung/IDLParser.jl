@@ -271,6 +271,16 @@ _default_name(::Type{M}) where {M} = _snake(String(nameof(M)))
 
 # ── port materialisation ────────────────────────────────────────────────────────
 
+# Function barrier for component reaction callbacks. `p.reaction` is stored `Any`, so a
+# closure capturing it directly (`msg -> react(m, msg)`) types the captured `react` as
+# `Any` and dynamically dispatches the handler on every message/tick — a per-message
+# dispatch, and a handler the warm can't reach. Routing through these `where {F}` helpers
+# specialises on the concrete reaction type, so the captured `react` is concrete and the
+# call static: the materialised callback (hence the whole handler path) is monomorphic and
+# precompilable, with the one dispatch paid once here at configure (DESIGN: G1a/G6).
+_sub_cb(reaction::F, m) where {F} = msg -> reaction(m, msg)     # subscription + service: react(m, x)
+_timer_cb(reaction::F, m) where {F} = () -> reaction(m)         # @every timer: react(m)
+
 # Create each declared port's runtime handle against the node-core. Returns the
 # handle NamedTuple (`entities(m)`) and the paused timers to start at activate.
 # `wiremap` is the member's resolved remap (port => wire name); a port not in it
@@ -283,16 +293,15 @@ function _materialize_ports!(node::Node, m, member::Symbol, specs::Vector{PortSp
         if p.kind === :publisher
             push!(handles, p.name => Publisher(node, _wire(p, wiremap), p.msgtype))
         elseif p.kind === :subscription
-            react = p.reaction
-            sub = Subscription(node, _wire(p, wiremap), p.msgtype) do msg
-                react(m, msg)
-            end
+            # `warmup = :off` here: the endpoint's own warm would fire now, before the
+            # typed `entities(m::M)`/`parameters(m::M)` accessors are generated (at the end
+            # of `_member_materialize!`), compiling the handler against the generic
+            # accessors only to invalidate it. The member warms all its reactions once, in
+            # `_warm_member_reactions!`, after those accessors exist (DESIGN: warm timing).
+            sub = Subscription(_sub_cb(p.reaction, m), node, _wire(p, wiremap), p.msgtype; warmup = :off)
             push!(handles, p.name => sub)
         elseif p.kind === :service
-            react = p.reaction
-            srv = Service(node, _wire(p, wiremap), p.msgtype) do req
-                react(m, req)
-            end
+            srv = Service(_sub_cb(p.reaction, m), node, _wire(p, wiremap), p.msgtype; warmup = :off)
             push!(handles, p.name => srv)
         elseif p.kind === :action
             f = p.reaction
@@ -308,8 +317,7 @@ function _materialize_ports!(node::Node, m, member::Symbol, specs::Vector{PortSp
                 hz isa Real || error(
                     "@every: member `$(member)` timer `$(p.name)` rate parameter `:$(p.extra.rate)` must be numeric (got `$(typeof(hz))`)")
             end
-            react = p.reaction
-            t = _paused_timer(node, Duration(round(Int64, 1.0e9 / hz)), () -> react(m))
+            t = _paused_timer(node, Duration(round(Int64, 1.0e9 / hz)), _timer_cb(p.reaction, m))
             push!(handles, p.name => t)
             push!(timers, t)
         else
@@ -542,11 +550,32 @@ function _check_runnable(M, what::AbstractString)
     error("$(what): $(M) is not a @mixin")
 end
 
+# Warm the member's reaction handlers — spec-driven, after the typed accessors exist (so
+# `parameters(m).x`/`entities(m).p` in a handler compile against the typed forms, not the
+# generic ones). `precompile`-anchor only: it compiles `(M, …)` without running user code,
+# so it's side-effect-free regardless of policy (subscriptions' own per-port warm is
+# `:off`ed in `_materialize_ports!`). Timers (G6) and services have no other warm at all.
+# Honours `node.warmup` via `_warmup!` (off / inline-sync / background); `:action` is S4.
+function _warm_member_reactions!(node::Node, m, specs::Vector{PortSpec})
+    M = typeof(m)
+    _warmup!(node.warmup, function ()
+        for p in specs
+            p.reaction === nothing && continue
+            if p.kind === :subscription || p.kind === :service
+                precompile(p.reaction, (M, p.msgtype))
+            elseif p.kind === :timer
+                precompile(p.reaction, (M,))
+            end
+        end
+    end)
+    return nothing
+end
+
 function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
     rt = getfield(m, :__rt__)::MixinRuntime
-    ports, timers = _materialize_ports!(cnode.node, m, nm, mixin_spec(_base(typeof(m))).ports,
-                                        current(rt.pserver),
+    specs = mixin_spec(_base(typeof(m))).ports
+    ports, timers = _materialize_ports!(cnode.node, m, nm, specs, current(rt.pserver),
                                         get(cnode.wires, nm, Dict{Symbol, String}()))
     rt.ports = ports
     rt.timers = timers
@@ -554,6 +583,8 @@ function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     # signature and the dedup key, so one method covers every instantiation (a concrete
     # signature here would silently strand other instantiations on the untyped generic).
     _ensure_entities_accessor!(_base(typeof(m)), ports)
+    # Now that the typed accessors exist, anchor each reaction handler (DESIGN: G1a/G6).
+    _warm_member_reactions!(cnode.node, m, specs)
     return nothing
 end
 
