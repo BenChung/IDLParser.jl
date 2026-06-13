@@ -56,6 +56,21 @@ module _CompPorts
 end
 using ._CompPorts
 
+# A publisher on a private `~/foo` and a `@hears foo` (relative) — the name-resolution
+# trap: `~/foo` resolves under the node FQN, bare `foo` under the namespace, so they
+# land on different topics. `describe_wiring` must make that split visible.
+module _CompWiring
+    using ROSNode
+    const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+    @mixin struct Talk; end
+    @publishes Talk foo :: _T on "~/foo"
+    @mixin struct Listen; end
+    @hears function foo(m::Listen, msg::_T) end
+end
+using ._CompWiring
+
+@node Mismatch = ["talk" => _CompWiring.Talk, "listen" => _CompWiring.Listen]
+
 @node TwoCam  = ["front" => _CompPorts.CamP{image => "front/image"},      # isolate the two outputs
                  "rear"  => _CompPorts.CamP{image => "rear/image"}]
 @node Fused   = ["front" => _CompPorts.CamP{image => "front/image"},      # cross-member wiring:
@@ -229,6 +244,17 @@ using ._CompPorts
             tc = run(TwoCam; ctx = ctx, name = "twocam", block = false)
             @test tc.wires[:front][:image] == "front/image"
             @test tc.wires[:rear][:image]  == "rear/image"
+        end
+    end
+
+    @testset "describe_wiring surfaces the ~/ name expansion" begin
+        _cctx() do ctx
+            mm = run(Mismatch; ctx = ctx, name = "mm", block = false)
+            out = sprint(describe_wiring, mm)
+            @test occursin("/mm", out)                  # node fqn in the header
+            @test occursin("~/foo", out)                # the authored private wire name
+            @test occursin("→ /mm/foo", out)            # private publisher resolves under the node
+            @test occursin("→ /foo", out)               # bare subscription stays at the namespace root
         end
     end
 

@@ -54,5 +54,6 @@ include("performance/intraprocess.jl")  # intra-process transport
 include("model/component/component.jl") # mixins/components: @mixin, HAS/DOES ports, lifecycle
 include("model/component/run.jl")       # node assembly: @node, run, port materialization
 include("model/component/composition.jl") # node-kind registry + container LoadNode/ros2 component services
+include("model/component/precompile.jl") # tier-2 scaffolding precompile anchors (after the above: names them)
 
 end # module ROSNode

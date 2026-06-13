@@ -136,6 +136,78 @@ function topic_edges(idx::ReachIndex; topic::Union{AbstractString, Nothing}=noth
 end
 
 """
+    WiringWarning
+
+A likely name-resolution slip surfaced by [`wiring_warnings`](@ref): a `consumer`
+endpoint (a subscription, or a service client) with **no** producer on its exact
+name, paired with a `producer` (a publisher, or a service server) on a *confusably
+similar* name — same final segment, different path. The fingerprint of a `~/`
+private name, a missing/extra namespace, or an absolute-vs-relative mix, e.g. a
+`~/foo` publisher resolving to `/node/foo` against a `foo` subscription resolving
+to `/foo`. `note` says how the two names differ.
+"""
+struct WiringWarning
+    consumer::Endpoint
+    producer::Endpoint
+    note::String
+end
+
+_basename(name::AbstractString) = String(last(split(name, '/')))
+
+# Describe how two same-basename names differ, naming the common nesting slip:
+# one name is a deeper-namespaced form of the other (the `~/`/private-name trap).
+function _wiring_note(consumer::AbstractString, producer::AbstractString)
+    if endswith(producer, consumer)
+        "the producer name is a namespaced form of the consumer name — likely a private " *
+        "`~/` or extra-namespace endpoint ($(consumer) vs $(producer))"
+    elseif endswith(consumer, producer)
+        "the consumer name is a namespaced form of the producer name ($(consumer) vs $(producer))"
+    else
+        "same basename, different path ($(consumer) vs $(producer))"
+    end
+end
+
+# The consumer→producer pairings near-miss detection runs over: a subscription
+# wants a publisher; a service client wants a server. Action legs ride these — an
+# action's send_goal/result/cancel are services, its feedback/status are topics.
+const _WIRING_PAIRS = ((Subscription, Publisher), (Client, Service))
+
+"""
+    wiring_warnings(idx) -> Vector{WiringWarning}
+
+Consumers that receive nothing but look like they were meant to connect. For every
+subscription with no publisher, and every service client with no server, on its
+exact name, flag a producer whose name shares the same final segment (basename) —
+the fingerprint of a ROS name-resolution slip (a `~/` private name, a
+missing/extra namespace, an absolute-vs-relative mix). Actions are covered through
+their underlying service and topic endpoints.
+
+Anchored on the unmatched consumer, so a healthy graph returns empty: this reports
+a likely *mistake*, not the legitimate fan-out a generic "name has no other side"
+scan would flag (a publisher nobody subscribes to). A live false positive is
+possible when the real producer simply hasn't come up yet; re-run once the graph
+settles.
+"""
+wiring_warnings(idx::ReachIndex) = _wiring_warnings(snapshot_endpoints(idx))
+
+function _wiring_warnings(eps::Vector{Endpoint})
+    out = WiringWarning[]
+    for (ckind, pkind) in _WIRING_PAIRS
+        producers = filter(e -> e.kind === pkind, eps)
+        producer_names = Set(p.topic for p in producers)
+        for c in filter(e -> e.kind === ckind, eps)
+            c.topic in producer_names && continue        # genuinely connected — no warning
+            base = _basename(c.topic)
+            for p in producers
+                _basename(p.topic) == base || continue
+                push!(out, WiringWarning(c, p, _wiring_note(c.topic, p.topic)))
+            end
+        end
+    end
+    out
+end
+
+"""
     endpoints_on_session(idx, zid) -> Vector{Endpoint}
 
 Every endpoint owned by the session `zid` — the computation→transport drill-down

@@ -31,6 +31,11 @@ end
 # by `ros_init!` for the precompiled case).
 @node Rig = ["a" => Counter, "b" => Other]
 
+# Bake the mixins' typed accessors + reaction-handler specialisations into THIS package's
+# precompile image. Asserted to survive in the fresh-subprocess check (the `__P_…__` /
+# `__entitiesnt_…__` markers exist after a load that doesn't re-run this body).
+@precompile_nodes
+
 # BYO `__init__`: defined ABOVE the macros, so they step aside; the user keeps ROSNode
 # initializing by calling `ros_init!` themselves. Proves the documented BYO contract
 # survives precompilation.
@@ -46,6 +51,7 @@ module Byo
     @every 5 function beat(m::Solo)
         m.v += 1
     end
+    @precompile_nodes      # bake under a BYO __init__ too (separate module roster)
 end
 
 end # module

@@ -136,6 +136,31 @@ end
 
 The ground station is a plain node subscribing to `/vehicle/telemetry`. The vehicle publishes telemetry at 5 Hz, and the guard answers the `~/safe_to_fly` query its `@serves` authored.
 
+## Inspecting the resolved wiring
+
+`describe_wiring` prints each member's ports and the fully-qualified ROS name each resolves to — the quick way to confirm two ports share a name before chasing a silent non-delivery:
+
+```julia
+describe_wiring(vehicle)
+```
+
+```
+wiring of /vehicle — 2 member(s)
+  sensor :: Sensor
+    telemetry         pub   ~/telemetry            → /vehicle/telemetry
+    tick              timer
+  guard :: Guard
+    safe              srv   ~/safe_to_fly          → /vehicle/safe_to_fly
+```
+
+The middle column is each port's authored wire name (after any [`@node`](@ref) remap), the arrow its resolved name. A name resolves against the node by the [standard ROS rules](https://design.ros2.org/articles/topic_and_service_names.html):
+
+- a relative name (`foo`) resolves under the node's namespace — `/foo`;
+- a private name (`~/foo`) resolves under the node's own name — `/vehicle/foo`;
+- an absolute name (`/foo`) stands as written.
+
+Two ports connect only when they resolve to the same name. A `@hears function foo` (relative `foo`) and a `@publishes … on "~/foo"` (private) therefore land on different topics — `describe_wiring` shows the split as `→ /foo` against `→ /vehicle/foo`.
+
 ## Lifecycle — acquiring and releasing state
 
 A mixin whose state wraps an external resource — a device, a file, a connection — authors the setup and the matching release as lifecycle hooks. The five hooks are plain methods on the mixin type, each defaulting to a no-op:
@@ -268,6 +293,7 @@ on_error
 
 ```@docs
 @node
+describe_wiring
 Container
 container
 add!

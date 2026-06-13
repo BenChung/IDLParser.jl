@@ -16,6 +16,8 @@
 # first-sight realize backs up to that bound and the receiver blocks on `put!` —
 # upstream backpressure, no drop.
 
+using FunctionWrappers: FunctionWrapper
+
 # Strip one leading and trailing slash so a parsed-keyexpr topic (no slashes) can
 # be matched against a graph FQN topic.
 function _strip_one_slash_local(s::AbstractString)
@@ -221,23 +223,25 @@ function _replay_manifest_warm(e::Entity, handler, warmed, warmlk)
     nothing
 end
 
-# World-age trampoline for the dynamic worker. The per-message hot path can't cross
-# the world-age boundary (you can't specialize through `invokelatest`), so the
-# crossing is hoisted to once per type: `_dynamic_worker` `invokelatest`s into
-# `_drain_known`, which dispatches every already-seen type with a plain cached
-# dynamic call and returns only on a new type (whose `realize!` may have bumped the
-# world). The outer loop re-enters in the fresher world. Steady state is one
-# long-lived `_drain_known` whose inner loop never returns, so crossings run ~once
-# per distinct type.
-#
-# Invariant: a key in `cache` was first seen in a prior incarnation that re-entered
-# past its `realize!` world; worlds are monotonic, so it is ≤ this incarnation's
-# world and `_run_typed_dynamic{T}` is directly callable. A single worker drains
-# `buf` in order across re-entries, so `Serial` total order holds.
+# Per-type world-age crossing, hoisted out of the per-message path. The worker keeps a
+# keyexpr-hash → (handler-of-bytes, keyexpr bytes) cache; on a miss it resolves the
+# sample's type, `realize!`s it if new, and builds a `FunctionWrapper` wrapping
+# `_dispatch_decoded` for that concrete `T` — once per type, through the one `invokelatest`
+# crossing (the trampoline must compile against `T`'s codegen world). Thereafter the hot
+# path calls the cached FW: a `ccall` through its cfunction ptr, NOT a Julia dispatch, so
+# it is not world-age-gated and the worker runs in one fixed world with no re-entry. A
+# single worker drains `buf` in arrival order, so `Serial` total order holds. (DESIGN: G1b.)
 
-# Re-entry counter, bumped once per `_drain_known` entry (≈ distinct-types + 1,
-# never per message). A test hook asserting steady-state dispatch stops re-entering.
+# Crossing counter, bumped once per FW build (≈ distinct types, never per message); the
+# `dynamic_live.jl` S5b hook asserts it does not scale with message count.
 const _DYNAMIC_REENTRIES = Threads.Atomic{Int}(0)
+
+# A type-erased, type-stable per-type dispatch callable `(SampleHolder) -> nothing` wrapping
+# `_dispatch_decoded` for a fixed `T`; built via `invokelatest` so its trampoline compiles
+# against the runtime-born `T`'s world, then called as a `ccall` on the hot path.
+const _DynFW = FunctionWrapper{Nothing, Tuple{SampleHolder}}
+_mk_fw(::Type{T}, e::Entity, handler, view::ViewMode) where {T} =
+    _DynFW(h -> _dispatch_decoded(e, h, T, handler, view))
 
 # Keyexpr cache key: a hash of the borrowed keyexpr bytes, so the hot path never
 # allocates a `String`. FNV-1a over the raw bytes — allocation-free, no `unsafe_wrap`.
@@ -271,111 +275,92 @@ end
 
 function _dynamic_worker(e::Entity, buf, handler, sched, view::ViewMode, pool,
                          logged, loglk, warmed, warmlk, warmup::WarmupPolicy)
-    # hash(keyexpr bytes) → (resolved type, keyexpr bytes for memcmp verify);
-    # worker-private (no lock). The byte copy is the collision-safety net.
-    cache   = Dict{UInt, Tuple{Type, Vector{UInt8}}}()
-    pending = nothing                     # just-realized item to dispatch first in the fresh world
-    while true
-        pending = Base.invokelatest(_drain_known, e, buf, handler, sched, view, pool, cache,
-                                    logged, loglk, warmed, warmlk, warmup, pending)::Union{Symbol, Nothing, Tuple{SampleHolder, Type}}
-        pending === :closed && break
-    end
-    nothing
-end
-
-function _drain_known(e::Entity, buf, handler, sched, view::ViewMode, pool,
-                      cache::Dict{UInt, Tuple{Type, Vector{UInt8}}},
-                      logged, loglk, warmed, warmlk, warmup::WarmupPolicy, pending)
-    Threads.atomic_add!(_DYNAMIC_REENTRIES, 1)
-    if pending !== nothing
-        (h, T) = pending
-        _run_typed_dynamic(T, e, h, handler, sched, view, pool) # direct: realized ≤ our world
-    end
+    # keyexpr-hash → (per-type FW, keyexpr bytes for memcmp verify). Worker-private (one
+    # worker, no lock); the byte copy is the collision-safety net. The FW firewall means
+    # this loop never re-enters a fresh world — it builds each type's FW once and calls
+    # cached FWs directly thereafter.
+    cache = Dict{UInt, Tuple{_DynFW, Vector{UInt8}}}()
     for h in buf
-        # Resolve the cached type by borrowing the keyexpr bytes (no String): hash
-        # them, look up, and `memcmp`-verify against the stored copy so a hash
-        # collision can't mis-dispatch. Returns the cached `T` or `nothing`.
-        T = Zenoh.keyexpr_view(h) do ptr, len
+        # Resolve the cached FW by borrowing the keyexpr bytes (no String): hash, look up,
+        # `memcmp`-verify against the stored copy so a hash collision can't mis-dispatch.
+        fw = Zenoh.keyexpr_view(h) do ptr, len
             entry = get(cache, _ke_fnv1a(ptr, len), nothing)
             (entry !== nothing && _ke_bytes_eq(ptr, len, entry[2])) ? entry[1] : nothing
         end
-        if T !== nothing
-            _run_typed_dynamic(T, e, h, handler, sched, view, pool)  # HOT PATH — direct, no invokelatest
-            continue
-        end
-        # First sight of this keyexpr by this worker: materialize the String (cold,
-        # once per type) and resolve (the first sample of a new type pays discovery +
-        # codegen here, off the receiver — HOL-blocking this sub only). Then hand
-        # the item back so the outer loop re-enters in the post-`realize!` world, where
-        # `T` is directly callable for every later message.
-        ke = string(Zenoh.keyexpr(h))
-        try
-            info = _sample_type_info(e, ke)
-            if info === nothing
-                pool === nothing || put!(pool, h)              # not dispatched → recycle the holder
+        if fw === nothing                                  # first sight of this keyexpr
+            fw = _resolve_and_build!(e, h, cache, handler, view, logged, loglk, warmed, warmlk, warmup)
+            if fw === nothing                              # unresolved type — recycle + skip
+                pool === nothing || put!(pool, h)
                 continue
             end
-            Tnew = _resolve_home(e.node, info.hash)                    # home table first
-            source = :home
-            if Tnew === nothing
-                Tnew = resolve_or_discover(e.node, info.name, info.hash)
-                # Tag the resolution source for the hint: a resolved entry's provenance —
-                # `:static`/`:cache`/`:ament` mean we already knew the type locally; `:wire`
-                # means we fetched + generated it from the publisher's ~/get_type_description.
-                ent = Tnew === nothing ? nothing : lookup_type(registry(_ctx(e.node)), info)
-                source = ent === nothing ? :wire : ent.provenance
-            end
-            if Tnew === nothing
-                @warn "dynamic subscription: could not resolve type" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) maxlog=1
-                pool === nothing || put!(pool, h)              # not dispatched → recycle the holder
-                continue                                       # unresolved: skip, no cache, no re-entry
-            end
-            # Key on the same FNV-1a the hot path computes; stash the bytes for memcmp.
-            kebytes = Vector{UInt8}(codeunits(ke))
-            cache[GC.@preserve kebytes _ke_fnv1a(pointer(kebytes), length(kebytes))] = (Tnew, kebytes)
-            _log_discovered_once(e, info, source, logged, loglk)
-            # Warm this runtime type's codec once (off the recv thread); `T` is
-            # runtime-born so reach the warm anchor via `invokelatest`. `warmed` is
-            # shared with the manifest replay task, so the once-guard is under `warmlk`.
-            if warmup.mode !== :off
-                isnew = @lock warmlk (Tnew in warmed ? false : (push!(warmed, Tnew); true))
-                if isnew
-                    note_interaction!(e.node.fqn, :subscription, info.hash, info.name, e.endpoint.topic)
-                    try
-                        Base.invokelatest(_warm_dynamic, Tnew, handler)
-                    catch err
-                        @warn "dynamic warm-up failed (ignored)" topic=e.endpoint.topic exception=(err, catch_backtrace())
-                    end
+        end
+        # Dispatch per the concurrency policy; the thunk owns the holder's lifetime. Under
+        # `Parallel` the spawned task captures the concrete FW + owned `h` and runs the whole
+        # `_dispatch_decoded` (decode + handler) synchronously inside the borrow — the FW is
+        # never decomposed into decode-then-spawn-handler.
+        let fw = fw, h = h
+            sched() do
+                try
+                    fw(h)                                  # ccall through the trampoline ptr — no dispatch
+                finally
+                    pool === nothing || put!(pool, h)
                 end
             end
-            return (h, Tnew)                # hand off; outer loop re-enters in the fresh world
-        catch err
-            err isa ShutdownException && rethrow()
-            @error "dynamic subscription resolve failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
-            pool === nothing || put!(pool, h)                  # not dispatched → recycle the holder
-            continue
-        end
-    end
-    return :closed
-end
-
-# Dispatch decode+handler per the concurrency policy. Reached only via
-# `invokelatest` (since `T` is runtime-born), so we are in the latest world: the
-# `@spawn` inside `sched` (Parallel) captures it and the spawned task runs
-# `handler(decode(bytes, T))` as compiled new-world code, no further `invokelatest`.
-function _run_typed_dynamic(::Type{T}, e::Entity, h::SampleHolder,
-                            handler, sched, view::ViewMode, pool) where {T}
-    # The sched thunk captures the owned holder `h`, so under `Parallel` the spawned
-    # task keeps the payload alive while the leaf decodes it, then returns `h` to the
-    # pool. `_dispatch_decoded` is the same leaf the static consumer runs.
-    sched() do
-        try
-            _dispatch_decoded(e, h, T, handler, view)
-        finally
-            pool === nothing || put!(pool, h)
         end
     end
     nothing
+end
+
+# First sight of a keyexpr: materialize the String (cold, once per type), resolve the
+# sample's type, `realize!` it if new, then build + cache its `FunctionWrapper` — the single
+# per-type `invokelatest` world-age crossing (the trampoline compiles against `Tnew`'s codegen
+# world, which also warms its `decode`+handler). Returns the FW, or `nothing` if the type
+# can't be resolved (worker recycles the holder + skips). A resolve error is logged and
+# swallowed (one bad sample must not kill the subscription); a `ShutdownException` propagates.
+function _resolve_and_build!(e::Entity, h::SampleHolder,
+                             cache::Dict{UInt, Tuple{_DynFW, Vector{UInt8}}},
+                             handler, view::ViewMode, logged, loglk, warmed, warmlk,
+                             warmup::WarmupPolicy)
+    ke = string(Zenoh.keyexpr(h))
+    try
+        info = _sample_type_info(e, ke)
+        info === nothing && return nothing
+        Tnew = _resolve_home(e.node, info.hash)                    # home table first
+        source = :home
+        if Tnew === nothing
+            Tnew = resolve_or_discover(e.node, info.name, info.hash)
+            # Provenance for the graduation hint: `:static`/`:cache`/`:ament` mean we knew
+            # the type locally; `:wire` means fetched + generated from the publisher's
+            # ~/get_type_description.
+            ent = Tnew === nothing ? nothing : lookup_type(registry(_ctx(e.node)), info)
+            source = ent === nothing ? :wire : ent.provenance
+        end
+        if Tnew === nothing
+            @warn "dynamic subscription: could not resolve type" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) maxlog=1
+            return nothing
+        end
+        # Build + cache the type-stable handler-of-bytes — once per type, the single world-age
+        # crossing. `invokelatest`: `Tnew` is runtime-born, so the trampoline must compile in
+        # the post-`realize!` world. Key on the same FNV-1a the hot path uses; stash the bytes
+        # for the memcmp collision check.
+        Threads.atomic_add!(_DYNAMIC_REENTRIES, 1)
+        fw = Base.invokelatest(_mk_fw, Tnew, e, handler, view)::_DynFW
+        kebytes = Vector{UInt8}(codeunits(ke))
+        cache[GC.@preserve kebytes _ke_fnv1a(pointer(kebytes), length(kebytes))] = (fw, kebytes)
+        _log_discovered_once(e, info, source, logged, loglk)
+        # Record for the next-run manifest warm, and mark `warmed` so the manifest-replay task
+        # skips re-warming a type the worker has already built (the FW build above warmed its
+        # codec; the manifest task only `precompile`s, so this is coordination, not correctness).
+        if warmup.mode !== :off
+            @lock warmlk (Tnew in warmed || push!(warmed, Tnew))
+            note_interaction!(e.node.fqn, :subscription, info.hash, info.name, e.endpoint.topic)
+        end
+        return fw
+    catch err
+        err isa ShutdownException && rethrow()
+        @error "dynamic subscription resolve failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
+        return nothing
+    end
 end
 
 # The TypeInfo for a received sample: from the data keyexpr (rmw_zenoh embeds it),

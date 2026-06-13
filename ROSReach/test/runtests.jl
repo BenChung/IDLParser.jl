@@ -77,6 +77,40 @@ mkep(; zid="aaaa", node="n", ns="/", kind=Publisher, topic="/t", type=nothing,
         @test _type_compat(pz, sz) == (true, false)
     end
 
+    @testset "wiring warnings (near-miss names)" begin
+        # Classic `~/` slip: @hears subscribes /foo, the publisher resolved ~/foo → /talker/foo.
+        eps = [mkep(node="talker", topic="/talker/foo", kind=Publisher),
+               mkep(node="listener", topic="/foo", kind=Subscription)]
+        w = ROSReach._wiring_warnings(eps)
+        @test length(w) == 1
+        @test w[1].consumer.topic == "/foo" && w[1].producer.topic == "/talker/foo"
+        @test w[1].consumer.kind === Subscription && w[1].producer.kind === Publisher
+        @test occursin("namespaced form", w[1].note)
+        # The service/client dual: a client on /svc with no server, server on /node/svc.
+        ws = ROSReach._wiring_warnings(
+            [mkep(node="server", topic="/node/svc", kind=Service),
+             mkep(node="caller", topic="/svc", kind=Client)])
+        @test length(ws) == 1
+        @test ws[1].consumer.kind === Client && ws[1].producer.kind === Service
+        # Connected on the exact name ⇒ silent, even with a look-alike pub also present.
+        @test isempty(ROSReach._wiring_warnings(
+            [mkep(node="t", topic="/chatter", kind=Publisher),
+             mkep(node="t", topic="/x/chatter", kind=Publisher),
+             mkep(node="l", topic="/chatter", kind=Subscription)]))
+        # A dangling sub with no look-alike ⇒ silent (not a generic "no publisher" report).
+        @test isempty(ROSReach._wiring_warnings(
+            [mkep(node="t", topic="/other", kind=Publisher),
+             mkep(node="l", topic="/bar", kind=Subscription)]))
+        # Different basename ⇒ not confusable, silent.
+        @test isempty(ROSReach._wiring_warnings(
+            [mkep(node="t", topic="/foo_raw", kind=Publisher),
+             mkep(node="l", topic="/foo", kind=Subscription)]))
+        # A sub and a client never cross-pair (different channels), even same basename.
+        @test isempty(ROSReach._wiring_warnings(
+            [mkep(node="t", topic="/a/foo", kind=Service),
+             mkep(node="l", topic="/foo", kind=Subscription)]))
+    end
+
     # The rest exercise the real liveliness/transport path; they need a Zenoh
     # session, which opens fine offline (peer mode, no router required).
     local s

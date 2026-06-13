@@ -14,7 +14,7 @@
 #
 # Deferred: a warm-up hook (first-run JIT latency).
 
-export @node
+export @node, @precompile_nodes, describe_wiring
 
 # ── the node-core wrapper ───────────────────────────────────────────────────────
 
@@ -67,6 +67,52 @@ entities(c::ComponentNode) = (; (nm => entities(c.members[nm]) for nm in c.order
 inner_node(c::ComponentNode) = c.node
 "The `LifecycleNode` driving a managed component node, or `nothing` (unmanaged)."
 lifecycle(c::ComponentNode) = c.lifecycle
+
+# A port kind's `resolve_name` channel (mirrors `_clobber_channel`'s resolve kind):
+# topics for pub/sub, the service channel for service/client/action.
+_resolve_kind(kind::Symbol) =
+    (kind === :service || kind === :client || kind === :action) ? :service : :topic
+_port_kindstr(kind::Symbol) =
+    kind === :publisher ? "pub" : kind === :subscription ? "sub" :
+    kind === :service   ? "srv" : kind === :client       ? "cli" :
+    kind === :action    ? "act" : kind === :timer ? "timer" : String(kind)
+
+"""
+    describe_wiring([io], node::ComponentNode)
+
+Print each member port's identifier and the fully-qualified ROS name it resolves
+to, so the name expansion is visible at a glance — in particular a private
+`~/foo` resolving to `/<node>/foo` versus a relative `foo` resolving to
+`/<namespace>/foo`, the usual reason a `@hears` and a publisher that "should"
+match land on different topics. The middle column is the authored (post-remap)
+wire name; the arrow shows where it resolves. Timers carry no wire and are listed
+bare.
+"""
+describe_wiring(c::ComponentNode) = describe_wiring(stdout, c)
+
+function describe_wiring(io::IO, c::ComponentNode)
+    println(io, "wiring of ", c.node.fqn, " — ", length(c.order), " member(s)")
+    for mem in c.order
+        m = c.members[mem]
+        base = _base(typeof(m))
+        ports = mixin_spec(base).ports
+        println(io, "  ", mem, " :: ", nameof(base))
+        isempty(ports) && (println(io, "    (no ports)"); continue)
+        wmap = get(c.wires, mem, Dict{Symbol, String}())
+        for p in ports
+            kindstr = _port_kindstr(p.kind)
+            if p.kind === :timer
+                println(io, "    ", rpad(string(p.name), 18), kindstr)
+                continue
+            end
+            wire = get(wmap, p.name, _wire(p))
+            fqn  = resolve_name(c.node, wire; kind = _resolve_kind(p.kind))
+            println(io, "    ", rpad(string(p.name), 18), rpad(kindstr, 6),
+                    rpad(wire, 22), " → ", fqn)
+        end
+    end
+    return nothing
+end
 
 # Closing a node tears it down: run each member's `cleanup` in reverse DI order,
 # then undeclare its entities + node token. Unmanaged closes here directly, behind a
@@ -195,6 +241,61 @@ macro node(assign)
         end
         $(esc(N))
     end
+end
+
+# ── module-end bake (`@precompile_nodes`) ───────────────────────────────────────
+# Bake each declared mixin's typed parameter schema (`__ros_pschema_<M>__`), entities accessor
+# (`__ros_entities_<M>__`), and reaction-handler specialisations into the CONSUMING module's
+# precompile image, so a runtime `run(MyNode)` skips that first-touch codegen + JIT. The
+# named `const`s/methods are `Core.eval`'d into the user module (so they ride its pkgimage —
+# never ROSNode-global state, the old `_MIXINS` trap), and the `precompile` of each handler
+# runs INSIDE `@precompile_nodes`' `@compile_workload`, so the transitive frames it pulls in
+# (codecs/dispatch specialised on the user's message types — bakeable only here, since
+# ROSNode's own type-agnostic workload can't know them) are captured into the user image too.
+# Guarded per base so one malformed mixin can't break the package's precompile. Idempotent:
+# at load, `ros_init!`/the materialise path find the markers present and reuse the bakes
+# rather than re-`Core.eval`ing (which would invalidate the baked specialisations).
+function _finalize_module!(mod::Module)
+    isdefined(mod, :__mixin_bases__) || return nothing
+    for M in getfield(mod, :__mixin_bases__)
+        try
+            _ensure_schema!(M)                          # __ros_pschema_<M>__ + descriptors/pschema
+            nt = _entities_accessor_from_specs!(M)      # __ros_entities_<M>__ + entities(m::M)
+            # Bake handlers only against a typed accessor: a mixin with a non-derivable port
+            # (action/client) keeps the generic `entities`, so its handlers warm at first `run`
+            # instead — baking them here would compile against the generic accessor and be
+            # invalidated when materialise emits the typed one.
+            nt === nothing || _anchor_reactions!(M)
+        catch err
+            @debug "_finalize_module!: skipped a mixin bake" mod mixin = M exception = err
+        end
+    end
+    return nothing
+end
+
+"""
+    @precompile_nodes
+
+Bake this module's `@mixin`/`@node` declarations into its precompile image for a faster
+first `run`. Place it as the LAST top-level statement in a module that declares mixins/nodes
+(after every `@mixin`/`@param`/`@publishes`/… and reaction handler). It generates each
+mixin's typed `parameters(m)`/`entities(m)` accessors and precompiles its reaction handlers
+— including the transitive codec/dispatch frames they specialise — into THIS package's image.
+
+Expands to a `PrecompileTools.@compile_workload` (referenced through ROSNode, so the
+consuming package needs no `using PrecompileTools` of its own). Opt-in and side-effect-free:
+it runs only `precompile`/codegen, never user reactions, and only at precompile
+(`jl_generating_output`) — at plain `include`/REPL it's a no-op and the same accessors
+generate lazily at the first `run` (capturing the authoritative materialised type).
+"""
+macro precompile_nodes()
+    # Build the `@compile_workload` macrocall via GlobalRef so it resolves to ROSNode's
+    # PrecompileTools regardless of the consuming module's imports; the workload runs
+    # `_finalize_module!` at the user package's precompile, capturing its transitive frames.
+    return Expr(:macrocall,
+                GlobalRef(PrecompileTools, Symbol("@compile_workload")),
+                __source__,
+                Expr(:call, _finalize_module!, __module__))
 end
 
 # Each member is `"name" => Mixin` (string name — the namespace), optionally with
@@ -550,24 +651,64 @@ function _check_runnable(M, what::AbstractString)
     error("$(what): $(M) is not a @mixin")
 end
 
-# Warm the member's reaction handlers — spec-driven, after the typed accessors exist (so
-# `parameters(m).x`/`entities(m).p` in a handler compile against the typed forms, not the
-# generic ones). `precompile`-anchor only: it compiles `(M, …)` without running user code,
-# so it's side-effect-free regardless of policy (subscriptions' own per-port warm is
-# `:off`ed in `_materialize_ports!`). Timers (G6) and services have no other warm at all.
-# Honours `node.warmup` via `_warmup!` (off / inline-sync / background); `:action` is S4.
-function _warm_member_reactions!(node::Node, m, specs::Vector{PortSpec})
-    M = typeof(m)
-    _warmup!(node.warmup, function ()
-        for p in specs
-            p.reaction === nothing && continue
-            if p.kind === :subscription || p.kind === :service
-                precompile(p.reaction, (M, p.msgtype))
-            elseif p.kind === :timer
-                precompile(p.reaction, (M,))
+# Anchor a mixin's reaction handlers against type `M` — `precompile`-only, no user code
+# runs, so it's side-effect-free regardless of policy. Spec-driven and type-driven (specs
+# come from `mixin_spec` keyed at `M`'s base), so the SAME routine serves both the runtime
+# warm (concrete `typeof(m)` — warms the actual instantiation, incl. parametric) and the
+# module-end bake (base mixin — `_finalize_module!`). Must run AFTER the typed accessors
+# exist (so `parameters(m).x`/`entities(m).p` in a handler compile against the typed forms,
+# not the generic ones).
+function _anchor_reactions!(::Type{M}) where {M}
+    for p in mixin_spec(_base(M)).ports
+        p.reaction === nothing && continue
+        if p.kind === :subscription
+            precompile(p.reaction, (M, p.msgtype))
+            # The consumer's decode→dispatch chain. A component subscription builds with
+            # `warmup = :off` (its own warm would fire before the typed accessors exist), so
+            # anchor that chain here through the materialised callback type — the `_sub_cb`
+            # closure the consumer actually invokes — in the default `Owned` view.
+            rts = Base.return_types(_sub_cb, (typeof(p.reaction), M))
+            if length(rts) == 1 && isconcretetype(only(rts))
+                H = only(rts)
+                T = p.msgtype
+                precompile(_dispatch_decoded, (Entity, SampleHolder, Type{T}, H, Owned))
+                precompile(decode_owned, (Memory{UInt8}, Type{T}))
+                precompile(_decode_on_consumer, (Entity, SampleHolder, Type{T}))
+                precompile(_invoke_owned, (Entity, T, H))
+            end
+        elseif p.kind === :service
+            precompile(p.reaction, (M, p.msgtype))
+        elseif p.kind === :timer
+            precompile(p.reaction, (M,))
+        elseif p.kind === :action
+            # G3: the action adapter calls the user handler via an `Any[]` splat, which
+            # inference can't follow — so the server's adapter-frame warm never anchors
+            # the handler `f`. Anchor it here with the exact signature the adapter calls:
+            # `f(m, goalfields…, FeedbackSink{FB})`, sink inserted at `fb_pos`. Guarded —
+            # a malformed reconstruction must never break configure/precompile.
+            try
+                f = p.reaction
+                support = ActionTypeSupport(typeof(f))
+                argtypes = Any[M]
+                for ft in fieldtypes(goal_type(support))
+                    push!(argtypes, ft)
+                end
+                insert!(argtypes, p.extra.fb_pos, FeedbackSink{feedback_type(support)})
+                precompile(f, (argtypes...,))
+            catch
             end
         end
-    end)
+    end
+    return nothing
+end
+
+# Runtime warm: anchor the member's handlers against its concrete `typeof(m)` once the typed
+# accessors exist. Honours `node.warmup` via `_warmup!` (off / inline-sync / background).
+# Subscriptions' own per-port warm is `:off`ed in `_materialize_ports!`; timers (G6) and
+# services have no other warm. The module-end bake (`@precompile_nodes`) does the same for
+# the base mixin ahead of time, so a baked node skips this work.
+function _warm_member_reactions!(node::Node, m)
+    _warmup!(node.warmup, () -> _anchor_reactions!(typeof(m)))
     return nothing
 end
 
@@ -582,9 +723,9 @@ function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     # type-stable `entities(m)::PortsNT` — the base goes in as BOTH the generated
     # signature and the dedup key, so one method covers every instantiation (a concrete
     # signature here would silently strand other instantiations on the untyped generic).
-    _ensure_entities_accessor!(_base(typeof(m)), ports)
+    _entities_accessor_from_ports!(_base(typeof(m)), ports)
     # Now that the typed accessors exist, anchor each reaction handler (DESIGN: G1a/G6).
-    _warm_member_reactions!(cnode.node, m, specs)
+    _warm_member_reactions!(cnode.node, m)
     return nothing
 end
 

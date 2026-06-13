@@ -739,7 +739,9 @@ mutable struct ServiceClient{Req, Resp}
 end
 
 function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
-                       qos::QosProfile=default_qos()) where {Srv}
+                       qos::QosProfile=default_qos(),
+                       warmup::Union{Symbol, Nothing}=nothing,
+                       warmup_sync::Union{Bool, Nothing}=nothing) where {Srv}
     Req  = request_type(Srv)
     Resp = response_type(Srv)
     sname = resolve_name(node, name; kind=:service)
@@ -753,7 +755,20 @@ function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
     tk = topic_keyexpr(ctx.format, ent.endpoint)
     querier = Querier(ctx.session, Keyexpr(tk); target=:all_complete)
     ent.wire = _ClientWire(querier, nothing, ReentrantLock())
-    return ServiceClient{Req, Resp}(ent, 0)
+    client = ServiceClient{Req, Resp}(ent, 0)
+    # Warm the call codec like the server endpoints (G2). Inherits `node.warmup`, so a
+    # `ParameterClient`'s lazily-built internal `ServiceClient`s warm here too.
+    _warmup!(_resolve_warmup(node, warmup, warmup_sync), () -> _warm_client(client))
+    return client
+end
+
+# Anchor the request-reply codec + call path for a client (G2): `encode(Req)` and the
+# `call(client, req)` body (which decodes the `Resp`). Precompile-only — never runs the
+# network `call`, just compiles it.
+function _warm_client(c::ServiceClient{Req, Resp}) where {Req, Resp}
+    precompile(encode, (Req,))
+    precompile(call, (typeof(c), Req))
+    nothing
 end
 
 Base.isopen(c::ServiceClient) = isopen(c.entity)

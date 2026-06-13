@@ -48,7 +48,7 @@ export
     # computation queries
     endpoints, node_names, topic_names_and_types, topic_edges, TopicEdge,
     publishers_info, subscriptions_info, count_publishers, count_subscribers,
-    session_of, endpoints_on_session,
+    session_of, endpoints_on_session, wiring_warnings, WiringWarning,
     # transport + reachability
     TransportPeer, TransportTopology, local_zid,
     connected_routers, connected_peers, transport_topology,

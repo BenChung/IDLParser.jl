@@ -21,6 +21,7 @@
 # `sync=true` blocks the constructor until warm (first message guaranteed compiled).
 
 using PrecompileTools: @setup_workload, @compile_workload
+import PrecompileTools          # module name, for `@precompile_nodes`' GlobalRef to its `@compile_workload`
 # Fixed primitive arrays (`float[3]`) generate as `SVector`; detect them for the
 # default-message builder. (StaticArrays is a ROSNode dep; typesupport.jl `using`s
 # it module-wide, but that file is included after this one — name it explicitly.)
@@ -158,10 +159,11 @@ function _warm_subscription(policy::WarmupPolicy, e::Entity, ::Type{T}, handler:
     nothing
 end
 
-# Dynamic (keyexpr-only) subscription: no compile-time `T` at construction — warmed
-# at *first sight* of each runtime type (reached via `invokelatest` from
-# `_run_typed_dynamic`, since `T` is runtime-born). Owned-only, precompile-only
-# (running a discovered handler on a synthesized sample is the manifest's job).
+# Dynamic (keyexpr-only) subscription: no compile-time `T` at construction. The worker
+# warms each runtime type by building its per-type `FunctionWrapper` (which compiles
+# decode+handler); this anchor is the *manifest-replay* path, run via `invokelatest` at
+# startup to pre-warm prior-run types ahead of the first message. Owned-only,
+# precompile-only (running a discovered handler on a synthesized sample is the manifest's job).
 function _warm_dynamic(::Type{T}, handler::H) where {T, H}
     # The dynamic worker borrows a `Memory{UInt8}` (`with_payload_memory`) and
     # decodes via `decode_view`/`decode_owned` per the sub's `view` flag — warm both.
@@ -200,11 +202,27 @@ end
 # meaningful, so :execute is a no-op here. `exec` is
 # the do-block body (high-level) or the `on_accepted` callback (low-level).
 function _warm_action(::Type{G}, ::Type{R}, ::Type{F}, exec::E,
-                      ::Type{GH}) where {G, R, F, E, GH}
+                      ::Type{GoalHandle{A, G, R, F}}) where {A, G, R, F, E}
+    GH = GoalHandle{A, G, R, F}
     precompile(decode_owned, (Memory{UInt8}, Type{G}))  # _decode_query → decode_owned
     precompile(exec, (GH,))
     precompile(encode, (R,))
     precompile(encode, (F,))
+    # The three service wrappers + feedback the server actually puts on the wire (the inner
+    # G/R/F above nest inside these). Each service decodes its `_Request` and encodes its
+    # `_Response`; feedback rides as `<A>_FeedbackMessage`; CancelGoal is the shared action_msgs
+    # type. Guarded — a hand-rolled action lacking a generated wrapper degrades to the inner-only
+    # warm rather than breaking construction.
+    try
+        precompile(decode_owned, (Memory{UInt8}, Type{_action_wrapper(A, "_SendGoal_Request")}))
+        precompile(encode, (_action_wrapper(A, "_SendGoal_Response"),))
+        precompile(decode_owned, (Memory{UInt8}, Type{_action_wrapper(A, "_GetResult_Request")}))
+        precompile(encode, (_action_wrapper(A, "_GetResult_Response"),))
+        precompile(encode, (_action_wrapper(A, "_FeedbackMessage"),))
+        precompile(decode_owned, (Memory{UInt8}, Type{_CancelGoal_Request}))
+        precompile(encode, (_CancelGoal_Response,))
+    catch
+    end
     nothing
 end
 
@@ -223,5 +241,16 @@ end
             decode_owned(as_memory(z, UInt8), T)
             decode_view(as_memory(z, UInt8), T)
         end
+        # Bake the bootstrap IDL parse here, in ROSNode's image, *where Zenoh is loaded*.
+        # `_wellknown_entries()` runs the PEG grammar over the vendored type_description
+        # sources — the grammar combinators the first `Context()` re-runs via
+        # `_register_canonical_types!`. ROSMessages bakes those combinators in its own
+        # Zenoh-free pkgimage, so Zenoh's `pointer(::GuardedPayloadView)`
+        # (GuardedPayloadView <: DenseVector) invalidates them at load and they re-JIT on
+        # the first `Context()` (~4s). Compiling them here (Zenoh present) pins valid copies
+        # in ROSNode's image. (The broader `_canonical_entries()` can't run yet — it needs
+        # staticgen.jl, included after this file — but the grammar is the same, so the
+        # bootstrap parse covers the invalidated combinators.)
+        _wellknown_entries()
     end
 end

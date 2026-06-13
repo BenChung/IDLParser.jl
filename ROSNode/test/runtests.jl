@@ -103,6 +103,14 @@ try
         # §2–§7: a precompiled package's @mixin/@node/authored declarations survive to
         # runtime (per-mixin spec store + ros_init! load hook), incl. a BYO __init__.
         _section("component_precompile", "model/component_precompile.jl")
+        # G4 drift guard: every tier-2 scaffolding precompile anchor still resolves.
+        _section("component_precompile_anchors", "model/component_precompile_anchors.jl")
+        # `_handle_type` exactness: the `@precompile_nodes` static `entities(m)::PortsNT`
+        # derivation must equal the live materialise capture (publisher/sub/service/timer).
+        _section("component_entities_static", "model/component_entities_static.jl")
+        # Warm/bake payoff: the function-barrier callback dispatches statically (S1a), client
+        # warm anchors encode/call (S3), and a live node's handler is compiled after bring-up.
+        _section("component_warm_compiled", "performance/component_warm_compiled.jl")
     end
 finally
     _kill_router!()

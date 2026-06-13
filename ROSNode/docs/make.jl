@@ -31,6 +31,7 @@ makedocs(;
             "Authoring Interfaces in Julia" => "advanced/authoring.md",
             "Runtime Type Discovery" => "advanced/discovery.md",
             "Message Delivery" => "advanced/delivery.md",
+            "Precompilation & Warm-up" => "advanced/precompilation.md",
         ],
         "Composition" => [
             "Components" => "composition/components.md",

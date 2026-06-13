@@ -34,6 +34,12 @@ Base.show(io::IO, e::TopicEdge) =
           " [", e.type_ok ? (e.type_verified ? "type✓" : "type?") : "type✗",
           " ", e.qos_ok ? "qos✓" : "qos✗", "]")
 
+Base.show(io::IO, w::WiringWarning) =
+    print(io, "⚠ ", _kindstr(w.consumer.kind), " ", w.consumer.topic,
+          " (", w.consumer.node_name, ") has no ", _kindstr(w.producer.kind), "; ",
+          _kindstr(w.producer.kind), " ", w.producer.topic,
+          " (", w.producer.node_name, ") shares its basename")
+
 # ── graph_report ───────────────────────────────────────────────────────────────
 
 """
@@ -72,6 +78,16 @@ function graph_report(io::IO, idx::ReachIndex, x=idx; transport::Bool=true)
         flag = length(types) > 1 ? "  ⚠ type mismatch" : ""
         println(io, "  ", rpad(topic, 28), " ", join((t.name for t in types), ", "),
                 "  ($np pub, $ns sub)", flag)
+    end
+
+    warns = wiring_warnings(idx)
+    if !isempty(warns)
+        println(io, "\nWiring warnings — ", length(warns),
+                " unmatched consumer(s) with a look-alike producer:")
+        for w in warns
+            println(io, "  ", w)
+            println(io, "      ", w.note)
+        end
     end
 
     if transport

@@ -74,7 +74,8 @@ function _spawn_consumer(e::Entity, ::Type{T}, handler, view::ViewMode,
 end
 
 # The single decode→dispatch leaf, shared by the static consumer (`_consume_loop`
-# and the `Parallel(Inf)` view path) and the dynamic worker (`_run_typed_dynamic`).
+# and the `Parallel(Inf)` view path) and the dynamic worker (wrapped per-type in the
+# `FunctionWrapper` the worker builds — see `_mk_fw`, dynamic.jl).
 # Given a concrete `T`, a live `sample`/holder, the handler, and the `ViewMode`, it
 # borrows the payload and runs the handler on the decoded message. One
 # implementation keeps the static and dynamic paths in sync. Type-stable: `T` is

@@ -49,12 +49,29 @@ mutable struct ActionClient{A, G, R, F}
 end
 
 function ActionClient(node::Node, name::AbstractString, ::Type{A};
-                      qos::QosProfile = default_qos()) where {A}
+                      qos::QosProfile = default_qos(),
+                      warmup::Union{Symbol, Nothing}=nothing,
+                      warmup_sync::Union{Bool, Nothing}=nothing) where {A}
     support = ActionTypeSupport(A)
     G = goal_type(support); R = result_type(support); F = feedback_type(support)
     fqn = resolve_name(node, name; kind=:service)
     gid = ROSZenoh.entity_gid(node.entity.z_id, next_entity_id!(node.context))
-    ActionClient{A, G, R, F}(node, fqn, support, qos, gid, 0, true, nothing, ReentrantLock())
+    client = ActionClient{A, G, R, F}(node, fqn, support, qos, gid, 0, true, nothing, ReentrantLock())
+    _warmup!(_resolve_warmup(node, warmup, warmup_sync), () -> _warm_client(client))
+    return client
+end
+
+# Anchor the action `get` request-wrapper codecs (G2). Control-plane, so just the encode
+# anchors (the goal-send / get-result requests); the response decode is infrequent and
+# uses the reply sample type, left to JIT. Guarded: a missing wrapper accessor for some
+# `A` must never break client construction.
+function _warm_client(c::ActionClient{A, G, R, F}) where {A, G, R, F}
+    try
+        precompile(encode, (_action_wrapper(A, "_SendGoal_Request"),))
+        precompile(encode, (_action_wrapper(A, "_GetResult_Request"),))
+    catch
+    end
+    nothing
 end
 
 # The rmw_zenoh per-request attachment for an action service `get`. Mirrors the

@@ -74,6 +74,8 @@ ServiceHandle
 ServiceClient
 call
 respond!
+detach!
+ServiceRequestHandle
 service_matched
 request_type
 response_type
