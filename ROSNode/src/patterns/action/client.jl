@@ -1,8 +1,6 @@
 # ── ActionClient ─────────────────────────────────────────────────────────────
-# `send` issues a send_goal request and returns a client-side goal handle that is
-# iterable over feedback, `fetch`-able for the result, and `cancel`-able. The
-# three services are reached with Zenoh `get` (one per call); feedback is a
-# Subscription on the feedback topic filtered by goal id.
+# Each of the three action services is reached with a one-shot Zenoh `get`;
+# feedback is a Subscription on the feedback topic filtered by goal id.
 
 """
     ActionClient(node, name, A; qos=default_qos()) -> ActionClient
@@ -34,16 +32,16 @@ mutable struct ActionClient{A, G, R, F}
     const name::String                   # resolved action FQN
     const support::ActionTypeSupport{A, G, R, F}
     const qos::QosProfile
-    # rmw_zenoh request attachment: the three action services are `get`s, and a
-    # real rmw_zenoh queryable reads the request's `(sequence_number, source_timestamp,
-    # source_gid)` attachment to stamp its reply — hiroz `.unwrap()`s it, so a request
-    # without one panics the peer. Stable per-client gid + a per-request seq.
+    # Stable per-client gid + per-request seq for the rmw_zenoh request attachment.
+    # A native queryable reads the request's (sequence_number, source_timestamp,
+    # source_gid) to stamp its reply and hard-panics on an absent attachment, so the
+    # gid stays a fixed 16-byte tuple and every service `get` carries one.
     const _gid::NTuple{16, UInt8}
     @atomic _seq::Int64
     @atomic open::Bool
-    # Lazy routing-match probes (`_ClientWire`s, service.jl) for `send_goal` and
-    # `get_result`, declared on first `wait_for_action_server`/`action_server_matched`
-    # and `nothing` until then. `send`/`fetch` use one-shot gets and never read these.
+    # Lazy routing-match probes for `send_goal` and `get_result`, declared on first
+    # `wait_for_action_server`/`action_server_matched`. `send`/`fetch` use one-shot
+    # gets and never read these.
     @atomic _match::Union{Vector{_ClientWire}, Nothing}
     const _match_lock::ReentrantLock
 end
@@ -61,10 +59,9 @@ function ActionClient(node::Node, name::AbstractString, ::Type{A};
     return client
 end
 
-# Anchor the action `get` request-wrapper codecs (G2). Control-plane, so just the encode
-# anchors (the goal-send / get-result requests); the response decode is infrequent and
-# uses the reply sample type, left to JIT. Guarded: a missing wrapper accessor for some
-# `A` must never break client construction.
+# Warm the request-wrapper encode paths only — the control-plane reply decode is
+# infrequent and left to JIT. Guarded so a missing wrapper accessor never breaks
+# client construction.
 function _warm_client(c::ActionClient{A, G, R, F}) where {A, G, R, F}
     try
         precompile(encode, (_action_wrapper(A, "_SendGoal_Request"),))
@@ -74,15 +71,15 @@ function _warm_client(c::ActionClient{A, G, R, F}) where {A, G, R, F}
     nothing
 end
 
-# The rmw_zenoh per-request attachment for an action service `get`. Mirrors the
-# `ServiceClient` path so a request reaching a C++/Rust peer carries the metadata it
-# echoes back into the reply (without it, hiroz's `query.attachment().unwrap()` panics).
+# The rmw_zenoh per-request attachment for an action service `get`: a native peer
+# echoes it into the reply and hard-panics on its absence, so every `get` carries one.
 _request_attachment(client::ActionClient) =
     encode_attachment((@atomic client._seq += 1), _now_ns(client.node), client._gid)
 
-# The action sub-service `TypeInfo` for a client call (`:send_goal` / `:get_result`
-# / `:cancel_goal`), or the action-typed info as a fallback — the client side of
-# `_action_service_tis`, keeping the client's `get` keyexpr matched to the server.
+# The SERVICE-level `TypeInfo` for a client call (`:send_goal`/`:get_result`/
+# `:cancel_goal`) — keying the `get` keyexpr on the service hash, never the action
+# type's own, is what routes against a native rmw_zenoh peer. The action-typed info
+# is the Julia-to-Julia path when the service hashes can't be synthesized.
 function _client_service_ti(client::ActionClient{A}, kind::Symbol) where {A}
     tis = _action_service_tis(A, client.support)
     tis === nothing ? type_info(A) : getfield(tis, kind)
@@ -91,7 +88,7 @@ end
 Base.isopen(c::ActionClient) = @atomic c.open
 function Base.close(c::ActionClient)
     (@atomicswap c.open = false) || return nothing
-    ws = @atomicswap c._match = nothing             # reap the lazy match probes, if any
+    ws = @atomicswap c._match = nothing             # reap any lazy match probes
     ws === nothing || for w in ws; (try; close(w); catch; end); end
     nothing
 end
@@ -100,11 +97,10 @@ Base.show(io::IO, c::ActionClient{A}) where {A} =
           isopen(c) ? "" : ", closed", ")")
 
 # Lazily declare matching probes (Queriers on the keyexprs `send`/`fetch` query) on
-# first await of the server, reusing the shared `_ClientWire` machinery (service.jl).
-# Probe both `send_goal` and `get_result`: `send` retries discovery itself, but
-# `fetch`'s `get_result` is a one-shot get with a long timeout, so awaiting its match
-# is what spares `fetch` from blocking on an unmatched service. A client that never
-# awaits declares no probes.
+# first await of the server, reusing the shared `_ClientWire` machinery. Probe both
+# `send_goal` and `get_result`: `fetch`'s `get_result` is a one-shot get with a long
+# timeout, so awaiting its match spares `fetch` from blocking on an unmatched service
+# (`send` retries discovery itself). A client that never awaits declares no probes.
 function _ensure_action_match!(client::ActionClient)
     ws = @atomic client._match
     ws === nothing || return ws
@@ -212,15 +208,13 @@ function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     ctx = client.node.context
     tk = _service_key(client, _send_goal_topic(client.name), _client_service_ti(client, :send_goal))
 
-    # The request is `<A>_SendGoal_Request{goal_id, goal}`; we mint the id (the
-    # correlation token reused on feedback / get_result / cancel). The reply is the
-    # `<A>_SendGoal_Response{accepted, stamp}`.
+    # The client mints the goal id (the correlation token reused on feedback /
+    # get_result / cancel) into `<A>_SendGoal_Request{goal_id, goal}`.
     req = _send_goal_request_type(A)(; goal_id = _to_uuid(id), goal = goal)
-    # The send_goal queryable can lag the liveliness token a peer discovers it by, so a
-    # one-shot `get` to a not-yet-route-matched queryable returns no reply — an empty
-    # result here means undiscovered, not rejected. Retry until a reply arrives (then it
-    # is authoritative) or the window elapses (no server ⇒ rejected); a retried `get`
-    # only re-fires while the route stays empty.
+    # The queryable can lag the liveliness token a peer discovers it by, so a `get` to
+    # a not-yet-matched route returns no reply — an empty result means undiscovered,
+    # not rejected. Retry until a reply lands (authoritative) or the window elapses
+    # (no server ⇒ rejected); a retried `get` re-fires only while the route is empty.
     accepted = false
     got_reply = false
     for _ in 1:40                                          # up to ~2s of 50ms backoffs
@@ -250,11 +244,10 @@ when the goal reaches a terminal state. The topic carries `<A>_FeedbackMessage`
 (goal_id + feedback), so the stream is filtered to *this* goal's id.
 """
 function feedback(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
-    # A bounded Channel (sized to the feedback QoS depth) fed by a Subscription on the
-    # feedback topic. The subscription decodes `<A>_FeedbackMessage`, drops messages for
-    # other goals, and forwards the unwrapped `Feedback`; the stream ends when the goal's
-    # result slot fills. Drop-oldest on enqueue so a slow or early-breaking consumer never
-    # blocks the subscription callback task (KEEP_LAST ring semantics).
+    # A bounded Channel (sized to the feedback QoS depth) fed by a Subscription that
+    # decodes `<A>_FeedbackMessage` and forwards this goal's `Feedback`. Drop-oldest on
+    # enqueue (KEEP_LAST ring) so a slow or early-breaking consumer never blocks the
+    # subscription callback task.
     client = g.client
     ch = Channel{F}(max(1, _fifo_capacity(client.qos)))
     sub = _make_subscription(client.node, _feedback_topic(client.name),
@@ -262,9 +255,8 @@ function feedback(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
         _from_uuid(msg.goal_id) == g.id && isopen(ch) && _put_drop_oldest!(ch, msg.feedback)
     end
     g._feedback_sub = sub
-    # The framework drives `get_result` (the single settlement signal), so the stream
-    # ends on settle even without a `fetch` call. The closer blocks on the result slot,
-    # then tears the subscription down.
+    # The framework drives `get_result` itself, so the stream ends on settle even with
+    # no `fetch` call: the closer blocks on the result slot, then tears the sub down.
     _ensure_result!(g)
     errormonitor(Threads.@spawn begin
         try
@@ -283,8 +275,8 @@ end
 
 _is_terminal_client_state(s::Symbol) = s in (:succeeded, :canceled, :aborted, :rejected)
 
-# Start (once) the single `get_result` task that fills the goal's write-once result
-# slot. Idempotent — `fetch` and `feedback` both call it; only the first spawns.
+# Exactly one `get_result` task per goal fills the write-once result slot. Both
+# `fetch` and `feedback` call this; the atomic gate ensures only the first spawns.
 function _ensure_result!(g::ClientGoal)
     (@atomicswap g._result_started = true) && return nothing
     errormonitor(Threads.@spawn _drive_result!(g))
@@ -309,11 +301,10 @@ function _drive_result!(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     nothing
 end
 
-# One `get_result` round-trip → the `Result`, or throws. Like `send_goal`, the
-# queryable can lag discovery, so a get to an unmatched route returns no reply; retry
-# until one lands. Once matched the server holds the reply until the goal settles, so
-# the matched attempt blocks to the timeout for the real result; retries only re-fire
-# while the route is still empty.
+# One `get_result` round-trip → the `Result`, or throws. The queryable can lag
+# discovery, so a get to an unmatched route returns no reply; retry until one lands.
+# Once matched the server holds the reply until the goal settles, so the matched
+# attempt blocks to the timeout for the real result.
 function _get_result_once(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     client = g.client
     # Outbound gate (entry-only): no get_result query from a non-Active managed node.
@@ -371,8 +362,8 @@ function Base.fetch(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     return something(o)::R
 end
 
-# get_result wait bound (ms): longer than the server's result-cache TTL so a real
-# result is always seen, finite so a never-coming reply can't wedge `fetch`.
+# get_result wait bound (ms): exceeds the server's result-cache TTL so a real result
+# is always seen, and stays finite so a never-coming reply can't wedge `fetch`.
 const _GET_RESULT_TIMEOUT_MS = Int(_RESULT_CACHE_TTL_NS ÷ 1_000_000) + 60_000
 
 _client_state_from_status(b::Integer) =
@@ -414,10 +405,9 @@ function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     nothing
 end
 
-# The Zenoh data-route keyexpr for a client-side service call: build the wire key
-# the server's queryable declared. We construct a transient `EndpointEntity` of
-# the matching kind so `topic_keyexpr` produces the same key — the client's own
-# id doesn't enter the topic key (only the topic + type + hash do).
+# The Zenoh data-route keyexpr for a client-side service call: reproduce the key the
+# server's queryable declared via a transient `EndpointEntity` of the matching kind,
+# since the topic key is a pure function of topic + type + hash (not the client id).
 function _service_key(client::ActionClient, topic::AbstractString, ti::TypeInfo)
     node = client.node
     e = ROSZenoh.EndpointEntity(; id=0, node=node.entity, kind=Service,

@@ -1,10 +1,7 @@
 # ── GoalHandle ───────────────────────────────────────────────────────────────
-# The per-goal object: the thing you `feedback!`, settle, and observe
-# cancellation on. Holds the goal id, the goal request, the live state, the
-# write-once result cell (settlement.jl), and a back-reference to the server for
-# feedback publication + status updates. Two lifetimes: the server is long-lived;
-# a GoalHandle lives from acceptance until its result is fetched (or the cache
-# evicts it).
+# The per-goal object you `feedback!`, settle, and observe cancellation on. It
+# holds a back-reference to the long-lived server; a GoalHandle itself lives from
+# acceptance until the result-cache TTL evicts it after settlement.
 
 """
     GoalHandle{A, G, R, F}
@@ -44,23 +41,19 @@ mutable struct GoalHandle{A, G, R, F}
     const accepted_at::Int64             # acceptance stamp (wall ns)
     const lock::ReentrantLock
     @atomic status::GoalState
-    # The settled result, cached for `get_result` replay so a late or repeated
-    # fetch is answered without re-running the goal. The ResultCell delivers the
-    # payload through `deliver` without retaining it, so the terminal fill captures
-    # it here. `nothing` until settled; written under `g.lock` before the cell
-    # flips `filled` (single-writer, in `_deliver_result!`), so a waiter waking on
-    # `wait_settled` always sees the result by the time it reads it.
+    # The settled result, cached so a late or repeated `get_result` is answered
+    # without re-running the goal (the cell delivers the payload without retaining it).
+    # Written once under `g.lock` before the cell flips `filled`, so a waiter waking
+    # on `wait_settled` always sees the result.
     result::Union{R, Nothing}
-    # Terminal stamp (wall ns) — when the goal settled; `0` while live. Drives
-    # TTL eviction of the result cache (the goal table holds settled goals only
-    # long enough for a late `get_result`).
+    # Terminal stamp (wall ns), `0` while live. Drives TTL eviction of the result cache.
     @atomic settled_at::Int64
-    # Set once a `get_result` has replayed this goal's result; `_publish_status`
-    # then drops it from the status array (rclcpp prunes fetched terminal goals).
-    # Eviction keys on the TTL alone — a repeated fetch must still replay.
+    # Set once `get_result` has replayed this result; `_publish_status` then drops the
+    # goal from the status array. Eviction keys on the TTL alone — a repeated fetch
+    # must still replay — so this flag never gates cache deletion.
     @atomic fetched::Bool
-    # The execution task (set when scheduled); tracked so `close(server)` joins
-    # outstanding goals incl. detached post-cancel cleanup (server drain).
+    # The execution task, tracked so `close(server)` joins outstanding goals including
+    # detached post-cancel cleanup.
     _task::Union{Task, Nothing}
 end
 
@@ -90,10 +83,9 @@ state(g::GoalHandle) = _state_symbol(@atomic g.status)
 Base.show(io::IO, g::GoalHandle{A}) where {A} =
     print(io, "GoalHandle(", nameof(A), " ", _state_symbol(@atomic g.status), ")")
 
-# Transition guard: advance the status only from a non-terminal state, under
-# `g.lock`. Settlement's terminal latch (`_deliver_result!`) takes the same lock,
-# so terminal always wins — a transition either sees the terminal state and bails
-# or is overwritten by the latch.
+# Advance the status from a non-terminal state under `g.lock`. The terminal latch
+# (`_deliver_result!`) takes the same lock, so terminal always wins: a transition
+# either sees the terminal state and bails or is overwritten by the latch.
 function _transition!(g::GoalHandle, to::GoalState)
     @lock g.lock begin
         cur = @atomic g.status
@@ -137,8 +129,7 @@ on cancellation.
 Returns `nothing`.
 """
 function checkpoint(g::GoalHandle)
-    # Once settled, the cancel signal is spent: a no-op here lets detached
-    # post-cancel cleanup run to completion.
+    # Once settled, the cancel signal is spent — a no-op lets post-cancel cleanup finish.
     isfilled(g.cell) && return nothing
     iscancelled(g) && throw(Cancelled())
     nothing
@@ -169,8 +160,8 @@ function feedback!(g::GoalHandle{A, G, R, F}, fb::F) where {A, G, R, F}
     nothing
 end
 
-# `respond!(goal, feedback, fb)` spelling — feedback is a stream verb, routed
-# here rather than to the cell (settlement.jl rejects `feedback` as non-terminal).
+# `respond!(goal, feedback, fb)` spelling — feedback is a stream verb, routed here
+# rather than to the cell, which only accepts terminal settlement tokens.
 function respond!(g::GoalHandle{A, G, R, F}, ::Feedback, fb::F) where {A, G, R, F}
     feedback!(g, fb)
 end

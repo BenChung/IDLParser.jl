@@ -1,12 +1,14 @@
 # Static type registration for the `@ros_import` / `@ros_cache` macros.
 #
 # Each macro generates interface types into the caller module and records them in a
-# module-local global `__ros_static_types__::Vector{Tuple{Type, String}}`: each type
-# paired with its canonical wire `TypeDescription` JSON. The global bakes into a
-# package image, or builds at eval in a script/REPL module. Module load absorbs it
-# into ROSNode's singleton; Context creation then registers each type bound to its
-# real RIHS01 hash, so keyexpr-only resolution and the type-description server use
-# the precompiled type directly.
+# module-local global `__ros_static_types__::Vector{Tuple{Type, String}}` — each type
+# paired with its canonical wire `TypeDescription` JSON. This module-local global bakes
+# into the consumer's package image (or builds at eval in a script/REPL module). A load
+# hook absorbs it into ROSNode's process-global singleton, and Context creation
+# registers each type bound to its real RIHS01 hash, so keyexpr-only resolution and the
+# type-description server use the precompiled type directly. The two-phase split (bake
+# the type-agnostic frames at precompile, defer the global-dict registration to load)
+# keeps the registry from emptying when a precompiled consumer discards ROSNode's state.
 
 # Module-local globals the macros populate: the baked static types, and the
 # `@ros_cache` persistence-dir marker (`""` selects the project default).
@@ -37,11 +39,10 @@ function _intern_static_entry!(@nospecialize(T), json::AbstractString; provenanc
     end
 end
 
-# ROSNode-local singleton that the macros flush into and Context pulls from.
-# `@ros_import`/`@ros_cache` emit a call to `absorb_static_types!` at module load —
-# from a generated `__init__` in precompiled packages, or a top-level call at eval in
-# script/REPL modules — which reads the module's accumulator into here. Entries are
-# interned by type, so repeated absorbs are idempotent.
+# Process-global singleton that the macros flush into and Context pulls from. The load
+# hook (`absorb_static_types!`, run from a generated `__init__` in precompiled packages
+# or at eval in script/REPL modules) reads the module's accumulator into here. Entries
+# are interned by type, so repeated absorbs are idempotent.
 struct _StaticTypeIndex
     lock::ReentrantLock
     entries::Vector{RegistryEntry}        # interned static type entries
@@ -145,7 +146,7 @@ function _register_static_types!(ctx)
     @lock _STATIC_TYPES.lock begin
         for e in _STATIC_TYPES.entries
             # First-wins: skip a present `(name, hash)`, never clobber. Decode identity is
-            # per-module via the `home` table, so this registry only feeds the
+            # per-module via the `home` table, so this registry feeds only the
             # type-description server (any struct with the same `(name, hash)` serves the
             # identical descriptor) and the canonical fallback.
             lookup_type(reg, e.info) === nothing && register_type!(reg, e.info, e)

@@ -1,18 +1,18 @@
 # ── dynamic acquisition: TypeDescription → registry entry ───────────────────
-# A GetTypeDescription reply (`TypeDescriptionMsg`) is verified against its wire
-# `TypeInfo`, lifted to IL, and turned into a registry entry. The discovery layer
-# issues the GetTypeDescription call (it holds the `ServiceClient` and remote
-# node identity) and hands the reply here.
+# A GetTypeDescription reply is verified against its wire `TypeInfo`, lifted to IL,
+# and turned into a registry entry. The discovery layer issues the call and hands
+# the reply here.
 
 """
     verify_type_description(td::TypeDescriptionMsg, info::TypeInfo) -> Bool
 
 The RIHS01 integrity gate: recompute `calculate_rihs01_hash` over the raw received
 `TypeDescriptionMsg` and require it to equal `info`'s advertised RIHS01 (the
-type-identity hash carried on every [`RegistryEntry`](@ref)). A mismatch means the
-remote's definition disagrees with the hash it advertised, so the type is unsafe to
-decode. Hashing the raw `td` keeps the gate exact, since RIHS01 ignores the constants
-and defaults that `lift` would drop.
+type-identity hash carried on every [`RegistryEntry`](@ref)). A match certifies that
+the local definition can safely decode the remote's wire bytes; a mismatch means the
+remote's definition disagrees with the hash it advertised. Hash the raw `td`, since
+RIHS01 is computed over the canonical field closure and excludes the constants and
+defaults `lift` drops.
 """
 function verify_type_description(td::TypeDescriptionMsg, info::TypeInfo)
     expected = to_rihs_string(info.hash)
@@ -30,8 +30,8 @@ discovered type must hash-match the name it travels under. `lift` reconstructs t
 main IL; nested types survive as `RRef`s in its fields, and codegen resolves them
 from the referenced closure carried in `td`.
 
-Codegen is deferred to `realize!` / first use, keeping registration cheap
-and letting discovery succeed even when a type later fails to generate.
+Codegen is deferred to `realize!` at first use, so registration stays cheap and
+discovery succeeds even for a type that later fails to generate.
 """
 function entry_from_type_description(td::TypeDescriptionMsg, info::TypeInfo;
                                      provenance::Symbol=:wire, verify::Bool=true)
@@ -53,9 +53,9 @@ landing point: a GetTypeDescription reply is verified, lifted, and registered in
 one call.
 
 **Caches only `:wire` provenance** (best-effort): the content-addressed JSON cache
-exists to skip re-discovering dynamically-discovered types across runs. Ament- and
-vendor-acquired types are statically loadable (`@ros_msgs`) and resolve directly, so
-they stay out of the cache even when a caller passes `cache=true`.
+skips re-discovering dynamic types across runs. Ament- and vendor-acquired types are
+statically loadable and resolve by name, so they bypass the cache regardless of
+`cache`.
 """
 function register_type_description!(reg::TypeRegistry, td::TypeDescriptionMsg,
                                     info::TypeInfo; provenance::Symbol=:wire,
@@ -67,22 +67,20 @@ function register_type_description!(reg::TypeRegistry, td::TypeDescriptionMsg,
 end
 
 # ── ament / colcon acquisition (static, no wire) ────────────────────────────
-# The "I'm in a sourced workspace" path: scan the install-prefix search paths for
-# installed interface packages and parse their `share/<pkg>/{msg,srv,action}/*`
-# files straight to IL — same as feeding them to `@ros_msgs`, but resolved by
-# package/type name at runtime with no codegen until first use.
+# Scan install-prefix search paths for installed interface packages and parse their
+# `share/<pkg>/{msg,srv,action}/*` files straight to IL, resolved by package/type
+# name at runtime with codegen deferred to first use.
 
-# Standard system install roots, searched after the env-var prefixes so a sourced
-# workspace overlay still wins. One `/opt/ros/<distro>` per distro we expect on a
-# vanilla install; nonexistent ones are dropped by the `isdir` filter.
+# Standard system install roots. The env-var prefixes precede these so a sourced
+# workspace overlay wins; the `isdir` filter drops a distro absent on the host.
 const _ROS_SYSTEM_DISTROS = ("rolling", "jazzy", "kilted", "lyrical", "humble")
 
 # User-added prefixes (highest precedence), populated via `add_search_path!`.
 const _USER_SEARCH_PATHS = String[]
 
-# Guards the process-global typesupport config — `_USER_SEARCH_PATHS` and the
-# `_CACHE` state (cache.jl) — so a late reconfigure cannot race concurrent type
-# resolution. A leaf lock: critical sections touch only the guarded fields.
+# Guards the process-global typesupport config (`_USER_SEARCH_PATHS` and the `_CACHE`
+# state) against a late reconfigure racing concurrent type resolution. A leaf lock:
+# critical sections touch only the guarded fields.
 const _TS_CONFIG_LOCK = ReentrantLock()
 
 """
@@ -107,8 +105,8 @@ function add_search_path!(path::AbstractString)
     end
 end
 
-# Colon-separated entries of env var `var`, empties dropped (no `isdir` filter —
-# `search_prefixes` does that once over the merged set).
+# Colon-separated entries of env var `var`, empties dropped. `search_prefixes`
+# applies the `isdir` filter once over the merged set.
 function _env_prefix_paths(var::AbstractString)
     raw = get(ENV, var, "")
     isempty(raw) && return String[]
@@ -199,8 +197,7 @@ function discover_ament_packages()
 end
 
 # Locate the interface file for a fully-qualified ROS2 name across the search
-# prefixes: `<prefix>/share/<pkg>/<qual>/<Name>.<ext>`. Returns the first match
-# (overlay order) or `nothing`.
+# prefixes: `<prefix>/share/<pkg>/<qual>/<Name>.<ext>`. First match (overlay order).
 function _find_ament_file(name::AbstractString)
     package, qualifier, bare = split_ros_name(name)
     isempty(package) && return nothing
@@ -224,17 +221,16 @@ wins), parse it to IL, compute the RIHS01 hash from the parsed definition, and
 the entry, or `nothing` when the type is not installed.
 
 The hash is computed locally from the parsed AST so an ament-acquired type keys
-identically to a wire-discovered one — RIHS01 is the shared identity. The three
-hash outcomes:
+identically to a wire-discovered one — RIHS01 is the shared identity. Three hash
+outcomes by interface shape:
 
 - Self-contained message type: the hash is exact.
-- Type that references other packages: keys correctly by name but its hash may
-  differ from a remote's until its referenced siblings are co-registered, at
-  which point the wire/cache path supplies the exact hash.
-- No struct declaration at all to hash (lowering yields none): the entry is
-  keyed with the RIHS01 placeholder hash (version `01`, all-zero digest) —
-  correct for keyexpr structure, with the wire/cache path supplying the exact
-  hash for cross-version matching.
+- Type that references other packages: keys correctly by name; its hash matches a
+  remote's once its referenced siblings are co-registered, at which point the
+  wire/cache path supplies the exact hash.
+- Interface that lowers to no struct: the entry takes the RIHS01 placeholder hash
+  (version `01`, all-zero digest), correct for keyexpr structure, with the
+  wire/cache path supplying the exact hash for cross-version matching.
 
 The entry is left unrealized (codegen deferred); nested references resolve once
 the package's siblings are co-registered, the usual whole-package acquisition
@@ -261,21 +257,16 @@ function load_ament_type(reg::TypeRegistry, name::AbstractString; register::Bool
 end
 
 # RIHS01 for an IL interface: lower to decls, find the primary struct AST, and run
-# ROSZenoh's `type_info_from_struct` (threads it through `type_description_from_struct`
-# + `calculate_rihs01_hash`). The walk recovers structs via ROSMessages' `lift(decls)`
-# seam to avoid the Moshi `@match` macro, which ROSNode does not depend on.
-#
-# TODO: collect nested-ref `references` for byte-parity hashing of cross-package
-# types (needs resolved + sorted sibling TypeDescriptions). Today the hash is exact
-# for self-contained types; a referencing type keys correctly by name but its hash
-# may differ from a remote's until refs are co-registered, where the exact wire/`td`
-# path takes over.
+# ROSZenoh's `type_info_from_struct`. The hash is exact for self-contained types; a
+# cross-package referencing type keys correctly by name and matches a remote's only
+# once its sibling refs are co-registered (the wire/cache path then supplies the
+# byte-parity hash).
 function _il_type_info(il, package::AbstractString, qualifier::AbstractString,
                        name::AbstractString)
     struct_ast = _primary_struct(il, package)
     if struct_ast === nothing
-        # No single struct to hash: key by name with the Humble placeholder hash.
-        # Correct for keyexpr structure; the wire/cache path supplies the exact hash.
+        # No single struct to hash: key by name with the placeholder hash, correct
+        # for keyexpr structure. The wire/cache path supplies the exact hash.
         return TypeInfo(name, TypeHash())
     end
     bare = split_ros_name(name)[3]
@@ -283,19 +274,18 @@ function _il_type_info(il, package::AbstractString, qualifier::AbstractString,
                                           package=package, qualifier=qualifier)
 end
 
-# The primary `StructDecl` AST for an IL interface, recovered by lowering then
-# scanning the (possibly module-wrapped) decl vector. Variants are discriminated by
-# `isa` against the Moshi `@data` *sum types* (`Parse.TypeDecl.Type` /
-# `Parse.ModuleDecl.Type`) plus positional field access (`getproperty(d, i)`) —
-# both stable across Moshi's emission without importing its `@match` macro. Every
-# ROS-message type decl is a `StructDecl` (ROS interfaces have no IDL union/enum/
-# typedef), so a `TypeDecl` here *is* the struct. Returns `nothing` if none found.
+# The primary `StructDecl` AST for an IL interface, by lowering then scanning the
+# decl vector. Every ROS-message type decl is a `StructDecl` (ROS interfaces have no
+# IDL union/enum/typedef), so the first `TypeDecl` is the struct.
 function _primary_struct(il, package::AbstractString)
     decls = lower(il; package=package)
     return _scan_for_struct(decls)
 end
 
-# Depth-first scan for the first type-decl struct; recurses through module wrappers.
+# Depth-first scan for the first type-decl struct, recursing through module wrappers.
+# Scan IDLParser's Moshi `@data` sum types with `isa` + positional `getproperty`, not
+# `@match`: both are stable across Moshi's emission and avoid a precompile-breaking
+# dependency on Moshi's macro layer.
 function _scan_for_struct(decls)
     for d in decls
         if d isa IDLParser.Parse.TypeDecl.Type
@@ -311,15 +301,14 @@ end
 
 # ── unified resolution: the registry-first lookup with acquisition fallbacks ─
 
-# The RIHS01 placeholder (`TypeHash()`, version 01 + all-zero digest) the ament
-# path assigns a type with no single struct to hash (`_il_type_info`). It carries no
-# comparable identity, so a mismatch against it is not a real revision divergence.
+# The RIHS01 placeholder (version 01 + all-zero digest) the ament path assigns a type
+# with no single struct to hash. It carries no comparable identity, so a mismatch
+# against it is not a real revision divergence.
 _is_placeholder_hash(h::TypeHash) = h == TypeHash()
 
-# The pinned (`:static`/`:authored`) registry entry for `name`, if one is registered
-# under a hash other than `other` — the type the user explicitly pinned whose RIHS01
-# a peer is now contradicting. `nothing` when no such conflict exists. Scans under the
-# registry lock (the registry is keyed on `(name, hash)`, so there is no by-name index).
+# A pinned (`:static`/`:authored`) entry for `name` registered under a hash other than
+# `other` — the user-pinned type whose RIHS01 a peer now contradicts. Scans under the
+# registry lock; the registry is keyed on `(name, hash)`, with no by-name index.
 function _pinned_conflict(reg::TypeRegistry, name::AbstractString, other::TypeHash)
     @lock reg.lock begin
         for ((n, h), entry) in reg.entries
@@ -330,10 +319,9 @@ function _pinned_conflict(reg::TypeRegistry, name::AbstractString, other::TypeHa
     return nothing
 end
 
-# The friendly type-revision diagnostic: a peer advertises `name` under `got`, but the
-# local definition hashes to `expected`. Names the type, both RIHS strings, the likely
-# cause, and the remedies. `weak` softens it to a `@debug` (the user opted into
-# following the peer); otherwise a `@warn`, since the pin is being enforced.
+# The type-revision diagnostic: a peer advertises `name` under `got`, but the local
+# definition hashes to `expected`. `weak` softens it to `@debug` (the user opted into
+# following the peer); otherwise `@warn`, since the pin is enforced.
 function _warn_revision_mismatch(name::AbstractString, expected::TypeHash,
                                  got::TypeHash; weak::Bool)
     msg = "type-revision mismatch for $(name): a peer advertises \
@@ -361,14 +349,14 @@ it tries three sources in order:
    (see [`load_ament_type`](@ref)).
 
 The ament lookup is name-only, so its result is re-validated against `info`'s
-RIHS01 before it is trusted (mirroring the cache path's revalidation): a real-hash
-mismatch is rejected with a diagnostic (the type-revision trust gate, D7) and
-returns `nothing` so the caller wire-discovers the peer's actual revision, while
-the all-zero placeholder hash (an uncomparable cross-package ref) is accepted with
-a `@debug` note. The diagnostic is loud (`@warn`) under the `Context`'s default
-pinned trust and quiet (`@debug`) under `weak_types=true`. When the ament path fires
-the diagnostic, `warned[]` (if given) is set `true`, so a wire-suppression site can
-own the no-ament-file pinned-conflict case without double-warning.
+RIHS01 before it is trusted (the same revalidation the cache path runs). A real-hash
+mismatch is rejected with a diagnostic and returns `nothing` so the caller
+wire-discovers the peer's actual revision; the all-zero placeholder hash (an
+uncomparable cross-package ref) is accepted with a `@debug` note. The diagnostic is
+loud (`@warn`) under the `Context`'s default pinned trust and quiet (`@debug`) under
+`weak_types=true`. When the ament path fires the diagnostic, `warned[]` (if given) is
+set `true`, so a wire-suppression site owns the no-ament-file pinned-conflict case
+without double-warning.
 
 Returns `nothing` when none of the local sources resolves the type. The dynamic
 over-the-wire path (issuing a `GetTypeDescription` query) stays with the
@@ -412,8 +400,8 @@ function resolve_type(ctxlike, info::TypeInfo; ament::Bool=true, cache::Bool=tru
                 return register_type!(reg, entry.info, entry)
             else
                 # Real-hash mismatch: reject so the wire path fetches the peer's
-                # revision (and so weak mode can bind it). Diagnostic either way;
-                # signal it so the wire-suppression site does not warn twice.
+                # revision (and weak mode can bind it). Signal the diagnostic so the
+                # wire-suppression site does not warn twice.
                 _warn_revision_mismatch(info.name, h, info.hash; weak=ctx.weak_types)
                 warned === nothing || (warned[] = true)
                 return nothing

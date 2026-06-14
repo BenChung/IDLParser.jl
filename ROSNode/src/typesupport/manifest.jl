@@ -1,26 +1,26 @@
-# Per-node manifest of runtime-discovered message types a node used.
+# Per-node manifest of runtime-discovered message types a node used — the "what to
+# warm" list for dynamic types.
 #
 # Each record is `(role, RIHS01 hash, name, topic)`, keyed by node fully-qualified
-# name. The manifest is the "what to warm" list for dynamic types: startup warm
-# (`_replay_manifest_warm` in node.jl) resolves each type and runs `_warm_dynamic`
-# while the node is still starting, moving first-message JIT cost to startup.
+# name. Startup warm (`_replay_manifest_warm`) resolves each type and runs
+# `_warm_dynamic` while the node starts, moving first-message JIT cost to startup.
 #
-# Persistence is append-only union. A run appends the interactions it newly used,
-# so a node's file grows toward the deployment's full set and warm-up cost falls as
-# it saturates. Records are keyed on the RIHS01 type hash, so an entry whose type no
-# longer resolves is skipped — the hash guards against a wrong decode.
+# Persistence is append-only union: a run appends the interactions it newly used, so a
+# node's file grows toward the deployment's full set and warm-up cost falls as it
+# saturates. Records key on the RIHS01 hash, so an entry whose type no longer resolves
+# is skipped and the hash guards against a wrong decode.
 #
 # Writes share the blob cache's opt-in (`_cache_enabled()`: `@ros_cache`,
-# `enable_project_cache!`, or the `$ROS_TYPESUPPORT_CACHE` env override); a manifest
-# is useful only when startup warm can resolve its entries, so the same gate covers
-# both. On-disk form is one TSV record per line under a `manifests/` subdir of the
-# cache dir, which makes appends crash-safe and needs no JSON dependency.
+# `enable_project_cache!`, or the `$ROS_TYPESUPPORT_CACHE` env override), since a
+# manifest is useful only when startup warm can resolve its entries. On-disk form is
+# one TSV record per line under a `manifests/` subdir of the cache dir: appends are
+# crash-safe and need no JSON dependency.
 
 # One recorded interaction. `role` is `:subscription` today — the keyexpr-only
-# `Subscription` is the only path that meets a runtime-born type — but the field is
-# stored so a future dynamic publisher or service needs no on-disk migration.
-# `name`/`hash` identify the resolved type (`name` lets Tier-1 `resolve_or_discover`
-# without scanning blobs); `topic` scopes the warm to the subscription.
+# `Subscription` is the only path that meets a runtime-born type — but storing it lets
+# a future dynamic publisher or service join with no on-disk migration. `name`/`hash`
+# identify the resolved type (`name` lets `resolve_or_discover` skip a blob scan);
+# `topic` scopes the warm to the subscription.
 struct Interaction
     role::Symbol
     hash::TypeHash
@@ -52,8 +52,8 @@ function _manifest_dir()
 end
 
 # A filesystem-safe leaf for an fqn (`/ns/node` → `_ns_node`): every char outside
-# `[A-Za-z0-9_-]` becomes `_`. A collision between two fqns only shares a file (an
-# entry still self-validates by its RIHS01 hash), so it stays correct.
+# `[A-Za-z0-9_-]` becomes `_`. Two fqns that collide share one file but stay correct,
+# since each entry self-validates by its RIHS01 hash.
 _sanitize_fqn(fqn::AbstractString) = replace(String(fqn), r"[^A-Za-z0-9_-]" => "_")
 
 _manifest_path(fqn::AbstractString) = joinpath(_manifest_dir(), _sanitize_fqn(fqn) * ".tsv")

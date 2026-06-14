@@ -82,10 +82,10 @@ macro parameters(structdef)
         fname, ftype, default, constraint, ro = _parse_param_field(stmt)
         doc = pending_doc; pending_doc = ""
 
-        # Selective hygiene: user-supplied type/default/constraint are escaped so
-        # they resolve in the caller's module; the field name stays a bare symbol
-        # (the struct's own field); ROSNode helpers are spliced as *values*
-        # (`$(fn)`), which survive any later `esc` and bind to this module.
+        # Selective hygiene: user-supplied type/default/constraint are `esc`'d to
+        # resolve in the caller's module, the field name stays a bare symbol (the
+        # struct's own field), and ROSNode helpers are spliced as *values* (`$(fn)`),
+        # which survive any later `esc` and bind to this module.
         push!(fieldexprs, :($(fname)::$(esc(ftype))))
         push!(kwparams, Expr(:kw, fname, esc(default)))
         push!(ctorassign, :($(_coerce_param)($(esc(ftype)), $(fname))))

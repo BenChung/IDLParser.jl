@@ -1,8 +1,8 @@
 # ── on-change events ──────────────────────────────────────────────────────────────
 # `/parameter_events` is a batched, post-commit notification: one message per
 # transaction listing the changed parameters. This file fans the batch to in-process
-# listeners; the wire `rcl_interfaces/msg/ParameterEvent` publish is attached by the
-# service layer (see `_events_pub` below).
+# listeners; the service wiring attaches the wire `rcl_interfaces/msg/ParameterEvent`
+# publisher to `_events_pub`.
 
 """
     ParameterEventBatch
@@ -50,8 +50,7 @@ function on_parameter_event(f, s::ParameterServer)
 end
 
 # Assemble the change batch (only fields whose value moved) and fan it to listeners
-# plus the wire publisher. A change to `use_sim_time` reroutes the node's clock,
-# so its hook fires here. Caller holds `s.lock`.
+# plus the wire publisher. Caller holds `s.lock`.
 function _emit_parameter_event!(s::ParameterServer{P}, old::P, new::P,
                                 overrides::AbstractDict, dyn_overrides::AbstractDict,
                                 dyn_previous::AbstractDict) where {P}
@@ -86,8 +85,8 @@ function _emit_parameter_event!(s::ParameterServer{P}, old::P, new::P,
         end
     end
 
-    # `_events_pub` is attached by `wire_parameter_services!` once the service layer
-    # is wired; until then the wire publish is skipped.
+    # `_events_pub` is attached by `wire_parameter_services!`; before then the wire
+    # publish is skipped.
     if s._events_pub !== nothing
         try
             _publish_parameter_event(s, batch)
@@ -113,8 +112,8 @@ end
 
 # `use_sim_time` toggle hook. The Context hosts the single `/clock` sub and per-node
 # opt-in; this routes the committed value there so `now(node, ROS())` follows
-# `/clock` and registered jump callbacks fire. Runs under the commit `s.lock`;
-# `set_use_sim_time!` documents why synchronous activation is safe under it.
+# `/clock` and registered jump callbacks fire. Runs synchronously under the commit
+# `s.lock`, which `set_use_sim_time!` is safe to be called under.
 function _on_use_sim_time_changed(s::ParameterServer, enabled)
     node = s.node
     node === nothing && return nothing

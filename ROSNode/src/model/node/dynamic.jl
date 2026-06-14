@@ -1,20 +1,18 @@
 # Type-less subscription dispatch. The route is a wildcard data keyexpr matching
-# every type on the topic; each sample carries its `(name, hash)`, which we resolve
-# to a runtime-born type `T` and cross the world-age boundary with `invokelatest`
-# for decode and handler. Every `ViewMode` applies as in the typed form; the typed
-# form is still faster (it drops the per-sample type resolution).
+# every type on the topic; each sample carries its `(name, hash)`, resolved to a
+# runtime-born type `T` reached through `invokelatest` for decode and handler. The
+# typed form is faster — it drops the per-sample type resolution.
 #
-# Two tasks, so codegen never deadlocks against the blocking recv:
-#   • receiver (sticky): owns `z_recv`, only copies bytes and enqueues, staying
-#     parked in a GC-safe recv so foreign zenohc threads keep reaching safepoints;
-#   • worker (plain `@spawn`): drains the buffer and does resolve → `realize!`
+# Split into two tasks so codegen never deadlocks against the blocking recv:
+#   • receiver (sticky): owns `z_recv`, copies bytes and enqueues, parked in a
+#     GC-safe recv so foreign zenohc threads keep reaching safepoints;
+#   • worker (plain `@spawn`): drains the buffer and runs resolve → `realize!`
 #     codegen → dispatch. Its GC completes because the receiver keeps the FIFO
 #     draining.
-# Correct single-threaded: the FIFO recv is a `@threadcall` (blocking C recv on a
-# libuv pool thread; the Julia task yields), so the worker runs even under `-t1`;
-# `-t>=2` adds overlap as an optimization. The buffer is QoS-depth-sized, so a slow
-# first-sight realize backs up to that bound and the receiver blocks on `put!` —
-# upstream backpressure, no drop.
+# Correct single-threaded: the FIFO recv is a `@threadcall` (the Julia task yields),
+# so the worker runs even under `-t1`; `-t>=2` adds overlap. The buffer is
+# QoS-depth-sized, so a slow first-sight realize backs up to that bound and the
+# receiver blocks on `put!` — upstream backpressure, no drop.
 
 using FunctionWrappers: FunctionWrapper
 
@@ -223,22 +221,21 @@ function _replay_manifest_warm(e::Entity, handler, warmed, warmlk)
     nothing
 end
 
-# Per-type world-age crossing, hoisted out of the per-message path. The worker keeps a
-# keyexpr-hash → (handler-of-bytes, keyexpr bytes) cache; on a miss it resolves the
-# sample's type, `realize!`s it if new, and builds a `FunctionWrapper` wrapping
-# `_dispatch_decoded` for that concrete `T` — once per type, through the one `invokelatest`
-# crossing (the trampoline must compile against `T`'s codegen world). Thereafter the hot
-# path calls the cached FW: a `ccall` through its cfunction ptr, NOT a Julia dispatch, so
-# it is not world-age-gated and the worker runs in one fixed world with no re-entry. A
-# single worker drains `buf` in arrival order, so `Serial` total order holds. (DESIGN: G1b.)
+# Per-type world-age crossing, hoisted out of the per-message path. A runtime-born
+# type is in a newer world than the compiled dispatcher, so a direct call errors; the
+# worker builds one `FunctionWrapper` per type (through the single `invokelatest`
+# crossing, where the trampoline compiles against `T`'s codegen world) and thereafter
+# the hot path calls the cached FW as a `ccall` through its cfunction ptr — not a
+# world-age-gated Julia dispatch. A single worker drains `buf` in arrival order, so
+# `Serial` total order holds.
 
-# Crossing counter, bumped once per FW build (≈ distinct types, never per message); the
-# `dynamic_live.jl` S5b hook asserts it does not scale with message count.
+# Crossing counter, bumped once per FW build (≈ distinct types, never per message);
+# a test asserts it does not scale with message count.
 const _DYNAMIC_REENTRIES = Threads.Atomic{Int}(0)
 
-# A type-erased, type-stable per-type dispatch callable `(SampleHolder) -> nothing` wrapping
-# `_dispatch_decoded` for a fixed `T`; built via `invokelatest` so its trampoline compiles
-# against the runtime-born `T`'s world, then called as a `ccall` on the hot path.
+# A type-stable per-type dispatch callable `(SampleHolder) -> nothing` wrapping
+# `_dispatch_decoded` for a fixed `T`; built via `invokelatest` so its trampoline
+# compiles against the runtime-born `T`'s world, then called as a `ccall` on the hot path.
 const _DynFW = FunctionWrapper{Nothing, Tuple{SampleHolder}}
 _mk_fw(::Type{T}, e::Entity, handler, view::ViewMode) where {T} =
     _DynFW(h -> _dispatch_decoded(e, h, T, handler, view))
@@ -276,9 +273,8 @@ end
 function _dynamic_worker(e::Entity, buf, handler, sched, view::ViewMode, pool,
                          logged, loglk, warmed, warmlk, warmup::WarmupPolicy)
     # keyexpr-hash → (per-type FW, keyexpr bytes for memcmp verify). Worker-private (one
-    # worker, no lock); the byte copy is the collision-safety net. The FW firewall means
-    # this loop never re-enters a fresh world — it builds each type's FW once and calls
-    # cached FWs directly thereafter.
+    # worker, no lock); the byte copy is the collision-safety net. With each type's FW
+    # built once, this loop never re-enters a fresh world.
     cache = Dict{UInt, Tuple{_DynFW, Vector{UInt8}}}()
     for h in buf
         # Resolve the cached FW by borrowing the keyexpr bytes (no String): hash, look up,
@@ -294,10 +290,9 @@ function _dynamic_worker(e::Entity, buf, handler, sched, view::ViewMode, pool,
                 continue
             end
         end
-        # Dispatch per the concurrency policy; the thunk owns the holder's lifetime. Under
-        # `Parallel` the spawned task captures the concrete FW + owned `h` and runs the whole
-        # `_dispatch_decoded` (decode + handler) synchronously inside the borrow — the FW is
-        # never decomposed into decode-then-spawn-handler.
+        # Dispatch per the concurrency policy; the thunk owns the holder's lifetime. A
+        # `Parallel` spawn captures the concrete FW + owned `h` and runs the whole
+        # `_dispatch_decoded` synchronously inside the borrow — never decode-then-spawn.
         let fw = fw, h = h
             sched() do
                 try
@@ -339,9 +334,9 @@ function _resolve_and_build!(e::Entity, h::SampleHolder,
             @warn "dynamic subscription: could not resolve type" topic=e.endpoint.topic type=info.name hash=to_rihs_string(info.hash) maxlog=1
             return nothing
         end
-        # Build + cache the type-stable handler-of-bytes — once per type, the single world-age
-        # crossing. `invokelatest`: `Tnew` is runtime-born, so the trampoline must compile in
-        # the post-`realize!` world. Key on the same FNV-1a the hot path uses; stash the bytes
+        # Build + cache the type-stable handler-of-bytes — the single per-type world-age
+        # crossing, since `Tnew` is runtime-born and the trampoline must compile in the
+        # post-`realize!` world. Key on the same FNV-1a the hot path uses; stash the bytes
         # for the memcmp collision check.
         Threads.atomic_add!(_DYNAMIC_REENTRIES, 1)
         fw = Base.invokelatest(_mk_fw, Tnew, e, handler, view)::_DynFW
@@ -349,8 +344,8 @@ function _resolve_and_build!(e::Entity, h::SampleHolder,
         cache[GC.@preserve kebytes _ke_fnv1a(pointer(kebytes), length(kebytes))] = (fw, kebytes)
         _log_discovered_once(e, info, source, logged, loglk)
         # Record for the next-run manifest warm, and mark `warmed` so the manifest-replay task
-        # skips re-warming a type the worker has already built (the FW build above warmed its
-        # codec; the manifest task only `precompile`s, so this is coordination, not correctness).
+        # skips a type the worker already built (coordination only; the FW build warmed the
+        # codec, the manifest task only `precompile`s).
         if warmup.mode !== :off
             @lock warmlk (Tnew in warmed || push!(warmed, Tnew))
             note_interaction!(e.node.fqn, :subscription, info.hash, info.name, e.endpoint.topic)
@@ -399,14 +394,11 @@ function _log_discovered_once(e::Entity, info::TypeInfo, source::Symbol, logged,
     graduate = "Subscription(node, \"$(e.endpoint.topic)\", $(bare))"
     rihs = to_rihs_string(info.hash)
     if source === :wire
-        # No local definition: we fetched the TypeDescription from the publisher and
-        # generated the struct at runtime.
         @info "dynamic subscription auto-generated a type over the wire — fetched its \
                definition from the publisher's ~/get_type_description (no local copy); \
                register it (e.g. `@ros_import`) to skip wire discovery, or use the static \
                form for the min-copy fast path" topic=e.endpoint.topic type=info.name hash=rihs graduate=graduate
     else
-        # Resolved a type we already knew (home/registry/cache/ament) — no wire trip.
         @info "dynamic subscription resolved a known type — for the min-copy fast path, \
                use the static form" topic=e.endpoint.topic type=info.name hash=rihs source=source graduate=graduate
     end

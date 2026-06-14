@@ -1,14 +1,7 @@
 # ── the generic Entity handle ─────────────────────────────────────────────────
-# One close-able handle backing every endpoint pattern (publisher/subscription/
-# service/client). It allocates the entity id, builds the `ROSZenoh.EndpointEntity`,
-# declares the liveliness token, and — for the data-plane kinds — declares the
-# data route (a `Zenoh.Publisher` for Publisher, a FIFO-channel subscriber +
-# consumer task for Subscription). Service/Client carry the entity + token only;
-# their Zenoh queryable/querier wiring is the service/client pattern layer's,
-# attached via `wire`.
-#
-# Pattern files hold an `Entity` and add their typed surface (message type,
-# handler, result cells), keeping the id/token/route/graph lifecycle in one place.
+# One close-able handle backing every endpoint pattern. Pattern files hold an
+# `Entity` and add their typed surface (message type, handler, result cells),
+# keeping the id/token/route/graph lifecycle in one place. See the `Entity` docstring.
 
 """
     Entity
@@ -50,30 +43,25 @@ mutable struct Entity
     const lv_key::String                 # liveliness keyexpr (graph index key)
     const gid::NTuple{16, UInt8}         # source_gid for attachments
     _lv_token::Any                       # Zenoh LivelinessToken
-    # The data route: a `Zenoh.Publisher` (Publisher), a FIFO-channel subscriber
-    # handler — advanced variant under transient_local — (Subscription), or
-    # `nothing` (Service/Client — their queryable/querier is wired by the
-    # service/client pattern layer and stored in `wire`).
+    # Data route: a `Zenoh.Publisher` (Publisher), a FIFO subscriber handler — advanced
+    # variant under transient_local — (Subscription), or `nothing` (Service/Client,
+    # whose queryable/querier the pattern layer wires into `wire`).
     _route::Any
-    # The subscription consumer task (Subscription only); `nothing` otherwise.
-    _consumer::Union{Task, Nothing}
-    # Re-latch thunk (transient_local Subscription only): undeclare + redeclare
-    # the advanced subscriber (re-runs the history query), novelty-gated. Called by
-    # `_relatch!(e)` on a managed node's Inactive→Active transition; `nothing` for
-    # every other entity (volatile subs, publishers, services).
+    _consumer::Union{Task, Nothing}      # subscription consumer task; nothing otherwise
+    # Re-latch thunk (transient_local Subscription only): redeclares the advanced
+    # subscriber to re-run the history query, novelty-gated. Fired by `_relatch!(e)`
+    # on a managed node's Inactive→Active; `nothing` for every other entity.
     _relatch::Union{Function, Nothing}
-    # Slot for the pattern layer to stash its kind-specific wiring (queryable,
-    # querier, pending-reply table) so it shares this handle's lifecycle.
+    # Pattern-layer kind-specific wiring (queryable, querier, pending-reply table),
+    # sharing this handle's lifecycle.
     wire::Any
-    # Weak-static Subscription: a typed sub that wildcard-matches the topic and
-    # runs the per-sample `check_sample_type` backstop (drop + `on_type_mismatch` on a
-    # name/hash mismatch). Set by `declare_subscription!` (match=:weak); false for every
-    # other entity. Written once before the consumer starts, so no atomic is needed.
+    # Weak-static Subscription: a typed sub that wildcard-matches the topic and runs the
+    # per-sample `check_sample_type` backstop. Written once before the consumer starts,
+    # so no atomic is needed.
     _weak_static::Bool
-    # message-lost: set true the first time an `on_message_lost` listener
-    # registers (graph.jl). The consumer hot path reads it per sample to decide
-    # whether to do the attachment-sequence bookkeeping (`note_sequence!`); the
-    # common no-listener case is one atomic load, no decode, no alloc.
+    # Message-lost gap detection is opt-in: set true when the first `on_message_lost`
+    # listener registers. The consumer reads it per sample (one atomic load) to skip the
+    # `note_sequence!` attachment decode until a listener exists.
     @atomic _track_lost::Bool
     @atomic open::Bool
 end
@@ -171,35 +159,29 @@ function _advanced_sub_kwargs(qos::QosProfile)
 end
 
 # ── novelty gate (transient_local re-latch dedup) ──────────────────────────────
-# A latched `transient_local` subscription that re-runs its history query (on a
-# managed node's Inactive→Active, `_do_relatch!`) is redelivered cached samples it
-# may already have processed. Replaying an effectful handler (replan, re-arm) on an
-# unchanged value is the hazard. The gate suppresses it.
+# A re-latching transient_local subscription is redelivered cached samples it may
+# already have processed; the gate suppresses the replay so an effectful handler
+# (replan, re-arm) does not re-fire on an unchanged value.
 #
-# The gate keys on the payload content-hash because Zenoh's advanced-pubsub cache
-# serves history replies as bare payloads: `z_sample_attachment`/`z_sample_timestamp`
-# are null on replays, so the attachment `(gid, seq)` and the sample timestamp
-# are both gone, and the payload is all that survives the cache round-trip. For a
-# latched state topic the payload is exactly the right key: an unchanged value is
-# identical bytes (suppress), an updated value is different bytes (deliver).
+# The gate keys on the payload content-hash: Zenoh's advanced-pubsub cache serves
+# history replies as bare payloads with null `z_sample_attachment` and null
+# `z_sample_timestamp`, so the payload is all that survives the round-trip. For a
+# latched state topic that is the right key — an unchanged value is identical bytes
+# (suppress), an updated value is different bytes (deliver).
 #
-#   • `delivered` — a bounded FIFO of recently-delivered payload hashes. Capped at the
-#     cache depth, the maximum the publisher can ever replay, so an evicted hash can't
-#     reappear: bounded memory with no correctness loss (and no leak on a high-cardinality
-#     topic). Recorded on delivery, not receipt, so a sample the inactive-window lifecycle
-#     gate drops still reads as novel on reactivation.
+#   • `delivered` — bounded FIFO of recently-delivered payload hashes, capped at the
+#     cache depth (the most the publisher can replay), so an evicted hash can't reappear.
+#     Recorded on delivery, not receipt, so a sample the inactive-window lifecycle gate
+#     drops still reads as novel on reactivation.
 #   • `snapshot` — frozen at each re-latch (`_arm_relatch!`) to a copy of `delivered`.
-#     A replayed sample whose hash ∈ snapshot is one we've already delivered → suppress;
-#     a new hash is a genuine update → deliver. `nothing` (no re-latch yet) ⇒ deliver
-#     everything — the plain non-lifecycle path is unchanged.
-#   • `force` — escape hatch: deliver on every activation regardless, for idempotent
-#     handlers that deliberately rebuild state from latched inputs.
+#     A replayed hash ∈ snapshot is already delivered → suppress; a new hash is an
+#     update → deliver. `nothing` (no re-latch yet) ⇒ deliver everything.
+#   • `force` — deliver on every activation regardless, for idempotent handlers that
+#     rebuild state from latched inputs.
 #
-# Invariant: after reactivation the node's view is indistinguishable from one
-# that stayed Active, save a gap where it processed nothing — effects fire once,
-# possibly later, never twice. (Edge case, accepted: two publishers emitting byte-
-# identical state are deduped across sources, and a live re-send of a byte-identical
-# pre-relatch value is suppressed — both correct for idempotent state.)
+# Invariant: after reactivation the node's view is indistinguishable from one that
+# stayed Active, save a gap where it processed nothing — effects fire once, possibly
+# later, never twice.
 mutable struct _NoveltyGate
     lock::ReentrantLock
     cap::Int
@@ -312,16 +294,13 @@ function declare_subscription!(e::Entity, msgtype::Type, handler;
 end
 
 # Re-latch: redeclare the advanced subscriber so its history query re-fires,
-# recovering latched state the node missed while inactive. The novelty gate makes the
-# redundant redelivery safe — a replayed value already delivered is dropped, only
-# genuine updates fire (the effectful-replay fix).
+# recovering latched state the node missed while inactive; the novelty gate drops the
+# redundant redelivery and lets only genuine updates fire.
 #
-# Order matters: tear down + **join** the old consumer *first*, so any sample it was
-# about to deliver (e.g. the declaration-time history reply that arrived once the gate
-# opened) is recorded, THEN arm the snapshot to capture it, THEN open the new route and
-# re-query. Arming before the join would race that delivery — the old consumer could
-# deliver a value after the snapshot froze, and the re-query would then deliver it a
-# second time (the value isn't yet in the snapshot it's checked against).
+# Order is load-bearing: close and join the old consumer first so its in-flight
+# deliveries land and record, THEN `_arm_relatch!` freezes the snapshot, THEN open the
+# new route and re-query. Arming before the join would race the old consumer — a value
+# delivered after the snapshot froze is absent from it and gets re-delivered.
 function _do_relatch!(e::Entity, msgtype::Type, handler, view::ViewMode,
                       concurrency::Concurrency, gate::_NoveltyGate,
                       tk::AbstractString, cap::Integer, qos::QosProfile)
@@ -332,11 +311,10 @@ function _do_relatch!(e::Entity, msgtype::Type, handler, view::ViewMode,
             @error "relatch: closing old route failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
         end
     end
-    # Join the old consumer so its in-flight deliveries land (and record in the gate)
-    # before we snapshot. Its loop ends when the route's FIFO disconnects. Skip only if
-    # we're somehow on that very task. Bounded (mirrors `close(::_ServiceWire)`): a
-    # consumer wedged in a native call must not wedge the Inactive→Active transition —
-    # move on after the budget and let the stuck task die with the process.
+    # Join the old consumer (its loop ends when the route's FIFO disconnects) so its
+    # in-flight deliveries record before we snapshot. Time-bounded: a consumer wedged
+    # in a native call must not wedge the Inactive→Active transition — proceed after
+    # the budget and let the stuck task die with the process.
     if old_consumer isa Task && old_consumer !== current_task()
         Base.timedwait(() -> istaskdone(old_consumer), 3.0; pollint=0.02) === :ok ||
             @warn "relatch: old consumer didn't end within budget; proceeding" topic=e.endpoint.topic

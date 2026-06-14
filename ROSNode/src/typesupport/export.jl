@@ -52,8 +52,8 @@ function export_typesupport(ctxlike, names; to::AbstractString=pwd(),
     return written
 end
 
-# Export is name-addressed: return any entry matching the name, ignoring hash
-# version (`Dict` iteration order is unspecified). `nothing` if unregistered.
+# Export is name-addressed: any entry matching the name, ignoring hash version (`Dict`
+# iteration order is unspecified). `nothing` if unregistered.
 function _registered_entry_by_name(reg::TypeRegistry, name::AbstractString)
     @lock reg.lock begin
         for ((n, _), v) in reg.entries
@@ -95,8 +95,8 @@ function _export_typedesc(entry::RegistryEntry, to::AbstractString)
 end
 
 # `:msg`/`:srv`/`:action` — `IL.unparse` into a ROS interface-package layout;
-# qualifier and extension follow the IL kind. A discovered type emits fields
-# only (RIHS01/`lift` drops constants and defaults), wire-faithful but lossy.
+# qualifier and extension follow the IL kind. A discovered type emits its fields
+# (the RIHS01 closure), wire-faithful; constants and defaults `lift` drops are absent.
 function _export_interface_text(entry::RegistryEntry, to::AbstractString)
     package, _, _ = split_ros_name(entry.info.name)
     qualifier, ext = _il_qualifier_ext(entry.il)
@@ -115,7 +115,7 @@ end
 # pretty-printed source so the file is human-readable and `include`-able.
 function _export_julia(entry::RegistryEntry, to::AbstractString)
     package, _, _ = split_ros_name(entry.info.name)
-    # Exported file is reparsed standalone, so each module emits its own imports.
+    # The exported file is reparsed standalone, so each module emits its own imports.
     exprs = _generate_exprs_multi(_closure_ils(entry, package); emit_imports=true)
     isdir(to) || mkpath(to)
     fname = isempty(package) ? split_ros_name(entry.info.name)[3] : package
@@ -139,16 +139,13 @@ _il_qualifier_ext(::IL.RAction)  = ("action", ".action")
 _il_qualifier_ext(_)             = ("msg", ".msg")
 
 # ── type_info specialization for registered (dynamic) types ─────────────────
-# serialization.jl's `type_info(::Type{T})` returns the zero hash for a generated
-# type (the Humble placeholder): correct for keyexpr structure, wrong for
-# cross-version matching. A registered type knows its real hash (its registry
-# key), so this exposes a lookup keyed by the generated type itself — `realize!`
-# stamps the entry and `type_info_of` recovers the real `TypeInfo`. Static types
-# keep the reflective default; dynamic ones carry the verified hash.
+# The reflective `type_info(::Type{T})` returns the placeholder zero hash for a
+# generated type, correct for keyexpr structure. A registered type knows its real
+# RIHS01 (its registry key), so `realize!` stamps the type→entry map and
+# `type_info_of` recovers the verified `TypeInfo` for cross-version matching.
 
-# Reverse map: generated `Type` → its `RegistryEntry`, populated at `realize!`.
-# Kept as an IdDict so identity (not name) keys it — distinct hash-versions are
-# distinct generated types.
+# Reverse map: generated `Type` → its `RegistryEntry`, populated at `realize!`. An
+# IdDict so identity keys it — distinct hash-versions are distinct generated types.
 const _TYPE_TO_ENTRY = IdDict{Type, RegistryEntry}()
 const _TYPE_TO_ENTRY_LOCK = ReentrantLock()
 
@@ -179,12 +176,12 @@ _entry_of(::Type{T}) where {T} =
     @lock _TYPE_TO_ENTRY_LOCK get(_TYPE_TO_ENTRY, T, nothing)
 
 # ── service-level type identity (rmw_zenoh service/client keyexpr) ──────────────
-# rmw_zenoh keys a service/client off the service type (`pkg::srv::dds_::Base_`
-# plus the service RIHS01); a keyexpr built from the request message's info never
-# matches a peer. `service_type_info_of` synthesizes the rosidl service type
-# description (ROSMessages.service_rihs01) and returns the service-level
-# `TypeInfo`. The synthesized service-event closure references
-# `service_msgs/msg/ServiceEventInfo`, read from the vendored canonical set.
+# rmw_zenoh keys a service/client on the SERVICE-level type (`pkg::srv::dds_::Base_`
+# plus the service RIHS01), so the keyexpr must carry that hash, never the request
+# message's. `service_type_info_of` synthesizes the rosidl service type description
+# (`ROSMessages.service_rihs01`) and returns the service-level `TypeInfo`. The
+# synthesized service-event closure references `service_msgs/msg/ServiceEventInfo`,
+# read from the vendored canonical set.
 
 const _SERVICE_EVENT_INFO_NAME = "service_msgs/msg/ServiceEventInfo"
 const _SEI_TD = Ref{Union{Nothing, TypeDescriptionMsg}}(nothing)

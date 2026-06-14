@@ -8,16 +8,15 @@
 #   <action>/_action/feedback      (topic)    goal_id + feedback
 #   <action>/_action/status        (topic)    GoalStatusArray
 #
-# The framework owns the goal state machine, the result cache (so a late
-# `get_result` is answered), status publication, and the fail-safe settlement
-# backstop (settlement.jl); *you* own execution & scheduling. The high-level
-# `do`-block is sugar — an `on_accepted` that spawns the body wrapped in the
-# `Cancelled` + settlement machinery, scheduled by `concurrency`.
+# The framework owns the goal state machine, the result cache, status publication,
+# and the fail-safe settlement backstop; you own execution & scheduling. The
+# high-level `do`-block is sugar — an `on_accepted` that spawns the body wrapped in
+# the cancellation + settlement machinery, scheduled by `concurrency`.
 #
 # The settlement core (write-once `ResultCell`, `respond!`/`fill!`/`force_abort!`,
-# `settle_handler!`) is shared with services verbatim — a `GoalHandle` *is* the
-# cell's handle. The status tokens (`succeeded`/`canceled`/`aborted`/`feedback`)
-# come from core.jl.
+# `settle_handler!`) is shared with services verbatim — a `GoalHandle` is the cell's
+# handle — and the status tokens (`succeeded`/`canceled`/`aborted`/`feedback`) are
+# the shared settlement vocabulary.
 
 using Zenoh: Zenoh, Keyexpr, Query, Queryable, Querier, reply, reply_err,
              Publisher as ZPublisher, put, payload, attachment
@@ -41,16 +40,13 @@ export ActionServer, ActionClient, GoalHandle,
 # the user-facing `Goal`/`Result`/`Feedback`, plus the protocol wrappers
 # (`SendGoal_Request/_Response`, `GetResult_Request/_Response`, the
 # `FeedbackMessage` goal_id+feedback pair, `action_msgs/CancelGoal` and
-# `GoalStatusArray`). `@ros_msg` on a `.action` today generates only the three
-# bare sub-types (`<A>_Goal`/`_Result`/`_Feedback`); the protocol
-# wrappers + `action_msgs`/`unique_identifier_msgs` types are a typesupport gap.
+# `GoalStatusArray`). `@ros_msgs` on a `.action` generates the full protocol set;
+# a bare `@ros_msg` generates only the `<A>_Goal`/`_Result`/`_Feedback` triple.
 #
 # `ActionTypeSupport` carries the three sub-types so the server/client speak in
-# them and centralizes the topic-suffix naming. The protocol wrappers
-# (`<A>_SendGoal_Request/_Response`, `<A>_GetResult_Request/_Response`,
-# `<A>_FeedbackMessage`) are generated as siblings of `A` by ROSMessages'
-# action-protocol declarations and resolved reflectively off `A` (`_action_wrapper`),
-# so the wire framing is built through the generated ctors.
+# them and centralizes the topic-suffix naming. The protocol wrappers are generated
+# as siblings of `A` and resolved reflectively off `A` (`_action_wrapper`), so the
+# wire framing is built through the generated ctors.
 
 """
     ActionTypeSupport{A, G, R, F}
@@ -71,12 +67,9 @@ result_type(::ActionTypeSupport{A, G, R, F})   where {A, G, R, F} = R
 feedback_type(::ActionTypeSupport{A, G, R, F}) where {A, G, R, F} = F
 action_type(::ActionTypeSupport{A})            where {A}          = A
 
-# The five protocol-wrapper structs rosidl derives from a `.action` are emitted
-# as siblings of `A` in its `.action` module (`<A>_SendGoal_Request`, etc., by
-# ROSMessages' action-protocol declarations). Resolve them by suffix off `A`'s name,
-# the same reflection `ActionTypeSupport` does for the `_Goal`/`_Result`/`_Feedback`
-# triple; a missing wrapper means the action was generated without the protocol
-# set (an `@ros_msg` on the bare `.action` text, not `@ros_msgs`).
+# Resolve a protocol-wrapper struct (`<A>_SendGoal_Request`, etc.) by suffix off
+# `A`'s name — they are emitted as siblings of `A` in its `.action` module. A missing
+# wrapper means the action was generated with bare `@ros_msg`, without the protocol set.
 function _action_wrapper(::Type{A}, suffix::AbstractString) where {A}
     m = parentmodule(A)
     s = Symbol(nameof(A), suffix)
@@ -93,10 +86,9 @@ _get_result_request_type(::Type{A}) where {A} = _action_wrapper(A, "_GetResult_R
 _get_result_response_type(::Type{A})where {A} = _action_wrapper(A, "_GetResult_Response")
 _feedback_message_type(::Type{A})   where {A} = _action_wrapper(A, "_FeedbackMessage")
 
-# Reflectively resolve `<A>_Goal`/`_Result`/`_Feedback` from `A`'s defining
-# module (the `<pkg>.action` submodule emitted by ROSMessages codegen). `A` is named by
-# its bare action name; the triple lives beside it. A missing sub-type is the
-# "this isn't an action type" mistake, named rather than left as an `UndefVar`.
+# Reflectively resolve the `<A>_Goal`/`_Result`/`_Feedback` triple, which lives beside
+# `A` in its `.action` module. A missing sub-type means `A` isn't an action type;
+# name that mistake rather than leave it as an `UndefVar`.
 function ActionTypeSupport(::Type{A}) where {A}
     m = parentmodule(A)
     base = string(nameof(A))
@@ -119,15 +111,12 @@ _send_goal_topic(name)   = string(name, "/_action/send_goal")
 _cancel_goal_topic(name) = string(name, "/_action/cancel_goal")
 _get_result_topic(name)  = string(name, "/_action/get_result")
 
-# rmw_zenoh action-protocol service keyexpr identity. The three services key
-# off SERVICE-level type hashes computed from the FIXED action-protocol type
-# descriptions (ROSMessages.{send_goal,get_result,cancel_goal}_service_rihs01) — the
-# same form a real ROS2 peer keys them on. send_goal/get_result depend on the
-# action's Goal/Result type descriptions; cancel_goal is the shared, constant
-# `action_msgs/srv/CancelGoal` (its keyexpr name is `srv`, though the hash is over
-# the `action`-path names — see ROSMessages). Returns a NamedTuple of the three
-# `TypeInfo`s, or `nothing` (→ caller falls back to the action-typed info) when the
-# Goal/Result types aren't registered with their wire descriptions.
+# rmw_zenoh action-protocol service keyexpr identity. The three services key on
+# SERVICE-level RIHS01 hashes — never the action type's own — which is the form a
+# native ROS2 peer routes on. send_goal/get_result hash the action's Goal/Result type
+# descriptions; cancel_goal is the constant `action_msgs/srv/CancelGoal` (keyexpr name
+# `srv`, hash over the `action`-path names). Returns a NamedTuple of the three
+# `TypeInfo`s, or `nothing` when the Goal/Result types lack registered wire descriptions.
 function _action_service_tis(::Type{A}, support::ActionTypeSupport) where {A}
     ge = _entry_of(goal_type(support))
     re = _entry_of(result_type(support))
@@ -148,9 +137,9 @@ _feedback_topic(name)    = string(name, "/_action/feedback")
 _status_topic(name)      = string(name, "/_action/status")
 
 # ── goal id ──────────────────────────────────────────────────────────────────
-# A goal is identified by a 16-byte `unique_identifier_msgs/UUID`. We mint a
-# random one server-side acceptance / client-side send; the bytes are the cache
-# key and the correlation token across the three services + feedback topic.
+# A goal is identified by a 16-byte `unique_identifier_msgs/UUID`, minted randomly
+# at client-side send. The bytes are the cache key and the correlation token across
+# the three services + feedback topic.
 
 const GoalId = NTuple{16, UInt8}
 
@@ -170,9 +159,8 @@ _from_uuid(u)::GoalId = ntuple(i -> u.uuid[i], 16)
 _is_zero_uuid(id::GoalId) = all(==(0x00), id)
 
 # ── goal state machine ─────────────────────────────────────────────────────────
-# rclcpp's status enum (action_msgs/GoalStatus): the values are wire-stable —
-# they ride the `status` topic and the `get_result` reply. Modeled as a sealed
-# `@enum` so the state transitions are exhaustive and an unknown code is caught.
+# The `action_msgs/GoalStatus` enum: the integer values are wire-stable — they ride
+# the `status` topic and the `get_result` reply, so changing them is a wire break.
 
 """
     GoalState
@@ -195,8 +183,7 @@ See the ROS 2 actions concept: https://docs.ros.org/en/rolling/Concepts/Basic/Ab
     GOAL_ABORTED   = 6
 end
 
-# Public `state(goal)` surface: Symbols at the API edge keep the wire enum
-# internal and read naturally (`state(goal) === :executing`).
+# Project the enum to a Symbol at the API edge, keeping the wire enum internal.
 _state_symbol(s::GoalState) =
     s === GOAL_ACCEPTED  ? :accepted  :
     s === GOAL_EXECUTING ? :executing :
@@ -205,8 +192,8 @@ _state_symbol(s::GoalState) =
     s === GOAL_CANCELED  ? :canceled  :
     s === GOAL_ABORTED   ? :aborted   : :unknown
 
-# Map a terminal settlement token (core.jl) onto its goal status. `feedback` is
-# not terminal and never reaches here.
+# Map a terminal settlement token onto its goal status. `feedback` is not terminal
+# and never reaches here.
 _terminal_state(::Succeeded) = GOAL_SUCCEEDED
 _terminal_state(::Canceled)  = GOAL_CANCELED
 _terminal_state(::Aborted)   = GOAL_ABORTED
@@ -216,9 +203,6 @@ _is_terminal_state(s::GoalState) =
     s === GOAL_SUCCEEDED || s === GOAL_CANCELED || s === GOAL_ABORTED
 
 # ── on_goal decisions ──────────────────────────────────────────────────────────
-# `on_goal` returns one of three tokens. `accept` starts execution immediately
-# (via `on_accepted`); `defer` accepts but leaves the goal in ACCEPTED for the
-# owner to `execute` later (the queue/orchestrator path); `reject` declines.
 
 "`on_goal` decision tokens — `accept()`/`reject()`/`defer()`."
 abstract type GoalResponse end

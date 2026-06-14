@@ -113,9 +113,6 @@ function respond!(cell::ResultCell, status::SettlementStatus, payload)
     end
 end
 
-# Service spelling: `respond!(req, failed, "message")` — the status carries the
-# success/failure choice, payload is the response (or an error string on failure).
-
 """
     fill!(cell, status::SettlementStatus, payload) -> Bool
 
@@ -136,13 +133,11 @@ function fill!(cell::ResultCell, status::SettlementStatus, payload)
 end
 
 # Deliver + latch, caller holds the lock and has checked emptiness. `deliver` runs
-# *before* `filled` flips so its side effects (the action result cache, the wire
-# reply) are visible to any waiter the instant `filled` reads true — a `get_result`
-# waking on `wait_settled` must never see `filled` ahead of the cached result. The
-# flip is in a `finally` so a throwing `deliver` still latches: a half-delivered
-# cell reads as filled, the fail-safe `finally` won't re-settle it, and the
-# delivery error is the caller's to log. `notify` follows the flip so a woken
-# waiter sees a consistent, fully-latched cell.
+# before `filled` flips, so a `get_result` waiter waking on `wait_settled` never
+# sees `filled=true` ahead of the cached result. The flip sits in a `finally` so a
+# throwing `deliver` still latches (the half-delivered cell reads filled, the
+# fail-safe `finally` leaves it alone, and the delivery error is the caller's to
+# log). `notify` follows the flip so a woken waiter sees a fully-latched cell.
 function _settle!(cell::ResultCell, status::SettlementStatus, payload)
     cell.status = status
     try

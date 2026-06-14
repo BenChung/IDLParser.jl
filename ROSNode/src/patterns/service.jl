@@ -1,19 +1,14 @@
-# Services: one callback and a write-once result cell. Under rmw_zenoh a
-# service is a Zenoh queryable — the request rides the query payload, the response
-# the reply. The fail-safe settlement core (settlement.jl) guarantees every handler
-# exit fills the cell exactly once: `return resp` → reply-ok; an explicit
-# `respond!(req, failed, …)`, a throw, or a non-responding return → a Zenoh query
-# error reply, so the client's blocking `call` raises rather than returning a
-# plausible zeroed response. The cell settles within the handler's extent: a
-# still-empty cell is force-aborted when the handler returns, then the owned
-# `Query` is finalized. `detach!(req)` opts a handler out of that at-return
-# settlement, transferring the owned query + cell to a spawned task (the
-# action-server pattern, ported here); a per-service `detach_timeout` sweeper +
-# `close`-drain bound a forgotten reply so the client still can't hang.
+# A service is a Zenoh queryable: the request rides the query payload, the response
+# the reply. Each handler settles a write-once result cell exactly once — `return
+# resp` replies ok; an explicit `respond!(req, failed, …)`, a throw, or a return that
+# is not a response replies a Zenoh query error, so the client's blocking `call`
+# raises rather than returning a zeroed response. Within the handler's extent a
+# still-empty cell is force-aborted at return, then the owned `Query` is finalized.
+# `detach!(req)` transfers the owned query + cell to another task; a per-service
+# `detach_timeout` sweeper and the `close` drain bound a forgotten reply.
 #
-# Client side: `call(client, req)` is a `Zenoh.get` whose handler we drain on the
-# *calling* task (it yields), raising on an error reply; `async=true` returns a
-# fetchable that resolves the same way off a spawned task.
+# `call(client, req)` is a `Zenoh.get` drained on the calling task, raising on an
+# error reply; `async=true` returns a Task that resolves the same way.
 
 using Zenoh: Zenoh, Keyexpr, Query, Queryable, Querier, reply, reply_err, is_ok, sample,
              error_payload, payload, matching_status, MatchingListener,
@@ -84,11 +79,10 @@ _strip_suffix(s::AbstractString, suffix::AbstractString) =
     endswith(s, suffix) ? s[1:end-length(suffix)] : s
 
 # ── ServiceHandle (the server) ───────────────────────────────────────────────
-# An `Entity` (node.jl) carrying a channel-form Zenoh `Queryable` plus its
-# consumer task. Draining with `take!` (not the callback form) lets the consumer
-# own the `Query` lifetime: it holds the owned `Query` across the handler and
-# `finalize`s it only after the reply is sent, which is the final-ack the client's
-# `get` waits on. The callback form drops the `Query` the instant the callback
+# An `Entity` carrying a channel-form Zenoh `Queryable` plus its consumer task.
+# Draining with `take!` lets the consumer own the `Query` across the handler and
+# finalize it only after the reply is sent — that drop is the rmw_zenoh final-ack
+# the client's `get` waits on. The callback form drops the `Query` the instant it
 # returns, racing the reply against the undeclare.
 
 """
@@ -110,18 +104,14 @@ mutable struct ServiceHandle{Req, Resp}
     const entity::Entity
 end
 
-# The per-query consumer wiring stashed in `entity.wire` so it shares the
-# entity's lifecycle. `close(queryable)` disconnects the channel, ending the
-# consumer task's drain loop; the task is waited on so a closing service can't
-# leave a reply half-sent.
+# The consumer wiring stashed in `entity.wire`, sharing the entity's lifecycle.
 #
-# `detached` is this service's registry of cells handed off by `detach!`: a
-# detached cell's owned `Query` is *not* finalized at handler return (ownership
-# transferred), so it lives here keyed to its force-abort deadline (`time()`
-# seconds, `Inf` ⇒ bounded only by drain). The `sweeper` Timer force-aborts +
-# finalizes cells past deadline; it is armed lazily on first detach and stopped
-# when the table empties (no perpetual idle timer). Per-service ownership: the
-# table dies with the service in `close`, draining outstanding cells.
+# `detached` holds cells handed off by `detach!`: ownership of a detached cell's
+# owned `Query` has transferred here, so it is finalized on settle/sweep rather
+# than at handler return. Each cell is keyed to its force-abort deadline (`time()`
+# seconds, `Inf` ⇒ bounded only by drain). The `sweeper` Timer force-aborts and
+# finalizes cells past deadline; it arms lazily on the first detach and stops when
+# the table empties. The table dies with the service in `close`, draining cells.
 mutable struct _ServiceWire
     const queryable::Queryable
     consumer::Union{Task, Nothing}
@@ -140,11 +130,9 @@ _ServiceWire(queryable::Queryable, consumer, seq::Int64, detach_timeout::Real) =
 const _DETACH_SWEEP_INTERVAL = 1.0
 
 function Base.close(w::_ServiceWire)
-    # Closing the queryable disconnects its channel → the `take!` loop sees
-    # CHANNEL_DISCONNECTED and ends. Then join the consumer so teardown is ordered
-    # (no reply racing the undeclare) — but *bounded*: if the consumer doesn't end
-    # promptly (e.g. wedged in a native call), we move on rather than hang `close`
-    # forever. The stuck task is detached and dies with the process.
+    # Close the queryable to end the `take!` loop, then join the consumer so no
+    # reply races the undeclare. Bounded: a consumer wedged in a native call is
+    # left detached to die with the process rather than hang `close`.
     try
         close(w.queryable)
     finally
@@ -157,10 +145,9 @@ function Base.close(w::_ServiceWire)
     nothing
 end
 
-# Drain outstanding detached cells at service teardown: force-abort + finalize
-# every cell still registered (mirrors the action server's `_await_goals` bound,
-# but services are single-reply so there is no body to await — a forgotten
-# respond! is aborted outright). Stops the sweeper.
+# Drain outstanding detached cells at service teardown: force-abort and finalize
+# every still-registered cell, then stop the sweeper. Services are single-reply,
+# so a forgotten respond! is aborted outright with no body to await.
 function _drain_detached!(w::_ServiceWire)
     cells = @lock w.detach_lock begin
         w.sweeper === nothing || (try; close(w.sweeper); catch; end)
@@ -175,9 +162,9 @@ function _drain_detached!(w::_ServiceWire)
     nothing
 end
 
-# Force-abort a detached cell and finalize its owned query (the final-ack
-# `_serve_query` skipped on the detach path). Both are infallible — a settled
-# cell's `force_abort!` is a no-op, finalize is idempotent.
+# Force-abort a detached cell and send its owned query's final-ack by finalizing
+# it. Both are infallible — `force_abort!` on a settled cell is a no-op, finalize
+# is idempotent.
 function _abort_detached!(cell::ResultCell)
     try; force_abort!(cell); catch; end
     q = cell.handle
@@ -200,9 +187,8 @@ function _register_detached!(w::_ServiceWire, cell::ResultCell)
     nothing
 end
 
-# Drop a detached cell from the registry (settled or aborted); stop the sweeper
-# once empty. Also finalizes the owned query — the final-ack `_serve_query`
-# skipped on the detach path.
+# Drop a settled detached cell from the registry, stop the sweeper once empty, and
+# send its owned query's final-ack by finalizing it.
 function _finalize_detached!(w::_ServiceWire, cell::ResultCell)
     @lock w.detach_lock begin
         delete!(w.detached, cell)
@@ -216,9 +202,8 @@ function _finalize_detached!(w::_ServiceWire, cell::ResultCell)
     nothing
 end
 
-# Sweeper tick: reap settled detached cells (finalizing their query) and
-# force-abort + finalize any past its deadline with an @error (a forgotten
-# respond!). Stops itself when the table empties.
+# Sweeper tick: finalize settled detached cells and force-abort + finalize any past
+# its deadline (a forgotten respond!, logged @error). Stops itself when empty.
 function _sweep_detached!(w::_ServiceWire)
     now = time()
     settled = ResultCell[]
@@ -316,10 +301,10 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
     Req  = request_type(Srv)
     Resp = response_type(Srv)
     sname = resolve_name(node, name; kind=:service)
-    # The service entity carries the SERVICE-level type identity (`pkg::srv::dds_::
-    # Base_` + the service RIHS01) in its keyexpr/liveliness, matching rmw_zenoh — the
-    # request type's own info would never match a peer. Falls back to the request
-    # info when the service type can't be synthesized (unregistered types).
+    # The keyexpr/liveliness key on the SERVICE-level type identity (`pkg/srv/Base` +
+    # the service RIHS01) to match rmw_zenoh peers; the request type's own RIHS keys a
+    # distinct keyexpr that round-trips Julia-to-Julia but routes against no native
+    # peer. Falls back to the request info only for unregistered (unsynthesizable) types.
     sti = something(service_type_info_of(Req, Resp), type_info_of(Req))
     ent = make_entity(node, Service, sname, sti; qos=qos)
 
@@ -330,24 +315,19 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
     ent.wire = wire
     wire.consumer = _spawn_service_consumer(ent, Req, Resp, handler, view, concurrency)
 
-    # Warm-up: precompile request-decode → handler → response-encode (and, under
-    # :execute, serve a default request once, its outbound `call`s null-routed).
+    # Warm-up compiles request-decode → handler → response-encode; under :execute it
+    # also serves one default request, its outbound `call`s null-routed.
     pol = _resolve_warmup(node, warmup, warmup_sync)
     _warmup!(pol, () -> _warm_service(pol, ent, Req, Resp, handler, warmup_sample))
 
     return ServiceHandle{Req, Resp}(ent)
 end
 
-# Drain the queryable's FIFO channel. Each query is decoded and dispatched per
-# the concurrency policy; a closed queryable ends the loop cleanly (the channel
-# disconnects → `take!` throws the disconnect, caught below). `take!` (not
-# `iterate`) is used so we own the `Query` lifetime: we finalize it only after
-# the reply is sent, which is the final-ack the client's `get` waits on.
-# A per-service scheduler: `Serial()` serves inline on the (sticky) consumer
-# task — one request at a time on one OS thread; `Parallel(n)` serves on spawned
-# threads bounded to `n` in flight by a semaphore; `Parallel(Inf)` is unbounded.
-# (A "busy error-reply on saturation" for services is a pending refinement;
-# today a full pool blocks the consumer, buffering queries in the queryable FIFO.)
+# Per-entity scheduler (there is no central executor): `Serial()` serves inline on
+# the sticky consumer task, one request at a time on one OS thread; `Parallel(n)`
+# serves on spawned threads bounded to `n` in flight by a semaphore; `Parallel(Inf)`
+# is unbounded. A full finite pool blocks the consumer, buffering queries in the
+# queryable FIFO (a busy error-reply on saturation is a pending refinement).
 _service_scheduler(::Serial, e, ::Type{Req}, ::Type{Resp}, h, v) where {Req, Resp} =
     query -> _serve_query(e, query, Req, Resp, h, v)
 function _service_scheduler(c::Parallel, e, ::Type{Req}, ::Type{Resp}, h, v) where {Req, Resp}
@@ -371,15 +351,15 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
                                  view::Bool, concurrency::Concurrency) where {Req, Resp}
     qable = (e.wire::_ServiceWire).queryable
     serve = _service_scheduler(concurrency, e, Req, Resp, handler, view)
-    # Sticky consumer: Serial handlers run on the node's one cooperative thread.
+    # Sticky so Serial handlers run on the node's one cooperative thread.
     t = Task() do
         try
             while true
                 serve(take!(qable))
             end
         catch err
-            # A closed queryable disconnects its channel; iteration over a dead
-            # channel is the normal teardown path, not an error.
+            # Closing the queryable disconnects its channel; the drain throws
+            # ShutdownException as the normal teardown exit.
             err isa ShutdownException && return
             isopen(e) &&
                 @error "service consumer task failed" service=e.endpoint.topic exception=(err, catch_backtrace())
@@ -390,13 +370,12 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
     return t
 end
 
-# The result cell of the service request currently being handled, bound by
-# `_serve_query` for the dynamic extent of the handler so the documented service
-# spelling `respond!(req, status, payload)` can reach it — a handler holds the
-# decoded request, not the cell.
+# The active request's result cell, bound by `_serve_query` over the handler's
+# extent so `respond!(req, …)` can reach it — the handler holds the decoded
+# request, not the cell.
 const _ACTIVE_SERVICE_CELL = Base.ScopedValues.ScopedValue{Any}(nothing)
-# The owning service's wire, bound alongside the cell so `detach!` can register
-# the handed-off cell on the detach registry (the cell alone can't reach it).
+# The owning service's wire, bound alongside so `detach!` can register the
+# handed-off cell on the detach registry.
 const _ACTIVE_SERVICE_WIRE = Base.ScopedValues.ScopedValue{Any}(nothing)
 
 """
@@ -501,38 +480,34 @@ function respond!(handle::ServiceRequestHandle, status::SettlementStatus, payloa
     return ok
 end
 
-# rcl-level infrastructure services (`~/get_type_description`, the parameter services)
-# sit BELOW the managed-node abstraction and must serve in every lifecycle state — a
-# manager resolves types / reads-and-sets parameters on an inactive node. Only
-# *application* services follow the `isactive` dispatch gate; matched by the resolved
-# topic basename so it holds however/whenever the service was wired.
+# RCL infrastructure services (`~/get_type_description`, the parameter services) are
+# exempt from the `isactive` dispatch gate so they serve in every lifecycle state — a
+# manager resolves types and reads/sets parameters on an inactive node. Matched by
+# resolved-topic basename, so the exemption holds however the service was wired.
 const _INFRA_SERVICE_NAMES = ("get_type_description", "describe_parameters",
     "get_parameter_types", "get_parameters", "list_parameters",
     "set_parameters", "set_parameters_atomically")
 _is_infra_service(topic::AbstractString) =
     any(n -> endswith(topic, "/" * n), _INFRA_SERVICE_NAMES)
 
-# Serve one query: decode the request, build the result cell whose `deliver`
-# closure turns the settled outcome into a reply (ok / error) stamped with the
-# attachment, then run the handler under the fail-safe wrapper. The owned `Query`
-# is held by the closure (via the cell's `handle`) and finalized once — after the
-# reply — to send the final-ack; finalizing in a `finally` guarantees it even if
-# delivery itself threw.
+# Serve one query: decode the request, build the result cell whose `deliver` closure
+# turns the settled outcome into an ok/error reply stamped with the attachment, then
+# run the handler under the fail-safe wrapper. The owned `Query` is finalized exactly
+# once, in the `finally` after any reply, to send the rmw_zenoh final-ack the client's
+# `get` waits on.
 function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
                       handler, view::Bool) where {Req, Resp}
     cell = nothing                          # hoisted so the `finally` can read its detach state
     try
         req = _decode_request(query, Req, view)
         cell = ResultCell{Query, Resp}(query, _service_deliver(e, query, Resp))
-        # Dispatch gate (`isactive`): an inactive managed node's application services
-        # don't run their handler — this site replies an error rather than a fabricated
-        # response. The control surface is exempt, so lifecycle services still serve.
-        # The owned query's final-ack rides the `finally` below.
+        # The `isactive` dispatch gate: an inactive managed node's application services
+        # error-reply here rather than run the handler; infra services are exempt. The
+        # owned query's final-ack still rides the `finally` below.
         isactive(e) || _is_infra_service(e.endpoint.topic) ||
             (reply_err(query, "node inactive"); return)
-        # Run the handler under the node logger so a plain `@info` inside it
-        # routes to the node's /rosout (wherever `settle_handler!` runs the thunk).
-        # Bind the cell + owning wire in scope so `respond!`/`detach!` reach them.
+        # Run under the node logger so a plain `@info` in the handler routes to /rosout,
+        # and bind the cell + wire in scope so `respond!`/`detach!` reach them.
         settle_handler!(cell,
                         () -> Base.ScopedValues.with(_ACTIVE_SERVICE_CELL => cell,
                                                      _ACTIVE_SERVICE_WIRE => e.wire) do
@@ -542,10 +517,9 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
                         default_result = () -> _zero_response(Resp),
                         log_id = e.endpoint.topic)
     catch err
-        # A decode failure (malformed request) can't go through the cell — there
-        # is no handler to run — so reply an error directly. Other escapes here
-        # are framework bugs; surface them and still send an error so the caller
-        # doesn't hang.
+        # A pre-settlement escape (decode failure, framework bug) has no cell to
+        # carry it, so log and error-reply directly to keep the caller from hanging.
+        # Only ShutdownException propagates, unwinding the consumer on Context drain.
         err isa ShutdownException && return
         @error "service request handling failed before settlement" service=e.endpoint.topic exception=(err, catch_backtrace())
         try
@@ -553,12 +527,10 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
         catch
         end
     finally
-        # The final-ack: drop the owned query exactly once, after any reply. A
-        # detached, still-empty cell is the exception — ownership of the query
-        # transferred to the detach registry, which finalizes it on settle/sweep —
-        # so we must NOT finalize it here. The attached path, and a detached cell
-        # already settled at return (its `respond!(handle, …)` finalized it), still
-        # finalize here (idempotent).
+        # Send the final-ack by finalizing the owned query, once, after any reply.
+        # The lone exception is a detached, still-empty cell: ownership transferred to
+        # the detach registry, which finalizes it on settle/sweep. The attached path —
+        # and a detached cell already settled at return — finalize here (idempotent).
         if !(cell isa ResultCell && (@atomic cell.detached) && !isfilled(cell))
             try
                 finalize(query.q)
@@ -569,44 +541,36 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
     nothing
 end
 
-# Decode the request from the query payload — owned by default, a `CDRView` over
-# an owned copy under `view=true` (see `decode_request`). A query with no payload
-# is a protocol error (a ROS request always carries a CDR body, even for an
-# empty Request).
+# Decode the request from the query payload. A query with no payload is a protocol
+# error: a ROS request always carries a CDR body, even an empty Request.
 function _decode_request(query::Query, ::Type{Req}, view::Bool) where {Req}
     p = payload(query)
     p === nothing && throw(ArgumentError("service request carried no payload"))
     return decode_request(p, Req, view)
 end
 
-# Decode from a `ZBytes`. Copy the payload into owned `Memory` first (the
-# query/payload buffer is borrowed and must not be aliased past the handler),
-# mirroring the subscription owned path (serialization.jl `decode(::Sample, …)`).
-# `view=true` then returns a `CDRView` aliasing that *owned* copy — safe to use
-# and escape for as long as the view is reachable, since the copy outlives the
-# query.
+# Copy the borrowed query payload into owned `Memory` first — it must not be aliased
+# past the handler. `view=true` then returns a `CDRView` over that owned copy, valid
+# for as long as the view is reachable since the copy outlives the query.
 # TODO(view): zero-copy directly over the borrowed query payload.
 function decode_request(p, ::Type{Req}, view::Bool) where {Req}
     mem = Zenoh.as_memory(p, UInt8)
     # Branch on the runtime `view` Bool so each arm calls a single-return-type
-    # decode (no `Any` box from a `view`-keyword `decode`).
+    # `decode_view`/`decode_owned`, keeping the result inferable to one concrete type.
     return view ? decode_view(mem, Req) : decode_owned(mem, Req)
 end
 
 # The cell's `deliver`: map a settled (status, payload) onto a Zenoh reply on the
-# captured query, stamping the rmw_zenoh attachment with this entity's gid. Runs
-# once, under the cell lock, holding the first terminal write (settlement.jl).
-# The `query` is closed over here (it's the cell's handle, but `deliver` is
-# handed only `(status, payload)`), so success replies on the right query.
+# captured query, stamping the rmw_zenoh attachment with this entity's fixed-width
+# gid. Runs once, under the cell lock, on the first terminal write. Settlement maps:
 #
 #   success + a `Resp` payload ⇒ reply-ok with the encoded Response
 #   failure (a message string) ⇒ reply_err (client `call` raises)
 #   aborted / force_abort! with `nothing` payload ⇒ a bare error reply (no ctor) —
 #     the fail-safe outcome for a non-defaultable result or delivery failure.
 #
-# Delivery does *not* finalize the query — `_serve_query`'s `finally` does, once,
-# after the handler returns and the cell has settled, separating the reply (here)
-# from the final-ack (there).
+# Delivery sends only the reply; `_serve_query`'s `finally` sends the separate
+# final-ack by finalizing the query once the cell has settled.
 function _service_deliver(e::Entity, query::Query, ::Type{Resp}) where {Resp}
     function (status::SettlementStatus, payload)
         if status === success && payload isa Resp
@@ -615,21 +579,16 @@ function _service_deliver(e::Entity, query::Query, ::Type{Resp}) where {Resp}
             ts = nanoseconds(Dates.now(e.node, System()))   # reply-time wall ns
             reply(query, bytes; attachment=encode_attachment(seq, ts, gid(e)))
         else
-            # Non-success (explicit `failed`, a thrown handler, or a synthesized
-            # abort) ⇒ a query error reply; the client's `call` raises. An
-            # explicit failure carries the user's message string; an abort
-            # carries a default/`nothing` Resp, for which we send a generic note.
+            # Any non-success settlement error-replies; the client's `call` raises.
             reply_err(query, _err_message(status, payload))
         end
         nothing
     end
 end
 
-# The error-reply message for a non-success settlement. An explicit `failure`
-# carries the user's error string/exception as the payload; an `aborted` outcome
-# carries a synthesized default Resp (or `nothing` from force_abort!) which has no
-# useful message. So the status picks the strategy — surface the failure payload,
-# or emit a generic note for an abort — and the payload formatting is one helper.
+# The error-reply message for a non-success settlement: a `failure` surfaces the
+# user's error string/exception payload, an abort carries no useful message (its
+# payload is a synthesized default Resp or `nothing`) so it gets a generic note.
 _err_message(::Failure, payload) = _failure_text(payload)
 _err_message(::SettlementStatus, _) = "service handler aborted"
 
@@ -637,10 +596,9 @@ _failure_text(msg::AbstractString) = String(msg)
 _failure_text(e::Exception)        = sprint(showerror, e)
 _failure_text(other)               = string(other)
 
-# A zero/default Response for the synthesized error/cancel reply. Most generated
-# responses are `@kwdef`/`@cdr1_compat` with an all-defaults constructor; fall
-# back to `nothing` (→ force_abort!'s bare-error path) if the type can't be
-# default-constructed, so a non-defaultable Response still settles fail-safe.
+# A default Response for the synthesized error reply, from the all-defaults
+# constructor most generated responses have. A non-defaultable Response yields
+# `nothing` (→ force_abort!'s bare-error path), keeping the settlement fail-safe.
 function _zero_response(::Type{Resp}) where {Resp}
     try
         return Resp()
@@ -659,19 +617,17 @@ Base.show(io::IO, s::ServiceHandle{Req}) where {Req} =
 entity(s::ServiceHandle) = s.entity
 
 # ── ServiceClient + call ──────────────────────────────────────────────────────
-# The client is an `Entity` of kind `Client` (it announces a matching liveliness
-# token so servers discover it); the request itself is a one-shot `Zenoh.get` on
-# the service keyexpr, not a long-lived route. `call` blocks the *calling* task
-# on the reply (it yields while draining the GetHandler's channel); `async=true`
-# runs the same drain on a spawned task and returns that task.
+# The client is an `Entity` of kind `Client` announcing a matching liveliness token
+# so servers discover it; each request is a one-shot `Zenoh.get` on the service
+# keyexpr. `call` blocks the calling task on the reply (yielding while draining the
+# GetHandler's channel); `async=true` runs the same drain on a spawned task.
 
 # A client's routing-match wire: a `Querier` on a request keyexpr plus a lazily
 # declared `MatchingListener` that wakes graph waiters on a match transition, so a
-# `_wait_on_graph` over `_wire_matched` re-checks promptly. The shared building
-# block behind both [`wait_for_service`](@ref) (ServiceClient, where this Querier
-# is *also* the `call` transport — stashed in `entity.wire`) and
-# [`wait_for_action_server`](@ref) (ActionClient, where it's a send_goal matching
-# probe only). `lock` guards the lazy listener declare.
+# `_wait_on_graph` over `_wire_matched` re-checks promptly. Shared by
+# [`wait_for_service`](@ref) (where this Querier is also the `call` transport, in
+# `entity.wire`) and [`wait_for_action_server`](@ref) (a send_goal matching probe).
+# `lock` guards the lazy listener declare.
 mutable struct _ClientWire
     const querier::Querier
     listener::Union{MatchingListener, Nothing}
@@ -681,9 +637,10 @@ end
 # Ground-truth routing-match predicate for a wire (`matching_status` is a live poll).
 _wire_matched(w::_ClientWire) = matching_status(w.querier)
 
-# Attach the match listener once (idempotent). It only *notifies* `ctx.graph.changed`
-# on a transition — `_wire_matched` stays the ground truth a waiter re-checks — so
-# there's no stale-state race. Shared by the service + action awaits.
+# Attach the match listener once (idempotent). It only notifies `ctx.graph.changed`
+# on a transition; a waiter re-checks `_wire_matched` (the live poll, the authoritative
+# match state) so the listener's delivered Boolean is never trusted as truth. Shared
+# by the service + action awaits.
 function _ensure_wire_listener!(w::_ClientWire, ctx)
     @lock w.lock begin
         w.listener === nothing || return nothing
@@ -748,23 +705,23 @@ function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
     # Service-level keyexpr type, matching the server's queryable (see `_make_service`).
     sti = something(service_type_info_of(Req, Resp), type_info_of(Req))
     ent = make_entity(node, Client, sname, sti; qos=qos)
-    # The call transport: a Querier on the service keyexpr. `:all_complete` fans to
-    # every complete server, like rmw_zenoh clients; the first reply settles the call.
-    # Stashed in `entity.wire` (reaped on close).
+    # The call transport: a Querier on the service keyexpr, in `entity.wire`.
+    # `:all_complete` fans to every complete server like rmw_zenoh clients; the
+    # first reply settles the call.
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
     querier = Querier(ctx.session, Keyexpr(tk); target=:all_complete)
     ent.wire = _ClientWire(querier, nothing, ReentrantLock())
     client = ServiceClient{Req, Resp}(ent, 0)
-    # Warm the call codec like the server endpoints (G2). Inherits `node.warmup`, so a
+    # Warm the call codec like the server endpoints. Inherits `node.warmup`, so a
     # `ParameterClient`'s lazily-built internal `ServiceClient`s warm here too.
     _warmup!(_resolve_warmup(node, warmup, warmup_sync), () -> _warm_client(client))
     return client
 end
 
-# Anchor the request-reply codec + call path for a client (G2): `encode(Req)` and the
-# `call(client, req)` body (which decodes the `Resp`). Precompile-only — never runs the
-# network `call`, just compiles it.
+# Compile the request-reply codec + call path: `encode(Req)` and the `call(client,
+# req)` body (which decodes the `Resp`). Precompile-only — it compiles `call` without
+# issuing the network query.
 function _warm_client(c::ServiceClient{Req, Resp}) where {Req, Resp}
     precompile(encode, (Req,))
     precompile(call, (typeof(c), Req))
@@ -869,9 +826,8 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     e = client.entity
 
     bytes = encode(req)
-    # The :execute warm-up null-routes the wire op: `encode` above still compiles and
-    # runs, but there is no server during warm-up, so hand back a default `Resp` (the
-    # handler's continuation still compiles/runs) instead of issuing the query.
+    # During :execute warm-up `encode` above runs but there is no server, so return a
+    # default `Resp` (the caller's continuation still compiles) without issuing the query.
     if _WARMUP[]
         return async ? Threads.@spawn(_default_msg(Resp)) : _default_msg(Resp)
     end
@@ -881,14 +837,12 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     attach = encode_attachment(seq, ts, gid(e))
 
     # A querier get carries no per-call timeout in libzenoh, so bound it with a
-    # `CancellationToken`: cancel fires → the in-flight get ends → the drain
-    # completes cleanly (no abandoned task). A deadline timer arms it when
-    # `timeout_ms > 0`, and the sync backstop also cancels on its own deadline.
-    # `timeout_ms == 0` is truly unbounded: no timer, no backstop — the token
-    # lives only for drain/transport teardown.
+    # `CancellationToken`: cancel ends the in-flight get and the drain completes
+    # cleanly. A deadline timer arms the token when `timeout_ms > 0`, and the sync
+    # backstop cancels on its own deadline. `timeout_ms == 0` is truly unbounded.
     tok = CancellationToken()
     run = function ()
-        # `Base.Timer` — ROSNode's own `Timer` (ROS timer, time.jl) shadows it here.
+        # `Base.Timer` qualified — ROSNode's own ROS `Timer` shadows the name here.
         timer = timeout_ms > 0 ?
             Base.Timer(_ -> (try; Zenoh.cancel(tok); catch; end), timeout_ms / 1000) :
             nothing
@@ -896,28 +850,25 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
             gh = Base.get(querier; payload=bytes, attachment=attach, cancellation=tok)
             return _resolve_reply(gh, Resp, e.endpoint.topic)
         finally
-            # Stop the timer so it can't fire post-return; the token drops via its
-            # finalizer (closing it here could race a firing `cancel`).
+            # Stop the timer so it can't fire post-return. The token drops via its
+            # finalizer — closing it here could race a firing `cancel`.
             timer === nothing || close(timer)
         end
     end
 
     async && return Threads.@spawn run()
 
-    # Synchronous, but **hard-bounded** so the caller can never hang forever (the
-    # fail-safe contract extends to the client). We run the reply-drain on a task and wait at
-    # most a deadline past `timeout_ms`; if the underlying `Zenoh.get` doesn't honor
-    # its own timeout (e.g. wedged, or its I/O thread starved under transport/
-    # multicast-discovery contention), we raise `ServiceError` rather than block
-    # indefinitely, cancelling the token so the abandoned get/drain terminates
-    # instead of leaking a blocked task per timed-out call.
+    # Hard backstop: run the reply-drain on a task and wait at most `timeout_ms` + 2s.
+    # A `Zenoh.get` that ignores its own timeout (wedged, or I/O thread starved) would
+    # otherwise block the caller forever, so on the deadline we cancel the token (the
+    # abandoned get/drain terminates) and raise `ServiceError`. This coexists with the
+    # CancellationToken deadline above — removing it as redundant reopens the hang.
     fut = Threads.@spawn run()
     # Explicit `timeout_ms == 0` is truly unbounded: wait forever for the reply.
     deadline = timeout_ms == 0 ? Inf : timeout_ms / 1000 + 2.0
     if timedwait(() -> istaskdone(fut), deadline; pollint=0.01) === :ok
         # `fetch` on a failed task throws `TaskFailedException`; unwrap it so the
-        # caller sees the `ServiceError` (error reply / no reply) the service contract
-        # promises, not the task wrapper.
+        # caller sees the `ServiceError` the contract promises, not the task wrapper.
         try
             return fetch(fut)
         catch err
@@ -938,10 +889,9 @@ end
 call(client::ServiceClient{Req}, req; kwargs...) where {Req} =
     throw(ArgumentError("call: expected a $(Req), got a $(typeof(req))"))
 
-# Drain the GetHandler for the (single) reply. The first reply settles the call:
-# ok → decode the Response (owned — it outlives the handler), error → raise
-# ServiceError. No reply at all (timeout / no matching server) is also an error,
-# since a blocked caller must not return a fabricated response.
+# Drain the GetHandler for the single reply. The first reply settles the call: ok →
+# decode the owned Response, error → raise ServiceError. A missing reply (timeout or
+# no server) also raises, so a blocked caller never returns a fabricated response.
 function _resolve_reply(gh, ::Type{Resp}, service::AbstractString) where {Resp}
     for r in gh
         if is_ok(r)
@@ -959,13 +909,12 @@ function _resolve_reply(gh, ::Type{Resp}, service::AbstractString) where {Resp}
 end
 
 # ── enum-instance call-method: the do-block spelling ──────────────────────────
-# `Service`/`Subscription` are `EndpointKind` *values* (core.jl re-export); the
-# do-block `Service(node, name, T) do req … end` desugars function-first, so both
-# route through one handler-form call-method dispatched on the kind. This is the
-# single owner of that method (pubsub.jl deliberately leaves it to us — defining it
-# in both files is an identical-signature overwrite, which precompile forbids): it
-# fans Subscription → pubsub's `_make_subscription` and Service → `_make_service`.
-# The `Client` kind has no do-block spelling — clients use `ServiceClient(…)`.
+# `Service`/`Subscription` are `EndpointKind` values, so `Service(node, name, T) do
+# req … end` desugars function-first and routes through one handler-form call-method
+# dispatched on the kind, fanning Subscription → `_make_subscription` and Service →
+# `_make_service`. This file is the sole owner: an identical-signature definition in
+# pubsub.jl too is an overwrite that precompile forbids. The `Client` kind has no
+# do-block spelling — clients use `ServiceClient(…)`.
 """
     Subscription(node::Node, topic, ::Type{T};
                  qos=default_qos(), view=Owned(), concurrency=Serial(),

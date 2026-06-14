@@ -65,10 +65,9 @@ Base.showerror(io::IO, ::Cancelled) =
     print(io, "Cancelled: goal was canceled")
 
 # ── settlement status tokens ─────────────────────────────────────────────
-# The write-once-cell verbs of services and actions: tags passed to
-# `respond!` to select an outcome. Singletons of a sealed abstract type (the
-# same clock-source pattern). `respond!` dispatches on the abstract type and uses
-# `is_terminal` to reject `feedback` where a result is due.
+# Tokens passed to `respond!` to select an outcome, as singletons of a sealed
+# abstract type (the clock-source pattern). `respond!` dispatches on the abstract
+# type and uses `is_terminal` to reject `feedback` where a result is due.
 #
 #   service:  return resp                  ⇒ success
 #             respond!(req, failure, msg)   ⇒ query error reply (client `call` raises)
@@ -77,9 +76,8 @@ Base.showerror(io::IO, ::Cancelled) =
 #             respond!(goal, aborted,  r)   ⇒ ABORTED
 #             respond!(goal, feedback, fb)  ⇒ one feedback message (a stream, not the cell)
 #
-# `success`/`succeeded` and `failure`/`aborted` read differently at the two
-# call sites by design (a service has no goal lifecycle); the distinct spellings
-# keep the service and action call sites self-describing.
+# The distinct service (`success`/`failure`) and action (`succeeded`/`aborted`)
+# spellings keep each call site self-describing.
 
 """
     SettlementStatus
@@ -265,10 +263,10 @@ end
 Base.show(io::IO, ::Serial)    = print(io, "Serial()")
 Base.show(io::IO, c::Parallel) = print(io, "Parallel(", isfinite(c.n) ? Int(c.n) : "Inf", ")")
 
-# ── view-borrow mode (only consulted when `view=true`) ───────────────────────
+# ── view-borrow mode (consulted when `view=true`) ────────────────────────────
 # Three points on the safety↔speed curve for how a `view` handler borrows the
-# payload, as flag structs (dispatched on, like `Concurrency`) rather than a
-# Bool/Symbol — so the choice is type-stable and self-describing at the call site.
+# payload, as flag structs dispatched on (like `Concurrency`) so the choice is
+# type-stable and self-describing at the call site.
 
 """
     ViewMode
@@ -351,14 +349,12 @@ macro unreachable(msg)
 end
 
 # ── warm-up / precompilation ───────────────────────────────────────────────
-# The dispatch chain is specialized on the message type, so the *first*
-# `publish(::T)` / first handler-on-`::T` JITs the whole chain — a startup spike.
-# The warm-up pass precompiles that chain at entity construction (warmup.jl).
-# `is_warming()` +
-# `@effectful` let user handlers stub their non-ROS effects during the `:execute`
-# warm-up (and during package precompilation) *without* specializing or folding
-# the wrong branch — it must be a runtime value flag, so both branches compile and
-# only one executes.
+# The dispatch chain specializes on the message type, so the first `publish(::T)`
+# or first handler-on-`::T` JITs the whole chain — a startup spike. The warm-up
+# pass precompiles that chain at entity construction. `is_warming()` + `@effectful`
+# let a handler stub its non-ROS effects during `:execute` warm-up (and package
+# precompilation) while both branches still compile: the flag is a runtime value,
+# so the live branch codegens even though the stub runs.
 
 "Runtime `:execute` warm-up scope. `true` only on a task the framework is warming."
 const _WARMUP = Base.ScopedValues.ScopedValue(false)

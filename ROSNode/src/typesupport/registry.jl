@@ -1,12 +1,12 @@
-# Type support — the runtime type registry and its three acquisition paths.
-# The IL is the hub: every way a type enters (static `@ros_msgs`, ament scan of an
-# installed workspace, or dynamic GetTypeDescription over the wire) normalizes into
-# `ROSMessages.IL`, and codegen/hashing/persistence all read from it.
+# Type support — the runtime type registry and its acquisition paths.
+# IL is the universal hub: every acquisition path (static `@ros_import`, ament scan of
+# an installed workspace, dynamic GetTypeDescription over the wire, authored types)
+# normalizes into `ROSMessages.IL` before codegen, hashing, or persistence.
 #
-# The registry (context.jl owns the storage + lock) is keyed by `(name, RIHS01)` so
+# The registry (storage + lock owned by the Context) is keyed by `(name, RIHS01)` so
 # evolved versions of a type coexist — the hash is the decode-safety key, not just a
-# version tag. This file owns the entry *shape* (`RegistryEntry`), the acquisition
-# front-ends, the content-addressed on-disk cache, and `export_typesupport`.
+# version tag. This file owns the entry shape (`RegistryEntry`), the acquisition
+# front-ends, and the codegen pipeline.
 #
 # Runtime codegen runs the macro pipeline programmatically:
 #   lower → resolve_constants → generate_code → eval into a fresh module.
@@ -22,10 +22,9 @@ import IDLParser
 using ROSZenoh: ROSZenoh, TypeInfo, TypeHash, to_rihs_string,
                 type_hash_from_rihs_string
 
-# `register_type!` / `lookup_type` / `TypeRegistry` / `registry` are context.jl's;
-# `type_info` / `ros_type_name` are serialization.jl's (this file specializes the
-# former per registered type). All are already in the module's scope by include
-# order, so no `import` is needed.
+# `register_type!` / `lookup_type` / `TypeRegistry` / `registry` come from the Context
+# layer; `type_info` / `ros_type_name` from serialization (this file specializes the
+# former per registered type). Include order puts them in module scope already.
 
 export TypeRegistry, RegistryEntry, register_type!, lookup_type,
        resolve_type, export_typesupport,
@@ -107,21 +106,18 @@ end
 
 # ── codegen: IL → generated module via the macro pipeline ───────────────────
 # The dynamic-type birth path. `lower(il; package)` → `resolve_constants` →
-# `generate_code` produces the same `Expr` vector `@ros_msgs` splices at macro
-# time; we `eval` it into a fresh anonymous module so a runtime type lives in a
-# clean namespace (no name clash with a statically-included one). The generated
-# code defines nested `<package>.<qualifier>.<Name>` submodules, so the concrete
-# type is fetched back out by walking that path.
+# `generate_code` produces the same `Expr` vector the static macros splice; eval it
+# into a fresh anonymous module so a runtime type lives in a clean namespace clear of a
+# statically-included one. The generated code defines nested
+# `<package>.<qualifier>.<Name>` submodules, walked to fetch the concrete type back out.
 
 # Run lower → resolve → generate over one IL interface and return the `Expr`s.
 # `package` threads through `lower` so cross-package `RRef`s project correctly.
-# `lower` yields a loosely-typed `Vector{Any}`; `resolve_constants` dispatches on
-# `Vector{<:Parse.CanAnnotate{Parse.Decl}}`, so we retype into `Parse.Decl[]` (what
-# the `@ros_msgs` macro feeds it) before the call.
-# `emit_imports=true` adds an inline `import StaticArrays, CDRSerialization` to the
-# generated package modules, required by the `:julia` textual export: reparsing the
-# source degrades the spliced module objects to bare names. Eval paths splice live
-# module objects, which resolve without the imports.
+# `resolve_constants` dispatches on `Vector{<:Parse.CanAnnotate{Parse.Decl}}`, so
+# retype `lower`'s `Vector{Any}` into `Parse.Decl[]` before the call.
+# `emit_imports=true` adds an inline `import StaticArrays, CDRSerialization`, required by
+# the `:julia` textual export: a reparse of the source has only bare names, not the
+# spliced live module objects the eval paths carry.
 function _generate_exprs(il, package::AbstractString; emit_imports::Bool=false)
     decls = IDLParser.Parse.Decl[]
     append!(decls, lower(il; package=package))
@@ -132,8 +128,8 @@ end
 # The full generation closure for a dynamic entry: every nested type it references
 # (lifted from the `td`'s referenced descriptions, each under its own package) followed
 # by the main IL. `generate_code` topo-sorts, so a nested-message field resolves to a
-# sibling generated into the SAME module — without the closure a `pkg/msg/Nested` field
-# is an UndefVarError in the gensym module. Mirrors @ros_import's multi-type closure.
+# sibling generated into the SAME module. The closure is required: a `pkg/msg/Nested`
+# field without it is an UndefVarError in the gensym module.
 function _closure_ils(entry::RegistryEntry, package::AbstractString)
     ils = Tuple{String, Any}[]
     if entry.td !== nothing
@@ -146,14 +142,14 @@ function _closure_ils(entry::RegistryEntry, package::AbstractString)
     return ils
 end
 
-# Eval an interface's generated code into a fresh module and return it. Generated
-# code splices the `StaticArrays`/`CDRSerialization` module objects directly, so it
-# resolves them regardless of the eval target's deps. The gensym'd target is rooted
-# under `CDRSerialization` (a stable, always-loaded host); its gensym name keeps it
-# from clashing with a static include.
+# Eval an interface's generated code into a fresh module and return it. Generated code
+# splices the `StaticArrays`/`CDRSerialization` module objects directly, resolving them
+# regardless of the eval target's deps. The gensym'd target is rooted under
+# `CDRSerialization` (a stable, always-loaded host); its gensym name keeps it clear of a
+# static include.
 #
-# TODO: dynamic types accumulate as hidden submodules of CDRSerialization rather
-# than ROSNode. A dedicated runtime-codegen root module would localize them.
+# TODO: dynamic types accumulate as hidden submodules of CDRSerialization rather than
+# ROSNode. A dedicated runtime-codegen root module would localize them.
 function _eval_module(entry::RegistryEntry, package::AbstractString)
     name = gensym(isempty(package) ? :ros_dynamic : Symbol(package))
     target = Core.eval(CDRSerialization, :(module $name end))
@@ -169,10 +165,10 @@ end
 # `srv`/`action`; for a plain message it's `msg`. Returns `nothing` if the path
 # isn't present (a partially-generated or unexpectedly-shaped module).
 #
-# The bindings are younger than the running world, so `isdefined`/`getfield` go
-# through `invokelatest` (Julia 1.12+ rejects a prior-world binding access
-# otherwise). This is the realize-time half of the "dynamic = invokelatest"
-# rule; the per-message decode/handler hop is the other half (the dispatch layer's).
+# The bindings are younger than the running world, so `isdefined`/`getfield` go through
+# `invokelatest`; Julia 1.12+ rejects a prior-world binding access. This is the
+# realize-time half of the dynamic-types-via-invokelatest rule (the per-message
+# decode/handler hop is the other half).
 function _fetch_generated_type(mod::Module, name::AbstractString)
     package, qualifier, bare = split_ros_name(name)
     cur = mod
@@ -204,9 +200,9 @@ const _REALIZE_LOCK = ReentrantLock()
 
 function realize!(entry::RegistryEntry)
     entry.mod === nothing || return entry
-    # Serialize codegen so concurrent first-uses share one eval instead of each
+    # Serialize codegen so concurrent first-uses share one eval rather than each
     # building a gensym module for the same type. The section runs only codegen and
-    # binding reads (no user handler code), so holding it across is deadlock-free.
+    # binding reads (no user handler code), so it is deadlock-free under the lock.
     @lock _REALIZE_LOCK begin
         entry.mod === nothing || return entry
         package, _, _ = split_ros_name(entry.info.name)

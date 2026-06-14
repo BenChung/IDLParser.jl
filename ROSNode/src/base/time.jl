@@ -252,9 +252,8 @@ Clock(node, src::C) where {C<:ClockSource} = Clock{C}(node, src, JumpCallback[])
 source(::Clock{C}) where {C} = C()
 Base.show(io::IO, ::Clock{C}) where {C} = print(io, "Clock{", nameof(C), "}")
 
-# Duck-typed node→clock accessor. The Node owns a clock registry keyed by
-# source; until that lands, synthesize a fresh handle. Defined permissively so
-# `now(node)` compiles against any node shape the later layers settle on.
+# Duck-typed node→clock accessor, defined permissively so `now(node)` compiles
+# against any node shape the later layers settle on.
 # TODO(graph): route through `node.clock(C())` once Node exists, so the ROS
 # clock can pick up the node's `use_sim_time` + Context `/clock` source.
 function _node_clock(node, src::C) where {C<:ClockSource}
@@ -386,13 +385,13 @@ function _clock_ctx(node)
     nothing
 end
 
-# The actual blocking wall sleep, interruptible on Context shutdown. Parks
-# on the Context's `_shutdown_wake` condition, which the drain notifies as step 1;
-# a one-shot `Base.Timer` bounds the wait to the requested span (a `Threads.Condition`
-# has no timed wait). Re-checks `is_shutdown` under the condition lock so a drain that
-# fires between the check and the `wait` can't be lost, then raises `ShutdownException`
-# — mirroring graph.jl's `_wait_on_graph` handshake. A clock with no resolvable
-# Context just sleeps the wall span.
+# The blocking wall sleep, interruptible on Context shutdown. Parks on the
+# Context's `_shutdown_wake` condition, which the drain notifies first; a one-shot
+# `Base.Timer` bounds the wait to the requested span (`Threads.Condition` has no
+# timed wait). Re-checks `is_shutdown` under the condition lock — the
+# check-before-park / re-check-after-notify ordering every interruptible wait
+# follows, so a drain firing between the check and the `wait` is never lost — then
+# raises `ShutdownException`. A clock with no resolvable Context sleeps the wall span.
 function _interruptible_sleep(c::Clock, ns::Integer)
     ctx = _clock_ctx(c.node)
     if ctx === nothing

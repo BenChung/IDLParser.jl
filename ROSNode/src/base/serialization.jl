@@ -183,9 +183,9 @@ decode_owned(view::CDRView) = materialize(view)
 
 # ── per-message attachment ───────────────────────────────────────────────
 # The `(sequence_number::Int64, source_timestamp::Int64, source_gid::NTuple{16,
-# UInt8})` triple that rides every `put`/request/reply, byte-for-byte with hiroz.
-# Encode/decode, the fixed `[u8;16]` gid form, and `gid` derivation (`entity_gid`)
-# live in ROSZenoh (`attachment.jl`); these wrappers thread them through so ROSNode
+# UInt8})` triple that rides every `put`/request/reply, byte-exact against native
+# rmw_zenoh peers. Encode/decode, the fixed `[u8;16]` gid form, and `gid`
+# derivation live in ROSZenoh; these wrappers thread them through so ROSNode
 # callers spell the wire metadata in one vocabulary. The publisher/service layer
 # supplies the gid from its `EndpointEntity`.
 
@@ -194,8 +194,9 @@ decode_owned(view::CDRView) = materialize(view)
 
 Serialize the per-message metadata triple into a `put`/`reply` attachment.
 Wraps [`ROSZenoh.encode_attachment`](@ref); `seq`/`ts` coerce to `Int64`, `gid`
-stays the fixed-width `NTuple{16,UInt8}` (the parity pivot — a `Vector` would be
-length-prefixed and break byte-compatibility).
+stays the fixed-width `NTuple{16,UInt8}` so the encoding is byte-exact against
+native rmw_zenoh peers — a `Vector` gid gets length-prefixed and fails their
+deserialize.
 """
 encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16,UInt8}) =
     ROSZenoh.encode_attachment(seq, ts, gid)

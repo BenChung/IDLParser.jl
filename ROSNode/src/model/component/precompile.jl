@@ -1,15 +1,14 @@
-# Tier-2 scaffolding precompile anchors (DESIGN: G4). The non-endpoint, type-AGNOSTIC
-# component control flow — assembly planning, the lifecycle fan-out, the run/teardown
-# entry, the node-kind registry, DI, and the load hook — is parameterised on
-# `Entity`/`NodeKind`/`ComponentNode`/`Symbol`/`Dict`, NOT on any user mixin type, so
-# baking each specialisation once helps *every* node. These are bare `precompile` anchors
-# (compile without running). `_component_precompile_specs` is the single source for both the
-# `@compile_workload` (which bakes them into ROSNode's pkgimage) and the drift-guard test
-# (which asserts each still resolves to a real method).
+# Type-agnostic scaffolding precompile anchors. The non-endpoint component control flow —
+# assembly planning, the lifecycle fan-out, the run/teardown entry, the node-kind registry,
+# DI, and the load hook — is parameterised on `Entity`/`NodeKind`/`ComponentNode`/`Symbol`/
+# `Dict`, not on any user mixin type, so baking each specialisation once helps every node.
+# These are bare `precompile` anchors (compile without running). `_component_precompile_specs`
+# is the single source for both the `@compile_workload` (which bakes them into ROSNode's
+# pkgimage) and the drift-guard test (which asserts each still resolves to a real method).
 #
-# Type-*specific* per-`(M, T)` handler/dispatch/codec leaves do NOT belong here — they are
-# per-user-type and warmed at node bring-up (`_warm_member_reactions!`) or baked into the
-# user's own package.
+# Type-specific per-`(M, T)` handler/dispatch/codec leaves belong to the consumer: they are
+# warmed at node bring-up (`_warm_member_reactions!`) or baked into the user's own package by
+# `@precompile_nodes`.
 
 # (callable, argtypes) pairs. The `Core.kwcall` entries target the *keyword* method of
 # `_assemble`/`load_node` — the real entry point (reached via `invokelatest` / the container

@@ -1,14 +1,9 @@
-# Contexts — the process-level container. One Context = one Zenoh session;
-# N nodes share it (hiroz's `ZContext`). It owns: the session (+ shared `z_id`),
-# an atomic entity-id counter, the domain id, default namespace/enclave, the
-# keyexpr formatter, the type registry, the discovery index fed by a
-# single `@ros2_lv/<domain>/**` liveliness subscriber, a clock, the
-# `on_shutdown` hooks, and the shutdown state machine + drain.
+# Contexts — the process-level container. One Context = one Zenoh session; N nodes
+# share it. It is the single shutdown root: close(ctx) is the one authoritative
+# teardown that undeclares entities, stops discovery, and closes the session in order.
 #
-# `# TODO(layer):` markers stub seams whose owning layer hasn't landed
-# (`--ros-args` remap parsing, the multi-Context signal manager, discovery-range
-# env mapping). Name resolution is duck-typed against a node's
-# `namespace`/`name`/`fqn`, so a bare Context works wherever a node would.
+# Name resolution is duck-typed against a node's `namespace`/`name`/`fqn`, so a bare
+# Context works wherever a node would.
 
 using Zenoh: Zenoh, Config, Session, Keyexpr, zid, to_le_bytes, LivelinessSubscriber,
              LivelinessSubscriberHandler
@@ -74,13 +69,12 @@ struct NodeInfo
     enclave::String
 end
 
-# Build an `EndpointInfo` from a parsed `EndpointEntity`. The node fields come
-# from the entity's node when present (rmw_zenoh carries it; ros2dds yields
-# `node === nothing`, leaving them blank — the bridge-compat gap).
+# Build an `EndpointInfo` from a parsed `EndpointEntity`. A ros2dds token yields
+# `node === nothing`, leaving node fields blank and the gid zero-filled.
 function _endpoint_info(e::EndpointEntity; is_local::Bool)
     nn = e.node === nothing ? "" : e.node.name
     ns = e.node === nothing ? "" : e.node.namespace
-    # gid needs the node identity; without it we can't derive it, so zero-fill.
+    # gid is derived from the node identity; zero-fill when there is none.
     gid = e.node === nothing ? ntuple(_ -> 0x00, 16) : ROSZenoh.entity_gid(e)
     EndpointInfo(nn, ns, e.kind, e.topic, e.type_info, e.qos, gid, is_local)
 end
@@ -104,12 +98,11 @@ one.
 """
 mutable struct GraphIndex
     lock::ReentrantLock
-    # liveliness token string → record (the token uniquely identifies an endpoint)
+    # Keyed by liveliness token string, which uniquely identifies an endpoint.
     endpoints::Dict{String, EndpointInfo}
-    # Bumped on every change; waiters re-check the graph predicate when notified.
+    # Notified on every change; waiters re-check the graph predicate.
     changed::Threads.Condition
-    # User `on_graph_change` listeners (added/removed EndpointInfo) — fired
-    # outside the index lock. Stored as plain functions of one `NamedTuple`.
+    # `on_graph_change` listeners, fired outside the lock since they may re-query the graph.
     listeners::Vector{Any}
 end
 
@@ -117,9 +110,9 @@ GraphIndex() = GraphIndex(ReentrantLock(), Dict{String, EndpointInfo}(),
                           Threads.Condition(), Any[])
 
 # ── type registry ──────────────────────────────────────────────────────────
-# Keyed by (name, RIHS01 hash) so evolved versions of a type coexist. The value
-# is left `Any` (a typesupport-layer `RegistryEntry`) — that layer owns the entry
-# shape; the Context only owns the table + lock so all nodes share discovered types.
+# Keyed by (name, RIHS01 hash) so evolved versions of a type coexist. RIHS01 is the
+# decode-safety identity, not a version tag: a hash match means the local struct can
+# safely decode the peer's wire bytes.
 
 """
     TypeRegistry
@@ -178,8 +171,8 @@ lookup_type(reg::TypeRegistry, info::TypeInfo) =
     @lock reg.lock get(reg.entries, (info.name, info.hash), nothing)
 
 # ── shutdown state ──────────────────────────────────────────────────
-# `running → shutting_down → shutdown_done`. The transition is the one drain
-# path every trigger funnels through (close / request_shutdown / signal).
+# `running → shutting_down → shutdown_done`. Every trigger (close / request_shutdown /
+# signal) funnels through the one drain path; the drain always reaches shutdown_done.
 
 @enum ShutdownState running shutting_down shutdown_done
 
@@ -193,8 +186,8 @@ lookup_type(reg::TypeRegistry, info::TypeInfo) =
     Context(f::Function; kwargs...)
 
 The process-level container shared by every node in a program — one
-`Context` holds exactly one Zenoh `Session`, and N nodes draw on it (modeled on
-hiroz's `ZContext`). It owns the session and its hex `z_id`, an atomic
+`Context` holds exactly one Zenoh `Session`, and N nodes draw on it. It owns the
+session and its hex `z_id`, an atomic
 entity-id counter, the `domain_id`, the default `namespace`/`enclave`, the
 keyexpr formatter, the type registry, the discovery index with its
 `@ros2_lv/<domain>/**` liveliness subscriber, a clock, the
@@ -256,22 +249,19 @@ mutable struct Context
     const registry::TypeRegistry
     const graph::GraphIndex
     # The `@ros2_lv/<domain>/**` liveliness subscriber (channel form) feeding `graph`,
-    # drained by a Julia consumer task (so no foreign thread runs Julia — see
-    # `_start_discovery!`).
-    # `Any` because Zenoh's handler type isn't in scope as a field constraint here and
-    # `close` is duck-typed.
+    # drained by a Julia consumer task to keep Julia off foreign libzenohc threads
+    # (see `_start_discovery!`). `Any` since Zenoh's handler type is out of scope here.
     _lv_sub::Any
-    # Clock handles by source — `clock(ctx, C())` returns/creates one. The
-    # `Clock` is duck-typed against `node.clocks`; the Context fills that role.
+    # Clock handles by source — `clock(ctx, C())` returns/creates one. The Context fills
+    # the node-role for the duck-typed `node.clocks` lookup.
     const clocks::Dict{DataType, Any}
-    # Sim-time source: the Context-hosted `/clock` value, atomically held.
-    # `nothing` until any node sets `use_sim_time` and the sub lands.
+    # The Context-hosted `/clock` value, atomically held. `nothing` until a node opts
+    # into `use_sim_time` and the `/clock` sub lands.
     @atomic sim_time_ns::Union{Int64, Nothing}
-    # Sim-time wiring. `_sim_users` is the set of nodes that opted into
-    # `use_sim_time` (sim active iff non-empty — ONE process-level `/clock` source,
-    # per-node opt-in). `_clock_node`/`_clock_sub` are the hidden internal node + its
-    # `/clock` Subscription carrying that source. All guarded by `_sim_lock` (a
-    # distinct lock — NOT `_state_lock`).
+    # Sim-time wiring: one process-level `/clock` source, per-node opt-in. `_sim_users`
+    # holds the opted-in nodes (sim active iff non-empty); `_clock_node`/`_clock_sub` are
+    # the hidden internal node + its `/clock` Subscription. `_sim_lock` guards all four
+    # and must never be acquired nested with `_state_lock`.
     _clock_node::Any
     _clock_sub::Any
     const _sim_users::Set{Any}
@@ -281,31 +271,28 @@ mutable struct Context
     @atomic _state::ShutdownState
     const _on_shutdown::Vector{Any}      # user cleanup hooks, run during the drain
     const _shutdown_done::Threads.Condition  # `spin`/`wait` park here until drained
-    # Notified `all=true` at drain start so blocked clock-waits
-    # (`_interruptible_sleep`, Rate, sleep_until) re-check `is_shutdown` and raise
-    # ShutdownException. The terminal counterpart is `_shutdown_done`, fired at drain end.
+    # Notified `all=true` at drain start so blocked clock-waits and graph waits re-check
+    # `is_shutdown` and raise ShutdownException. `_shutdown_done` is the terminal counterpart.
     const _shutdown_wake::Threads.Condition
     const drain_timeout::Float64         # seconds to await in-flight work
-    # Registered close-able handles (nodes, entities, timers) undeclared on drain
-    # (step 4). The entity layer pushes here; `close(ctx)` walks it in reverse.
+    # Registered close-able handles; `close(ctx)` walks them in reverse so dependents
+    # close before their dependencies.
     const _resources::Vector{Any}
-    # Dynamic-resolution lens: the module whose baked `__ros_resolve__` table this
-    # Context looks through, so every node/sub on it sees one consistent, deterministic
-    # picture. `nothing` ⇒ content-canonical resolution only.
+    # Type-resolution lens: the module whose baked `__ros_resolve__` table this Context
+    # resolves wire types through, so every node/sub sees one consistent picture.
+    # `nothing` ⇒ content-canonical resolution only.
     const home::Union{Module, Nothing}
     # Type-revision trust. `false` (default): a pinned (`:static`/`:authored`) type
-    # enforces its RIHS01 — a peer advertising the same name with a different hash is
-    # rejected with a diagnostic, never silently rebound. `true` (weak mode): the
-    # dynamic fallback may bind the peer's wire-discovered revision past a pinned
-    # mismatch. Orthogonal to the per-subscription `weak` keyexpr flag (entity.jl).
+    # enforces its RIHS01, so a peer advertising the same name with a different hash is
+    # rejected with a diagnostic. `true` (weak mode): the dynamic fallback binds the
+    # peer's wire-discovered revision past a pinned mismatch. Orthogonal to the
+    # per-subscription `weak` keyexpr flag.
     const weak_types::Bool
 end
 
-# Render the session's `z_id_t` into ROSZenoh's canonical lowercase-hex form.
-# zenoh's own `z_id_to_string` reverses the LE bytes (MSB first) and elides
-# leading zero nibbles (hex digits, so possibly odd-length); we reproduce that
-# so the hex matches what rmw_zenoh writes into liveliness tokens (and what
-# `parse_liveliness` reads back).
+# Z-ID hex reproduces zenoh's `z_id_to_string`: reverse the LE bytes (MSB first) and
+# strip leading zero nibbles, so the hex matches what rmw_zenoh writes into liveliness
+# tokens and `parse_liveliness` reads back. Any deviation breaks node-identity matching.
 function _zid_hex(s::Session)
     le = to_le_bytes(zid(s))                       # NTuple{16,UInt8}, little-endian
     hex = bytes2hex(reverse(collect(le)))
@@ -314,18 +301,14 @@ function _zid_hex(s::Session)
     hex[i:end]
 end
 
-# ROS env → values, with explicit kwargs winning. Kept tiny: domain/namespace/
-# enclave here; the localhost/peers→Zenoh-config translation is below.
+# ROS env defaults; explicit kwargs win at the call site.
 _env_domain_id() = (v = get(ENV, "ROS_DOMAIN_ID", nothing); v === nothing ? 0 : parse(Int, v))
 _env_namespace() = get(ENV, "ROS_NAMESPACE", "")
 _env_enclave()   = get(ENV, "ROS_ENCLAVE", "")
 
-# Translate the ROS transport-shaping env vars into the Zenoh `Config` via its
-# `c[key]=value` JSON5 setter. Only the unambiguous mappings: localhost-only
-# → scouting off + loopback connect; static peers → connect/endpoints. `domain_id`
-# deliberately does *not* go here — it lives in the keyexprs, not the transport.
-# TODO(layer): `ROS_AUTOMATIC_DISCOVERY_RANGE` → gossip/multicast scope once the
-# exact rmw_zenoh scouting mapping is pinned down.
+# Translate the ROS transport-shaping env vars into the Zenoh `Config`: localhost-only
+# → scouting off + loopback connect; static peers → connect/endpoints. `domain_id` lives
+# in the keyexprs rather than the transport, so it is set elsewhere.
 function _apply_ros_transport_config!(c::Config; localhost_only::Bool, peers::Vector{String})
     if localhost_only
         c["scouting/multicast/enabled"] = false
@@ -350,8 +333,8 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
     ns  = _normalize_namespace(namespace === nothing ? _env_namespace() : String(namespace))
     enc = enclave === nothing ? _env_enclave() : String(enclave)
 
-    # Zenoh session config: reuse the caller's `Config` wholesale, else a default
-    # (peer mode → local router). ROS transport env is layered in either way.
+    # Reuse the caller's `Config` when given, else a default peer-mode one; either
+    # way the ROS transport env is layered in.
     cfg = config === nothing ? Config() : config
     _apply_ros_transport_config!(cfg; localhost_only=localhost_only,
                                        peers=collect(String, peers))
@@ -366,11 +349,9 @@ function Context(; domain_id::Union{Integer, Nothing}=nothing,
                   Threads.Condition(), Float64(drain_timeout), Any[], home,
                   weak_types)
 
-    # Register the statically-compiled bootstrap types (type_description_interfaces)
-    # so the type-description server can serve them and discovery can use them, plus any
-    # @ros_import/@ros_cache statically-generated types (so keyexpr-only resolution
-    # uses the precompiled type directly). Forward references into typesupport/
-    # wellknown (included after this file).
+    # Register the bootstrap types (type_description_interfaces) so the type-description
+    # server can serve them, plus any @ros_import/@ros_cache statically-generated types so
+    # keyexpr-only resolution uses the precompiled struct directly.
     _register_canonical_types!(ctx)
     _register_static_types!(ctx)
     home === nothing && _maybe_hint_no_home()    # nudge if a resolvable home exists
@@ -415,8 +396,8 @@ end
 ```
 """
 macro context(args...)
-    # Julia hands a trailing do-block to a macro as its FIRST argument (an `->` lambda);
-    # any `kwargs` written inside the parens follow it. So the body is `args[1]`, not `args[end]`.
+    # Julia hands a trailing do-block to a macro as its FIRST argument (an `->` lambda),
+    # with any in-paren `kwargs` following — so the body is `args[1]`.
     (!isempty(args) && args[1] isa Expr && args[1].head === :->) ||
         error("@context needs a trailing do-block: `@context(kwargs…) do ctx … end`")
     body = esc(args[1])
@@ -474,8 +455,8 @@ reading). Thread-safe: the increment-and-fetch is a single atomic operation.
 """
 next_entity_id!(ctx::Context) = (@atomic ctx._next_id += 1)
 
-# The Context fills the clock's `node`-role for context-level reads; the time
-# layer reads `node.clocks` duck-typed, so a Context works wherever a node would.
+# The Context fills the node-role for context-level clock reads, so a Context works
+# wherever the duck-typed `node.clocks` lookup expects a node.
 function clock(ctx::Context, src::ClockSource)
     C = typeof(src)
     @lock ctx._state_lock get!(ctx.clocks, C) do
@@ -485,21 +466,19 @@ end
 clock(ctx::Context) = clock(ctx, ROS())
 
 # ── sim-time: use_sim_time → /clock routing ──────────────────────────────────
-# ONE process-level `/clock` data source (a Subscription on a hidden internal node),
-# per-node opt-in: `_sim_users` holds the nodes whose ROS clock follows sim time, so
-# `now(node, ROS())` reads `sim_time_ns` only for an opted-in node (time.jl). Jump
-# callbacks fire on the clock each node actually holds (`node.clocks[ROS]`): a per-node
-# `sim_activated`/`sim_deactivated` on opt-in/opt-out, and a `time_forward`/`time_backward`
-# to every active node on a `/clock` discontinuity. Follow-only (no interpolation): `now`
-# holds between samples (rclcpp TimeSource); ROS `Timer`/`Rate` are NOT sim-driven here.
+# ONE process-level `/clock` source (a Subscription on a hidden internal node), per-node
+# opt-in: `_sim_users` holds the nodes whose ROS clock follows sim time, so `now(node,
+# ROS())` reads `sim_time_ns` only for an opted-in node. Jump callbacks fire on the clock
+# each node holds (`node.clocks[ROS]`): per-node `sim_activated`/`sim_deactivated` on
+# opt-in/opt-out, and `time_forward`/`time_backward` to every active node on a `/clock`
+# discontinuity. Follow-only: `now` holds between samples; ROS `Timer`/`Rate` are not
+# sim-driven here.
 #
-# Activation declares a real `/clock` Subscription, which needs a `NodeEntity`
-# (`topic_keyexpr` requires one) — hence a hidden internal node, not a bare Context. It
-# runs synchronously (under the param-commit `s.lock` via the event hook): toggling is
-# rare/one-time, and nothing takes a param lock while holding `_sim_lock`/node locks, so
-# there is no cycle. (A jump callback that re-enters parameter mutation is safe only
-# because `s.lock` is a `ReentrantLock` — same-thread re-entry succeeds; a non-reentrant
-# lock here would reintroduce a self-deadlock.)
+# Activation needs a `NodeEntity` for `topic_keyexpr`, hence the hidden internal node
+# rather than a bare Context. It runs synchronously under the param-commit `s.lock` via
+# the event hook; this is deadlock-free because no path takes a param lock while holding
+# `_sim_lock` or a node lock, and `s.lock` is reentrant so a jump callback may re-enter
+# parameter mutation on the same thread.
 
 _is_sim_user(ctx::Context, node) = @lock ctx._sim_lock (node in ctx._sim_users)
 
@@ -538,18 +517,16 @@ function set_use_sim_time!(ctx::Context, node, on::Bool)
     nothing
 end
 
-# Activation delta for a node joining an already-running sim: the actual sim−system
-# offset (so threshold callbacks fire too); 0 for the first opt-in (no `/clock` sample
-# yet — `on_clock_change` still triggers it).
+# Activation delta for a node joining an already-running sim: the sim−system offset so
+# threshold callbacks fire; 0 for the first opt-in, which has no `/clock` sample yet.
 _activate_delta(ctx::Context) =
     (s = @atomic ctx.sim_time_ns; s === nothing ? Duration(0) : Duration(s - _read_ns(System())))
 
 # Declare the `/clock` Subscription on the hidden internal node (created once, reused
 # across reactivations). Each sample's `builtin_interfaces/Time` is ingested as ns.
 function _activate_sim!(ctx::Context)
-    # Build into locals; commit BOTH to the Context only after the Subscription
-    # succeeds — so a throwing `Subscription` ctor can't strand `_clock_node` without a
-    # `/clock` sub (which would make every later reactivation a no-op).
+    # Commit both references to the Context only after the Subscription ctor succeeds, so
+    # a throw can't strand `_clock_node` without a `/clock` sub and wedge reactivation.
     node = ctx._clock_node === nothing ?
         Node(ctx, "_ros_clock"; serve_type_description = false) : ctx._clock_node
     ClockMsg = Interfaces.rosgraph_msgs.msg.Clock
@@ -563,8 +540,8 @@ function _activate_sim!(ctx::Context)
     nothing
 end
 
-# Tear down the `/clock` source: close the sub and clear sim time. A late in-flight
-# sample is ignored by `_ingest_clock!` (it re-checks `_sim_users` under the lock).
+# Tear down the `/clock` source: close the sub and clear sim time. `_ingest_clock!`
+# ignores a late in-flight sample by re-checking `_sim_users` under the lock.
 function _deactivate_sim!(ctx::Context)
     sub = @lock ctx._sim_lock begin
         s = ctx._clock_sub
@@ -581,10 +558,9 @@ function _deactivate_sim!(ctx::Context)
     nothing
 end
 
-# Ingest one `/clock` sample. Resurrection-safe: a sample arriving after deactivation
-# (empty `_sim_users`) is ignored. The first post-activation sample only sets the
-# baseline (the per-node `sim_activated` already fired at opt-in); a later change fires a
-# `time_forward`/`time_backward` to every active node.
+# Ingest one `/clock` sample. A sample arriving after deactivation (empty `_sim_users`)
+# is ignored. The first post-activation sample only sets the baseline; a later change
+# fires `time_forward`/`time_backward` to every active node.
 function _ingest_clock!(ctx::Context, ns::Int64)
     local jump
     @lock ctx._sim_lock begin
@@ -601,12 +577,11 @@ function _ingest_clock!(ctx::Context, ns::Int64)
     nothing
 end
 
-# Fire a jump to the callbacks on one node's ROS clock (the handle the user holds,
-# `node.clocks[ROS]`), gated by `_triggers`. A snapshot copy decouples firing from a
-# concurrent `register!`.
+# Fire a jump to the callbacks on one node's ROS clock, gated by `_triggers`. Snapshot
+# `c.jumps` under no lock and fire over the copy, decoupling from a concurrent `register!`.
 function _fire_jumps_to!(node, j::TimeJump)
     node === nothing && return nothing
-    node isa Node && !isopen(node) && return nothing   # skip a closed/closing node (no fire on a torn-down clock)
+    node isa Node && !isopen(node) && return nothing   # skip a closed/closing node
     (hasproperty(node, :clocks) && haskey(node.clocks, ROS)) || return nothing
     c = node.clocks[ROS]::Clock{ROS}
     for cb in copy(c.jumps)
@@ -630,12 +605,10 @@ function _fire_clock_jumps!(ctx::Context, j::TimeJump)
 end
 
 # ── name resolution ────────────────────────────────────────────────────
-# Turn a user name into a fully-qualified name *before* it reaches ROSZenoh:
-# absolute `/foo` as-is; relative `foo` → prepend namespace; private `~/foo` →
-# prepend the node FQN; then validate. Remap is a per-context rule table (the
-# `from:=to` / `__ns:=` / `__node:=` forms) — applied last; today the table is
-# empty until `--ros-args` parsing lands (TODO below). ROSZenoh stays
-# naming-agnostic — it takes the final topic string.
+# Resolve a user name to a fully-qualified name before it reaches ROSZenoh, which stays
+# naming-agnostic and takes the final topic string. Forms: absolute `/foo` as-is;
+# relative `foo` → prepend namespace; private `~/foo` → prepend the node FQN. The remap
+# rule table is applied last, then the result is validated.
 
 # Normalize a namespace to a leading-slash, no-trailing-slash form. Empty ⇒ "/".
 function _normalize_namespace(ns::AbstractString)
@@ -719,11 +692,9 @@ function resolve_name(node, name::AbstractString; kind::Symbol=:topic)
     return _validate_fqn(resolved)
 end
 
-# Remap rule application. The rule table lives on the node/context as `remaps`
-# (an ordered `Vector{Pair{String,String}}`), empty until `--ros-args` parsing
-# lands. Exact-match `from => to` on the resolved FQN (rclcpp's static remap).
-# TODO(layer): `__ns:=`/`__node:=` and node-scoped `nodename:from:=to` parsing
-# from `--ros-args`; today only an explicit `remaps` table is honored.
+# Apply the node/context `remaps` table: exact-match `from => to` on the resolved FQN
+# (rclcpp's static remap). The table is honored when present; populating it from
+# `--ros-args` is not yet wired.
 function _apply_remap(node, resolved::AbstractString, ::Symbol)
     hasproperty(node, :remaps) || return resolved
     for (from, to) in node.remaps
@@ -733,37 +704,32 @@ function _apply_remap(node, resolved::AbstractString, ::Symbol)
 end
 
 # ── discovery: the @ros2_lv/<domain>/** liveliness subscriber ────────
-# One channel-form subscriber per Context, drained by a Julia consumer task. Each
-# token PUT/DELETE updates the index and fans a `GraphChange` to listeners. Parse
-# failures are logged and skipped — a malformed/foreign token must not kill the task.
+# One channel-form subscriber per Context, drained by a Julia consumer task. Each token
+# PUT/DELETE updates the index and fans a `GraphChange` to listeners. A parse failure is
+# logged and skipped so a malformed or foreign token never kills the task.
 #
-# Channel (FIFO) form, NOT callback — this is load-bearing for deadlock-freedom. The
-# callback form runs `_ingest_liveliness!` on a foreign libzenohc thread; a stop-the-
-# world GC anywhere else in the process (e.g. the first service round-trip's first-
-# call JIT — acute when a process queries *itself*, both serving and calling) must
-# then halt that foreign thread, but it can be mid-Julia-callback and unable to reach
-# a safepoint → deadlock. Draining a FIFO on a Julia-managed (GC-safe) consumer task
-# keeps ALL Julia execution off foreign threads, so a GC can always complete.
+# The FIFO channel form (not callback) is load-bearing for deadlock-freedom: the callback
+# form would run `_ingest_liveliness!` on a foreign libzenohc thread, where a process-wide
+# stop-the-world GC can halt it before it reaches a safepoint and deadlock. Draining a
+# FIFO on a Julia-managed consumer task keeps all Julia execution off foreign threads, so
+# a GC can always complete.
 
-# The wildcard liveliness keyexpr. rmw_zenoh tokens carry the domain as their
-# first segment (`@ros2_lv/<domain>/...`), so the subscription itself scopes
-# discovery to this Context's domain. ros2dds tokens (`@/<zid>/@ros2_lv/...`)
-# carry no domain segment, so the generic form stays unscoped.
+# The wildcard liveliness keyexpr. rmw_zenoh tokens carry the domain as their first
+# segment, so the subscription itself scopes discovery to this Context's domain. ros2dds
+# tokens (`@/<zid>/@ros2_lv/...`) carry no domain segment, so the generic form is unscoped.
 _lv_wildcard(::RmwZenoh, domain_id::Integer) = "@ros2_lv/$domain_id/**"
 _lv_wildcard(::KeyExprFormat, ::Integer) = "**/@ros2_lv/**"
 
 function _start_discovery!(ctx::Context)
     ke = Keyexpr(_lv_wildcard(ctx.format, ctx.domain_id))
     # `history=true` replays the live token set so a late-joining Context sees the
-    # existing graph (eventual consistency). Capacity is generous: a discovery
-    # burst (many tokens at once) buffers rather than drops, and the consumer drains
-    # it fast (a locked index update per token, no user handler).
+    # existing graph. Capacity is sized so a discovery burst buffers rather than drops;
+    # the consumer drains it fast (a locked index update per token, no user handler).
     sub = LivelinessSubscriberHandler(ctx.session, ke; channel=:fifo,
                                       capacity=1024, history=true)
     ctx._lv_sub = sub
-    # Plain `@spawn` (migratable): the index update is lock-guarded, needs no thread
-    # affinity, and runs on any thread under `-t>=2`. Closing the handler on drain
-    # disconnects the channel → the `for` loop ends → the task exits.
+    # Plain `@spawn` (migratable): the index update is lock-guarded, so it needs no thread
+    # affinity. Closing the handler on drain disconnects the channel, ending the loop.
     Threads.@spawn begin
         try
             for sample in sub
@@ -783,10 +749,9 @@ function _start_discovery!(ctx::Context)
     return ctx
 end
 
-# Apply one liveliness sample to the index. PUT = appeared (parse + insert),
-# DELETE = withdrew (remove by the token key). Node tokens (`parse_liveliness`
-# returns a `NodeEntity`) carry no endpoint, so they only register the node's
-# presence — we track endpoints here and recover node identity from them.
+# Apply one liveliness sample to the index: PUT inserts or updates the record, DELETE
+# removes it by the token key. Node identity is recovered from endpoint tokens, so a
+# node-only token carries nothing to index.
 function _ingest_liveliness!(ctx::Context, sample)
     key = Zenoh.keyexpr(sample)                       # the token string is the index key
     appeared = Zenoh.kind(sample) === Zenoh.SampleKinds.PUT
@@ -801,10 +766,9 @@ function _ingest_liveliness!(ctx::Context, sample)
     end
 
     entity = parse_liveliness(ctx.format, key)
-    # A node token (`NN` kind) parses to a `NodeEntity` — no endpoint to index.
-    entity isa EndpointEntity || return nothing
-    # Backstop behind the domain-scoped wildcard. ros2dds entities carry no node
-    # (hence no domain) and pass through.
+    entity isa EndpointEntity || return nothing       # node token (`NN`): no endpoint to index
+    # Backstop behind the domain-scoped wildcard. A ros2dds entity carries no node, hence
+    # no domain, and passes through.
     entity.node === nothing || entity.node.domain_id == ctx.domain_id || return nothing
 
     info = _endpoint_info(entity; is_local=false)
@@ -813,15 +777,13 @@ function _ingest_liveliness!(ctx::Context, sample)
     return nothing
 end
 
-# Wake graph waiters and fan a `GraphChange` to user listeners. Listeners run
-# outside the index lock (their handlers may query the graph). The condition is
-# how `wait_for_service`/`wait_for_matched` re-check on each change.
+# Wake graph waiters and fan a `GraphChange` to user listeners. The condition is how
+# `wait_for_service`/`wait_for_matched` re-check on each change.
 function _notify_graph_change!(ctx::Context, added::Vector{EndpointInfo},
                                removed::Vector{EndpointInfo})
     @lock ctx.graph.changed notify(ctx.graph.changed)
-    # Snapshot under the index lock, then fire outside it: listeners may query the
-    # graph or register more, and a concurrent `push!` must not reallocate the
-    # Vector mid-iteration.
+    # Snapshot the listeners under the lock, then fire outside it: a listener may re-query
+    # the graph or register more, which would re-enter the lock or reallocate mid-iteration.
     fns = @lock ctx.graph.lock copy(ctx.graph.listeners)
     isempty(fns) && return nothing
     change = (; added=added, removed=removed)
@@ -967,23 +929,21 @@ function request_shutdown(ctx::Context; reason::AbstractString="")
     return true
 end
 
-# The one drain path every trigger funnels through. Ordered so peers see
-# a clean exit and in-flight work finishes:
-#   1. (already flipped to :shutting_down) wake clock-waits / blocked calls
+# The one drain path every trigger funnels through, ordered so peers see a clean exit
+# and in-flight work finishes:
+#   1. (state already :shutting_down) wake clock-waits / blocked calls
 #   2. run on_shutdown hooks
-#   3. await in-flight tasks up to drain_timeout  (TODO: task tracking)
+#   3. await in-flight tasks up to drain_timeout
 #   4. undeclare entities (liveliness + routes)
-#   5. close the session  → :shutdown, notify spin/wait waiters
+#   5. close the session → :shutdown_done, notify spin/wait waiters
 function _drain!(ctx::Context)
-    # The whole drain is wrapped so the terminal state-flip + waiter notify in the
-    # `finally` *always* run — even if a step throws unexpectedly. This is the
-    # invariant `close`/`wait`/`spin` rely on: a drain that started always
-    # completes, so a blocked main task can never hang on a drain-internal bug.
+    # The `finally` terminal state-flip + waiter notify always run, even if a step throws.
+    # This is the invariant `close`/`wait`/`spin` rely on: a started drain always reaches
+    # shutdown_done, so a blocked main task can never hang on a drain-internal bug.
     try
-        # 1. Wake blocked clock-waits and the graph waits so they unwind with a
-        # ShutdownException rather than hanging the drain. `_shutdown_wake` releases
-        # `_interruptible_sleep`/Rate/sleep_until (time.jl), `graph.changed` the
-        # graph waits; both re-check `is_shutdown` and raise.
+        # 1. Wake blocked clock-waits (`_shutdown_wake`) and graph waits (`graph.changed`)
+        # so each re-checks `is_shutdown` and unwinds with a ShutdownException rather than
+        # hanging the drain.
         @lock ctx._shutdown_wake notify(ctx._shutdown_wake; all=true)
         @lock ctx.graph.changed notify(ctx.graph.changed; all=true)
 
@@ -995,19 +955,15 @@ function _drain!(ctx::Context)
             end
         end
 
-        # 3. Await in-flight goal/service handler tasks (incl. detached cleanup)
-        # up to drain_timeout. TODO(layer): the Service/Action layers
-        # register their handler tasks with the Context; until then there is
-        # nothing to await and this is a no-op — the timeout still bounds the
-        # whole drain via steps 2 and 5.
+        # 3. Await in-flight handler tasks up to drain_timeout. The Service/Action layers
+        # do not yet register handler tasks with the Context, so this is a no-op for now;
+        # steps 2 and 5 still bound the whole drain.
 
-        # 4–5. Undeclare entities (clean graph departure, reverse order), stop
-        # discovery, then close the session — all **bounded by drain_timeout**. A
-        # wedged native close (e.g. libzenohc blocking under router contention) must
-        # not hang shutdown forever: the drain gives up after the timeout, its
-        # `finally` flips the state + wakes `close`/`spin`/`wait`, and the stuck
-        # native call dies with the process. (Without this bound a single stuck
-        # close is the catastrophic, SIGTERM-ignoring hang.)
+        # 4–5. Undeclare entities (clean graph departure, reverse order), stop discovery,
+        # then close the session, all bounded by drain_timeout. A wedged libzenohc close
+        # ignores SIGTERM and would hang shutdown for tens of minutes; the bound makes the
+        # drain give up, and its `finally` flips the state and wakes `close`/`spin`/`wait`
+        # so the stuck native call dies with the process.
         _run_bounded(ctx, "drain teardown", ctx.drain_timeout) do
             resources = @lock ctx._state_lock reverse(copy(ctx._resources))
             for r in resources
@@ -1025,9 +981,8 @@ function _drain!(ctx::Context)
                 end
                 ctx._lv_sub = nothing
             end
-            # Sim-time: the `/clock` sub rides `_clock_node` (a registered resource,
-            # already closed in the reverse walk above). Just clear the references + the
-            # opt-in set so nothing dangles.
+            # The `/clock` sub rides `_clock_node`, already closed in the reverse walk
+            # above; clear the references and opt-in set so nothing dangles.
             @lock ctx._sim_lock begin
                 ctx._clock_sub = nothing
                 ctx._clock_node = nothing
@@ -1047,11 +1002,10 @@ function _drain!(ctx::Context)
     return nothing
 end
 
-# Run `f()` with a wall-time bound: spawn it, poll for completion up to `secs`,
-# log on overrun (the task keeps running detached — we don't hard-kill a hook
-# mid-cleanup, the drain just moves on). Exceptions from `f` are logged, not
-# raised. `Base.timedwait` is the bound — note `Timer` here would resolve to
-# ROSNode's clock `Timer`, so the wall-clock primitives are spelled `Base.`.
+# Run `f()` with a wall-time bound: spawn it, poll up to `secs`, log on overrun. An
+# overrunning task keeps running detached rather than being hard-killed mid-cleanup, so
+# the drain moves on. Exceptions from `f` are logged. Wall-clock primitives are spelled
+# `Base.` since a bare `Timer` would resolve to ROSNode's clock `Timer`.
 function _run_bounded(f, ::Context, what::AbstractString, secs::Real)
     t = @async try
         f()
@@ -1129,11 +1083,9 @@ function spin(ctx::Context; handle_signals::Bool=false)
     nothing
 end
 
-# Park on the drain, turning SIGINT into a graceful shutdown. With
-# `exit_on_sigint(false)` set (see `_install_signal_handlers!`), Julia delivers a
-# Ctrl-C as an `InterruptException` thrown into this task at its `wait` yield-point
-# rather than exiting the process. The first requests the drain (idempotent) and
-# re-parks until it completes; a second hard-exits.
+# Park on the drain, turning SIGINT into a graceful shutdown. With `exit_on_sigint(false)`
+# set, Julia delivers a Ctrl-C as an `InterruptException` into this task at its `wait`
+# yield-point: the first requests the drain and re-parks, a second hard-exits.
 function _park_until_drained(ctx::Context)
     interrupted = false
     while true
@@ -1154,11 +1106,8 @@ function _park_until_drained(ctx::Context)
     end
 end
 
-# Signal handling: opt-in, scoped to the spin call. Installs handlers,
-# runs `f`, removes them on return. First signal → graceful `request_shutdown`;
-# a second SIGINT while draining → immediate `exit(130)`.
-# TODO(layer): a process-global manager that fans one signal to all opted-in
-# Contexts (multi-Context processes); today this installs per-spin handlers.
+# Signal handling scoped to the spin call: install handlers, run `f`, remove them on
+# return, so a library embedding ROSNode keeps its own handlers.
 function _with_signal_handlers(f, ctx::Context)
     installed = false
     try
@@ -1174,11 +1123,9 @@ function _with_signal_handlers(f, ctx::Context)
     end
 end
 
-# Per the design's "scheduler does the work": we don't install a raw sigaction.
-# `exit_on_sigint(false)` makes Julia route a Ctrl-C to the spin task as an
-# `InterruptException`; `_park_until_drained` catches it and drives the graceful
-# request_shutdown (first) / hard exit (second). TODO(layer): SIGTERM + the
-# uv_async_send relay; today SIGINT (Ctrl-C) is the only signal wired.
+# Route Ctrl-C through Julia's scheduler rather than a raw sigaction: `exit_on_sigint(false)`
+# makes Julia deliver SIGINT to the spin task as an `InterruptException`, which
+# `_park_until_drained` turns into a graceful shutdown. Only SIGINT is wired today.
 function _install_signal_handlers!(::Context)
     Base.exit_on_sigint(false)
     return nothing
@@ -1194,8 +1141,7 @@ _ctx(ctx::Context) = ctx
 _ctx(node) = hasproperty(node, :context) ? node.context :
              throw(ArgumentError("expected a Context or a Node holding one"))
 
-# `Node` is the node layer's type, defined in model/node/node.jl (included after
-# this file); its `struct Node` replaces this binding. The forward declaration
-# lets the `Context`/`Node` vocabulary co-export cleanly and the duck-typed
+# Forward declaration: the node layer's `struct Node` (included after this file) replaces
+# this binding, letting the `Context`/`Node` vocabulary co-export and the duck-typed
 # accessors above name it.
 function Node end

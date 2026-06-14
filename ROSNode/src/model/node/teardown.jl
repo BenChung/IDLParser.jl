@@ -8,11 +8,12 @@ iteration for a Subscription), withdraw the liveliness token, drop it from the
 discovery index, and detach any pattern-layer wiring (`entity.wire`). Idempotent.
 """
 function Base.close(e::Entity)
-    (@atomicswap e.open = false) || return nothing
+    (@atomicswap e.open = false) || return nothing   # single-winner close latch
     ctx = e.node.context
 
-    # Close the data route first: undeclaring the subscriber disconnects its FIFO
-    # channel, so the consumer task's `for sample in …` loop terminates cleanly.
+    # Data route first so the consumer task exits via FIFO disconnect rather than being
+    # killed mid-dispatch: undeclaring the subscriber disconnects its channel and the
+    # consumer's recv loop ends cleanly. Then withdraw liveliness, then drop the index.
     if e._route !== nothing
         try
             close(e._route)

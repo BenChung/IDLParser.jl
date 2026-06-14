@@ -1,18 +1,16 @@
 # ── the multi-schema parameter façade ────────────────────────────────────────────
 # A composed node (`@node N = [ … ]`) has one node-core but several member mixins,
 # each with its own typed `ParameterServer{P_M}`. To a ROS2 parameter client the
-# node must still look like ONE node: a single flat namespace, one set of the six
-# standard services, one `/parameter_events`. `CompositeParameterServer` is that
-# façade — it aggregates the member servers behind member-prefixed names
-# (`<member>.<field>`, the per-member name prefix, dot-separated as ROS2 nests
-# parameters) and reuses the schema-independent service core (services.jl) verbatim
-# by implementing the same six reflection handlers + `parameter_names`.
+# node presents as one node: a single flat namespace, one set of the six standard
+# services, one `/parameter_events`. `CompositeParameterServer` is that façade,
+# aggregating the member servers behind member-prefixed names (`<member>.<field>`,
+# dot-separated as ROS2 nests parameters) and reusing the schema-independent service
+# core verbatim through the same six reflection handlers plus `parameter_names`.
 #
 # Each member keeps its own `ParameterServer{P_M}`, so `parameters(m)` stays
-# mixin-local and type-stable; the façade is only the node-level view. It is
-# wired for a composed node, while a single mixin promoted to a node (`run(M)`)
-# keeps the un-prefixed plain server — the prefix tracks the construction
-# path, not the member count.
+# mixin-local and type-stable; the façade is only the node-level view. The prefix
+# tracks the construction path: a composed node gets the façade, while a single
+# mixin promoted to a node (`run(M)`) keeps the un-prefixed plain server.
 
 export CompositeParameterServer
 
@@ -48,9 +46,9 @@ end
 CompositeParameterServer(node, members::Vector{Pair{Symbol, ParameterServer}}) =
     CompositeParameterServer(node, members, nothing, Any[])
 
-# A composed node has no node-level dynamic (undeclared) tier — each member's typed
-# `ParameterServer{P_M}` owns its own. Surface that as a clear error (composed
-# `node.parameters` is a façade), not a `MethodError` from the `ParameterServer`-only form.
+# A composed node's dynamic (undeclared) tier lives on each member's own
+# `ParameterServer{P_M}`. Direct callers to the façade get a clear redirect rather
+# than a `MethodError` from the `ParameterServer`-only form.
 dynamic_parameters(::CompositeParameterServer) =
     throw(ArgumentError("a composed @node has no node-level dynamic parameters; reach a member's server " *
                         "(member schemas are typed — `parameters(m)`)"))
@@ -67,9 +65,9 @@ function _member_server(s::CompositeParameterServer, member::Symbol)
     return nothing
 end
 
-# Split a flat `<member>.<field>` name on its FIRST dot → `(member, field)`, or
-# `nothing` when unprefixed. Member and field names are Julia identifiers (no dots),
-# and members are one level deep, so the first dot is the boundary.
+# Split a flat `<member>.<field>` name on its first dot into `(member, field)`, or
+# `nothing` when unprefixed. Member and field names are Julia identifiers and members
+# are one level deep, so the first dot is the boundary.
 function _split_prefixed(name)
     str = String(name)
     i = findfirst(==('.'), str)
@@ -89,8 +87,8 @@ function _resolve_member_field(s::CompositeParameterServer, name)
 end
 
 # ── the six reflection handlers, flat over `<member>.<field>` ─────────────────────
-# Each mirrors its `ParameterServer` counterpart (services.jl) but splits the
-# prefixed name and delegates to the owning member server; outputs re-prefix.
+# Each mirrors its `ParameterServer` counterpart but splits the prefixed name,
+# delegates to the owning member server, and re-prefixes the output.
 
 function parameter_names(s::CompositeParameterServer)
     names = Symbol[]
@@ -145,12 +143,13 @@ function set_parameters(s::CompositeParameterServer, pairs)
     end
 end
 
-# All-or-nothing across members. Members own independent locks, so true node-wide
-# atomicity would need a two-phase commit; we approximate it: group by member,
-# validate every member's candidate first (coerce + per-field constraints + the user
-# `validate` hook, no commit), and only commit once all pass — so a rejection on any
-# member commits nothing. The residual gap is a concurrent set on a member between
-# the validate and commit phases, acceptable for a composed node's parameter surface.
+# All-or-nothing across members, approximating node-wide atomicity: members own
+# independent locks, so full atomicity would need a two-phase commit. Group by
+# member, validate every member's candidate first (coerce, per-field constraints,
+# the user `validate` hook, no commit), and commit only once all pass, so a rejection
+# on any member commits nothing. Residual gap: a concurrent set on a member between
+# the validate and commit phases can leave earlier members committed while the call
+# reports failure — a deliberate trade-off for a composed node's parameter surface.
 function set_parameters_atomically(s::CompositeParameterServer, pairs)
     bymember = Dict{Symbol, Vector{Tuple{Symbol, Any}}}()
     order = Symbol[]
@@ -182,14 +181,14 @@ function set_parameters_atomically(s::CompositeParameterServer, pairs)
         end
     end
 
-    # phase 2 — commit. Each member's commit fires its forwarding listener; a node-level
-    # atomic set must surface as ONE `/parameter_events` (rclcpp parity), not one per
-    # member. We collect the member batches into a task-local buffer (the member
-    # transactions + their synchronous listeners run on *this* task, so a concurrent
-    # direct `parameters(m)` set on another task is unaffected and still publishes its
-    # own event), then publish a single combined event. `transaction` re-validates under
-    # the member's lock, so a concurrent set that moved the base between phase 1 and here
-    # can still reject — mapped to `(false, reason)` (the `SetParametersResult` contract).
+    # phase 2 — commit, coalescing into ONE `/parameter_events` (rclcpp parity). Each
+    # member commit fires its forwarding listener; the member transactions and their
+    # synchronous listeners run on *this* task, so collecting their batches into a
+    # task-local buffer keyed by `_PARAM_COLLECTOR_KEY` captures exactly this set while a
+    # concurrent direct `parameters(m)` set on another task still publishes its own
+    # event. `transaction` re-validates under the member's lock, so a concurrent set that
+    # moved the base since phase 1 can still reject, mapped to the `(false, reason)`
+    # `SetParametersResult` contract.
     entries = Tuple{String, ParameterEventBatch}[]
     failure = nothing
     task_local_storage(_PARAM_COLLECTOR_KEY, entries) do
@@ -216,13 +215,13 @@ function set_parameters_atomically(s::CompositeParameterServer, pairs)
 end
 
 # ── node-level /parameter_events ──────────────────────────────────────────────────
-# The façade owns the one `/parameter_events` publisher (created by the wiring); the
-# member servers have none. A forwarding listener on each member republishes that
-# member's post-commit batch on the node's publisher with prefixed names — so a
-# change driven through the node-level `~/set_parameters` AND one made directly via
-# `parameters(m)`/`@on_parameter` both surface a node-level event. When a node-level
-# atomic set is in progress on this task, the listener instead *collects* its batch
-# into the task-local buffer so the whole set publishes as one event (above).
+# The façade owns the one `/parameter_events` publisher; member servers have none. A
+# forwarding listener on each member republishes that member's post-commit batch on
+# the node's publisher with prefixed names, so a change driven through the node-level
+# `~/set_parameters` and one made directly via `parameters(m)`/`@on_parameter` both
+# surface a node-level event. During a node-level atomic set on this task, the listener
+# collects its batch into the task-local buffer instead, so the whole set publishes as
+# one event.
 
 # Task-local key under which `set_parameters_atomically` parks its batch collector.
 const _PARAM_COLLECTOR_KEY = :__rosnode_param_event_collector__
@@ -237,10 +236,10 @@ function _wire_composite_events!(s::CompositeParameterServer)
     return s
 end
 
-# The forwarding listener: append to the current task's collector when a node-level
-# atomic set is running (coalesced into one event by the caller), else publish this one
-# member's change immediately. Task-local, so a concurrent direct mutation on another
-# task always takes the immediate path.
+# Forwarding listener: append to the current task's collector during a node-level
+# atomic set (the caller coalesces it into one event), else publish this one member's
+# change immediately. Task-local, so a concurrent direct mutation on another task takes
+# the immediate path.
 function _on_member_event!(s::CompositeParameterServer, prefix::String, batch::ParameterEventBatch)
     collector = get(task_local_storage(), _PARAM_COLLECTOR_KEY, nothing)
     if collector === nothing
@@ -251,9 +250,9 @@ function _on_member_event!(s::CompositeParameterServer, prefix::String, batch::P
     return nothing
 end
 
-# Assemble + publish ONE node-level `ParameterEvent` from a set of `(member-prefix,
-# batch)` entries, prefixing each moved name with `<member>.`. Mirrors
-# `_publish_parameter_event` (services.jl) but over the façade's publisher.
+# Assemble and publish ONE node-level `ParameterEvent` from a set of `(member-prefix,
+# batch)` entries, prefixing each moved name with `<member>.`. The single-server
+# `_publish_parameter_event` counterpart, over the façade's publisher.
 function _publish_event!(s::CompositeParameterServer, entries::Vector{Tuple{String, ParameterEventBatch}})
     s._events_pub === nothing && return nothing
     node = s.node

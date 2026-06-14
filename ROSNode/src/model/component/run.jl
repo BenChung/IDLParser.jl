@@ -3,7 +3,7 @@
 # dependency order), and drives the lifecycle; `container` composes nodes into
 # one process.
 #
-# One assembly path serves both flavours ("vocabulary always, surface opt-in"):
+# One assembly path serves both flavours:
 #   - unmanaged (default): the node-core is a plain `Node`; assembly autostarts
 #     (configure → activate) and there is no control surface or gating cost.
 #   - managed (`managed=true`): the node-core is a `LifecycleNode` (the five
@@ -11,8 +11,6 @@
 #     transitions fan out to the members' `configure`/`activate`/… hooks. Ports
 #     materialise at the configure transition, so an inactive node's entities are
 #     gated/silent until `activate`.
-#
-# Deferred: a warm-up hook (first-run JIT latency).
 
 export @node, @precompile_nodes, describe_wiring
 
@@ -114,15 +112,13 @@ function describe_wiring(io::IO, c::ComponentNode)
     return nothing
 end
 
-# Closing a node tears it down: run each member's `cleanup` in reverse DI order,
-# then undeclare its entities + node token. Unmanaged closes here directly, behind a
-# single-winner `@atomicswap` latch — an `unload_node` service task and the Context
-# drain hook can close concurrently, and `_member_cleanup!`'s materialised-ports guard
-# is check-then-act, not atomic; managed routes through `close(LifecycleNode)` →
-# `shutdown!` → the `on_shutdown` hook, which fans out the same `_member_cleanup!`
-# behind its own latch. `_member_cleanup!` is a no-op on a member whose ports aren't
-# materialised (never configured / already cleaned), so this is safe on a half-built
-# node and idempotent under a (sequential) double close.
+# Closing a node tears it down: run each member's `cleanup` in reverse DI order, then
+# undeclare its entities + node token. The single-winner `@atomicswap` latch makes this
+# idempotent — an `unload_node` service task and the Context drain hook race to close, and
+# `_member_cleanup!`'s materialised-ports guard is check-then-act, not atomic. A managed
+# node routes through `close(LifecycleNode)` → `shutdown!` → its `on_shutdown` hook, which
+# fans out the same `_member_cleanup!` behind its own latch. `_member_cleanup!` no-ops on a
+# member whose ports aren't materialised, so close is safe on a half-built node too.
 function Base.close(c::ComponentNode)
     if c.lifecycle === nothing
         (@atomicswap c.open = false) || return nothing
@@ -222,9 +218,8 @@ macro node(assign)
                 for (nm, mx, rms) in members]
     modu = __module__
     # Register the kind by name (the `rclcpp_components_register_nodes` analog) so a
-    # container's `load_node` can instantiate it from a `ros2 component load` request.
-    # Immediate for the REPL/script case; deferred to `ros_init!` for a precompiled
-    # package (a top-level mutation of ROSNode's registry would not survive precompile).
+    # container's `load_node` can instantiate it. Immediate for the REPL/script case;
+    # deferred to `ros_init!` for a precompiled package.
     return quote
         const $(esc(N)) = $(NodeKind)($(QuoteNode(N)), $(NodeMember)[$(memexprs...)])
         if ccall(:jl_generating_output, Cint, ()) == 0
@@ -246,24 +241,22 @@ end
 # ── module-end bake (`@precompile_nodes`) ───────────────────────────────────────
 # Bake each declared mixin's typed parameter schema (`__ros_pschema_<M>__`), entities accessor
 # (`__ros_entities_<M>__`), and reaction-handler specialisations into the CONSUMING module's
-# precompile image, so a runtime `run(MyNode)` skips that first-touch codegen + JIT. The
-# named `const`s/methods are `Core.eval`'d into the user module (so they ride its pkgimage —
-# never ROSNode-global state, the old `_MIXINS` trap), and the `precompile` of each handler
-# runs INSIDE `@precompile_nodes`' `@compile_workload`, so the transitive frames it pulls in
-# (codecs/dispatch specialised on the user's message types — bakeable only here, since
-# ROSNode's own type-agnostic workload can't know them) are captured into the user image too.
-# Guarded per base so one malformed mixin can't break the package's precompile. Idempotent:
-# at load, `ros_init!`/the materialise path find the markers present and reuse the bakes
-# rather than re-`Core.eval`ing (which would invalidate the baked specialisations).
+# precompile image, so a runtime `run(MyNode)` skips that first-touch codegen + JIT. The named
+# `const`s/methods are `Core.eval`'d into the user module so they ride its pkgimage, and each
+# handler's `precompile` runs inside `@precompile_nodes`' `@compile_workload` so the transitive
+# frames it pulls in (codecs/dispatch on the user's message types, which ROSNode's own
+# type-agnostic workload cannot know) land in the user image too. Guarded per base so one
+# malformed mixin can't break the package's precompile. Idempotent: at load, `ros_init!`/the
+# materialise path find the markers present and reuse the bakes rather than re-`Core.eval`ing.
 function _finalize_module!(mod::Module)
     isdefined(mod, :__mixin_bases__) || return nothing
     for M in getfield(mod, :__mixin_bases__)
         try
             _ensure_schema!(M)                          # __ros_pschema_<M>__ + descriptors/pschema
             nt = _entities_accessor_from_specs!(M)      # __ros_entities_<M>__ + entities(m::M)
-            # Bake handlers only against a typed accessor: a mixin with a non-derivable port
-            # (action/client) keeps the generic `entities`, so its handlers warm at first `run`
-            # instead — baking them here would compile against the generic accessor and be
+            # Bake handlers only once a typed accessor exists. A mixin with a non-derivable
+            # port (action/client) keeps the generic `entities`, so its handlers warm at
+            # first `run`; baking here would compile against the generic accessor and be
             # invalidated when materialise emits the typed one.
             nt === nothing || _anchor_reactions!(M)
         catch err
@@ -374,11 +367,10 @@ _default_name(::Type{M}) where {M} = _snake(String(nameof(M)))
 
 # Function barrier for component reaction callbacks. `p.reaction` is stored `Any`, so a
 # closure capturing it directly (`msg -> react(m, msg)`) types the captured `react` as
-# `Any` and dynamically dispatches the handler on every message/tick — a per-message
-# dispatch, and a handler the warm can't reach. Routing through these `where {F}` helpers
-# specialises on the concrete reaction type, so the captured `react` is concrete and the
-# call static: the materialised callback (hence the whole handler path) is monomorphic and
-# precompilable, with the one dispatch paid once here at configure (DESIGN: G1a/G6).
+# `Any` and dynamically dispatches the handler on every message/tick — and inference dies
+# through it, so the warm never reaches it. Routing through these `where {F}` helpers
+# specialises on the concrete reaction type, so the materialised callback is monomorphic and
+# precompilable, with the one dispatch paid once here at configure.
 _sub_cb(reaction::F, m) where {F} = msg -> reaction(m, msg)     # subscription + service: react(m, x)
 _timer_cb(reaction::F, m) where {F} = () -> reaction(m)         # @every timer: react(m)
 
@@ -394,11 +386,11 @@ function _materialize_ports!(node::Node, m, member::Symbol, specs::Vector{PortSp
         if p.kind === :publisher
             push!(handles, p.name => Publisher(node, _wire(p, wiremap), p.msgtype))
         elseif p.kind === :subscription
-            # `warmup = :off` here: the endpoint's own warm would fire now, before the
-            # typed `entities(m::M)`/`parameters(m::M)` accessors are generated (at the end
-            # of `_member_materialize!`), compiling the handler against the generic
-            # accessors only to invalidate it. The member warms all its reactions once, in
-            # `_warm_member_reactions!`, after those accessors exist (DESIGN: warm timing).
+            # `warmup = :off`: the endpoint's own warm would fire now, before the typed
+            # `entities(m::M)`/`parameters(m::M)` accessors are generated (at the end of
+            # `_member_materialize!`), compiling the handler against the generic accessors only
+            # to invalidate it. The member warms all its reactions once afterward, in
+            # `_warm_member_reactions!`.
             sub = Subscription(_sub_cb(p.reaction, m), node, _wire(p, wiremap), p.msgtype; warmup = :off)
             push!(handles, p.name => sub)
         elseif p.kind === :service
@@ -651,13 +643,12 @@ function _check_runnable(M, what::AbstractString)
     error("$(what): $(M) is not a @mixin")
 end
 
-# Anchor a mixin's reaction handlers against type `M` — `precompile`-only, no user code
-# runs, so it's side-effect-free regardless of policy. Spec-driven and type-driven (specs
-# come from `mixin_spec` keyed at `M`'s base), so the SAME routine serves both the runtime
-# warm (concrete `typeof(m)` — warms the actual instantiation, incl. parametric) and the
-# module-end bake (base mixin — `_finalize_module!`). Must run AFTER the typed accessors
-# exist (so `parameters(m).x`/`entities(m).p` in a handler compile against the typed forms,
-# not the generic ones).
+# Anchor a mixin's reaction handlers against type `M`, `precompile`-only and side-effect-free.
+# Specs come from `mixin_spec` keyed at `M`'s base, so the same routine serves both the
+# runtime warm (concrete `typeof(m)`, warming the actual instantiation incl. parametric) and
+# the module-end bake (base mixin, from `_finalize_module!`). Must run after the typed
+# accessors exist, so `parameters(m).x`/`entities(m).p` in a handler compile against the typed
+# forms rather than the generic ones — otherwise the bake is wasted and then invalidated.
 function _anchor_reactions!(::Type{M}) where {M}
     for p in mixin_spec(_base(M)).ports
         p.reaction === nothing && continue
@@ -681,9 +672,9 @@ function _anchor_reactions!(::Type{M}) where {M}
         elseif p.kind === :timer
             precompile(p.reaction, (M,))
         elseif p.kind === :action
-            # G3: the action adapter calls the user handler via an `Any[]` splat, which
-            # inference can't follow — so the server's adapter-frame warm never anchors
-            # the handler `f`. Anchor it here with the exact signature the adapter calls:
+            # The action adapter calls the user handler via an `Any[]` splat, which inference
+            # can't follow, so the server's adapter-frame warm never anchors the handler `f`.
+            # Anchor it here with the exact signature the adapter calls:
             # `f(m, goalfields…, FeedbackSink{FB})`, sink inserted at `fb_pos`. Guarded —
             # a malformed reconstruction must never break configure/precompile.
             try
@@ -704,9 +695,9 @@ end
 
 # Runtime warm: anchor the member's handlers against its concrete `typeof(m)` once the typed
 # accessors exist. Honours `node.warmup` via `_warmup!` (off / inline-sync / background).
-# Subscriptions' own per-port warm is `:off`ed in `_materialize_ports!`; timers (G6) and
-# services have no other warm. The module-end bake (`@precompile_nodes`) does the same for
-# the base mixin ahead of time, so a baked node skips this work.
+# Subscriptions' own per-port warm is `:off`ed in `_materialize_ports!`; timers and services
+# have no other warm. The module-end bake (`@precompile_nodes`) does the same for the base
+# mixin ahead of time, so a baked node skips this work.
 function _warm_member_reactions!(node::Node, m)
     _warmup!(node.warmup, () -> _anchor_reactions!(typeof(m)))
     return nothing
@@ -724,7 +715,7 @@ function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     # signature and the dedup key, so one method covers every instantiation (a concrete
     # signature here would silently strand other instantiations on the untyped generic).
     _entities_accessor_from_ports!(_base(typeof(m)), ports)
-    # Now that the typed accessors exist, anchor each reaction handler (DESIGN: G1a/G6).
+    # Now that the typed accessors exist, anchor each reaction handler.
     _warm_member_reactions!(cnode.node, m)
     return nothing
 end
@@ -1050,8 +1041,7 @@ deploy-time composition of `run`'s standalone form. Built by
 [`container`](@ref); [`add!`](@ref) instantiates each node on the shared Context, so
 the nodes share one session, discovery, type registry, and Julia scheduler, plus —
 when intra-process delivery is enabled (`container`'s default) — the intra-process
-short-circuit (same-Context publisher↔subscriber pairs bypass serialize/Zenoh/decode;
-owned by the intra-process delivery layer in `performance/intraprocess.jl`).
+short-circuit, where same-Context publisher↔subscriber pairs bypass serialize/Zenoh/decode.
 
 The container is itself a ROS node (`inner_node(c)`, named after the container)
 hosting the `~/_container/{load_node,unload_node,list_nodes}` services over the
@@ -1106,9 +1096,8 @@ container accepts `ros2 component load/unload/list` and the `ComposableNodeConta
 launch action.
 
 `intra_process=true` (default) enables the intra-process short-circuit (same-Context
-publisher↔subscriber pairs bypass serialize/Zenoh/decode; owned by the intra-process
-delivery layer in `performance/intraprocess.jl`) through `set_intra_process!` — a
-process-global switch today.
+publisher↔subscriber pairs bypass serialize/Zenoh/decode) through `set_intra_process!` —
+a process-global switch today.
 
 ```julia
 container("vision") do c

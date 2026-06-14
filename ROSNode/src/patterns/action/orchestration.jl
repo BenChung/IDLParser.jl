@@ -1,9 +1,7 @@
 # ── SingleFlight orchestrator ───────────────────────────────────────────────────
 # An orchestrator over the low-level action API: one active goal plus a bounded
-# queue, the common one-actuator pattern. Wire it with
+# queue, the common single-actuator pattern. Wire it with
 # `on_accepted = g -> submit!(sched, g)` and `execute!(sched) do goal … end`.
-# Pause gates at the dispatch boundary: the loop parks before dispatching the
-# next goal; a running body is unaffected.
 
 """
     SingleFlight(; queue=4) -> SingleFlight

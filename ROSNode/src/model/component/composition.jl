@@ -11,11 +11,11 @@
 export register_node_kind!, node_kind, node_kinds, load_node, unload_node, list_nodes
 
 # ── the node-kind registry (rclcpp_components_register_nodes analog) ─────────────
-# Process-global name → kind. Inherently a runtime registry (string → kind can't
-# dispatch), so unlike the per-mixin spec store it can't move into the defining module.
-# `@mixin`/`@node` therefore register a kind via the dual path — immediately in the
-# REPL/script case, and through `ros_init!` (the load hook) for a precompiled package,
-# where a top-level mutation of this dict would not survive precompile.
+# Process-global name → kind. A string → kind map can't dispatch, so unlike the per-mixin
+# spec store this stays a runtime registry rather than module-local. `@mixin`/`@node`
+# register a kind via the dual path: immediately in the REPL/script case, and through
+# `ros_init!` (the load hook) for a precompiled package, where a top-level mutation of this
+# dict would not survive precompile.
 
 const _NODE_KINDS = Dict{String, Any}()
 const _NODE_KINDS_LOCK = ReentrantLock()
@@ -32,10 +32,8 @@ request.
 `K` is a `NodeKind` (from `@node N = […]`) or a `@mixin` type used directly as
 a node. `@node`/`@mixin` register a kind via the dual path that survives precompilation:
 immediately at module-body evaluation in the REPL/script/`Main` case, and through the
-module's load hook ([`ros_init!`](@ref)) for a precompiled package — where a top-level
-mutation of this registry would be discarded with ROSNode's deserialized state before
-the package cache is written. The call is thread-safe (guarded by the registry lock),
-and a repeated `name` is last-writer-wins.
+module's load hook ([`ros_init!`](@ref)) for a precompiled package. The call is
+thread-safe (guarded by the registry lock), and a repeated `name` is last-writer-wins.
 """
 function register_node_kind!(name::AbstractString, @nospecialize(K))
     @lock _NODE_KINDS_LOCK (_NODE_KINDS[String(name)] = K)

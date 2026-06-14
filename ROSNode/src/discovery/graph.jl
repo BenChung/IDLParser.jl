@@ -1,22 +1,16 @@
-# Discovery, the graph & QoS — all views over one change stream. The Context
-# already owns the discovery index (`GraphIndex`), the liveliness subscriber that
-# feeds it, and the inject/remove seam for our own entities (context.jl). This
-# file is everything built *on top* of that one stream:
+# Views over the Context's discovery index (`GraphIndex`), keyed off the
+# `EndpointInfo` records the index holds — one per discovered endpoint, the unit
+# every query and detector below filters and pairs:
 #
-#   - graph queries (endpoints / publishers_info / count_* / topic_names_and_types
-#     / node_names) over the index snapshot;
-#   - graph waits (service_is_ready / wait_for_service / wait_for_graph_change),
-#     parking on the index's `changed` condition, shutdown-interruptible;
-#   - the mismatch detectors (type-mismatch, QoS-incompat) as `on_graph_change`
-#     listeners — deduped + throttled — firing `on_type_mismatch` /
-#     `on_qos_incompatible` events;
-#   - the QoS event surface sourced from the same stream + the attachment:
-#     liveliness-changed (from the stream) and message-lost (attachment `seq`
-#     gaps). deadline/lifespan enforcement is a per-endpoint concern left as
-#     a TODO — the events feed off the data plane, not the graph.
-#
-# Everything here keys off the `EndpointInfo` records the context owns: one per
-# discovered endpoint, the unit every query and detector below filters and pairs.
+#   - graph queries over the index snapshot (endpoints / publishers_info /
+#     count_* / topic_names_and_types / node_names);
+#   - graph waits that park on the index's `changed` condition, shutdown-
+#     interruptible (service_is_ready / wait_for_service / wait_for_graph_change);
+#   - the type-mismatch and QoS-incompat detectors as `on_graph_change`
+#     listeners, deduped + throttled, firing `on_type_mismatch` /
+#     `on_qos_incompatible`;
+#   - liveliness-changed (from the stream) and message-lost (attachment `seq`
+#     gaps).
 
 using Zenoh: Zenoh
 using ROSZenoh: ROSZenoh, EndpointKind, Publisher, Subscription, Service, Client,
@@ -33,9 +27,8 @@ export endpoints, publishers_info, subscriptions_info,
        qos_compatible, QosIncompatibility
 
 # ── graph queries ───────────────────────────────────────────────────────────
-# Symmetric self+remote queries over the index snapshot. Each filters
-# `endpoints_snapshot(ctx)` (a consistent instant, copied under the lock by
-# context.jl) — never the live dict, so a query can't race a discovery update.
+# Each filters `endpoints_snapshot(ctx)` — a consistent instant copied under the
+# index lock, never the live dict — so a query can't race a discovery update.
 
 """
     endpoints(node_or_ctx; topic=nothing, kind=nothing, node=nothing,
@@ -73,9 +66,7 @@ function endpoints(node_or_ctx; topic::Union{AbstractString, Nothing}=nothing,
                    node::Union{AbstractString, Nothing}=nothing,
                    namespace::Union{AbstractString, Nothing}=nothing)
     ctx = _ctx(node_or_ctx)
-    # Resolve a relative topic filter against the node so it compares to the FQN
-    # form stored in the index. A bare Context has no namespace root for `~`, but
-    # absolute/relative names still resolve.
+    # Resolve the topic filter to the FQN form the index stores.
     want_topic = topic === nothing ? nothing : resolve_name(node_or_ctx, topic)
     out = EndpointInfo[]
     for e in endpoints_snapshot(ctx)
@@ -183,8 +174,7 @@ function node_names(node_or_ctx)
         key = (e.namespace, e.node_name)
         key in seen && continue
         push!(seen, key)
-        # rmw_zenoh always writes "%" in the enclave slot, so no enclave survives
-        # the wire; report empty rather than invent one.
+        # rmw_zenoh writes "%" in the enclave slot, so no enclave survives the wire.
         push!(out, NodeInfo(e.node_name, e.namespace, ""))
     end
     out
@@ -192,14 +182,12 @@ end
 
 # ── graph waits — park on the change stream, shutdown-interruptible ──────────
 # Every wait re-checks a predicate over the snapshot, then blocks on the index's
-# `changed` condition until the next discovery event re-checks. The Context's
-# drain notifies the same condition (`all=true`, context.jl step 1), so a blocked
-# wait wakes and raises `ShutdownException` rather than hanging the drain.
+# `changed` condition until the next discovery event. The Context drain notifies
+# the same condition, so a blocked wait wakes and raises `ShutdownException`
+# rather than hanging the drain.
 
-# Block until `pred()` holds or the deadline/shutdown fires. Returns true if the
-# predicate became true; false on timeout. Raises ShutdownException if the Context
-# drains while we wait (the cooperative unwind signal). `timeout` is seconds;
-# `nothing` waits forever.
+# Block until `pred()` holds (true), the deadline elapses (false), or the Context
+# drains (raises ShutdownException). `timeout` is seconds; `nothing` waits forever.
 function _wait_on_graph(ctx::Context, pred; timeout::Union{Real, Nothing})
     pred() && return true
     deadline = timeout === nothing ? nothing : time() + Float64(timeout)
@@ -212,9 +200,9 @@ function _wait_on_graph(ctx::Context, pred; timeout::Union{Real, Nothing})
             else
                 remaining = deadline - time()
                 remaining <= 0 && return false
-                # `Threads.Condition` has no timed wait; arm a one-shot Base.Timer
-                # to notify us at the deadline so the loop re-checks and times out.
-                # The timer fires on its own task and must take the lock to notify.
+                # `Threads.Condition` has no timed wait; a one-shot Timer notifies
+                # at the deadline so the loop re-checks. It fires on its own task,
+                # so it must take the lock to notify.
                 t = Base.Timer(remaining) do _
                     @lock ctx.graph.changed notify(ctx.graph.changed)
                 end
@@ -253,9 +241,7 @@ function service_is_ready(node, service_name::AbstractString)
     false
 end
 
-# Client form, duck-typed against the handle's shape: any client holding an
-# `Entity` in `.entity` (`ServiceClient` does) whose `endpoint.topic` is the
-# resolved service name and whose `node` we query through.
+# Client form: read the resolved name and node off the handle's `.entity`.
 function service_is_ready(client)
     e = _client_entity(client)
     service_is_ready(e.node, e.endpoint.topic)
@@ -295,10 +281,10 @@ function wait_for_service(node, service_name::AbstractString;
     _wait_on_graph(ctx, () -> _service_present(ctx, want); timeout=timeout)
 end
 
-# Client form: wait on the routing-plane match (`service_matched`) — the guarantee
-# that `call` will actually reach a server, not just liveliness. The (lazily
-# declared) match listener notifies `ctx.graph.changed`, so we reuse
-# `_wait_on_graph` for timeout + shutdown-interruptibility for free.
+# Client form: wait on the routing-plane match (`service_matched`), the guarantee
+# that `call` reaches a server rather than mere graph liveliness. The lazily-
+# declared match listener notifies `ctx.graph.changed`, so this reuses
+# `_wait_on_graph` for the timeout and shutdown-interruptibility.
 function wait_for_service(client::ServiceClient; timeout::Union{Real, Nothing}=nothing)
     _ensure_match_listener!(client)
     ctx = client.entity.node.context
@@ -306,7 +292,7 @@ function wait_for_service(client::ServiceClient; timeout::Union{Real, Nothing}=n
 end
 
 # Generic fallback for any other handle carrying an `.entity` (or an `Entity`):
-# liveliness only — it has no querier to read routing match from.
+# liveliness only, since it has no querier to read a routing match from.
 function wait_for_service(client; timeout::Union{Real, Nothing}=nothing)
     e = _client_entity(client)
     wait_for_service(e.node, e.endpoint.topic; timeout=timeout)
@@ -336,7 +322,6 @@ function wait_for_action_server(client::ActionClient; timeout::Union{Real, Nothi
     _wait_on_graph(client.node.context, () -> all(_wire_matched, ws); timeout=timeout)
 end
 
-# Predicate over the snapshot: a Service endpoint on `want` exists.
 function _service_present(ctx::Context, want::AbstractString)
     for e in endpoints_snapshot(ctx)
         e.kind === Service && e.topic == want && return true
@@ -344,9 +329,8 @@ function _service_present(ctx::Context, want::AbstractString)
     false
 end
 
-# Recover the [`Entity`](@ref) a client handle wraps. The pattern handles
-# ([`PublisherHandle`](@ref), [`SubscriptionHandle`](@ref), [`ServiceClient`](@ref))
-# all hold one in a `.entity` field — accept that shape directly, or a bare Entity.
+# Recover the [`Entity`](@ref) a client handle wraps: the pattern handles all hold
+# one in a `.entity` field. Accept that shape, or a bare Entity.
 _client_entity(e::Entity) = e
 _client_entity(client) = hasproperty(client, :entity) ? client.entity::Entity :
     throw(ArgumentError("wait_for_service expects a service client (or node + name)"))
@@ -365,7 +349,7 @@ The predicate compares the index keyset before and after each wakeup, so a
 spurious notify (an in-place endpoint update with no add or remove) keeps
 waiting, and add/remove churn that restores the original keyset between wakeups
 coalesces away. For a push-based callback on every change, register an
-`on_graph_change` listener (context.jl).
+[`on_graph_change`](@ref) listener.
 """
 function wait_for_graph_change(node_or_ctx; timeout::Union{Real, Nothing}=nothing)
     ctx = _ctx(node_or_ctx)
@@ -377,14 +361,14 @@ _graph_keyset(ctx::Context) = @lock ctx.graph.lock Set(keys(ctx.graph.endpoints)
 
 # ── mismatch detection — views on the change stream ─────────────────────────
 # Both detectors are `on_graph_change` listeners: when an endpoint appears, they
-# compare it to the standing endpoints on the other side of the local/remote
-# divide on the same topic and, on a violation, fire a programmatic event and
-# emit a throttled+deduped warning. Detection is per matched (ours, theirs)
-# pair, keyed so we report each distinct mismatch once.
+# compare it to the standing endpoints across the local/remote divide on the same
+# topic and, on a violation, fire an event and a throttled `@warn`. Detection is
+# per matched (local, remote) pair, keyed so each distinct mismatch reports once.
 #
-# The graph is the primary signal; for type-mismatch a per-sample backstop in the
+# The graph is the primary signal. For type-mismatch a per-sample backstop in the
 # subscription path (`check_sample_type`) catches wildcard subs whose concrete
-# remote type only shows up on the wire.
+# remote type shows up only on the wire; it shares the signature so a mismatch
+# seen both ways still fires listeners once.
 
 """
     TypeMismatch(local_endpoint, remote_endpoint, reason, suggestion)
@@ -421,20 +405,16 @@ struct QosIncompatible
     suggestion::String
 end
 
-# The detector state hangs off the Context's graph, lazily attached on first
-# `on_type_mismatch`/`on_qos_incompatible` registration. Holds the user event
-# listeners + the dedupe/throttle bookkeeping. Stored in the GraphIndex's
-# `listeners` indirectly (we register one umbrella listener that fans out), but
-# kept here as a Context-keyed singleton so repeated registration is cheap.
-
+# Per-Context detector state: the user event listeners plus the two independent
+# dedup gates. One umbrella `on_graph_change` listener fans out to both detectors.
 mutable struct _Detectors
     lock::ReentrantLock
     type_listeners::Vector{Any}
     qos_listeners::Vector{Any}
-    # signature → last-warned monotonic seconds, for log throttling + dedupe.
+    # signature → last-warned monotonic seconds, throttling repeat `@warn`s.
     seen::Dict{Any, Float64}
-    # signatures whose listeners have already fired — edge-trigger, no time
-    # component, so a hot per-sample mismatch fans out once, never time-debounced.
+    # signatures whose listeners have already fired: edge-trigger with no time
+    # component, so a hot per-sample mismatch fans out once.
     fired::Set{Any}
     installed::Bool                 # the umbrella on_graph_change is registered
     throttle_s::Float64             # min seconds between repeat warnings per signature
@@ -442,8 +422,8 @@ end
 _Detectors() = _Detectors(ReentrantLock(), Any[], Any[], Dict{Any, Float64}(),
                           Set{Any}(), false, 5.0)
 
-# One detector-state per Context, keyed by `objectid(ctx.graph)` so we don't extend
-# the Context struct. The GraphIndex object's identity is stable for its lifetime.
+# Keyed by `objectid(ctx.graph)` (stable for the GraphIndex's lifetime) so the
+# detector state need not be a field on the Context struct.
 const _DETECTORS = Dict{UInt, _Detectors}()
 const _DETECTORS_LOCK = ReentrantLock()
 
@@ -452,9 +432,8 @@ function _detectors(ctx::Context)
     @lock _DETECTORS_LOCK get!(() -> _Detectors(), _DETECTORS, k)
 end
 
-# Register the umbrella `on_graph_change` listener once: it scans `change.added`
-# for endpoints that match (by topic) a standing endpoint on the other side and
-# dispatches the two detectors. Idempotent — guarded by `installed`.
+# Register the umbrella `on_graph_change` listener once (guarded by `installed`):
+# it dispatches both detectors over each change's added endpoints.
 function _ensure_detectors_installed!(ctx::Context, d::_Detectors)
     @lock d.lock begin
         d.installed && return nothing
@@ -467,12 +446,10 @@ function _ensure_detectors_installed!(ctx::Context, d::_Detectors)
     nothing
 end
 
-# For each freshly-added endpoint, find the standing endpoints across the
-# local/remote divide — an added remote vs our locals, an added local vs the
-# already-discovered remotes — on the same topic with the complementary kind
-# (their pub ↔ our sub, their sub ↔ our pub) and check type + QoS.
-# Local-vs-local and remote-vs-remote are not our concern. Checks always run as
-# (local, remote) pairs, so a pair added in one change dedupes to one signature.
+# For each added endpoint, pair it across the local/remote divide on the same
+# topic with the complementary kind (pub ↔ sub, service ↔ client) and check type
+# + QoS. Checks always run as (local, remote) pairs so a pair added in one change
+# dedupes to one signature; local-vs-local and remote-vs-remote are skipped.
 function _run_detectors(ctx::Context, d::_Detectors, added::Vector{EndpointInfo})
     snapshot = endpoints_snapshot(ctx)
     locals = filter(e -> e.is_local, snapshot)
@@ -490,11 +467,10 @@ function _run_detectors(ctx::Context, d::_Detectors, added::Vector{EndpointInfo}
     nothing
 end
 
-# Retroactive scan for one just-registered listener (D8 `scan=true`): walk the
-# standing snapshot once, pairing local↔remote complementary endpoints exactly as
+# Retroactive scan for one just-registered listener (`scan=true`): walk the
+# standing snapshot once, pairing local↔remote complementary endpoints as
 # `_run_detectors` does, and deliver each pre-existing mismatch to `f` alone. The
-# D6 `fired` edge-trigger set is honoured so a later change does not double-fire,
-# and a signature already fired by a change is skipped here.
+# shared `fired` edge-trigger set keeps a later change from double-firing.
 function _scan_for_listener!(ctx::Context, d::_Detectors, f::Function, kind::Symbol)
     snapshot = endpoints_snapshot(ctx)
     locals = filter(e -> e.is_local, snapshot)
@@ -508,8 +484,8 @@ function _scan_for_listener!(ctx::Context, d::_Detectors, f::Function, kind::Sym
     nothing
 end
 
-# Scan variant of `_check_type_mismatch`/`_emit_type_mismatch`: same comparison and
-# signature, but mark-fired-then-deliver only to `f` (no full fan-out, no `@warn`).
+# Scan variant of `_check_type_mismatch`: same comparison and signature, but
+# delivers only to `f` (no full fan-out, no `@warn`).
 function _scan_type_mismatch(d::_Detectors, f::Function, local_e::EndpointInfo, remote::EndpointInfo)
     lt = local_e.type
     rt = remote.type
@@ -529,8 +505,8 @@ function _scan_type_mismatch(d::_Detectors, f::Function, local_e::EndpointInfo, 
     nothing
 end
 
-# Scan variant of `_check_qos_incompat`/`_emit_qos_incompat`: same RxO check and
-# signature, delivered only to `f`.
+# Scan variant of `_check_qos_incompat`: same RxO check and signature, delivered
+# only to `f`.
 function _scan_qos_incompat(d::_Detectors, f::Function, local_e::EndpointInfo, remote::EndpointInfo)
     requested, offered = if local_e.kind === Subscription || local_e.kind === Client
         (local_e.qos, remote.qos)
@@ -554,9 +530,9 @@ _complementary(a::EndpointKind, b::EndpointKind) =
     (a === Service && b === Client) ||
     (a === Client && b === Service)
 
-# Compare a local endpoint's TypeInfo to a remote's. Skip if either side carries
-# no type (an EMPTY_TOPIC_TYPE token — nothing to compare). Name differs ⇒ wrong
-# type; same name, hash differs ⇒ wrong version (decode-unsafe).
+# Compare TypeInfos (skipping an EMPTY_TOPIC_TYPE token on either side): a
+# different name is the wrong type; the same name with a different RIHS01 is a
+# version skew, and the remote's bytes are decode-unsafe against the local struct.
 function _check_type_mismatch(d::_Detectors, local_e::EndpointInfo, remote::EndpointInfo)
     lt = local_e.type
     rt = remote.type
@@ -573,9 +549,8 @@ function _check_type_mismatch(d::_Detectors, local_e::EndpointInfo, remote::Endp
     nothing
 end
 
-# Check RxO: offered must be ≥ requested. The subscription side is the requester.
-# Run the check in the right direction for the local/remote roles, then merge —
-# `qos_compatible(requested, offered)` (ROSZenoh) returns the violations.
+# DDS Request-vs-Offered: the subscription (or client) is the requester. Run
+# `qos_compatible` in the role's direction; it returns the policy violations.
 function _check_qos_incompat(d::_Detectors, local_e::EndpointInfo, remote::EndpointInfo)
     requested, offered = if local_e.kind === Subscription || local_e.kind === Client
         (local_e.qos, remote.qos)
@@ -589,10 +564,11 @@ function _check_qos_incompat(d::_Detectors, local_e::EndpointInfo, remote::Endpo
         join(("offered $(i.policy)=$(i.offered) < requested $(i.requested)" for i in issues), ", "))
 end
 
-# Two-gate split: `@warn` is throttled (`_mark_seen!`, 5 s/signature) as log-spam
-# control; the listener fan-out is edge-triggered (`_mark_fired!`, once per
-# distinct (topic, kinds, reason)) so a listener sees every distinct mismatch but
-# is never time-debounced.
+# Two independent gates: the `@warn` is time-throttled (`_mark_seen!`, 5 s per
+# signature) for log-spam control, while the listener fan-out is edge-triggered
+# (`_mark_fired!`, once per distinct (topic, kinds, reason)) so a listener sees
+# every distinct mismatch but is never time-debounced. Conflating them would let
+# a listener miss a mismatch during the throttle window.
 function _emit_type_mismatch(d::_Detectors, local_e, remote, reason, suggestion)
     sig = (:type, local_e.topic, local_e.kind, remote.kind, reason)
     _mark_seen!(d, sig) &&
@@ -604,12 +580,11 @@ function _emit_type_mismatch(d::_Detectors, local_e, remote, reason, suggestion)
     nothing
 end
 
-# Route a pre-built `TypeMismatch` — from the per-sample weak-static backstop
-# (`check_sample_type`) — through the SAME two-gate split as `_emit_type_mismatch`
-# (signature mirrors it), so one logical mismatch reports once across both the
-# on-the-wire and graph paths. This fires per mismatched SAMPLE: the throttled
-# `@warn` bounds the log, and the edge-triggered fan-out (`_mark_fired!`) keeps a
-# hot mismatched topic from flooding listeners.
+# Route a pre-built `TypeMismatch` from the per-sample backstop
+# (`check_sample_type`) through the same two gates and the same signature as
+# `_emit_type_mismatch`, so a mismatch seen on the wire and in the graph reports
+# once. Fires per mismatched sample, so the edge-trigger is what keeps a hot
+# mismatched topic from flooding listeners.
 function report_type_mismatch!(ctx::Context, tm::TypeMismatch)
     d = _detectors(ctx)
     sig = (:type, tm.local_endpoint.topic, tm.local_endpoint.kind,
@@ -634,8 +609,8 @@ function _emit_qos_incompat(d::_Detectors, local_e, remote, issues, suggestion)
     nothing
 end
 
-# Record a signature; return true if it's the first time (or the throttle window
-# has elapsed since we last reported it). Bounds repeat reports per signature.
+# Time-throttle gate: true the first time a signature is seen or once the throttle
+# window has elapsed since the last report, bounding repeat `@warn`s per signature.
 function _mark_seen!(d::_Detectors, sig)
     now = time()
     @lock d.lock begin
@@ -648,9 +623,8 @@ function _mark_seen!(d::_Detectors, sig)
     end
 end
 
-# Edge-trigger: return true only the first time a signature stands up (no time
-# component), so the listener fan-out fires once per distinct mismatch and never
-# floods on a per-sample backstop hitting a hot mismatched topic.
+# Edge-trigger gate: true only the first time a signature stands up, so the
+# listener fan-out fires once per distinct mismatch even on a hot per-sample topic.
 function _mark_fired!(d::_Detectors, sig)
     @lock d.lock (sig in d.fired ? false : (push!(d.fired, sig); true))
 end
@@ -755,10 +729,9 @@ sample's topic keyexpr and compare its `TypeInfo` to the
 subscription's. Returns a `TypeMismatch` (and lets the caller decide to drop/warn)
 or `nothing` when types agree or the key carries no type (ros2dds, EMPTY).
 
-The subscription dispatch path (`_predispatch`, dispatch.jl) calls this before
-decoding for weak-static subscriptions and routes a mismatch to the
-type-mismatch listeners; a hash mismatch means the bytes are
-decode-unsafe against the local struct.
+The subscription dispatch path calls this before decoding for weak-static
+subscriptions and routes a mismatch to the type-mismatch listeners; a hash
+mismatch means the bytes are decode-unsafe against the local struct.
 """
 function check_sample_type(sub, sample)
     e = _client_entity(sub)
@@ -784,8 +757,8 @@ function check_sample_type(sub, sample)
     nothing
 end
 
-# A minimal remote `EndpointInfo` for a per-sample mismatch: we only learn the
-# type from the key, not the remote's node/QoS, so fill what we know.
+# A minimal remote `EndpointInfo` for a per-sample mismatch: the keyexpr yields
+# only the type, so the node and QoS fields stay empty.
 _remote_shell(local_endpoint, got::TypeInfo) =
     EndpointInfo("", "", Publisher, local_endpoint.topic, got,
                  local_endpoint.qos, ntuple(_ -> 0x00, 16), false)
@@ -795,12 +768,11 @@ _remote_shell(local_endpoint, got::TypeInfo) =
 """
     liveliness_changed(node_or_ctx, topic) -> (; alive, not_alive)
 
-A snapshot of the liveliness of *remote* publishers on `topic` (resolved FQN),
-sourced from the discovery stream: `alive` is the count currently present
-in the graph. There is no separate liveliness protocol — a Zenoh liveliness token
-present ⇒ alive, withdrawn (DELETE) ⇒ not alive, which the index already tracks.
-For change *events*, register an [`on_graph_change`](@ref) listener filtered to
-the topic; this is the point-in-time count.
+A point-in-time count of live *remote* publishers on `topic` (resolved FQN),
+read straight from the discovery stream: `alive` is the number currently present
+in the graph. Liveliness rides the Zenoh tokens the index already tracks — a
+present token means alive, a withdrawn (DELETE) one means gone. For change
+*events*, register an [`on_graph_change`](@ref) listener filtered to the topic.
 
 `not_alive` is `0` here: the graph holds only live tokens (a withdrawn token is
 removed), so we report transitions via the change stream rather than a standing
@@ -891,10 +863,9 @@ Feed one received sample to the message-lost detector for `sub`: decode
 `gid`, fire the `on_message_lost` listeners and return the `MessageLost`. Returns
 `nothing` when in-order (or the very first message from a gid, or the sample
 carries no usable attachment). The subscription dispatch path calls this per
-sample, gated on `Entity._track_lost`.
+sample, gated on `Entity._track_lost`, so the common no-listener path never
+decodes the attachment.
 """
-# dispatch.jl gates this call on `Entity._track_lost`, so the common no-listener
-# path never decodes the attachment.
 function note_sequence!(sub, sample)
     e = _client_entity(sub)
     decoded = try
@@ -927,17 +898,16 @@ function note_sequence!(sub, sample)
     lost
 end
 
-# Drop a subscription's detector state when it closes (called from the entity
-# teardown path, teardown.jl); safe to call for entities that never registered one.
+# Drop a subscription's detector state on close (from the entity teardown path);
+# safe for entities that never registered one.
 function _forget_lost_tracker!(e::Entity)
     @lock _LOST_LOCK delete!(_LOST, objectid(e))
     nothing
 end
 
-# deadline-missed (per-endpoint Timer) and lifespan (drop on attachment-ts age)
-# enforcement are data-plane concerns, not graph views; they hang off the
-# subscription's dispatch + a per-endpoint clock.
-# TODO: deadline-missed Timer (notify-only, matches ROS2) and lifespan
-# drop (compare `source_timestamp` to `now` against `qos.lifespan`). Both want
-# the node clock + the subscription dispatch hook; left as a stub here so this file
-# stays a pure view over the graph + attachment stream and precompiles standalone.
+# deadline-missed and lifespan enforcement are data-plane concerns: they need the
+# node clock and the subscription dispatch hook, so they belong with dispatch, not
+# here. Keeping them out leaves this file a pure view over the graph + attachment
+# stream that precompiles standalone.
+# TODO: deadline-missed Timer (notify-only, matches ROS2) and lifespan drop
+# (compare `source_timestamp` to `now` against `qos.lifespan`).

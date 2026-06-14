@@ -3,8 +3,8 @@
 # Dict{Symbol, ResolveEntry}` (key = RIHS01 string) into its image, mapping a wire type
 # to the Julia struct this module resolves it to. `_merge_resolve!` builds it at the
 # module's precompile, where the loaded-module set is exactly the module's dependency
-# closure, so the table is a pure function of the declared deps and immune to runtime
-# load order. A Context resolves through one module's table (its `home`).
+# closure, making the table a pure function of the declared deps and load-order
+# independent. A Context resolves through one module's table (its `home`).
 
 """
     ResolveEntry(type, origin, tied)
@@ -35,9 +35,9 @@ function _warn_tie(rihs::Symbol, keep::ResolveEntry, drop::ResolveEntry)
            shared message package so they alias a single struct." rihs=String(rihs) maxlog=1
 end
 
-# Fold source table `src` into `dst` (this module's). Agreement (diamond) is a no-op;
-# a fresh fork is picked deterministically by the fully-qualified type string, marked
-# `tied`, and warned once; an already-`tied` settlement is sticky.
+# Fold source table `src` into `dst` (this module's). Agreement (diamond) is a no-op; a
+# fresh fork is picked deterministically by fully-qualified type string, marked `tied`,
+# and warned once. An already-`tied` settlement is sticky.
 function _fold_resolve!(dst::Dict{Symbol, ResolveEntry}, src::Dict{Symbol, ResolveEntry})
     for (sym, e) in src
         prev = get(dst, sym, nothing)

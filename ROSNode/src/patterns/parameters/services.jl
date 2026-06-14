@@ -263,11 +263,11 @@ function _from_param_value(pv)
 end
 
 # An internal `ParameterDescriptor` → the wire `rcl_interfaces/msg/ParameterDescriptor`.
-# The constraint forms (numeric range / choice set) don't map onto ROS2's
-# `FloatingPointRange`/`IntegerRange` arms cleanly (those carry a step and a single
-# value type), so we leave the range sequences empty and surface the human form via
-# `additional_constraints`. `dynamic_typing` is true only for a synthesized dynamic
-# descriptor (no fixed declared type).
+# The numeric-range and choice-set constraints travel as the human
+# `additional_constraints` string with the range sequences left empty: ROS2's
+# `FloatingPointRange`/`IntegerRange` arms carry a step and a single value type that
+# the tuple constraint does not map onto. `dynamic_typing` is true only for a
+# synthesized dynamic descriptor (no fixed declared type).
 function _to_descriptor(d::ParameterDescriptor)
     constraints = d.constraint === nothing ? "" : string("∈ ", d.constraint)
     return _WireDescriptor(; name = String(d.name), type = UInt8(d.ptype),
@@ -385,9 +385,10 @@ function Node(ctx::Context, name::AbstractString, ::Type{P};
     server = ParameterServer{P}(node; overrides = overrides, allow_undeclared = allow_undeclared)
     wire_parameter_services!(server)
     node.parameters = server
-    # Startup overrides commit through the ctor, NOT a transaction, so the `use_sim_time`
-    # event hook never fires for them. Activate sim explicitly if the committed value
-    # is true, so a node started with `use_sim_time=true` follows `/clock` from the start.
+    # Startup overrides commit through the ctor rather than a transaction, so the
+    # `use_sim_time` event hook never fires for them. Activate sim explicitly when the
+    # committed value is true, so a node started with `use_sim_time=true` follows
+    # `/clock` from the start.
     if hasfield(P, :use_sim_time) && getfield((@atomic server.value), :use_sim_time) === true
         set_use_sim_time!(ctx, node, true)
     end

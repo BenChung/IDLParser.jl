@@ -1,23 +1,17 @@
-# Introspection — the dual of discovery: we serve the interfaces others use
-# to inspect us. Two facilities live here:
+# Introspection: the interfaces a peer uses to inspect this node, wired against the
+# vendored `type_description_interfaces` / `rcl_interfaces` wire types. Two facilities:
 #
 #   • `~/get_type_description` — a Service answering from the Context type registry.
-#     Every registered type carries its `TypeDescription`; the served
-#     closure is canonicalized so its RIHS01 matches the hash we advertise, and
-#     a request for an unknown (name, hash) is a clean `successful=false` reply.
+#     The served closure is canonicalized so its RIHS01 matches the hash advertised
+#     on the graph, and an unknown (name, hash) gets a clean `successful=false` reply.
+#     An `include_type_sources` request also returns `type_sources` regenerated from
+#     each served entry's IL (`IL.unparse`).
 #   • the `/rosout` bridge — an `AbstractLogger` teeing Julia logging to the parent
 #     logger and to a node-owned `rcl_interfaces/msg/Log` publisher, so a Julia
 #     `@info`/`@warn` on a node surfaces on the ROS `/rosout` topic.
-#
-# Both are wired against the vendored `type_description_interfaces` / `rcl_interfaces`
-# wire types (the `Interfaces` subtree, wellknown.jl): `~/get_type_description`
-# serves real `TypeDescription`s from the type registry, and the `/rosout` bridge
-# publishes `rcl_interfaces/msg/Log`. A request with `include_type_sources` also gets
-# `type_sources` regenerated from each served entry's IL (`IL.unparse`).
 
 import Logging
 using Logging: AbstractLogger, LogLevel
-# `TypeInfo` is in scope (core.jl re-exports it); the RIHS-string parser is not.
 using ROSZenoh: TypeInfo, type_hash_from_rihs_string
 
 export RosoutLogger, with_rosout, Fatal, logger, set_logger_level!,
@@ -25,14 +19,13 @@ export RosoutLogger, with_rosout, Fatal, logger, set_logger_level!,
        resolve_or_discover, wire_get_type_description!, describe_type
 
 # ── ~/get_type_description: the registry-served type description ───────────────
-# rmw_zenoh exposes `~/get_type_description` (a `type_description_interfaces/srv/
-# GetTypeDescription` service) so a peer that sees our (name, RIHS01) on the graph
-# but doesn't have the type can fetch its `TypeDescription` from us and codegen it
-# (the dynamic type-discovery handshake, seen from the *serving* side). The request
-# is `(type_name::String, type_hash::String, include_type_sources::Bool)`; the
-# reply is `(successful::Bool, failure_reason::String, type_description, …)`.
-# Canonicalization (and the entry shape) is typesupport's; here we own the lookup,
-# the hash-string parsing, and the not-found contract.
+# The serving side of rmw_zenoh's dynamic type discovery: a peer that sees a
+# (name, RIHS01) on the graph but lacks the type fetches its `TypeDescription`
+# here and codegens it. The request is
+# `(type_name::String, type_hash::String, include_type_sources::Bool)`; the reply
+# is `(successful::Bool, failure_reason::String, type_description, …)`. This file
+# owns the registry lookup, the hash-string parsing, and the not-found contract;
+# canonicalization and the entry shape are typesupport's.
 
 """
     describe_type(ctx_or_node, type_name, type_hash) -> Union{TypeDescriptionMsg, Nothing}
@@ -76,9 +69,8 @@ function describe_type(ctx_or_node, type_name::AbstractString,
     return _entry_type_description(reg, entry)
 end
 
-# Registry is keyed on `(name, hash)`; a name-only lookup scans for the first
-# entry whose name matches, under the registry's own lock. Lives here as an
-# introspection-specific convenience over the generic `(name, hash)` key.
+# The registry is keyed on `(name, hash)`, so a name-only lookup scans under the
+# registry lock for the first entry whose name matches.
 function _lookup_any_version(reg, name::String)
     @lock reg.lock begin
         for ((n, _h), entry) in reg.entries
@@ -88,13 +80,10 @@ function _lookup_any_version(reg, name::String)
     return nothing
 end
 
-# Project a registry entry to the canonical internal `TypeDescriptionMsg` we
-# serve. An entry's stored `td` (wire-discovered / cached / well-known) is served
-# directly, closure sorted by `type_name` so `calculate_rihs01_hash` of what we
-# serve equals the hash we advertise (hash parity). An IL-only entry (ament/
-# static) is rebuilt — lower to the struct AST, collect the referenced closure
-# from the registry, rebuilding IL-only refs the same way. `nothing` when the
-# entry has neither a `td` nor a recoverable struct AST — a fail-safe not-found.
+# Project a registry entry to the canonical internal `TypeDescriptionMsg`. A
+# stored `td` is canonicalized and served directly; an IL-only entry is rebuilt
+# from the struct AST with its referenced closure collected from the registry.
+# `nothing` (a fail-safe not-found) when the entry has neither.
 function _entry_type_description(reg, entry::RegistryEntry)
     entry.td !== nothing && return _canonicalize_tdmsg(entry.td)
     main = _entry_main_td(entry)
@@ -102,16 +91,15 @@ function _entry_type_description(reg, entry::RegistryEntry)
     return TypeDescriptionMsg(main, _collect_registry_closure(reg, main))
 end
 
-# Re-sort a TypeDescriptionMsg's referenced closure by `type_name` — the canonical
-# order the RIHS01 hash is defined over (the hash itself does not sort).
+# Sort the referenced closure by `type_name`, the canonical order RIHS01 is
+# defined over, so what we serve re-hashes to the hash advertised on the graph.
 _canonicalize_tdmsg(td::TypeDescriptionMsg) =
     isempty(td.referenced_type_descriptions) ? td :
     TypeDescriptionMsg(td.type_description,
         sort(td.referenced_type_descriptions; by = t -> t.type_name))
 
-# The main internal `TypeDescription` of a registry entry, if recoverable: its
-# stored `td`'s main, else rebuilt from the IL via the struct AST — one path for
-# the described type and for the IL-only refs in its closure.
+# The main internal `TypeDescription` of a registry entry: its stored `td`'s main,
+# else rebuilt from the IL via the struct AST. Reused for IL-only refs in a closure.
 function _entry_main_td(e::RegistryEntry)
     e.td !== nothing && return e.td.type_description
     pkg, _, _ = split_ros_name(e.info.name)
@@ -124,10 +112,10 @@ function _entry_main_td(e::RegistryEntry)
     return type_description_from_struct(ast, e.info.name; package = pkg, qualifier = "msg")
 end
 
-# Transitively collect the referenced types of `main` from the registry (by name),
-# sorted by `type_name` — the closure a peer needs to codegen a referencing type.
-# An unresolvable ref throws: a truncated closure would re-hash to a
-# RIHS01 differing from the advertised one and fail every peer's integrity gate.
+# Transitively collect `main`'s referenced types from the registry, sorted by
+# `type_name` — the closure a peer needs to codegen a referencing type. An
+# unresolvable ref throws: a truncated closure re-hashes to a RIHS01 differing
+# from the advertised one and fails every peer's integrity gate.
 function _collect_registry_closure(reg, main::TypeDescription)
     seen = Set{String}()
     out = TypeDescription[]
@@ -209,9 +197,8 @@ function fetch_type_description(node, remote::AbstractString, type_name::Abstrac
     client = ServiceClient(node, svc, GetTypeDescription_Request)
     try
         # Discovery is eventually-consistent: a query issued before the remote's
-        # queryable is routable matches nothing and never replies. Wait for the service
-        # to appear (same budget) before querying — else the get silently round-trips to
-        # nothing on a cold route.
+        # queryable is routable silently matches nothing. Wait for the service to
+        # become routable (same budget) before querying.
         if !wait_for_service(client; timeout = timeout_ms / 1000)
             @debug "fetch_type_description: service not discovered" remote svc timeout_ms
             return nothing
@@ -224,8 +211,8 @@ function fetch_type_description(node, remote::AbstractString, type_name::Abstrac
         end
         tdmsg = from_wire_td(resp.type_description)
         info = TypeInfo(String(type_name), th)
-        # register_type_description! runs the RIHS01 integrity gate; a mismatch
-        # throws (never trust a definition that doesn't hash to its advertised id).
+        # register_type_description! runs the RIHS01 integrity gate: a definition
+        # that doesn't hash to its advertised id throws rather than binding.
         return register_type_description!(registry(_ctx(node)), tdmsg, info)
     catch err
         err isa ShutdownException && rethrow()
@@ -236,10 +223,10 @@ function fetch_type_description(node, remote::AbstractString, type_name::Abstrac
     end
 end
 
-# The remote node FQN advertising `(name, hash)` on the graph, to call its
-# `~/get_type_description`. Scans the discovery index for any endpoint with this
-# exact TypeInfo and a known node identity; prefers a remote (non-local) one (our
-# own types were already checked in the registry). `nothing` if none is visible.
+# The node FQN advertising `(name, hash)` on the graph, to call its
+# `~/get_type_description`. Scans the index for any endpoint with this exact
+# TypeInfo and a known node identity, preferring a remote advertiser over a local
+# one. `nothing` if none is visible.
 function _find_remote_for(ctx, info::TypeInfo)
     local_fallback = nothing
     for ep in endpoints_snapshot(ctx)
@@ -293,14 +280,14 @@ function resolve_or_discover(node, name::AbstractString, hash;
     th === nothing && return nothing
     info = TypeInfo(String(name), th)
 
-    # 1–3: registry → cache → ament (resolve_type's order). `warned` flags whether the
-    # ament path already surfaced the revision diagnostic, so we don't warn twice.
+    # 1–3: registry → cache → ament (resolve_type's order). `warned` flags whether
+    # the ament path already surfaced the revision diagnostic, to avoid a double warn.
     warned = Ref(false)
     entry = resolve_type(ctx, info; ament = ament, cache = cache, warned = warned)
-    # 4: wire — ask whoever advertises it on the graph. Type-revision trust (D7): a
-    # pinned (`:static`/`:authored`) local type under a different hash enforces its
-    # RIHS01 — the wire bind of the peer's diverging revision is suppressed unless the
-    # Context opted into weak mode.
+    # 4: wire — ask whoever advertises it on the graph. Type-revision trust: a pinned
+    # (`:static`/`:authored`) local type under a different hash enforces its RIHS01,
+    # suppressing the wire bind of the peer's diverging revision unless the Context is
+    # in weak mode.
     if entry === nothing && wire
         conflict = ctx.weak_types ? nothing : _pinned_conflict(registry(ctx), info.name, th)
         if conflict === nothing
@@ -308,9 +295,9 @@ function resolve_or_discover(node, name::AbstractString, hash;
             remote === nothing ||
                 (entry = fetch_type_description(node, remote, name, th; timeout_ms = timeout_ms))
         elseif !warned[]
-            # Pinned entry under a different hash and no local ament file to trip the
+            # Pinned entry under a different hash with no local ament file to trip the
             # acquire-path diagnostic: surface the mismatch here so the suppression is
-            # not silent (D7's user-facing contract).
+            # visible to the user.
             _warn_revision_mismatch(info.name, conflict.info.hash, th; weak = false)
         end
     end
@@ -336,11 +323,8 @@ _gtd_not_found(type_name::AbstractString) =
 
 # One `WireTypeSource` regenerated from a registry entry's IL (for an
 # `include_type_sources` request): `encoding` is the IL kind's qualifier
-# (`msg`/`srv`/`action`), `raw_file_contents` the `IL.unparse` text — mirrors
-# `_export_interface_text`. The entry stores no original source, so the text is
-# regenerated (fields-only for wire-discovered types, faithful for static/ament/
-# well-known). The try/catch contains a bad unparse (exotic IL) to an empty body so
-# one type can't fail the whole reply.
+# (`msg`/`srv`/`action`), `raw_file_contents` the `IL.unparse` text. A bad unparse
+# is contained to an empty body so one exotic type can't fail the whole reply.
 function _entry_type_source(entry::RegistryEntry)
     encoding, _ = _il_qualifier_ext(entry.il)
     raw = try
@@ -352,11 +336,10 @@ function _entry_type_source(entry::RegistryEntry)
                           raw_file_contents = raw)
 end
 
-# Sources for the served closure: main type first, then each referenced type
-# in the (already-sorted) served `tdmsg`, each looked up by name in `reg` and
-# regenerated via `_entry_type_source`. Iterating the served `tdmsg` (not a fresh
-# registry walk) keeps sources and `type_description` in lockstep. De-dup by name;
-# skip names with no entry (a concurrently-removed type ⇒ fewer sources, no crash).
+# Sources for the served closure, main type first then each referenced type in the
+# served `tdmsg`. Iterating the served `tdmsg` (not a fresh registry walk) keeps
+# the sources and `type_description` in lockstep. A concurrently-removed type just
+# yields fewer sources.
 function _type_sources(reg, tdmsg::TypeDescriptionMsg)
     out = WireTypeSource[]
     seen = Set{String}()
@@ -405,23 +388,21 @@ function wire_get_type_description!(node)
 end
 
 # ── /rosout: the Julia-logging → rcl_interfaces/msg/Log bridge ────────────────
-# Julia's `@info`/`@warn`/`@error`/`@logmsg` are the ROS logging API; there are
-# no `RCLCPP_INFO`-style macros. `RosoutLogger <: AbstractLogger` is node-scoped and,
-# per record, (a) writes the ROS console line `[LEVEL] [stamp] [name]: msg` to
-# stderr, (b) publishes an `rcl_interfaces/msg/Log` on the node's shared `/rosout`
-# publisher, and (c) optionally forwards to a `parent` logger (a file/Julia console
-# sink), if one was supplied. The dispatcher wraps every handler in the node logger
-# (`_with_node_logger`, called from node.jl/service.jl/action.jl), so a plain `@info`
-# inside any handler routes to that node's `/rosout` with no user effort.
+# Julia's `@info`/`@warn`/`@error`/`@logmsg` are the ROS logging API.
+# `RosoutLogger <: AbstractLogger` is node-scoped and, per record, (a) writes the
+# ROS console line `[LEVEL] [stamp] [name]: msg` to stderr, (b) publishes an
+# `rcl_interfaces/msg/Log` on the node's shared `/rosout` publisher, and (c)
+# forwards to an optional `parent` logger (a file/Julia console sink). The
+# dispatcher wraps every handler in the node logger, so a plain `@info` inside any
+# handler routes to that node's `/rosout` with no user effort.
 #
 # Logger name = node FQN; `logger(node, "child")` gives a `.`-separated child. Per-
-# logger min levels live in a node-local table (`set_logger_level!`); `--ros-args
-# --log-level` will populate it once ros-args parsing lands. `maxlog` is
-# enforced here (it's the logger's responsibility, not the frontend's).
+# logger min levels live in a node-local table (`set_logger_level!`). `maxlog` is
+# the logger's responsibility, enforced here.
 #
 # The level mapping follows ROS2's `rcl_interfaces/msg/Log` constants (DEBUG=10,
-# INFO=20, WARN=30, ERROR=40, FATAL=50). Julia has no FATAL, so we add one (`Fatal`,
-# above `Error`) and map `@logmsg Fatal …` to ROS2 FATAL.
+# INFO=20, WARN=30, ERROR=40, FATAL=50). Julia's standard levels stop at Error, so
+# `Fatal` (above `Error`) maps `@logmsg Fatal …` to ROS2 FATAL.
 
 const LogMsg  = Interfaces.rcl_interfaces.msg.Log
 const TimeMsg = Interfaces.builtin_interfaces.msg.Time
@@ -430,10 +411,9 @@ const TimeMsg = Interfaces.builtin_interfaces.msg.Time
     Fatal
 
 A Julia `LogLevel` of `3000`, one step above `Logging.Error` (`2000`), giving Julia
-code a way to request ROS 2's `FATAL` severity, which Julia's standard levels don't
-provide. A [`RosoutLogger`](@ref) maps `@logmsg Fatal …` to the `rcl_interfaces/msg/Log`
-`FATAL` constant (`0x32`) and labels the console line `[FATAL]`; a plain `@error` stays
-at ROS 2 `ERROR`.
+code a way to request ROS 2's `FATAL` severity. A [`RosoutLogger`](@ref) maps
+`@logmsg Fatal …` to the `rcl_interfaces/msg/Log` `FATAL` constant (`0x32`) and labels
+the console line `[FATAL]`; a plain `@error` stays at ROS 2 `ERROR`.
 
 ```julia
 using Logging
@@ -479,9 +459,8 @@ writes the ROS console line `[LEVEL] [secs.nanosec] [name]: msg` to stderr (when
 `console`), publishes an `rcl_interfaces/msg/Log` on `node`'s shared `/rosout`
 publisher, and — when a `parent` logger is supplied — forwards the raw record to that
 extra sink (a file or Julia console). Installing it routes a plain `@info`/`@warn`/
-`@error`/`@logmsg` to ROS 2 logging with no special macros; the request dispatcher
-installs the node's logger around every handler so handler logs reach `/rosout`
-automatically.
+`@error`/`@logmsg` to ROS 2 logging; the request dispatcher installs the node's
+logger around every handler so handler logs reach `/rosout` automatically.
 
 `name` is the ROS logger name (the node FQN by default; [`logger`](@ref)`(node,
 "child")` makes a `.`-separated child sharing the same publisher and console).
@@ -504,16 +483,16 @@ end
 ```
 """
 mutable struct RosoutLogger <: AbstractLogger
-    const node::Any                              # the Node whose /rosout we publish to
+    const node::Any                              # the Node whose /rosout it publishes to
     const name::String                           # ROS logger name (FQN or "<fqn>.child")
     const parent::Union{AbstractLogger, Nothing} # optional extra sink (file/Julia console)
     const console::Bool                          # write the ROS-format line to stderr
     const min_level::LogLevel
     # The shared `/rosout` publisher (a `PublisherHandle{LogMsg}`); `nothing` for a
-    # sessionless node — then the bridge skips the /rosout sink.
+    # sessionless node, where the bridge skips the /rosout sink.
     _pub::Any
-    # `maxlog` is the logger's responsibility (the frontend doesn't enforce it):
-    # per-call-site-id emit counts, mirroring `ConsoleLogger`'s `message_limits`.
+    # Per-call-site-id `maxlog` emit counts (the logger enforces `maxlog`), mirroring
+    # `ConsoleLogger`'s `message_limits`.
     const _maxlog_counts::Dict{Any, Int}
     # Guards `_maxlog_counts`: the node's one logger is shared across `Parallel(n)`
     # handler threads, and concurrent `Dict` mutation can corrupt it.
@@ -535,14 +514,12 @@ function RosoutLogger(node; name::AbstractString=_default_logger_name(node),
     return lg
 end
 
-# The node-owned `/rosout` publisher, declared once and **shared** by the node logger
-# and every `logger(node,"child")` (so children don't each declare a duplicate).
-# rmw_zenoh publishes `/rosout` as a transient-local `rcl_interfaces/msg/Log` topic
-# with a deep history, so late subscribers (`ros2 topic echo /rosout`) get the
-# backlog. The QoS is ROS 2's rosout default (KEEP_LAST 1000, reliable,
-# transient-local, 10 s lifespan) so native peers see a matching offer. A
-# sessionless/closed node can't carry one — return `nothing` and the bridge skips
-# the /rosout sink rather than throwing during logger construction.
+# The node-owned `/rosout` publisher, declared once and shared by the node logger
+# and every `logger(node,"child")`. The QoS is ROS 2's rosout default (KEEP_LAST
+# 1000, reliable, transient-local, 10 s lifespan) so native peers see a matching
+# offer and late subscribers (`ros2 topic echo /rosout`) get the backlog. A
+# sessionless/closed node returns `nothing` so the bridge skips the /rosout sink
+# instead of throwing during logger construction.
 function _rosout_publisher!(node)
     (node isa Node && isopen(node)) || return nothing
     @lock node.lock begin
@@ -576,9 +553,8 @@ uses double-checked locking so the per-message dispatch path stays lock-free onc
 logger is cached.
 """
 function logger(node::Node)
-    # Unlocked fast path: `_logger` is set once. The dispatcher calls this per
-    # message, so we must not take the node lock every time — a stale `nothing`
-    # read just falls to the locked re-check below (double-checked locking).
+    # Double-checked locking: the dispatcher calls this per message, so the cached
+    # `_logger` is read unlocked; a stale `nothing` falls to the locked re-check.
     node._logger === nothing || return node._logger
     @lock node.lock begin
         node._logger === nothing || return node._logger
@@ -589,18 +565,17 @@ end
 logger(node::Node, child::AbstractString) =
     RosoutLogger(node; name = string(node.fqn, ".", child))
 
-# Run a user handler `f` under the node's `RosoutLogger`, so a plain `@info`
-# inside it routes to that node's `/rosout` + ROS console. Forward-referenced from
-# the dispatch sites in node.jl/service.jl/action.jl (included before this file); a
-# non-`Node` owner (shouldn't happen on those paths) just runs `f` unwrapped.
+# Run a user handler `f` under the node's `RosoutLogger`, so a plain `@info` inside
+# it routes to that node's `/rosout` + ROS console. The dispatch sites call this; a
+# non-`Node` owner runs `f` unwrapped.
 _with_node_logger(f, node::Node) = Logging.with_logger(f, logger(node))
 _with_node_logger(f, ::Any)      = f()
 
 # Emit one record to up to three sinks: ROS console (stderr), an optional `parent`
-# logger, and the `/rosout` publisher. `maxlog` is gated first (the logger's job).
-# Every sink is best-effort and isolated — a failure in one (a bad `show`, a dead
-# `/rosout` route) must never break the others or escape `handle_message`. Errors go
-# straight to stderr (NOT through logging) to avoid recursion under the active logger.
+# logger, and the `/rosout` publisher, after gating `maxlog`. Each sink is best-
+# effort and isolated — a failure in one (a bad `show`, a dead `/rosout` route)
+# must not break the others or escape `handle_message`. Errors go straight to
+# stderr, not through logging, to avoid recursion under the active logger.
 function Logging.handle_message(lg::RosoutLogger, level, message, _module, group,
                                 id, file, line; kwargs...)
     _maxlog_exceeded!(lg, id, kwargs) && return nothing
@@ -629,11 +604,9 @@ function Logging.handle_message(lg::RosoutLogger, level, message, _module, group
     nothing
 end
 
-# `maxlog`: emit at most `maxlog` records per call-site `id`. Counts live on the
-# logger (`ConsoleLogger` does the same). The frontend does NOT enforce `maxlog`,
-# so without this `@info … maxlog=1` would log every time. Locked: unlike a
-# per-task `ConsoleLogger`, this one logger is shared across `Parallel(n)`
-# concurrent handler threads.
+# `maxlog`: emit at most `maxlog` records per call-site `id`, the count kept on the
+# logger as `ConsoleLogger` does. Locked because this one logger is shared across
+# `Parallel(n)` concurrent handler threads.
 function _maxlog_exceeded!(lg::RosoutLogger, id, kwargs)
     maxlog = get(kwargs, :maxlog, nothing)
     maxlog === nothing && return false
@@ -645,11 +618,11 @@ function _maxlog_exceeded!(lg::RosoutLogger, id, kwargs)
     end
 end
 
-# The node's ROS clock instant as `(sec, nanosec)` for a stamp; `(0,0)` if the clock
-# can't be read (a non-`Node` owner / closed node) so the console line never throws.
+# The node's ROS clock instant as `(sec, nanosec)` for a stamp, falling back to
+# `(0,0)` for a non-`Node` or closed node so the console line never throws.
 function _stamp_sec_nanosec(node)
     try
-        return _sec_nanosec(Dates.now(node).ns)   # `now(node)` is `Dates.now` extended (time.jl)
+        return _sec_nanosec(Dates.now(node).ns)   # `now(node)` extends `Dates.now`
     catch
         return (Int32(0), UInt32(0))
     end
@@ -673,10 +646,10 @@ end
 const _ROSOUT_SKIP_KWARGS = (:maxlog, :_id)
 
 # Render a log record's `message` + structured `kwargs` into one `Log.msg` string.
-# `@warn "x" a=1 b=2` carries the extras as kwargs; we append them as `(a=1, b=2)`
-# so the structure survives onto a flat ROS string. An `:exception` value renders
-# as its message (the backtrace would bloat the line). Must never throw — a bad
-# `show`/`string` on a user value can't be allowed to break logging.
+# `@warn "x" a=1 b=2` carries the extras as kwargs, appended as `(a=1, b=2)` so the
+# structure survives onto a flat ROS string. An `:exception` renders as its message
+# (the backtrace would bloat the line). Must never throw: a bad `show`/`string` on a
+# user value falls back to a placeholder.
 function _render_message(message, kwargs)
     base = try
         string(message)
@@ -701,11 +674,9 @@ function _render_message(message, kwargs)
     isempty(parts) ? base : string(base, " (", join(parts, ", "), ")")
 end
 
-# Build and publish the `rcl_interfaces/msg/Log` for one record. The stamp is the
-# node's ROS clock, the level the bucketed severity, `name` the node FQN, and
-# `function` is unavailable from `handle_message`'s arguments (Julia carries no
-# enclosing-function name there) so it's left empty — matching what rmw_zenoh emits
-# when the producing function is unknown.
+# Build and publish the `rcl_interfaces/msg/Log` for one record. The `function`
+# field is empty: `handle_message` carries no enclosing-function name, matching what
+# rmw_zenoh emits when the producing function is unknown.
 function _emit_rosout(lg::RosoutLogger, level, message, file, line; kwargs...)
     log = LogMsg(; stamp = to_msg(TimeMsg, Dates.now(lg.node)),
                  level = _rosout_level(level),
@@ -718,10 +689,9 @@ function _emit_rosout(lg::RosoutLogger, level, message, file, line; kwargs...)
     return nothing
 end
 
-# The effective min level for this logger: the longest-prefix match in the node's
-# level table (set by `set_logger_level!` / future `--ros-args --log-level`),
-# else the logger's own `min_level`. Hierarchy: `/ns/n.child` inherits `/ns/n`'s
-# level unless it has its own entry.
+# The effective min level: the longest-prefix match in the node's level table (set
+# by `set_logger_level!`), else the logger's own `min_level`. A child `/ns/n.child`
+# inherits `/ns/n`'s level through the prefix match until it has its own entry.
 function _effective_level(lg::RosoutLogger)
     lg.node isa Node || return lg.min_level
     lvls = lg.node._log_levels
@@ -734,9 +704,8 @@ function _effective_level(lg::RosoutLogger)
     return best === nothing ? lg.min_level : LogLevel(best)
 end
 
-# `AbstractLogger` interface. Gate on the effective level; when a `parent` sink is
-# present also defer to its `shouldlog`/`min_enabled_level` so its per-module
-# settings still apply (a `nothing` parent → console+/rosout only, gate on level).
+# `AbstractLogger` interface. Gate on the effective level, then defer to a `parent`
+# sink's `shouldlog`/`min_enabled_level` so its per-module settings still apply.
 function Logging.shouldlog(lg::RosoutLogger, level, _module, group, id)
     level >= _effective_level(lg) || return false
     lg.parent === nothing && return true
@@ -758,8 +727,7 @@ Set a per-logger minimum severity in the node's level table. A `name` entry gate
 that logger and every `.`-separated descendant that lacks its own entry — so
 `set_logger_level!(node, "/n", Logging.Warn)` also gates `"/n.child"` (longest matching
 prefix wins). The two-argument form targets the node's own logger (its FQN). This is
-the programmatic form of `--ros-args --log-level name:=…`, which will populate the same
-table once ros-args parsing lands.
+the programmatic form of `--ros-args --log-level name:=…`.
 
 Returns `nothing`. Levels are Julia `LogLevel`s; a [`RosoutLogger`](@ref) consults this
 table on every `shouldlog`/`min_enabled_level` check.
@@ -794,16 +762,15 @@ with_rosout(f, node; kwargs...) =
     Logging.with_logger(f, RosoutLogger(node; kwargs...))
 
 # ── Zenoh transport logs → /rosout (opt-in) ───────────────────────────────────
-# Zenoh's Rust core emits its own logs (session, transport, liveliness). Zenoh.jl
-# can capture them into a bounded, pull-based `LogStream` (`open_log_stream`); we
-# drain it and re-emit each record through Julia logging under a `<fqn>.zenoh` child
-# logger, so it rides the same path to `/rosout` + ROS console + the level table.
+# Zenoh.jl captures the Rust core's logs (session, transport, liveliness) into a
+# bounded, pull-based `LogStream` (`open_log_stream`). A background task drains it
+# and re-emits each record through Julia logging under a `<fqn>.zenoh` child logger,
+# so it rides the same path to `/rosout` + ROS console + the level table.
 #
-# Opt-in, off by default: nothing claims Zenoh's process-global (one-shot) logger
-# unless this is called. Feedback-loop discipline (Zenoh docs/logging.md): the
-# `WARN` floor is enforced *inside* Zenoh, so a `/rosout` publish's own data-plane
-# DEBUG/TRACE logs never enter the stream and steady-state forwarding can't feed
-# itself; the bounded drop-oldest ring is the backstop. Keep the floor at WARN.
+# Opt-in, off by default: only this call claims Zenoh's process-global (one-shot)
+# logger. Keep the `min_severity` floor at WARN: Zenoh applies it inside the stream,
+# so a `/rosout` publish's own data-plane DEBUG/TRACE logs stay below it and
+# steady-state forwarding can't feed itself; the drop-oldest ring backstops the rest.
 
 _julia_log_level(s) =
     s == Zenoh.LogSeverities.ERROR ? Logging.Error :
@@ -824,10 +791,9 @@ which ends the iterator and lets the task exit cleanly. `capacity` bounds the st
 drop-oldest ring.
 
 Zenoh's logger is process-global and one-shot: call this at most once per process, and
-not together with `Zenoh.setup_logging`. Keep `min_severity` at `WARN` (the default):
-the WARN floor keeps steady-state forwarding self-contained — a `/rosout` publish's own
-data-plane DEBUG/TRACE records stay below it, so forwarded logs never feed back into
-the stream.
+never together with `Zenoh.setup_logging`. Keep `min_severity` at `WARN` (the default):
+the WARN floor keeps steady-state forwarding self-contained, since a `/rosout` publish's
+own data-plane DEBUG/TRACE records stay below it.
 """
 function bridge_zenoh_logs!(node::Node;
                             min_severity = Zenoh.LogSeverities.WARN,
@@ -852,6 +818,5 @@ function bridge_zenoh_logs!(node::Node;
     return stream
 end
 
-# `_ctx` (a Context from a Node-or-Context) is context.jl's, duck-typed on
-# `.context`; a bare `Context` returns itself. `registry`/`lookup_type` are
-# context.jl's. `now`/`to_msg` are time.jl's. All in module scope here.
+# `_ctx`, `registry`, `lookup_type`, `now`, and `to_msg` are defined elsewhere in
+# the module and in scope here.

@@ -1,23 +1,15 @@
 # ── the remote parameter client ──────────────────────────────────────────────────
-# The async, fallible dual of the local `node.parameters` accessor: a remote's
-# parameters are intrinsically asymmetric — a local accessor for us vs. an async,
-# fallible client for a remote. `ParameterClient` is that client, driving a remote
-# node's six standard parameter services + `/parameter_events` over the Service
-# layer (same wire contract as rclcpp/rclpy/hiroz, so it talks to any of them). It
-# follows the `fetch_type_description` template (introspection.jl): a lazily-built
-# `ServiceClient` per service, `wait_for_service`, `call`, decode.
-#
-# Three layers over one set of verbs (all dispatching local-vs-remote on the first
-# arg, so a `ParameterServer` and a `ParameterClient` read identically):
+# The async, fallible dual of the local `node.parameters` accessor, driving a remote
+# node's six standard parameter services plus `/parameter_events`. Three layers over
+# one set of verbs, all dispatching local-vs-remote on the first argument so a
+# `ParameterServer` and a `ParameterClient` read identically:
 #   L0  the six service generics — `get_parameters(c, names)`, … — dynamic, fallible.
-#   L1  `c[:field]` / `c[:field] = v` — one round-trip each (indexing, not property
-#       access, to signal a remote lookup that can cost/fail — cf. `server.field`).
+#   L1  `c[:field]` / `c[:field] = v` — one round-trip each; indexing rather than
+#       property access signals a remote lookup that can cost or fail.
 #   L2  `fetch(c)::P` materializes the whole remote into the shared `@parameters`
-#       struct, and `transaction(c) do p … end` drafts + pushes the diff atomically,
-#       reusing the server's `setproperties`/`_validate_candidate`/`ParameterRejection`
-#       so the mutation API is uniform local↔remote. The schema type `P` is the
-#       structure; a schemaless `ParameterClient{Nothing}` degrades to L0 + a dynamic
-#       `NamedTuple` snapshot for talking to a node whose schema we don't share.
+#       struct, and `transaction(c) do p … end` drafts and pushes the diff atomically.
+#       A schemaless `ParameterClient{Nothing}` degrades to L0 plus a dynamic
+#       `NamedTuple` snapshot for a node whose schema this process does not share.
 
 """
     ParameterClient(node, target) -> ParameterClient{Nothing}
@@ -58,8 +50,8 @@ Base.show(io::IO, c::ParameterClient{P}) where {P} =
     print(io, "ParameterClient", P === Nothing ? "" : string("{", nameof(P), "}"),
           "(", c.target, isopen(c) ? "" : ", closed", ")")
 
-# The `*_Request` type for a service base name — the `Srv` a `ServiceClient` keys on
-# (its `_Response` sibling is resolved automatically).
+# The `*_Request` type a `ServiceClient` keys on for a service base name; the
+# `_Response` sibling resolves automatically.
 function _param_req_type(sym::Symbol)
     sym === :get_parameters            && return _RCL_SRV.GetParameters_Request
     sym === :get_parameter_types       && return _RCL_SRV.GetParameterTypes_Request
@@ -121,8 +113,8 @@ _to_wire_params(ps) =
     _Parameter[_Parameter(name = String(first(p)), value = _to_param_value(last(p))) for p in ps]
 
 # ── L0: the six service generics, remote arm ─────────────────────────────────────
-# Same names + return types as the server methods (services.jl); these add the wire
-# call + `timeout_ms` and decode the reply back to the identical Julia types.
+# Same names and return types as the local server methods, plus the wire call and
+# `timeout_ms`, decoding the reply back to the identical Julia types.
 
 """
     get_parameters(client, names; timeout_ms=2000) -> Vector{Any}
@@ -211,8 +203,8 @@ end
 
 # ── singular conveniences + L1 indexing ──────────────────────────────────────────
 # `parameter`/`set_parameter!`/`parameter_names` are the same exported verbs the
-# server uses; `c[:name]` / `c[:name] = v` are the indexing sugar (an explicit
-# "remote lookup", distinct from the server's cheap `server.name` field read).
+# server uses; `c[:name]` / `c[:name] = v` are indexing sugar, an explicit remote
+# lookup distinct from the server's cheap `server.name` field read.
 
 """
     parameter(client, name; timeout_ms=2000)
@@ -258,7 +250,7 @@ function Base.fetch(c::ParameterClient{P}; timeout_ms::Integer = 2000) where {P}
     vals = get_parameters(c, fns; timeout_ms = timeout_ms)
     kw = Dict{Symbol, Any}()
     for (f, v) in zip(fns, vals)
-        v === nothing || (kw[f] = v)          # NOT_SET → let the schema default fill in
+        v === nothing || (kw[f] = v)          # an unset field falls back to the schema default
     end
     return P(; kw...)
 end
@@ -269,9 +261,9 @@ function _fetch_dynamic(c::ParameterClient; timeout_ms::Integer = 2000)
     return NamedTuple{Tuple(names)}(Tuple(vals))
 end
 
-# The client-side analog of the server's `Draft` (server.jl) — a mutable overlay
-# over a fetched base, but with no server/dynamic tier: only declared fields, each
-# coerced to its field type on assignment (fail-fast before the wire).
+# The client-side analog of the server's `Draft`: a mutable overlay over a fetched
+# base, declared fields only (no dynamic tier), each coerced to its field type on
+# assignment so a bad value fails before the wire call.
 mutable struct _ClientDraft{P}
     const base::P
     const overrides::Dict{Symbol, Any}
@@ -313,7 +305,7 @@ function transaction(f, c::ParameterClient{P}; timeout_ms::Integer = 2000) where
         throw(ArgumentError("transaction requires a typed ParameterClient{P}; for a schemaless remote use set_parameters_atomically"))
     base = fetch(c; timeout_ms = timeout_ms)::P
     draft = _ClientDraft{P}(base, Dict{Symbol, Any}())
-    f(draft)                                              # may throw → abort, nothing pushed
+    f(draft)                                              # a throw aborts before anything is pushed
     isempty(draft.overrides) && return base
     candidate = setproperties(base, NamedTuple(draft.overrides))
     _validate_candidate(_descriptor_map(P), base, candidate, keys(draft.overrides))

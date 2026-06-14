@@ -1,26 +1,27 @@
 # ── content-addressed cache (project-local, opt-in) ─────────────────────────
-# A store keyed by RIHS01, holding the wire `TypeDescription` JSON (the form
-# `calculate_rihs01_hash` hashes over, so self-validating on load). Discovery
-# checks it before the network; a fetch writes it back. Because codegen is cheap, the
-# cache holds the definition and regenerates the code on load.
+# A store keyed by RIHS01, holding each wire `TypeDescription` as the exact JSON
+# `calculate_rihs01_hash` hashes over, so a load self-validates. The cache holds the
+# definition and regenerates the code on load; discovery consults it before the
+# network, and a fetch writes it back.
 #
-# Location & opt-in: the cache is a project-local folder (in the active project's
-# dir) of `.json` blobs keyed by RIHS01 hash, off by default. Three opt-ins: the
-# [`@ros_cache`](@ref) macro (its dir marker is absorbed at module load and
-# registered via `_register_cache_dirs!` at Context creation), an explicit
-# [`enable_project_cache!`](@ref) call, and the `$ROS_TYPESUPPORT_CACHE` env
-# override (ops/tests, force-enables with that dir).
-# ROSNode is a library; discovered types are deployment-specific, so they belong in
-# the importing project, owned by the user — not a package-global scratchspace.
-# The JSON body is the exact `to_ros2_json` text plus the type name on a header line
-# so a reload reconstructs the `TypeInfo` without re-parsing the name out of the blob.
+# The cache is a project-local folder of `.json` blobs keyed by RIHS01 hash, owned by
+# the importing project (ROSNode is a library and discovered types are
+# deployment-specific). Persistence is off by default; three opt-ins enable it:
+#
+#   1. the [`@ros_cache`](@ref) macro (its dir marker is absorbed at module load and
+#      registered via `_register_cache_dirs!` at Context creation),
+#   2. an explicit [`enable_project_cache!`](@ref) call,
+#   3. the `$ROS_TYPESUPPORT_CACHE` env override (ops/tests, force-enables with that dir).
+#
+# The JSON body carries the type name on a header line ahead of the `to_ros2_json`
+# text, so a reload reconstructs the `TypeInfo` without re-parsing the name from the blob.
 
-# Cache opt-in state. `dir === nothing` ⇒ use the project-local default when enabled.
+# Cache opt-in state. `dir === nothing` ⇒ the project-local default when enabled.
 # `dirs` is the ordered read search-list (a project may register several `@ros_cache`
-# dirs); `dir` is the single primary write dir (the deterministic min of `dirs`, or
-# the last explicit `enable_project_cache!`). Reads consult every entry in `dirs`.
-# Field access goes through `_TS_CONFIG_LOCK` (acquire.jl); writers rebind `dirs`
-# wholesale (never mutate in place), so a vector handed out under the lock stays valid.
+# dirs); `dir` is the single primary write dir (the deterministic min of `dirs`, or the
+# last explicit `enable_project_cache!`). Reads consult every entry in `dirs`.
+# Field access goes through `_TS_CONFIG_LOCK`. Writers must rebind `dirs` wholesale, not
+# mutate in place, so a vector handed out under the lock stays valid.
 mutable struct _CacheState
     enabled::Bool
     dir::Union{String, Nothing}
@@ -131,8 +132,8 @@ function _cache_read_dirs()
     return String[dir === nothing ? _default_project_cache_dir() : dir]
 end
 
-# The content-addressed leaf for a hash: `<64-hex>.json`. The bare hex (not the
-# `RIHS01_` prefix) names the file — content-addressed by the 32-byte digest.
+# The content-addressed leaf for a hash: `<64-hex>.json`, the bare hex of the 32-byte
+# digest (no `RIHS01_` prefix).
 _cache_leaf(info::TypeInfo) = bytes2hex(collect(info.hash.value)) * ".json"
 
 # Cache file for a hash under the primary (write) dir.
@@ -156,9 +157,8 @@ function _cache_store(info::TypeInfo, td::TypeDescriptionMsg)
 end
 
 # Load + self-validate a cached `TypeDescriptionMsg` for `info`, searching every
-# registered cache dir in order (first hit wins). Recomputes the RIHS01 over the parsed
-# blob and discards on mismatch (a stale/corrupt entry can never decode wrong).
-# Returns `nothing` on miss, parse failure, or hash mismatch across all dirs.
+# registered cache dir in order (first hit wins). Returns `nothing` on miss, parse
+# failure, or hash mismatch across all dirs.
 function _cache_load(info::TypeInfo)
     _cache_enabled() || return nothing
     leaf = _cache_leaf(info)
@@ -169,8 +169,10 @@ function _cache_load(info::TypeInfo)
     return nothing
 end
 
-# Load + self-validate one cache file. `nothing` on miss / parse failure / hash mismatch;
-# a mismatched blob is removed (it can never decode right).
+# Load + self-validate one cache file by recomputing RIHS01 over the parsed blob: a blob
+# whose content no longer matches its hash (corruption, collision) is removed and ignored,
+# so a stale entry can never decode to the wrong type. `nothing` on miss / parse failure /
+# hash mismatch.
 function _cache_load_path(path::AbstractString, info::TypeInfo)
     isfile(path) || return nothing
     td = try
@@ -194,16 +196,15 @@ function _cache_load_path(path::AbstractString, info::TypeInfo)
 end
 
 # ── TypeDescription JSON (de)serialization ──────────────────────────────────
-# The cache and the `:typedesc` export round-trip the wire blob through the exact
-# JSON `to_ros2_json` emits. Serialization is ROSMessages' (`to_ros2_json`, the
-# hashing form); the inverse parser lives here as a cache/persistence concern. It
-# parses the fixed, hand-written shape directly to avoid a JSON dependency, matching
-# the posture ROSMessages takes when writing it.
+# The cache and the `:typedesc` export round-trip the wire blob through the exact JSON
+# `to_ros2_json` emits (the hashing form). Serialization is ROSMessages' `to_ros2_json`;
+# the inverse parser lives here as a cache/persistence concern, parsing the fixed
+# hand-written shape directly so there is no JSON-package dependency.
 
 # Minimal recursive-descent parser for the exact JSON shape `to_ros2_json` emits:
 # `{"type_description": <td>, "referenced_type_descriptions": [<td>...]}` where a
 # <td> is `{"type_name": <str>, "fields": [{"name": <str>, "type": {...}}...]}`.
-# Returns `nothing` on any structural surprise (treated as a cache miss upstream).
+# Any structural surprise yields `nothing` (a cache miss upstream).
 function _parse_type_description_json(json::AbstractString)
     val, _ = _json_value(json, firstindex(json))
     val isa Dict || return nothing

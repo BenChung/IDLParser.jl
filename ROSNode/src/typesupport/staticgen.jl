@@ -240,12 +240,12 @@ function _from_literals(val)
     end
 end
 
-# Emit, per provided hit, `module <pkg> module <qual> const <Name> = <T> end end`
-# so the caller's `<pkg>.<qual>.<Name>` path *aliases* an already-compiled struct `T`
-# (one wire type ⇒ one Julia struct), reusing it rather than minting a duplicate. `T` is
-# the resolved type spliced in literally — ROSNode's vendored canonical copy, or a
-# type a dependency already `@ros_import`ed — so it's an external reference (single
-# copy, even across a precompile boundary). One module pair per (pkg, qual).
+# Emit, per provided hit, `module <pkg> module <qual> const <Name> = <T> end end` so the
+# caller's `<pkg>.<qual>.<Name>` path *aliases* an already-compiled struct `T`, upholding
+# one-wire-type-to-one-Julia-struct rather than minting a duplicate. `T` is the resolved
+# type spliced in literally — ROSNode's vendored canonical copy, or one a dependency
+# already `@ros_import`ed — so it is an external reference (single copy across a
+# precompile boundary). One module pair per (pkg, qual).
 function _alias_block(hits::Vector{Tuple{String, String, String, Any}})
     bypkg = Dict{String, Dict{String, Vector{Tuple{String, Any}}}}()
     pkg_order = String[]
@@ -353,10 +353,10 @@ function _merge_module!(dst::Expr, src::Expr)
 end
 
 # Append a plan's code to `block`. Provided-type aliases for a package that is *also*
-# generated are merged into that package's generated `module` (a second `module pkg`
-# at the same scope would clobber the first, dropping the aliased sections); aliases
-# for packages with no generated section stay standalone and are emitted *before* the
-# generated modules, which reference them by path. A provided srv/action also gets its
+# generated must merge into that package's generated `module`, since a second
+# `module pkg` at the same scope would clobber the first and drop the aliased sections.
+# Aliases for packages with no generated section stay standalone, emitted ahead of the
+# generated modules that reference them by path. A provided srv/action also gets its
 # `Foo.Request`/`Foo.Goal` namespace (generated ones get it from `_expand_msg_files`).
 function _plan_block!(block, plan)
     (alias_hits, gen_paths, gen_jsons, alias_ifaces, byo_deps) = plan

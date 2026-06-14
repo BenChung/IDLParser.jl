@@ -1,6 +1,6 @@
 # The parameters layer. Declared parameters are typed and baked into the node: a
 # `@parameters` macro generates an immutable struct (type-stable reads) plus a
-# `descriptors(::Type)` method, and the live value sits behind an atomic `Ref{P}`
+# `descriptors(::Type)` method, and the live value sits behind an `@atomic` field
 # inside a `ParameterServer{P}`. Mutation is transactional — `transaction(server)
 # do p … end` builds a mutable draft, validates the whole candidate, swaps once,
 # and fires one `/parameter_events` batch. Single-statement sugar (`server.x = v`,
@@ -34,10 +34,10 @@ const _SCALAR_PARAM_TYPES = (Bool, Int64, Float64, String, Symbol)
 const _ARRAY_ELT_TYPES    = (Bool, Int64, Float64, String, UInt8)
 
 # Supertype of every node-level parameter surface: the single-schema
-# `ParameterServer{P}` (server.jl) and the multi-schema `CompositeParameterServer`
-# façade (composite.jl). `wire_parameter_services!` and `node.parameters`
-# are written against this so a composed node exposes one member-prefixed `ros2
-# param` namespace over its members' servers.
+# `ParameterServer{P}` and the multi-schema `CompositeParameterServer` façade.
+# `wire_parameter_services!` and `node.parameters` are written against this so a
+# composed node exposes one member-prefixed `ros2 param` namespace over its members'
+# servers.
 abstract type AbstractParameterServer end
 
 """
@@ -111,8 +111,8 @@ function parameter_type(::Type{T}) where {T}
     throw(ArgumentError("not a legal parameter type: $(T)"))
 end
 
-# Boolean form of the legal-type check. Currently unused — type validation runs
-# through `parameter_type`'s throw inside the generated `descriptors` body.
+# Boolean form of the legal-type check. The live validation path is `parameter_type`'s
+# throw inside the generated `descriptors` body; this predicate is the reusable form.
 _is_legal_param_type(::Type{T}) where {T} =
     (T in _SCALAR_PARAM_TYPES) ||
     (T <: Vector && eltype(T) in _ARRAY_ELT_TYPES)

@@ -1,15 +1,8 @@
-# The pub/sub pattern layer. Publishers and subscriptions are created with
-# *type-constructors* — `Publisher(node, topic, T)` / `Subscription(node, topic, T)
-# do msg … end` — following the `Timer(f, …)` precedent: a registered route
-# that lives until `close` and dies with its node. `Publisher`/`Subscription` are
-# the `EndpointKind` enum instances re-exported by core.jl; this file gives those
-# instances call-methods so the spelling reads as a constructor. Each holds a
-# generic `Entity` (node.jl) for the id/token/route/graph lifecycle and adds the
-# typed surface: the message type, the publish path, the handler.
-#
-# Data plane: publish sizes-then-serializes once (`encode`) and `put`s with
-# the per-message attachment; receive decodes owned (default) or view (opt-in)
-# through the `Entity`'s consumer task (node.jl's `declare_subscription!`).
+# The pub/sub pattern layer. `Publisher` and `Subscription` are `EndpointKind` enum
+# values; this file gives them call-methods so `Publisher(node, topic, T)` and
+# `Subscription(node, topic, T) do msg … end` read as constructors, following the
+# `Timer(f, …)` precedent. Each handle wraps a generic `Entity` for the
+# id/token/route/graph lifecycle and adds the typed surface.
 
 using Zenoh: Zenoh, put
 using ROSZenoh: ROSZenoh
@@ -17,10 +10,6 @@ using ROSZenoh: ROSZenoh
 export Publisher, Subscription, publish
 
 # ── Publisher ─────────────────────────────────────────────────────────────────
-# A long-lived publish handle: an `Entity` carrying the Zenoh `Publisher` route,
-# the message type, and the per-endpoint attachment sequence counter. The
-# gid lives on the `Entity`; `publish` stamps `(seq, source_timestamp, gid)` on
-# every `put`.
 
 """
     PublisherHandle{T}
@@ -36,7 +25,9 @@ spell `PublisherHandle{T}`.
 """
 mutable struct PublisherHandle{T, R}
     const entity::Entity
-    const route::R               # concrete Zenoh route (plain Publisher or AdvancedPublisher)
+    # Route type R pins the concrete Zenoh route (plain Publisher / AdvancedPublisher)
+    # so put dispatches statically with no plain-vs-advanced branch on the hot path.
+    const route::R
     @atomic seq::Int64           # per-endpoint attachment sequence_number
 end
 
@@ -48,12 +39,8 @@ function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          warmup_sample=nothing) where {T}
     name = resolve_name(node, topic)
     ent = make_entity(node, Publisher, name, type_info_of(T); qos=qos)
-    # `transient_local` routes to an AdvancedPublisher (sample cache); the
-    # concrete route type flows into `PublisherHandle{T,R}` so `put` stays monomorphic.
     route = declare_publisher!(ent; congestion_control=congestion_control, priority=priority)
     pub = PublisherHandle{T, typeof(route)}(ent, route, 0)
-    # Warm-up: precompile the publish/encode chain (and, under :execute, publish once
-    # with the `put` null-routed) so the first real publish isn't a JIT spike.
     pol = _resolve_warmup(node, warmup, warmup_sync)
     _warmup!(pol, () -> _warm_publisher(pol, pub, warmup_sample))
     return pub
@@ -82,11 +69,10 @@ This is the drop-on-publish point of the managed-node lifecycle gate
 ([`LifecycleNode`](@ref) outside [`Active`](@ref)).
 
 When the intra-process short-circuit is enabled, same-Context publisher↔subscriber
-pairs bypass serialize/Zenoh/decode; the intra-process delivery layer
-(`performance/intraprocess.jl`) owns the mechanism. Those subscribers open their
-Zenoh subscriber with a local-origin filter (`local_origin`), so the direct delivery
-is their only copy of this publish; the `put` still goes out and reaches subscribers
-in other Contexts normally.
+pairs hand the message over directly, bypassing serialize/Zenoh/decode. Those
+subscribers open their Zenoh subscriber with a remote-only origin filter, so the
+direct hand-off is their only copy of this publish; the `put` still goes out and
+reaches subscribers in other Contexts normally.
 
 Passing a `msg` whose type differs from `T` throws an `ArgumentError` naming the
 expected and actual types.
@@ -99,30 +85,27 @@ publish(pub, std_msgs.msg.String(data = "hello"))
 function publish(pub::PublisherHandle{T}, msg::T) where {T}
     e = pub.entity
     isopen(e) || return nothing
-    isactive(e) || return nothing                   # lifecycle gate: inactive node ⇒ drop
+    isactive(e) || return nothing                   # lifecycle gate: inactive node drops the publish
 
     payload = encode(msg)
-    ts = nanoseconds(Dates.now(e.node, System()))   # publish-time wall ns
-    # The :execute warm-up compiles and runs the encode/attach path in-memory but
-    # skips the wire `put` and the seq commit — sequence numbers are wire state, so
-    # the first real message must carry seq=1. The speculative read may duplicate a
-    # racing real publish's seq; harmless, the warm-up attachment never leaves this
-    # frame. The hot path reads only the scoped value: `publish` never runs during
-    # package precompilation, so the `jl_generating_output` check in `is_warming()`
-    # is unneeded here.
+    ts = nanoseconds(Dates.now(e.node, System()))   # System clock stamps wire timestamps
+    # Warm-up compiles the encode/attach path but skips the put and the seq commit:
+    # the seq counter is wire state and the first real message must carry seq=1, the
+    # invariant a subscriber's gap detection relies on.
     if _WARMUP[]
         encode_attachment((@atomic pub.seq) + 1, ts, gid(e))
         return nothing
     end
     seq = (@atomic pub.seq += 1)
+    # The attachment (sequence_number, source_timestamp, fixed 16-byte source_gid) is
+    # byte-exact and mandatory: a real ROS 2 peer unwraps it and panics if absent.
     attach = encode_attachment(seq, ts, gid(e))
-    deliver_local(pub, msg)                           # intra-process short-circuit: hand to same-Context subs directly (no-op when disabled)
-    put(pub.route, payload; attachment=attach)        # monomorphic on R (plain / advanced route)
+    deliver_local(pub, msg)                           # intra-process short-circuit (no-op when disabled)
+    put(pub.route, payload; attachment=attach)        # statically dispatched on route type R
     return nothing
 end
 
-# A non-`T` payload is the common "wrong message type for this topic" mistake; a
-# `MethodError` is opaque, so name it.
+# Name the wrong-message-type mistake; the bare MethodError is opaque.
 publish(pub::PublisherHandle{T}, msg) where {T} =
     throw(ArgumentError("publish: expected a $(T), got a $(typeof(msg))"))
 
@@ -136,9 +119,6 @@ Base.show(io::IO, pub::PublisherHandle{T}) where {T} =
 entity(pub::PublisherHandle) = pub.entity
 
 # ── Subscription ──────────────────────────────────────────────────────────────
-# A subscribe handle: an `Entity` carrying the FIFO Zenoh subscriber route and its
-# consumer task (node.jl's dispatch runtime). The handler is a plain `do`-block;
-# decode is owned by default or a zero-copy `CDRView` under `view=true`.
 
 """
     SubscriptionHandle{T}
@@ -166,14 +146,12 @@ function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T
     view = _view_mode(view)
     name = resolve_name(node, topic)
     ent = make_entity(node, Subscription, name, type_info_of(T); qos=qos)
-    # `transient_local` ⇒ an AdvancedSubscriber with latched history.
-    # `force_relatch` is the latched-history escape hatch: re-deliver on every
-    # activation regardless of sequence (for idempotent handlers that rebuild from
-    # latched inputs); the default dedups replays by novelty.
+    # transient_local routes to an AdvancedSubscriber with latched history. The
+    # transient_local re-latch dedup keys on payload content-hash, since cache replays
+    # arrive as bare payloads with null attachment and timestamp; force_relatch bypasses
+    # the dedup to re-deliver every latched sample for accumulating handlers.
     declare_subscription!(ent, T, handler; view=view, concurrency=concurrency,
                           force_relatch=force_relatch, weak = match === :weak)
-    # Warm-up: precompile decode + the handler-dispatch frame (and, under :execute, run
-    # the handler once on a sample) so the first real message isn't a JIT spike.
     pol = _resolve_warmup(node, warmup, warmup_sync)
     _warmup!(pol, () -> _warm_subscription(pol, ent, T, handler, view, warmup_sample))
     return SubscriptionHandle{T}(ent)
@@ -189,11 +167,9 @@ Base.show(io::IO, sub::SubscriptionHandle{T}) where {T} =
 entity(sub::SubscriptionHandle) = sub.entity
 
 # ── DynamicSubscription: the keyexpr-only variant ─────────────────────────────
-# A subscription with a runtime-resolved message type. It wildcards the data route
-# so samples of any type on the topic arrive, resolves each sample's type at runtime
-# via the type-discovery path, and decodes + dispatches through `invokelatest`. The
-# user observes the real typed `msg`, learns what to write, then graduates to the
-# static `Subscription(node, topic, T)` for the min-copy fast path.
+# A subscription with a runtime-resolved message type: it wildcards the data route,
+# resolves each sample's type at runtime, and decodes + dispatches through
+# `invokelatest` to cross the world-age boundary into the runtime-born type.
 
 """
     DynamicSubscriptionHandle
@@ -214,20 +190,16 @@ function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     concurrency::Concurrency=Serial(),
                                     warmup::Union{Symbol, Nothing}=nothing,
                                     warmup_sync::Union{Bool, Nothing}=nothing)
-    # Trap: keep codegen off the caller's task. Per-sample `realize!` runs on the
-    # dispatch *worker* (node.jl), off the recv thread and while the receiver drains
-    # the FIFO GC-safe, so the codegen's GC always completes. `Core.eval` codegen on
-    # this task — with the node's Zenoh sessions live (its `get_type_description`
-    # queryable, liveliness traffic) — stalls on a JIT-vs-Zenoh GC race.
+    # Per-sample realize! runs Core.eval codegen on the dispatch worker task, never on
+    # a foreign libzenohc callback thread: codegen on this caller's task, with the
+    # node's Zenoh sessions live, stalls on a JIT-vs-Zenoh GC race.
     name = resolve_name(node, topic)
     # No type identity: liveliness advertises the empty-type placeholder and the
     # data route wildcards type+hash (the type rides each sample's keyexpr).
     ent = make_entity(node, Subscription, name, nothing; qos=qos)
-    # Warm-up: no compile-time `T`, so warm-up is deferred to *first sight* of each
-    # runtime type (the dynamic consumer warms its codec via `invokelatest`). The
-    # resolved policy rides into the consumer; `:execute` degrades to `:precompile`
-    # there (a discovered handler can't be safely run on a synthesized sample —
-    # that's the manifest's job).
+    # No compile-time T, so warm-up defers to first sight of each runtime type. :execute
+    # degrades to :precompile here, since running a discovered handler on a synthesized
+    # sample is the type manifest's job.
     pol = _resolve_warmup(node, warmup, warmup_sync)
     declare_subscription!(ent, handler; view=view, concurrency=concurrency, warmup=pol)
     return DynamicSubscriptionHandle(ent)
@@ -243,11 +215,10 @@ Base.show(io::IO, sub::DynamicSubscriptionHandle) =
 entity(sub::DynamicSubscriptionHandle) = sub.entity
 
 # ── enum-instance call-methods: the constructor spelling ──────────────────────
-# `Publisher`/`Subscription` are `EndpointKind` *values* (same type), so a single
-# call-method on `EndpointKind` branches on the value — `Publisher(node, …)` and
-# `Subscription(node, …)` route to their builders, any other kind errors. The
-# do-block form desugars to a function-first call, so the handler-carrying
-# `Subscription` arity takes `f` first (the `Timer(f, …)` precedent).
+# `Publisher`/`Subscription` are `EndpointKind` values of one type, so a single
+# call-method per arity on `EndpointKind` branches on the value to its builder. The
+# do-block form desugars to a function-first call, so the handler-carrying arity
+# takes `f` first, following the `Timer(f, …)` precedent.
 
 """
     Publisher(node::Node, topic, ::Type{T};
@@ -278,9 +249,9 @@ Zenoh publisher.
 
 `warmup`, `warmup_sync`, and `warmup_sample` select the warm-up policy
 (precompile/execute/off, sync/async) that pre-JITs the encode/decode dispatch chain
-so the first real `publish` isn't a JIT spike; the warm-up layer (`base/core.jl`)
-owns it. Under `:execute` the synthesized publish runs with the wire `put`
-suppressed. Each defaults to the node's policy.
+so the first real `publish` runs at full speed. Under `:execute` the synthesized
+publish compiles the path with the wire `put` suppressed. Each defaults to the
+node's policy.
 
 ```julia
 pub = Publisher(node, "/chatter", std_msgs.msg.String)
@@ -293,9 +264,8 @@ publish(pub, std_msgs.msg.String(data = "hello"))
         throw(ArgumentError("Subscription requires a handler: `Subscription(node, topic, T) do msg … end`")) :
         throw(ArgumentError("$(k) is not a pub/sub kind (see Service/Client for request/reply)"))
 
-# Distinct arity from both the no-handler form above (node, topic, ::Type) and the
-# typed handler-form in service.jl (handler, node, name, ::Type), and the arg types
-# don't overlap (here arg2 is the Node), so there's no method ambiguity.
+# Arg2 is the Node here, vs the typed handler-form in service.jl (handler, node, …),
+# so this dynamic arity stays unambiguous against the other EndpointKind call-methods.
 """
     Subscription(node::Node, topic;
                  qos=default_qos(), view=Owned(), concurrency=Serial(),
@@ -339,8 +309,7 @@ end
         throw(ArgumentError("$(k) has no type-less form; only `Subscription(node, topic) do … end` \
                              omits the type (e.g. Service needs `Service(node, name, SrvType) do … end`)"))
 
-# The handler-form call-method (`Subscription(node, topic, T) do msg … end`) is
-# defined once, in service.jl — it fans Subscription → `_make_subscription` and
-# Service → `_make_service`. service.jl is included after this file; defining the
-# Subscription-only form here too would be a method *overwrite*, which precompile
-# forbids (the two signatures are identical). So the single owner is service.jl.
+# The typed handler-form call-method `Subscription(node, topic, T) do msg … end`
+# lives once in service.jl, where it fans Subscription → `_make_subscription` and
+# Service → `_make_service`. A duplicate Subscription-only definition here shares
+# that signature, and precompile rejects the resulting method overwrite at load.

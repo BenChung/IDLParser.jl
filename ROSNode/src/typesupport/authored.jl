@@ -1,11 +1,11 @@
 # Authored Julia types — the reverse pipeline (Julia type → ROS interface). A user
-# struct/handler is the source of truth; reflection (ROSMessages.il_from_type) yields the
-# IL, and everything downstream reuses the @ros_import generate→register→resolve path.
+# struct/handler is the source of truth; reflection (`ROSMessages.il_from_type`) yields
+# the IL hub form, and codegen/hashing/registration read from it.
 #
-# Registration is deferred to module-load (`absorb_static_types!`, the authored drain
-# arm in static_types.jl): a struct's IL — and thus its RIHS — isn't known until its
-# nested types are registered, which happens in source order at load. The macros emit
-# only (a) the structs into `<pkg>.<qual>` and (b) a `(Type, name)` push + flush hooks.
+# Reflection and RIHS are deferred to module load (`absorb_static_types!`), because a
+# struct's IL — and thus its RIHS — needs its nested types already registered, which
+# the source-order drain guarantees. The macros emit only the structs into
+# `<pkg>.<qual>` plus a `(Type, name)` push and the load-hook flush.
 
 # ── @ros_package ─────────────────────────────────────────────────────────────────
 """
@@ -42,16 +42,17 @@ function _caller_package(caller::Module)
 end
 
 # ── cross-macro merge: fold a freshly-built `module <pkg>` into the live one ──────
-# Each authored macro is its own top-level statement; a second top-level `module <pkg>`
-# would rebind/wipe the first. So `<pkg>` is created fresh on first sighting (a real
-# top-level `module`); after that, new members fold in through the live module's own
-# `eval` with a BARE `Expr(:toplevel,…)` (a new `<qual>` submodule likewise via
-# `<pkg>.eval(:(module <qual> end))`).
-# Define structs into `<pkg>.<qual>`, resolving each field's type IN THE CALLER (so the refs the
-# user wrote — sibling/imported messages, vendored `UUID`/`Time` — resolve where they're visible)
-# and splicing the resolved `Type` into the struct. `specs :: [(name::Symbol, [(field::Symbol,
-# type_expr)…])]`. A generated cross-ref (a wrapper → its section) is written as the qualified
-# `<pkg>.<qual>.<Name>` path, caller-resolvable once the earlier struct in `specs` has been eval'd.
+# `<pkg>` is created fresh on first sighting as a real top-level `module`; later members
+# fold in through the live module's own `eval` of a bare `Expr(:toplevel,…)` (a new
+# `<qual>` submodule via `<pkg>.eval(:(module <qual> end))`). A second top-level
+# `module <pkg>` would rebind and wipe the first.
+#
+# Define structs into `<pkg>.<qual>`, resolving each field's type IN THE CALLER (so the
+# user's refs — sibling/imported messages, vendored `UUID`/`Time` — resolve where they
+# are visible) and splicing the resolved `Type` into the struct.
+# `specs :: [(name::Symbol, [(field::Symbol, type_expr)…])]`. A generated cross-ref
+# (a wrapper → its section) is the qualified `<pkg>.<qual>.<Name>` path,
+# caller-resolvable once the earlier struct in `specs` has been eval'd.
 function _emit_structs(caller::Module, pkg::AbstractString, qual::Symbol, specs)
     pkgsym = Symbol(pkg)
     out = Any[]
@@ -62,15 +63,15 @@ function _emit_structs(caller::Module, pkg::AbstractString, qual::Symbol, specs)
     end
     qualpath = Expr(:., pkgsym, QuoteNode(qual))               # <pkg>.<qual>
     for (name, fields) in specs
-        # A fieldless interface must still carry rosidl's synthetic uint8 member — the RIHS
-        # IL injects it (`IL.nonempty_fields`), so the struct's wire form has to match; the
-        # `= 0x00` default lets `@kwdef` construct it bare.
+        # A fieldless interface carries rosidl's synthetic uint8 EMPTY_STRUCT_MEMBER on
+        # the wire (CDR layout must match a peer's); the `= 0x00` default lets `@kwdef`
+        # construct it bare.
         decls = isempty(fields) ?
             Any[:(Expr(:(=), Expr(:(::), $(QuoteNode(IL.EMPTY_STRUCT_MEMBER)), UInt8), 0x00))] :
             Any[:(Expr(:(::), $(QuoteNode(fn)), $(ft))) for (fn, ft) in fields]   # $(ft) → Type in caller
         # `@kwdef` so the action/service runtime can build wrappers/sections by keyword
-        # (e.g. `SendGoal_Request(; goal_id=…, goal=…)`, client.jl); the positional ctor the
-        # generic CDR reader and `struct_from_nt` use is retained.
+        # (e.g. `SendGoal_Request(; goal_id=…, goal=…)`); the positional ctor the generic
+        # CDR reader and `struct_from_nt` use is retained.
         push!(out, :( $(qualpath).eval(Expr(:macrocall, GlobalRef(Base, Symbol("@kwdef")),
             LineNumberNode(0), Expr(:struct, false, $(QuoteNode(name)), Expr(:block, $(decls...))))) ))
     end
@@ -90,9 +91,9 @@ function _struct_fields(s::Expr)
 end
 
 # ── emitting the authored registration (deferred reflection at load) ──────────────
-# Mirrors `_static_register_stmts` but targets `__ros_authored_types__` of `(Type, fqn)`
-# pairs (no JSON — the IL/RIHS is reflected at drain). Also seeds `__ros_resolve__`; the
-# actual `_merge_resolve!` runs at drain once the RIHS is known.
+# Push `(Type, fqn)` pairs onto `__ros_authored_types__` (no JSON — the IL/RIHS is
+# reflected at drain) and seed `__ros_resolve__`; `_merge_resolve!` runs at drain once
+# the RIHS is known.
 const _AUTHORED_GLOBAL = :__ros_authored_types__
 
 function _authored_register_stmts(pairs)
@@ -108,8 +109,8 @@ function _authored_register_stmts(pairs)
               ROSNode.absorb_static_types!(@__MODULE__)
           end),
         # The load hook routes through `ros_init!` (a superset of `absorb_static_types!`)
-        # so a module also carrying `@mixin`/`@node` initializes fully no matter which
-        # macro installed `__init__`. A user `__init__` steps in front; it should call
+        # so a module also carrying `@mixin`/`@node` initializes fully whichever macro
+        # installed `__init__`. A user-defined `__init__` takes precedence and must call
         # `ROSNode.ros_init!(@__MODULE__)` itself.
         :(if !$(Expr(:isdefined, :__init__))
               function __init__()
@@ -205,9 +206,10 @@ function _emit_message_define(caller::Module, pkg::AbstractString, name::Symbol,
     return block
 end
 
-# Annotate: alias the caller's existing top-level struct `jsym` into `<pkg>.msg` under the ROS
-# name `rosname` (Type spliced at eval, where `jsym` exists), then register. `jsym` may differ
-# from `rosname` (the explicit `"pkg/msg/Name" T` form). The struct stays usable at the caller too.
+# Annotate: alias the caller's existing top-level struct `jsym` into `<pkg>.msg` under the
+# ROS name `rosname` (Type spliced at eval, where `jsym` exists), then register. `jsym` may
+# differ from `rosname` (the explicit `"pkg/msg/Name" T` form). The struct stays usable at
+# the caller under its original name.
 function _emit_message_annotate(caller::Module, pkg::AbstractString, rosname::Symbol, jsym::Symbol=rosname)
     pkgsym = Symbol(pkg)
     name   = rosname
@@ -231,8 +233,8 @@ end
 
 # ── deferred reflection intern (called from absorb_static_types!' authored arm) ───
 # Reflect `T` → IL → TypeDescription (closure from already-registered nested entries) →
-# RIHS01 → RegistryEntry(:authored). Nested names resolve through the registry (`_entry_of`),
-# which is populated nested-first by the source-order drain — a hard error if absent.
+# RIHS01 → RegistryEntry(:authored). Nested names resolve through the registry, which the
+# source-order drain populates nested-first; an absent nested name is a hard error.
 function _intern_authored_entry!(@nospecialize(T), fqn::AbstractString)
     @lock _STATIC_ENTRY_LOCK begin
         haskey(_STATIC_ENTRY_CACHE, T) && return _STATIC_ENTRY_CACHE[T]
@@ -257,9 +259,10 @@ function _intern_authored_entry!(@nospecialize(T), fqn::AbstractString)
     end
 end
 
-# A nested type's ROS name: the registry first (authored/imported), else `ros_type_name` (a vendored
-# type the action wrappers reference — UUID/Time — resolved from its module nesting). A bare
-# (non-qualified) result means an unregistered user type: a hard error, not a silent wrong RRef.
+# A nested type's ROS name: the registry first (authored/imported), then `ros_type_name`
+# (a vendored type the action wrappers reference — UUID/Time — resolved from its module
+# nesting). A bare (non-qualified) result means an unregistered user type: a hard error,
+# so a wrong RRef never lands silently.
 function _authored_name_of(@nospecialize(S))
     e = _entry_of(S)
     e === nothing || return e.info.name
@@ -269,9 +272,9 @@ function _authored_name_of(@nospecialize(S))
     return n
 end
 
-# Add nested type `S`'s `TypeDescription` (and its own closure) to the RIHS `pool`. An authored/
-# imported type comes from the registry (`_entry_of`); a vendored protocol type the wrappers
-# reference (UUID/Time — not registry-resident) is reflected on the fly. Recurses (UUID/Time are leaves).
+# Add nested type `S`'s `TypeDescription` (and its own closure) to the RIHS `pool`. An
+# authored/imported type comes from the registry; a vendored protocol type the wrappers
+# reference (UUID/Time) is reflected on the fly. Recurses (UUID/Time are leaves).
 function _dep_into_pool!(pool, @nospecialize(S), ctx::AbstractString)
     e = _entry_of(S)
     if e !== nothing && e.td !== nothing
@@ -398,8 +401,8 @@ function _nt_fields(ntexpr)
 end
 
 # ── service runtime: adapter + Function-marker dispatch + client (defined once) ───
-# The synthetic empty-interface member exists for the wire/RIHS only; the handler-splat
-# and @NamedTuple surfaces treat a synthetic-only section as fieldless.
+# The synthetic EMPTY_STRUCT_MEMBER is wire/RIHS-only; the handler-splat and @NamedTuple
+# surfaces treat a synthetic-only section as fieldless.
 _synthetic_only(::Type{T}) where {T} = fieldnames(T) === (IL.EMPTY_STRUCT_MEMBER,)
 _surface_fields(::Type{T}) where {T} = _synthetic_only(T) ? () : fieldnames(T)
 _from_nt(::Type{T}, nt::NamedTuple) where {T} = _synthetic_only(T) ? T() : ROSMessages.struct_from_nt(T, nt)
@@ -421,8 +424,8 @@ function _authored_service_adapter(f::F) where {F<:Function}
     end
 end
 
-# `Service(node, name, f::Function)` — the function is marker + handler (3-arg: distinct from
-# the 4-arg do-block method and the `Publisher`/`Subscription` `::Type` 3-arg method).
+# `Service(node, name, f::Function)` — the function is marker + handler. 3-arg, distinct
+# from the 4-arg do-block method and the `Publisher`/`Subscription` `::Type` 3-arg method.
 (k::EndpointKind)(node::Node, name::AbstractString, f::F; kwargs...) where {F<:Function} =
     k === Service ?
         _make_service(_authored_service_adapter(f), node, name, F; kwargs...) :
@@ -431,7 +434,8 @@ end
 ServiceClient(node::Node, name::AbstractString, f::F; kwargs...) where {F<:Function} =
     ServiceClient(node, name, typeof(f); kwargs...)
 
-# kwargs in, @NamedTuple out — mirrors the handler. (Struct-passing `call(client, req)` stays.)
+# kwargs in, @NamedTuple out — the symmetric surface to the handler. (Struct-passing
+# `call(client, req)` stays.)
 function call(client::ServiceClient{Req, Resp}; async::Bool=false, timeout_ms::Integer=0, fields...) where {Req, Resp}
     out = call(client, _from_nt(Req, NamedTuple(fields)); async=async, timeout_ms=timeout_ms)
     return async ? out : _to_nt(out)
@@ -533,17 +537,19 @@ function _emit_action(caller::Module, pkg::AbstractString, fname::Symbol, args, 
     block = Expr(:toplevel)
     push!(block.args, _rebuild_handler(f, fname, args, fb_pos, rettype))     # handler = marker + body
     append!(block.args, _emit_structs(caller, pkg, :action, specs))
-    # Wire the action runtime to `typeof(fname)` (the reflective default keys on `nameof(A)`,
-    # which a function type lacks): specialize the support + wrapper + fb-index resolvers.
+    # Wire the action runtime to `typeof(fname)`, since the reflective default keys on
+    # `nameof(A)` which a function type lacks: specialize the support + wrapper + fb-index
+    # resolvers.
     push!(block.args, :(ROSNode.ActionTypeSupport(::Type{typeof($fname)}) =
         ROSNode.ActionTypeSupport{typeof($fname), $(actpath(goalsym)), $(actpath(resultsym)), $(actpath(fbsym))}()))
     push!(block.args, :(ROSNode._action_wrapper(::Type{typeof($fname)}, suffix::AbstractString) =
         getfield($actmod, Symbol($(string(fname)), suffix))))
     push!(block.args, :(ROSNode._feedback_param_index(::Type{typeof($fname)}) = $fb_pos))
-    # Register all eight types nested-first: the three sections, then the five rosidl wrappers.
-    # The qualifier-carrying `lower` makes a wrapper's section ref reflect to `pkg/action/<Section>`,
-    # so each wrapper's RIHS matches a ROS2 peer's (the section TDs are interned by the time a
-    # source-order drain reaches the wrappers).
+    # Register all eight types nested-first: the three sections, then the five rosidl
+    # wrappers. The qualifier-carrying `lower` makes a wrapper's section ref reflect to
+    # `pkg/action/<Section>`, so each wrapper's RIHS matches a ROS2 peer's (the section TDs
+    # are interned by the time the source-order drain reaches the wrappers). Each wrapper
+    # carries its own service-level RIHS distinct from the action's.
     regpairs = Tuple{Any,String}[
         (actpath(goalsym),   string(pkg, "/action/", goalsym)),
         (actpath(resultsym), string(pkg, "/action/", resultsym)),
@@ -557,7 +563,7 @@ function _emit_action(caller::Module, pkg::AbstractString, fname::Symbol, args, 
 end
 
 # ── action runtime: FeedbackSink + adapter + Function-marker dispatch (defined once) ───
-# Named FeedbackSink because `Feedback` is a SettlementStatus in core.jl.
+# Named FeedbackSink because `Feedback` is already a SettlementStatus.
 """
     FeedbackSink{F}
 
@@ -594,9 +600,10 @@ goal_handle(fb::FeedbackSink) = fb.gh
 _feedback_param_index(::Type) = error("authored action: handler not registered (no _feedback_param_index)")
 _splice(xs::AbstractVector, x, pos::Integer) = (ys = collect(Any, xs); insert!(ys, pos, x); ys)
 
-# Splat the decoded Goal's fields into the handler, injecting a `FeedbackSink{<Feedback>}` at the
-# recorded position; build the Result struct from the returned @NamedTuple. A throw → ABORTED, a
-# `Cancelled` (from `fb`) → CANCELED (settle_handler!), so the adapter just returns the result.
+# Splat the decoded Goal's fields into the handler, injecting a `FeedbackSink{<Feedback>}` at
+# the recorded position; build the Result struct from the returned @NamedTuple. The adapter
+# just returns the result: `settle_handler!` maps a normal return → SUCCEEDED, a propagating
+# `Cancelled` (from `fb`) → CANCELED, any other throw → ABORTED.
 function _authored_action_adapter(f::FN, ::Type{AT}) where {FN<:Function, AT}
     support = ActionTypeSupport(AT)
     G = goal_type(support); R = result_type(support); FB = feedback_type(support)
@@ -609,8 +616,8 @@ function _authored_action_adapter(f::FN, ::Type{AT}) where {FN<:Function, AT}
     end
 end
 
-# `ActionServer(node, name, f::Function)` — the function is marker + handler (3-arg: distinct
-# from the do-block `(body, node, name, ::Type)` and the `(node, name, ::Type)` forms).
+# `ActionServer(node, name, f::Function)` — the function is marker + handler. 3-arg,
+# distinct from the do-block `(body, node, name, ::Type)` and `(node, name, ::Type)` forms.
 ActionServer(node::Node, name::AbstractString, f::FN; kwargs...) where {FN<:Function} =
     _make_action_server(node, name, FN; body = _authored_action_adapter(f, FN), kwargs...)
 
@@ -621,17 +628,17 @@ ActionClient(node::Node, name::AbstractString, f::FN; kwargs...) where {FN<:Func
 send(client::ActionClient{A, G, R, F}; fields...) where {A, G, R, F} =
     send(client, _from_nt(G, NamedTuple(fields)))
 
-# @NamedTuple out for authored actions — mirrors the handler. Keyed on the function marker, so
-# `@ros_import` actions (tag-struct marker, not <:Function) keep returning their structs. Field
-# access is identical either way; this is the symmetric surface. (`invoke` reaches the generic
+# @NamedTuple out for authored actions — the symmetric surface to the handler. Keyed on the
+# `<:Function` marker, so `@ros_import` actions (tag-struct marker) keep returning their
+# structs; field access is identical either way. (`invoke` reaches the generic
 # struct-returning methods, then converts.)
 function feedback(g::ClientGoal{A, G, R, F}) where {A<:Function, G, R, F}
     src = invoke(feedback, Tuple{ClientGoal}, g)         # the generic Channel{F}
     out = Channel{NamedTuple}(max(1, _fifo_capacity(g.client.qos)))
     errormonitor(Threads.@spawn begin
         try
-            # Drop-oldest (KEEP_LAST ring): a consumer that breaks early no longer pins
-            # this task in a blocked `put!`; it still exits when `src` closes on settle.
+            # Drop-oldest (KEEP_LAST ring): a consumer that breaks early does not pin this
+            # task in a blocked `put!`, and it exits when `src` closes on settle.
             for fb in src; _put_drop_oldest!(out, _to_nt(fb)); end
         finally
             close(out)

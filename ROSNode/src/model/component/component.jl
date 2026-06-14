@@ -3,11 +3,8 @@
 # `@every`/`@hears`/`@serves`/`@runs` author DOES reactions; lifecycle hooks are plain
 # methods dispatched on the mixin; `@node` assembles members and `run` instantiates.
 #
-# Deferred: `retime!`/drift detection for `:param` timer rates, and `:client`
-# port materialisation for `@uses`.
-#
-# The macros accumulate specs into per-type registries at load (the authored-types
-# deferred pattern, typesupport/authored.jl); `run` reads them to materialize a node.
+# The declaration macros accumulate specs into per-type module-local stores at load;
+# `run` reads them to materialize a node.
 
 """
     abstract type Component end
@@ -63,24 +60,22 @@ mutable struct MixinSpec
 end
 MixinSpec() = MixinSpec(ParamSpec[], PortSpec[])
 
-# Spec storage is per-mixin and lives in the mixin's OWN module: `@mixin` defines a
-# `const MixinSpec()` there and a `mixin_spec(::Type{M})` method returning it, so the
-# container rides that module's precompile image (which persists its own globals). A
-# registry held here in ROSNode breaks under precompilation — a consuming package's
-# top-level mutation of ROSNode's dict happens in the package's precompile process and
-# is discarded with ROSNode's deserialized state, never reaching the package cache.
-# `ismixin` is likewise a per-type method `@mixin` emits. Both dispatch (no shared dict,
-# no lock); a missing `mixin_spec` method means the `@mixin` is absent or defined below.
+# Spec storage is per-mixin in the mixin's own module: `@mixin` defines a `const
+# MixinSpec()` there plus a `mixin_spec(::Type{M})` method returning it, so the spec
+# rides that module's precompile image. A ROSNode-global registry instead would lose a
+# precompiled consumer's mixins, since a top-level mutation of ROSNode's dict runs in the
+# consumer's precompile process and is discarded before its package cache is written.
+# `ismixin` is likewise a per-type method. A missing `mixin_spec` method means the
+# `@mixin` is absent or defined below.
 function mixin_spec end
 ismixin(@nospecialize(_)) = false
 
-# Lock for the process-global codegen caches (`_SCHEMAS`) + entity-accessor codegen — runtime
-# state rebuilt every load, so precompile-safe; the lock just serialises concurrent
-# first-touches.
+# Serialises concurrent first-touches of the process-global codegen caches (`_SCHEMAS`)
+# and entity-accessor codegen.
 const _CACHE_LOCK = ReentrantLock()
 
-# Declarations attach to the registered base; a concrete instantiation reaching here is
-# a value-level spelling (type alias, `typeof`) the syntactic macro guards can't see —
+# Declarations attach to the registered base. A concrete instantiation reaching here is
+# a value-level spelling (type alias, `typeof`) the syntactic macro guards cannot see;
 # it would push onto the wrong mixin's spec, invisible to materialisation.
 function _check_decl_key(::Type{M}) where {M}
     M isa DataType && Base.typename(M).wrapper !== M && error(
@@ -94,9 +89,9 @@ _add_port!(::Type{M}, p::PortSpec) where {M} =
     (_check_decl_key(M); push!(mixin_spec(M).ports, p); nothing)
 
 # ── the per-instance runtime binding (the hidden `__rt__`) ──────────────────────
-# Each constructed mixin carries a back-ref to its node-core + its materialised
-# surface, so `entities(m)`/`parameters(m)` resolve against it without a field on the
-# user's struct beyond the one hidden slot.
+# Each constructed mixin carries a back-ref to its node-core plus its materialised
+# surface, so `entities(m)`/`parameters(m)` resolve against the one hidden slot rather
+# than a field on the user's struct.
 
 mutable struct MixinRuntime
     const corenode::Any              # the ComponentNode (below)
@@ -107,31 +102,24 @@ mutable struct MixinRuntime
 end
 
 # ── per-mixin baked artifacts ───────────────────────────────────────────────────
-# A mixin's declarations attach to its TYPE, never to a ROSNode global — so each rides the
-# *consuming* package's precompile image (the old `_MIXINS` design was a ROSNode-global dict,
-# discarded across that boundary, leaving runtime lookups empty). Three module-local `const`s,
-# each keyed by the mixin's short `nameof` and living in its home module (`parentmodule(M)`),
-# where that name is unique:
+# Three module-local `const`s per mixin, keyed by its short `nameof` in its home module,
+# so each rides the consuming package's precompile image:
 #
-#   __ros_spec_<Name>__      ::MixinSpec     declaration registry — `@param`/`@publishes`/… push
-#                                            onto it. Emitted eagerly by `@mixin`. Reached by
-#                                            DISPATCH: `mixin_spec(::Type{M})`.
-#   __ros_pschema_<Name>__   ::Type{P_M}     typed parameter schema struct, the sum of the
-#                                            mixin's `@param`s. Emitted lazily by `_gen_schema`.
-#                                            Reached by DISPATCH `pschema(::Type{<:M})`; drives
-#                                            the typed `parameters(m::M)::P_M`.
-#   __ros_entities_<Name>__  ::Type{PortsNT} materialised-ports NamedTuple type, one handle per
-#                                            port. Emitted lazily by `_define_entities_accessor!`.
-#                                            Drives the typed `entities(m::M)::PortsNT`.
+#   __ros_spec_<Name>__      ::MixinSpec     declaration store, `@param`/`@publishes`/…
+#                                            push onto it. Eager (`@mixin`). Reached by
+#                                            `mixin_spec(::Type{M})`.
+#   __ros_pschema_<Name>__   ::Type{P_M}     typed parameter schema, the `@param` set.
+#                                            Lazy (`_gen_schema`). Reached by
+#                                            `pschema(::Type{<:M})`; drives `parameters(m::M)`.
+#   __ros_entities_<Name>__  ::Type{PortsNT} materialised-ports NamedTuple type. Lazy
+#                                            (`_define_entities_accessor!`); drives `entities(m::M)`.
 #
-# `pschema`/`entities` generate lazily at first `run` when absent, but a *defined* const is also
-# the REUSE MARKER: `_ensure_schema!` / `_define_entities_accessor!` skip regeneration when the
-# const already exists (`isdefined(home, sym)`) — whether generated earlier this process or BAKED
-# at the consuming package's precompile by `@precompile_nodes`. Re-emitting a baked artifact would
-# redefine its struct/method and invalidate the specialisations baked against it, so the skip is
-# load-bearing, not a mere optimisation. The two shapes derive from the specs: `P_M` is the
-# `@param` set (`_gen_schema`); `PortsNT` is the port set, each handle either statically derived
-# (`_handle_type`, the bake path) or captured from the live materialise (`typeof(ports)`).
+# A defined const is the bake-reuse marker: `_ensure_schema!` / `_define_entities_accessor!`
+# skip regeneration when it already exists, whether generated this process or baked at the
+# consumer's precompile by `@precompile_nodes`. Re-emitting would redefine the struct/method
+# and invalidate the specialisations baked against it, so the skip is a correctness guard, not
+# an optimisation. `PortsNT` is either statically derived from the specs (`_handle_type`, the
+# bake path) or captured from the live materialise (`typeof(ports)`).
 _spec_sym(name::Symbol)            = Symbol("__ros_spec_", name, "__")
 _pschema_sym(::Type{M}) where {M}  = Symbol("__ros_pschema_", nameof(M), "__")
 _entities_sym(::Type{M}) where {M} = Symbol("__ros_entities_", nameof(M), "__")
@@ -156,24 +144,21 @@ reached reflectively through [`entities`](@ref) / [`parameters`](@ref), never as
 fields.
 
 The macro injects a hidden `__rt__` runtime slot (defaulting to `nothing`), defines the
-mixin's spec store and its `mixin_spec`/`ismixin` dispatch in *this* module (so the
-declarations survive precompilation — see below), records the type as a loadable node
-kind by name (so a container's [`load_node`](@ref) can instantiate it), and installs
-ROSNode's single load hook [`ros_init!`](@ref) as the module's `__init__` unless the
-module defines its own. That hook drains the module's authored types (`@ros_message` /
-inline `@serves`/`@runs`), generates each mixin's parameter schema, and registers each
-kind — so a module mixing `@mixin` with authored-type macros initializes under one hook.
-If you write your own `__init__`, call `ROSNode.ros_init!(@__MODULE__)` from it to keep
-that setup running. Every declared field needs a default unless [`construct`](@ref) is
-overridden to supply it; with all fields defaulted the mixin builds as `M()`.
+mixin's spec store and its `mixin_spec`/`ismixin` dispatch in *this* module, records the
+type as a loadable node kind by name (so a container's [`load_node`](@ref) can
+instantiate it), and installs ROSNode's single load hook [`ros_init!`](@ref) as the
+module's `__init__` unless the module defines its own. That hook drains the module's
+authored types (`@ros_message` / inline `@serves`/`@runs`), generates each mixin's
+parameter schema, and registers each kind — so a module mixing `@mixin` with
+authored-type macros initializes under one hook. If you write your own `__init__`, call
+`ROSNode.ros_init!(@__MODULE__)` from it to keep that setup running. Every declared field
+needs a default unless [`construct`](@ref) is overridden to supply it; with all fields
+defaulted the mixin builds as `M()`.
 
-The spec store is a `const` defined in the *defining* module and reached by dispatch
-(`mixin_spec(::Type{M})`), not a registry inside ROSNode — a mixin declared in a
-precompiled package would otherwise lose its parameters/ports, because a top-level
-mutation of ROSNode's global runs in the package's precompile process and is discarded
-before the package cache is written. Storing per-mixin in the defining module rides that
-module's own precompile image. Likewise the loadable-kind registration is deferred to
-`ros_init!` (immediate only in the REPL/script case).
+The spec store is a `const` in the defining module, reached by dispatch
+(`mixin_spec(::Type{M})`), so it rides that module's own precompile image and a mixin
+declared in a precompiled package keeps its parameters and ports. The loadable-kind
+registration is likewise deferred to `ros_init!`, immediate only in the REPL/script case.
 
 A mixin may be parametric (`struct M{B}`) for type-stable dependency injection: a
 free-type-parameter field with no default is filled by `construct`. Supply the DI form
@@ -201,28 +186,26 @@ macro mixin(structexpr)
     specsym = _spec_sym(base)
     return esc(quote
         Base.@kwdef $newstruct
-        # Spec storage + dispatch: the `MixinSpec` is a `const` in THIS module, so it
-        # rides this module's precompile image; `mixin_spec(::Type{$base})` reaches it.
-        # `@param`/`@publishes`/… push onto it (they run as later top-level statements,
-        # so this method is already visible to them).
+        # Spec store + dispatch, both `const`/method in this module so they ride its
+        # precompile image. `@param`/`@publishes`/… run as later top-level statements, so
+        # `mixin_spec` is already visible when they push onto the spec.
         const $specsym = $(MixinSpec)()
         $(GlobalRef(@__MODULE__, :mixin_spec))(::$(Type){$base}) = $specsym
         $(GlobalRef(@__MODULE__, :ismixin))(::$(Type){$base}) = true
-        # The module's own roster of mixin bases, drained by `ros_init!` at load to
-        # generate each schema and register each as a loadable kind. Module-local, so it
-        # too survives precompile.
+        # Module-local roster of mixin bases, drained by `ros_init!` at load to generate
+        # each schema and register each as a loadable kind.
         if !isdefined(@__MODULE__, :__mixin_bases__)
             global __mixin_bases__ = $(Any)[]
         end
         push!(__mixin_bases__, $base)
-        # Register the loadable kind (mixin-as-node). Immediate for the
-        # REPL/script case; deferred to `ros_init!` for a precompiled package (a
-        # top-level mutation of ROSNode's registry would not survive precompile).
+        # Register the loadable kind immediately for the REPL/script case; a precompiled
+        # package defers to `ros_init!`, since a top-level mutation of ROSNode's registry
+        # would not survive precompile.
         if ccall(:jl_generating_output, Cint, ()) == 0
             $(GlobalRef(@__MODULE__, :register_node_kind!))(string(nameof($base)), $base)
         end
-        # Install ROSNode's single load hook unless the module brings its own `__init__`
-        # (then call `ROSNode.ros_init!(@__MODULE__)` from it — see `ros_init!`).
+        # Install ROSNode's load hook unless the module brings its own `__init__` (which
+        # must then call `ROSNode.ros_init!(@__MODULE__)`).
         if !isdefined(@__MODULE__, :__init__)
             function __init__()
                 $(GlobalRef(@__MODULE__, :ros_init!))(@__MODULE__)
@@ -362,11 +345,10 @@ The timer is built paused at the configure step and started at the activate step
 tick cannot fire before the node is configured or while a managed node is gated below
 Active. Reach the live `Timer` handle through `entities(m)` under the reaction's name.
 
-A `:param` rate is read once at materialisation and then fixed: changing the parameter
-afterward does not re-time the timer, and no drift warning is emitted (the
-detect-and-warn plus `retime!`/`@on_parameter` rewiring are deferred). A `:param`
-naming a non-parameter or a non-numeric parameter errors at materialisation, naming
-the member, port, and symbol.
+A `:param` rate is read once at materialisation and then fixed for the timer's life; a
+later change to that parameter leaves the period as set. A `:param` naming a
+non-parameter or a non-numeric parameter errors at materialisation, naming the member,
+port, and symbol.
 
 ```julia
 @every :fps function tick(m::ImageCapture)
@@ -634,8 +616,8 @@ function _parse_reaction_sig(f, nargs::Int)
 end
 
 # ── lifecycle hooks: plain methods, defaulting to no-ops on Component ───────────
-# These are the user-override side; the transition drivers (configure!/activate!/…)
-# own the state-machine edges and call them.
+# The user-override side. The transition drivers (configure!/activate!/…) own the
+# state-machine edges and call these.
 
 """
     configure(m::M)
@@ -735,9 +717,9 @@ against the captured concrete NamedTuple type.
 entities(m::Component) = _ports_value(m)
 
 # Emit the type-stable `entities(m::M)::PortsNT` (a typed field load mirroring `parameters(m)`)
-# plus its `__ros_entities_<Name>__` reuse marker, once. Skips if the marker already exists
-# (this process, or baked at precompile — see the artifact-family note). `PortsNT` comes from one
-# of two sources, both proven equal for the statically-derivable kinds by `component_entities_static.jl`:
+# plus its `__ros_entities_<Name>__` reuse marker, once. Skips if the marker already exists,
+# whether generated this process or baked at precompile. The two `PortsNT` sources (static
+# derivation and live capture) are proven equal for statically-derivable kinds.
 function _define_entities_accessor!(::Type{M}, PortsNT::Type) where {M}
     mod  = parentmodule(M)
     msym = _entities_sym(M)
@@ -752,19 +734,16 @@ function _define_entities_accessor!(::Type{M}, PortsNT::Type) where {M}
     return nothing
 end
 
-# Source 1 — the live materialise: `typeof(ports)` is the authoritative concrete type (and a
-# no-op if the bake already emitted the accessor). Always works, incl. ports whose handle type
-# isn't statically derivable (`:action`/`:client`).
+# Source 1 — the live materialise: `typeof(ports)` is the authoritative concrete type.
+# Covers every kind, including those whose handle type isn't statically derivable
+# (`:action`/`:client`).
 _entities_accessor_from_ports!(::Type{M}, ports) where {M} = _define_entities_accessor!(M, typeof(ports))
 
-# The materialised handle type for a port, as a pure function of its spec — so the
-# `entities(m::M)::PortsNT` accessor can be generated WITHOUT materialising (the bake path).
-# `nothing` for a kind whose handle type isn't statically derivable here (`:action` — the
-# server type; `:client` — not materialised), which makes the whole mixin fall back to the
-# materialise-time capture. Component publishers carry no per-port QoS, so the route is
-# always the default plain `Zenoh.Publisher`; a future QoS-bearing port that diverges is
-# caught by `_define_entities_accessor!`'s reuse-marker skip (the divergent live type would be
-# stranded on a stale baked accessor — `component_entities_static.jl` guards against exactly that).
+# The materialised handle type for a port as a pure function of its spec, so the
+# `entities(m::M)::PortsNT` accessor can be baked WITHOUT materialising. `nothing` for a
+# kind whose handle type isn't statically derivable (`:action` server type, `:client` not
+# materialised), which falls the whole mixin back to materialise-time capture. Component
+# publishers carry no per-port QoS, so the route is always the plain `Zenoh.Publisher`.
 function _handle_type(p::PortSpec)
     p.kind === :publisher    && return PublisherHandle{p.msgtype, Zenoh.Publisher}
     p.kind === :subscription && return SubscriptionHandle{p.msgtype}
@@ -787,11 +766,11 @@ function _ports_nt_type(specs::Vector{PortSpec})
     return NamedTuple{(names...,), Tuple{types...}}
 end
 
-# Source 2 — the static derivation (`@precompile_nodes` bake): compute `PortsNT` from the declared
-# specs via `_handle_type`, no materialise needed. Returns the generated `PortsNT`, or `nothing` for
-# a mixin with a port whose handle type isn't statically derivable — leaving its accessor (and so its
-# handler bake) to source 1 at first `run`, since a handler baked against the generic accessor here
-# would be wasted, then invalidated when materialise emits the typed one.
+# Source 2 — the static derivation (`@precompile_nodes` bake): compute `PortsNT` from the
+# declared specs via `_handle_type`, no materialise needed. Returns `PortsNT`, or `nothing`
+# for a mixin with a non-derivable port — leaving its accessor and handler bake to source 1
+# at first `run`, since a handler baked against the generic accessor here would be wasted,
+# then invalidated when materialise emits the typed one.
 function _entities_accessor_from_specs!(::Type{M}) where {M}
     nt = _ports_nt_type(mixin_spec(M).ports)
     nt === nothing && return nothing
@@ -799,10 +778,9 @@ function _entities_accessor_from_specs!(::Type{M}) where {M}
     return nt
 end
 
-# The live parameter snapshot for `m` — dynamically typed. `_ensure_schema!` generates
-# a per-mixin `parameters(m::M)` that branches on the unset slot (reusing this error)
-# then asserts `::ParameterServer{P_M}` for a statically-dispatched `current`; this
-# generic is the pre-generation fallback.
+# The live parameter snapshot for `m`, dynamically typed — the pre-generation fallback.
+# `_ensure_schema!` later generates a per-mixin `parameters(m::M)` that asserts
+# `::ParameterServer{P_M}` for a statically-dispatched `current`.
 function _param_value(m::Component)
     rt = getfield(m, :__rt__)
     rt === nothing && error("parameters($(typeof(m))): not materialised yet (no node-core)")
@@ -859,10 +837,9 @@ construct(::Type{Watch}, node, s::Sensor) = Watch(sensor = s)
 """
 construct(::Type{M}, node) where {M <: Component} = _zero_dep_construct(M)
 
-# Kind-dispatched fallback body: method existence can't detect an author override (the
-# generic above matches every `M <: Component`, UnionAlls included), and a sibling
-# `construct(::UnionAll, node)` loses specificity to it — dead code. `DataType` vs
-# `UnionAll` on the type *value* splits cleanly.
+# Splits on the type *value*: the `construct` generic above matches every `M <: Component`
+# (UnionAlls included), so a sibling `construct(::UnionAll, node)` loses specificity to it
+# and is dead. Dispatching on `DataType` vs `UnionAll` here separates plain from parametric.
 _zero_dep_construct(M::DataType) = M()
 _zero_dep_construct(M::UnionAll) = error(
     "$(M) has a free type parameter: define `construct(::Type{$(nameof(M))}, node)` to " *
@@ -959,12 +936,11 @@ end
 
 # ── parameter-schema codegen ──────────────────────────────────────────────────────
 # A mixin's `@param`s accumulate across separate statements, so the typed schema `P_M`
-# can't be generated at `@mixin` expansion. It's generated lazily at first `run`
-# (cached): a `@parameters`-style coercing struct + its `descriptors` + the covariant
-# `pschema(::Type{<:M}) = P_M` accessor, evaluated into the mixin's home module — the
-# authored-types deferred-codegen pattern (typesupport/authored.jl). `run` reaches the
-# new-world type through `invokelatest`; reactions compiled afterward see it statically,
-# so `parameters(m).fps` is a type-stable field load.
+# is generated lazily at first `run` (cached), not at `@mixin` expansion: a
+# `@parameters`-style coercing struct + its `descriptors` + the covariant
+# `pschema(::Type{<:M}) = P_M` accessor, evaluated into the mixin's home module. `run`
+# reaches the new-world type through `invokelatest`; reactions compiled afterward see it
+# statically, so `parameters(m).fps` is a type-stable field load.
 
 "`pschema(::Type{M})` → the mixin's generated parameter schema type `P_M`."
 pschema(::Type{M}) where {M} =
@@ -983,11 +959,10 @@ function _ensure_schema!(::Type{M}) where {M}
     @lock _CACHE_LOCK (haskey(_SCHEMAS, M) && return _SCHEMAS[M])
     mod = parentmodule(M)
     psym = _pschema_sym(M)
-    # If `P_M` already exists — generated earlier this process, OR baked into the image at the
-    # consuming package's precompile (`@precompile_nodes`) — reuse it; re-`_gen_schema` would
-    # redefine `P_M`/`pschema`/`parameters` and invalidate the baked specialisations. The defined
-    # `const` is the reuse marker (rides the consuming pkgimage, unlike the ROSNode-global
-    # `_SCHEMAS`) — see the artifact-family note.
+    # If `P_M` already exists — generated this process or baked at the consumer's precompile
+    # — reuse it: re-`_gen_schema` would redefine `P_M`/`pschema`/`parameters` and invalidate
+    # the baked specialisations. The defined `const` is the reuse marker, riding the consumer's
+    # pkgimage where the ROSNode-global `_SCHEMAS` cannot.
     P = isdefined(mod, psym) ? getfield(mod, psym) : _gen_schema(mod, psym, mixin_spec(M).params, M)
     @lock _CACHE_LOCK (_SCHEMAS[M] = P)
     return P
@@ -1017,9 +992,9 @@ Skipping it in a *precompiled* package leaves authored types unresolved and `@mi
 a direct `run(MyMixin)` still works (the schema generates lazily at `run`).
 """
 function ros_init!(mod::Module)
-    # One hook covers both layers: drain authored types AND finalize mixins/nodes, so a
+    # One hook covers both layers — drain authored types AND finalize mixins/nodes — so a
     # module mixing `@mixin` with `@ros_message` initializes fully whichever macro
-    # installed `__init__` — resolving the prior install-order collision.
+    # installed `__init__`.
     try
         absorb_static_types!(mod)
     catch err
@@ -1064,10 +1039,9 @@ function _gen_schema(mod::Module, psym::Symbol, params::Vector{ParamSpec}, ::Typ
         $(GlobalRef(@__MODULE__, :pschema))(::Type{<:$M}) = $psym
         # The type-stable per-mixin accessor. The `=== nothing` branch keeps the friendly
         # pre-materialisation error (`_param_value` raises it); the server assert makes
-        # `current(::ParameterServer{P_M})` dispatch statically and return `P_M`. Emission
-        # rules are load-bearing: this block is eval'd into the mixin's home module, so
-        # functions interpolate as GlobalRefs and types as values — a bare name would
-        # silently define a fresh local function there.
+        # `current(::ParameterServer{P_M})` dispatch statically and return `P_M`. This block
+        # is eval'd into the mixin's home module, so framework functions must interpolate as
+        # GlobalRefs — a bare name would silently define a fresh local function there instead.
         $(GlobalRef(@__MODULE__, :parameters))(m::$M) = begin
             rt = getfield(m, :__rt__)
             rt === nothing && $(GlobalRef(@__MODULE__, :_param_value))(m)
