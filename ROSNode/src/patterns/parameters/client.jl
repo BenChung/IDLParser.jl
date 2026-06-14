@@ -21,10 +21,13 @@ remote's six standard parameter services and `/parameter_events` over the wire.
 
 See the ROS 2 parameter concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Parameters.html
 
-Passing a [`@parameters`](@ref) schema `P` (the same struct the remote baked in via
-`Node(ctx, name, P)`) makes it a typed lens — `fetch(client)` returns a `P` and
-`transaction(client) do p … end` mutates it type-stably. Without a schema it is
-dynamic (returns `NamedTuple`/`Any`), for talking to an arbitrary ROS2 node.
+A [`@parameters`](@ref) schema `P` (the same struct the remote baked in via
+`Node(ctx, name, P)`) selects the client kind:
+
+| Client kind | `P` | `fetch(client)` returns | usable with |
+|---|---|---|---|
+| Typed lens | a `@parameters` struct | a type-stable `P`; `transaction(client) do p … end` mutates it type-stably | a remote sharing schema `P` |
+| Dynamic | omitted (`Nothing`) | a `NamedTuple` (values `Any`) | an arbitrary ROS 2 node |
 
 The underlying [`ServiceClient`](@ref)s are built lazily per service and reaped by
 `close(client)`. Calls are fallible: a timeout or error reply raises
@@ -239,10 +242,11 @@ Base.setindex!(c::ParameterClient, value, name::Union{Symbol, AbstractString}) =
 """
     fetch(client::ParameterClient{P}; timeout_ms=2000) -> P
 
-Materialize the whole remote into one value: for a typed client a type-stable
-`P` (one round-trip, then read fields locally); for a schemaless client a
-`NamedTuple` of every remote parameter. An unset field falls back to the schema
-default.
+Materialize the whole remote into one value:
+
+- typed client — a type-stable `P` (one round-trip, then read fields locally).
+- schemaless client — a `NamedTuple` of every remote parameter.
+- an unset field falls back to the schema default.
 """
 function Base.fetch(c::ParameterClient{P}; timeout_ms::Integer = 2000) where {P}
     P === Nothing && return _fetch_dynamic(c; timeout_ms = timeout_ms)
@@ -296,9 +300,13 @@ Remote mutation with the same do-block shape as the server's [`transaction`](@re
 runs `f` against a draft of the fetched current value, then pushes the diff
 as one `set_parameters_atomically`. The client validates the candidate locally first
 (per-field constraints + read-only gate + user `validate`) for fast feedback, then
-the remote re-validates authoritatively. Returns the new `P` on success,
-or raises [`ParameterRejection`](@ref) on a rejected set — uniform with the local
-path. Requires a typed client (schemaless remotes use `set_parameters_atomically`).
+the remote re-validates authoritatively — the outcome is uniform with the local path:
+
+- on success — returns the new `P`.
+- on a rejected set — raises [`ParameterRejection`](@ref).
+
+Requires a typed client (a typed [`ParameterClient`](@ref)`{P}`); schemaless remotes use
+`set_parameters_atomically` directly.
 """
 function transaction(f, c::ParameterClient{P}; timeout_ms::Integer = 2000) where {P}
     P === Nothing &&
@@ -321,9 +329,11 @@ end
 
 Watch the remote's parameter changes: subscribe `/parameter_events`, filter to
 this client's `target`, and call `f(batch::ParameterEventBatch)` per event. The
-remote analog of the server-side `on_parameter_event`. For a typed client the changed
-values are coerced to their field types. `batch.previous` is empty: the wire event
-carries only current values. The subscription is reaped by `close(client)`.
+remote analog of the server-side `on_parameter_event`.
+
+- a typed client coerces the changed values to their field types.
+- `batch.previous` is always empty — the wire event carries only current values.
+- the subscription is reaped by `close(client)`.
 """
 function on_parameter_event(f, c::ParameterClient{P}) where {P}
     sub = Subscription(c.node, "/parameter_events", _ParameterEvent) do ev

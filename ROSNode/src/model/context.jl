@@ -60,8 +60,8 @@ end
 
 Identity of a discovered node: its `name`, `namespace`, and security `enclave`.
 This is the shape `node_names` returns from a graph query. `node_names`
-currently reports `enclave` as `""` — the enclave is unrecoverable from
-rmw_zenoh liveliness tokens (always `%` on the wire).
+currently reports `enclave` as `""`. The enclave is unrecoverable from
+rmw_zenoh liveliness tokens, which always carry `%` on the wire.
 """
 struct NodeInfo
     name::String
@@ -197,14 +197,24 @@ closes the session (the `rclcpp::init`/`shutdown` bracket).
 
 Configuration is two layers. The Zenoh session config is Zenoh.jl's `Config`
 (`config=`, default a fresh peer-mode `Config`); `localhost_only` and `peers`
-layer the ROS transport-shaping env into it: `localhost_only=true` disables
-multicast scouting and, when no explicit `peers` are given, connects to the
-loopback router (`tcp/localhost:7447`); `peers` sets `connect/endpoints`;
-`shm_clients` passes through to the session open. The ROS settings
-`domain_id`/`namespace`/`enclave` each fall back to
-`ROS_DOMAIN_ID`/`ROS_NAMESPACE`/`ROS_ENCLAVE` when left `nothing`, with the
-kwarg winning; the namespace is normalized to a leading-slash,
-no-trailing-slash form (empty becomes `/`). `domain_id` is stamped into every
+layer the ROS transport-shaping env into it:
+
+- `localhost_only=true` — disables multicast scouting and, when no explicit
+  `peers` are given, connects to the loopback router (`tcp/localhost:7447`).
+- `peers` — sets `connect/endpoints`.
+- `shm_clients` — passes through to the session open.
+
+The ROS settings `domain_id`/`namespace`/`enclave` each fall back to an
+environment variable when left `nothing`, with the kwarg winning:
+
+| kwarg | env var fallback |
+|-------|------------------|
+| `domain_id` | `ROS_DOMAIN_ID` |
+| `namespace` | `ROS_NAMESPACE` |
+| `enclave` | `ROS_ENCLAVE` |
+
+The namespace is normalized to a leading-slash, no-trailing-slash form (empty
+becomes `/`). `domain_id` is stamped into every
 data-plane topic keyexpr and scopes the liveliness subscription, so topic
 traffic and graph discovery both stay within the domain. `home` binds a module
 whose baked `__ros_resolve__` table this Context resolves wire types through,
@@ -666,9 +676,13 @@ and is charset/structure-validated: leading slash, no empty `//` token, no
 trailing slash, each token starting with a letter or underscore and containing
 only letters, digits, and underscores.
 
-Returns the validated FQN. Throws `ArgumentError` for an empty name, a private
-name resolved against a bare `Context` (no node FQN to anchor `~`), or a
-resolved name that fails validation. `kind` (`:topic`/`:service`/`:node`) is
+Returns the validated FQN. Throws `ArgumentError` for:
+
+- an empty name.
+- a private name resolved against a bare `Context` (no node FQN to anchor `~`).
+- a resolved name that fails validation.
+
+`kind` (`:topic`/`:service`/`:node`) is
 carried for kind-scoped remap rules and leaves the algorithm unchanged today.
 
 The first argument may be a `Context` (relative names resolve against its
@@ -1055,10 +1069,19 @@ keeping the process alive while Julia's scheduler delivers messages and runs
 callbacks on their own tasks (the scheduler fills the [executor](https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Executors.html)
 role). Returns once the drain has fully completed.
 
-With `handle_signals=false` (the default) this is exactly `wait(ctx)`; Julia's
-default Ctrl-C handling applies. With `handle_signals=true`, signal handling is
-scoped to this call: a first Ctrl-C requests a graceful drain and re-parks
-until it finishes; a second Ctrl-C during the drain forces `exit(130)`. The
+`handle_signals` selects the Ctrl-C behavior:
+
+| value | behavior |
+|-------|----------|
+| `false` (the default) | exactly `wait(ctx)`; Julia's default Ctrl-C handling applies. |
+| `true` | signal handling is scoped to this call (see below). |
+
+Under `handle_signals=true`:
+
+- a first Ctrl-C requests a graceful drain and re-parks until it finishes.
+- a second Ctrl-C during the drain forces `exit(130)`.
+
+The
 handlers are removed when `spin` returns, so a library embedding ROSNode keeps
 its own handlers.
 

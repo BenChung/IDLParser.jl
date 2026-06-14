@@ -50,10 +50,14 @@ Base.showerror(io::IO, ::ShutdownException) =
 
 Thrown by the action cancellation checkpoints — `checkpoint(goal)` and
 `feedback!(goal, …)` — when the goal has moved to the `CANCELING` action goal
-state. A goal handler that lets it propagate settles cleanly: the fail-safe
-settlement maps a thrown `Cancelled` to a `CANCELED` result (filling the result
-cell with `canceled(default_result())`), where any other exception maps to
-`ABORTED`. Cancellation then unwinds structurally through the handler's call
+state. A goal handler that lets it propagate settles cleanly through the
+fail-safe settlement:
+
+  - `Cancelled` — fills the result cell with `canceled(default_result())`, a
+    `CANCELED` result.
+  - any other exception — maps to `ABORTED`.
+
+Cancellation then unwinds structurally through the handler's call
 stack, with no manual status polling.
 
 Models the ROS 2 action goal-state path `{ACCEPTED, EXECUTING}` → `CANCELING` →
@@ -84,10 +88,15 @@ Base.showerror(io::IO, ::Cancelled) =
 
 Sealed abstract supertype of the outcome tokens passed to `respond!` to settle a
 service request or an action goal. The singleton instances split by call site:
-services use [`success`](@ref) and [`failure`](@ref) (alias [`failed`](@ref));
-actions use [`succeeded`](@ref), [`canceled`](@ref), and [`aborted`](@ref) (the
-terminal result outcomes) plus [`feedback`](@ref) (a stream verb, not a terminal
-cell write).
+
+| Token | Call site | Terminal? |
+|-------|-----------|-----------|
+| [`success`](@ref) | service | yes |
+| [`failure`](@ref) (alias [`failed`](@ref)) | service | yes |
+| [`succeeded`](@ref) | action | yes |
+| [`canceled`](@ref) | action | yes |
+| [`aborted`](@ref) | action | yes |
+| [`feedback`](@ref) | action | no — a stream verb, not a terminal cell write |
 
 `respond!` dispatches on this abstract type, so it accepts any token; the
 non-terminal [`feedback`](@ref) passed where a result is due raises an
@@ -274,17 +283,17 @@ Base.show(io::IO, c::Parallel) = print(io, "Parallel(", isfinite(c.n) ? Int(c.n)
 Sealed abstract supertype controlling how a subscription delivers each message to
 its handler — the single `view=` knob, on a safety-versus-speed curve:
 
-  - [`Owned`](@ref) (default) — a fully-owned message: storable, forwardable, and
-    safe to spawn beyond the handler's return, with no lifetime caveats.
-  - [`Checked`](@ref) — a zero-copy `CDRView` aliasing the payload, with a runtime
-    escape guard: a view used after the handler returns throws
+  - [`Owned`](@ref) (default; `view=false`) — a fully-owned message: storable,
+    forwardable, and safe to spawn beyond the handler's return, with no lifetime
+    caveats.
+  - [`Checked`](@ref) (`view=true`) — a zero-copy `CDRView` aliasing the payload,
+    with a runtime escape guard: a view used after the handler returns throws
     `BorrowError`.
   - [`Unchecked`](@ref) — the same zero-copy view with the guard removed: fastest
     and zero-allocation; an escaping view is undefined behavior.
 
 `Checked` and `Unchecked` borrow over the *same* representation, so validating
-under `Checked` exercises exactly what `Unchecked` runs. The Bool shorthands
-`view=true` and `view=false` map to `Checked()` and `Owned()`.
+under `Checked` exercises exactly what `Unchecked` runs.
 """
 abstract type ViewMode end
 
@@ -405,12 +414,21 @@ end
 """
     WarmupPolicy(mode, sync)
 
-Per-entity warm-up policy. `mode` is `:precompile` (default — a
-side-effect-free `precompile`-anchor of the dispatch chain), `:execute` (run the
-handler once on a sample message with side effects suppressed, reaching full
-native depth), or `:off` (no warm-up). `sync=false` (default) warms on a
-background task — zero construction latency; `sync=true` blocks the constructor
-until warm (first message guaranteed compiled — hard real-time).
+Per-entity warm-up policy.
+
+`mode` selects how the dispatch chain is warmed:
+
+  - `:precompile` (default) — a side-effect-free `precompile`-anchor of the
+    dispatch chain.
+  - `:execute` — run the handler once on a sample message with side effects
+    suppressed, reaching full native depth.
+  - `:off` — no warm-up.
+
+`sync` selects when the warm-up runs:
+
+  - `false` (default) — warms on a background task; zero construction latency.
+  - `true` — blocks the constructor until warm; first message guaranteed
+    compiled (hard real-time).
 """
 struct WarmupPolicy
     mode::Symbol

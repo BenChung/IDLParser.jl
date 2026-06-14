@@ -27,9 +27,12 @@ Two construction forms share one constructor:
   [`SingleFlight`](@ref) or your own orchestrator.
 
 Pass either a `do`-block body or `on_accepted=`, never both; a server with
-neither raises `ArgumentError`. `on_goal(request)` returns
-[`accept`](@ref)/[`reject`](@ref)/[`defer`](@ref) (default accept-all);
-`on_cancel(goal)` returns `accept`/`reject` (default accept).
+neither raises `ArgumentError`. The two decision callbacks:
+
+| callback | returns | default |
+|---|---|---|
+| `on_goal(request)` | [`accept`](@ref) / [`reject`](@ref) / [`defer`](@ref) | accept-all |
+| `on_cancel(goal)` | `accept` / `reject` | accept |
 
 The three services key off rmw_zenoh SERVICE-level type names and RIHS01 hashes —
 `<pkg>/action/<A>_SendGoal`, `…_GetResult`, and `action_msgs/srv/CancelGoal` fill
@@ -516,9 +519,13 @@ orchestrator such as [`SingleFlight`](@ref). Each call spawns a fresh task, so
 two `execute` calls on different goals run simultaneously — the caller owns any
 one-at-a-time policy.
 
-The body's exit maps to a goal terminal status: normal return settles `succeeded`,
-a thrown [`Cancelled`](@ref) settles `canceled`, any other throw (or a body that
-exits without responding) settles `aborted` and logs. [`respond!`](@ref) owns the
+The body's exit maps to a goal terminal status:
+
+- normal return settles `succeeded`;
+- a thrown [`Cancelled`](@ref) settles `canceled`;
+- any other throw (or a body that exits without responding) settles `aborted` and logs.
+
+[`respond!`](@ref) owns the
 exactly-once settlement that guarantees this mapping fires exactly once.
 """
 function execute(body::Function, g::GoalHandle{A, G, R, F}) where {A, G, R, F}

@@ -44,26 +44,37 @@ nothing`.
 Context's namespace; the fully-qualified name is `namespace/name`, validated at
 construction. `enclave` defaults to the Context's enclave (SROS2 security enclave).
 
-Construction allocates an entity id from `ctx`, builds the wire identity
-(`ROSZenoh.NodeEntity`), declares the node's liveliness token so peers discover it
-(the `NN` node-liveliness kind), and injects the node into the local
-discovery index so self-queries see it immediately. The node is registered
-with `ctx`, so a Context drain closes it. `serve_type_description=true` also
-declares the `~/get_type_description` service (matching real ROS 2 nodes on Jazzy
-and later) so peers can resolve the types this node advertises; a failure
-declaring it is logged and construction continues.
+Construction performs these steps:
 
-`warmup`/`warmup_sync` set the node-default `WarmupPolicy` — the warm-up policy
-(precompile/execute/off, sync/async) that pre-JITs the encode/decode dispatch
-chain — for entities created on the node. Each entity constructor's own `warmup`/`warmup_sync`
-keywords override per-endpoint.
+- Allocates an entity id from `ctx`.
+- Builds the wire identity (`ROSZenoh.NodeEntity`).
+- Declares the node's liveliness token (the `NN` node-liveliness kind) so peers discover it.
+- Injects the node into the local discovery index so self-queries see it immediately.
+- Registers the node with `ctx`, so a Context drain closes it.
+- With `serve_type_description=true`, declares the `~/get_type_description` service
+  (matching real ROS 2 nodes on Jazzy and later) so peers can resolve the types this
+  node advertises; a failure declaring it is logged and construction continues.
 
-Every entity created against the node is tracked and dies with it: `close(node)`
-leaves the Context's sim-time set, closes each owned entity in reverse creation
-order (failures logged, teardown continues), withdraws the node liveliness token,
-and drops the node from the discovery index. `close` is idempotent and
-`isopen(node)` reports liveness. Clock access (`clock(node)`, `now(node)`,
-`Timer(node, …)`) reads through the node's per-source clock table, routed to
+`warmup` and `warmup_sync` set the node-default `WarmupPolicy` that pre-JITs the
+encode/decode dispatch chain for entities created on the node:
+
+| Keyword | Accepted values | Effect |
+|---|---|---|
+| `warmup` | `:precompile`, `:execute`, `:off` | Selects the warm-up mode. |
+| `warmup_sync` | `false`, `true` | Runs the warm-up asynchronously or synchronously. |
+
+Each entity constructor's own `warmup`/`warmup_sync` keywords override per-endpoint.
+
+Every entity created against the node is tracked and dies with it. `close(node)`
+tears down in order:
+
+1. Leaves the Context's sim-time set.
+2. Closes each owned entity in reverse creation order; failures are logged and teardown continues.
+3. Withdraws the node liveliness token.
+4. Drops the node from the discovery index.
+
+`close` is idempotent and `isopen(node)` reports liveness. Clock access (`clock(node)`,
+`now(node)`, `Timer(node, …)`) reads through the node's per-source clock table, routed to
 the Context's session or sim time source.
 
 ```julia

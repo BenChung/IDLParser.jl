@@ -200,9 +200,11 @@ end
 """
     JumpCallback(f; min_forward=nothing, min_backward=nothing, on_clock_change=true)
 
-A registerable jump handler. `f(::TimeJump)` fires when the clock leaps forward
-by ≥ `min_forward`, backward by ≥ `min_backward`, or (if `on_clock_change`) on a
-sim activate/deactivate. Thresholds are `Duration`/`Period`/`nothing`.
+A registerable jump handler. `f(::TimeJump)` fires on any of:
+
+- `min_forward` — the clock leaps forward by ≥ this threshold (`Duration`/`Period`/`nothing`).
+- `min_backward` — the clock leaps backward by ≥ this threshold (`Duration`/`Period`/`nothing`).
+- `on_clock_change` — a sim activate/deactivate, when `true`.
 """
 struct JumpCallback
     f::Function
@@ -290,7 +292,7 @@ register!(f::Function, c::Clock; kwargs...) = register!(c, JumpCallback(f; kwarg
 
 # ── now() ───────────────────────────────────────────────────────────────────
 # Raw clock reads. Steady uses Julia's monotonic `time_ns`; System uses wall
-# `time()`. ROS == System until sim time is wired.
+# `time()`. The ROS clock's sim-time routing is in `_read_ns(::Clock{ROS})` below.
 
 _read_ns(::Steady) = Int64(Base.time_ns() & typemax(Int64))   # monotonic, ns
 _read_ns(::System) = round(Int64, time() * 1e9)               # wall, ns since unix epoch
@@ -313,8 +315,9 @@ _read_ns(::ROS) = _read_ns(System())
 """
     now(clock::Clock{C}) -> RTime{C}
 
-Read a held clock. For `Clock{ROS}` this honors the node's sim-time routing
-(system time until `/clock` wiring lands).
+Read a held clock. For `Clock{ROS}` this honors the node's sim-time routing: the
+Context's `/clock`-driven time when the node opted into `use_sim_time`, else system
+time.
 """
 Dates.now(c::Clock{C}) where {C} =
     C === ROS ? RTime{ROS}(_read_ns(c)) : RTime{C}(_read_ns(C()))
@@ -363,8 +366,11 @@ Base.sleep(node::Any, dur) = Base.sleep(clock(node, ROS()), dur)
     sleep_until(node, t::RTime{C})
 
 Sleep until `t`. The instant's clock tag selects the timeline: a `node` first
-argument is resolved to *its* clock for `C` (so `sleep_until(node, now(node))`
-waits on the ROS clock, `now(node, Steady())` on the steady one).
+argument is resolved to *its* clock for `C`. So the tag on the instant picks the
+node's clock:
+
+- `sleep_until(node, now(node))` — the ROS clock.
+- `sleep_until(node, now(node, Steady()))` — the steady clock.
 """
 function sleep_until(c::Clock{C}, t::RTime{C}) where {C}
     rem = t - Dates.now(c)        # Duration
@@ -423,10 +429,13 @@ end
     Timer(f, node, period; clock=ROS())
     Timer(node, period; clock=ROS()) do … end
 
-Fire `f()` every `period` (a `Duration` or `Dates.Period`) on `clock`. On a
-`Steady()`/`System()` clock it's a wall-driven `Base.Timer` task; on the `ROS()`
-clock under sim it tracks `/clock` (TODO). `close(timer)` stops it; it also dies
-with the node.
+Fire `f()` every `period` (a `Duration` or `Dates.Period`) on `clock`. The
+backing implementation depends on the clock:
+
+- `Steady()`/`System()` — a wall-driven `Base.Timer` task.
+- `ROS()` — under sim it tracks `/clock` (TODO).
+
+`close(timer)` stops it; it also dies with the node.
 """
 mutable struct Timer{C<:ClockSource}
     const clk::Clock{C}

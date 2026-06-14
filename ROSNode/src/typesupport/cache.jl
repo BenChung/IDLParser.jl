@@ -49,17 +49,20 @@ Returns the directory (created if absent).
 Persistence is off by default — ROSNode is a library, and discovered types are
 deployment-specific, so they belong to the importing project. `dir` defaults to
 `ros_typesupport` under the active project's directory (the current working
-directory when no project is active). Calling this sets `dir` as both the
-single write directory and the sole read directory, replacing any previously
-registered set.
+directory when no project is active).
 
-The `@ros_cache` macro is the declarative alternative: a project opts in by
-adding the macro to a module, and the absorbed cache directories are registered
-at `Context` creation — which likewise replaces the registered set, so the last
-registration wins; call `enable_project_cache!` after `Context()` when its
-directory must win over macro-registered ones. The `ROS_TYPESUPPORT_CACHE`
-environment variable force-enables persistence at its directory (an ops/test
-escape hatch) regardless of this call.
+Three paths opt a project into persistence:
+
+- `enable_project_cache!` — this call. Sets `dir` as both the single write
+  directory and the sole read directory, replacing any previously registered
+  set.
+- [`@ros_cache`](@ref) macro — the declarative alternative: a project adds the
+  macro to a module, and the absorbed cache directories are registered at
+  `Context` creation, likewise replacing the registered set. The last
+  registration wins, so call `enable_project_cache!` after `Context()` when its
+  directory must win over macro-registered ones.
+- `ROS_TYPESUPPORT_CACHE` environment variable — force-enables persistence at
+  its directory (an ops/test escape hatch) regardless of this call.
 """
 function enable_project_cache!(dir::AbstractString=_default_project_cache_dir())
     d = String(dir)

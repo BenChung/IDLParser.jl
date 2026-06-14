@@ -406,22 +406,26 @@ precompile time: the types land at `<pkg>.<qual>.<Name>` and bake into the modul
 image, so a loaded module starts with them already compiled.
 
 # Binding
-Resolution mirrors Julia's `import`. An explicitly-named fully-qualified type binds
-its bare leaf, like `import Mod: Name`: a message binds its struct —
-`@ros_import "sensor_msgs/msg/Image"` gives `Image` (and `sensor_msgs.msg.Image`) —
-and a service or action binds its request/goal namespace module (`Name.Request`,
-`Name.Goal`). A bare package binds the module, like `import Mod` —
-`@ros_import "sensor_msgs"` gives `sensor_msgs`, used as `sensor_msgs.msg.X`.
-Transitively-pulled dependencies stay reachable only by their `pkg.qual.Name` path,
-keeping the leaf namespace to the types you named. Naming two types with the same
-leaf in one call errors, pointing at `as`.
+Resolution mirrors Julia's `import`, with one binding per argument form:
+
+| Argument form | Bound name(s) |
+|---|---|
+| Fully-qualified message (`"sensor_msgs/msg/Image"`) | the bare leaf struct `Image` (and `sensor_msgs.msg.Image`), like `import Mod: Name` |
+| Fully-qualified service or action | its request/goal namespace module (`Name.Request`, `Name.Goal`) |
+| Bare package (`"sensor_msgs"`) | the module `sensor_msgs`, used as `sensor_msgs.msg.X`, like `import Mod` |
+| Transitively-pulled dependency | reachable only by its `pkg.qual.Name` path |
+
+Keeping transitive deps off the leaf namespace confines bare names to the types you
+named. Naming two types with the same leaf in one call errors, pointing at `as`.
 
 `… as Alias` binds the imported message type to `Alias` directly — for a short handle,
 or to disambiguate two same-named but different-RIHS01 versions. The `as` form accepts
 only a fully-qualified message type (`"pkg/msg/Name"`); a service or action has no
-single struct to bind and errors. A generated `as` type is isolated in a hidden
-submodule so its `pkg.qual.Name` path cannot collide with another import; a provided
-one binds straight through.
+single struct to bind and errors. The aliased type binds by origin:
+
+- A generated `as` type is isolated in a hidden submodule, so its `pkg.qual.Name`
+  path cannot collide with another import.
+- A provided `as` type binds straight through.
 
 # Registration
 Generated types are auto-registered with their real RIHS01 hash when a `Context` is
@@ -681,13 +685,23 @@ written in `format`:
   static fast path.
 - `:typedesc` — the raw wire `TypeDescription` JSON blob, language-agnostic.
 
-`dir` defaults to the full read search-list: the `\$ROS_TYPESUPPORT_CACHE`
-override, else every registered `@ros_cache` dir, else the project default — so a
-multi-cache project's blobs all graduate, wherever discovery persisted them. A
+`dir` defaults to the full read search-list, in priority order:
+
+1. the `\$ROS_TYPESUPPORT_CACHE` override;
+2. else every registered `@ros_cache` dir;
+3. else the project default.
+
+So a multi-cache project's blobs all graduate, wherever discovery persisted them. A
 type cached under several dirs exports once, from the first dir in search order.
-A nonexistent dir is warned and skipped, an unparseable blob is skipped, and a
-per-type export failure is logged and skipped, leaving the rest of the run
-intact; an empty vector comes back when no dir holds a readable blob. The exported identity is whatever the blob's content
+
+Each failure is isolated so the rest of the run stays intact:
+
+- A nonexistent dir is warned and skipped.
+- An unparseable blob is skipped.
+- A per-type export failure is logged and skipped.
+- When no dir holds a readable blob, the result is an empty vector.
+
+The exported identity is whatever the blob's content
 hashes to — the content-address revalidation that guards the discovery read path
 does not run here.
 """

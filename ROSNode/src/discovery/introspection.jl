@@ -37,18 +37,24 @@ entry with that exact name and version is registered. This is the server-side ha
 rmw_zenoh's dynamic type discovery: a peer that sees a `(name, RIHS01)` on the graph
 but lacks the type fetches its description here.
 
-`type_hash` is the RIHS01 string (`"RIHS01_<64-hex>"`); an empty string matches any
-registered version of `type_name` (the "I have the name, send me whatever you
-advertise" form), resolving to the first matching entry under the registry lock. A
-malformed RIHS string resolves to `nothing` (treated as not-found).
+`type_hash` selects the version:
 
-A [`RegistryEntry`](@ref) that stores a `td` is served from it directly, its closure
-sorted by `type_name` so that the served description re-hashes to the RIHS01 advertised
-on the graph (the integrity invariant a receiving peer re-checks). An IL-only entry
-(ament/static) is rebuilt: the main type from the struct AST, the closure collected
-from the registry by name, IL-only referenced types rebuilt the same way. A referenced
-type that cannot be resolved from the registry throws an `ArgumentError` — a truncated
-closure would fail the receiving peer's integrity gate anyway.
+- `"RIHS01_<64-hex>"` — selects that exact version.
+- empty string — matches any registered version of `type_name` (the "I have the name,
+  send me whatever you advertise" form), resolving to the first matching entry under
+  the registry lock.
+- malformed RIHS string — resolves to `nothing` (treated as not-found).
+
+The served description depends on the matched [`RegistryEntry`](@ref):
+
+- entry storing a `td` — served from it directly, its closure sorted by `type_name` so
+  the served description re-hashes to the RIHS01 advertised on the graph (the integrity
+  invariant a receiving peer re-checks).
+- IL-only entry (ament/static) — rebuilt: the main type from the struct AST, the closure
+  collected from the registry by name, IL-only referenced types rebuilt the same way.
+- a referenced type that cannot be resolved from the registry — throws an `ArgumentError`,
+  since a truncated closure would fail the receiving peer's integrity gate anyway.
+
 [`wire_get_type_description!`](@ref) converts the result to the wire form via
 `to_wire_td`; a `nothing` result becomes a `successful=false` reply.
 """
@@ -172,17 +178,25 @@ The wire step of rmw_zenoh dynamic type discovery: call `<remote>/get_type_descr
 for `(type_name, hash)`, then on a successful reply verify, lift, and register the
 result into the node's type registry (via `register_type_description!`, which
 also persists it to the content-addressed cache for the next run). Returns the
-registered [`RegistryEntry`](@ref), or `nothing` when the remote lacks the type, no
-server answered, or the reply failed the RIHS01 integrity gate.
+registered [`RegistryEntry`](@ref), or `nothing` in any of:
+
+- the remote lacks the type;
+- no server answered;
+- the reply failed the RIHS01 integrity gate.
 
 Blocks the calling task. First it waits up to `timeout_ms` for the remote's service
 to become routable ([`wait_for_service`](@ref)) — discovery is eventually consistent,
 so a query issued before the queryable is matched would silently match nothing — then
 issues the [`get_type_description`](@ref) call under the same budget. `remote` is the
 serving node's fully qualified name (e.g. `"/talker"`); `hash` is a `TypeHash` or a
-RIHS string (a malformed string returns `nothing`). The client is closed before
-return. A [`ShutdownException`](@ref) propagates; every other error (timeout, decode
-failure, hash mismatch from the gate) is caught and reported as `nothing`.
+RIHS string. The client is closed before return.
+
+Error and return outcomes:
+
+- malformed `hash` string — returns `nothing` immediately.
+- [`ShutdownException`](@ref) — propagates.
+- every other error (timeout, decode failure, hash mismatch from the gate) — caught
+  and reported as `nothing`.
 
 Choosing *which* source to try — registry, then cache, then ament, then this wire
 path — is [`resolve_or_discover`](@ref)'s job; this function is only the wire leg.
@@ -369,9 +383,10 @@ than an error. Every node serves this so peers can fetch the descriptions it
 advertises on the graph.
 
 Returns the [`ServiceHandle`](@ref), tracked on `node` and reaped by `close(node)`
-like any other entity. When a request sets `include_type_sources`, `type_sources`
-carries one regenerated `IL.unparse` text per served type (via `_type_sources`);
-otherwise it is empty, since the description alone is enough to decode.
+like any other entity. The request's `include_type_sources` flag sets `type_sources`:
+
+- `true` — carries one regenerated `IL.unparse` text per served type (via `_type_sources`).
+- `false` — empty, since the description alone is enough to decode.
 """
 function wire_get_type_description!(node)
     return Service(node, "~/get_type_description", GetTypeDescription_Request) do req
@@ -455,10 +470,15 @@ end
                  min_level=Logging.BelowMinLevel)
 
 An `AbstractLogger` that bridges Julia logging to ROS 2's `/rosout`. Per record it
-writes the ROS console line `[LEVEL] [secs.nanosec] [name]: msg` to stderr (when
-`console`), publishes an `rcl_interfaces/msg/Log` on `node`'s shared `/rosout`
-publisher, and — when a `parent` logger is supplied — forwards the raw record to that
-extra sink (a file or Julia console). Installing it routes a plain `@info`/`@warn`/
+drives up to three sinks:
+
+- when `console=true` — writes the ROS console line `[LEVEL] [secs.nanosec] [name]: msg`
+  to stderr.
+- always — publishes an `rcl_interfaces/msg/Log` on `node`'s shared `/rosout` publisher.
+- when a `parent` logger is supplied — forwards the raw record to that extra sink (a
+  file or Julia console).
+
+Installing it routes a plain `@info`/`@warn`/
 `@error`/`@logmsg` to ROS 2 logging; the request dispatcher installs the node's
 logger around every handler so handler logs reach `/rosout` automatically.
 

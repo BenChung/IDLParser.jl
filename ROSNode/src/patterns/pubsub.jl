@@ -176,9 +176,16 @@ entity(sub::SubscriptionHandle) = sub.entity
 
 The handle returned by the type-less `Subscription(node, topic) do msg … end` — a
 subscription whose message type is resolved at runtime. The data route is
-wildcarded and each sample's type is resolved per sample (registry, then project
-cache, then ament, then a wire `GetTypeDescription` query). Wraps the generic
-[`Entity`](@ref); `isopen`/`close`-able and reaped when its node closes.
+wildcarded and each sample's type is resolved per sample, walking these sources in
+order until one resolves:
+
+1. the registry,
+2. the project cache,
+3. ament,
+4. a wire `GetTypeDescription` query.
+
+Wraps the generic [`Entity`](@ref); `isopen`/`close`-able and reaped when its node
+closes.
 """
 mutable struct DynamicSubscriptionHandle
     const entity::Entity
@@ -241,11 +248,14 @@ graph, and declares the Zenoh data route on the topic keyexpr. The
 handle is tracked on `node`, so `close(node)` reaps it; `close(pub)` undeclares the
 route and withdraws the token on its own.
 
-`qos` is the ROS 2 QoS profile. `reliability` maps onto the Zenoh publisher
-(`:reliable`/`:best_effort`); `durability=:transient_local` selects the route that
-latches history to late-joining subscribers (an `AdvancedPublisher`).
-`congestion_control` and `priority` pass through to the
-Zenoh publisher.
+Keyword arguments shaping the route:
+
+- `qos` — the ROS 2 QoS profile.
+- `reliability` — maps onto the Zenoh publisher (`:reliable`/`:best_effort`).
+- `durability=:transient_local` — selects the route that latches history to
+  late-joining subscribers (an `AdvancedPublisher`).
+- `congestion_control` — passes through to the Zenoh publisher.
+- `priority` — passes through to the Zenoh publisher.
 
 `warmup`, `warmup_sync`, and `warmup_sample` select the warm-up policy
 (precompile/execute/off, sync/async) that pre-JITs the encode/decode dispatch chain
@@ -281,8 +291,13 @@ This call-method is the type-less spelling of the `Subscription` enum value,
 distinct from the typed `Subscription(node, topic, T) do … end`; `Subscription` is
 the only kind with a type-less form — a `Service` needs its type to know
 request/response. The data route wildcard-matches every type published on the
-topic; each sample carries its own `(name, hash)`, resolved through the registry,
-then the project cache, then ament, then a wire `GetTypeDescription` query.
+topic; each sample carries its own `(name, hash)`, resolved by walking these
+sources in order until one resolves:
+
+1. the registry,
+2. the project cache,
+3. ament,
+4. a wire `GetTypeDescription` query.
 
 The handler receives the **real generated type** `msg::T`, not a boxed `Any`.
 Decode and the handler call cross the world-age boundary via `invokelatest`, so
@@ -291,12 +306,17 @@ The first sample of each type pays type discovery plus codegen; subsequent sampl
 are fast registry lookups. Resolution and codegen run on a dispatch worker task off
 the receive thread, so codegen's GC completes while the receiver keeps draining.
 
-`view` is a [`ViewMode`](@ref) — [`Owned`](@ref) (the default), [`Checked`](@ref),
-or [`Unchecked`](@ref), with `true`/`false` shorthand; here the resulting `CDRView`
-aliases the runtime-resolved type's payload. `concurrency` is a [`Concurrency`](@ref)
-([`Serial`](@ref) or [`Parallel`](@ref)) as for the typed form. Warm-up is deferred
-to first sight of each runtime type, and `:execute` degrades to `:precompile` here
-(running a discovered handler on a synthesized sample is the manifest's job).
+`view` is a [`ViewMode`](@ref), with `true`/`false` shorthand:
+
+- [`Owned`](@ref) — the default.
+- [`Checked`](@ref)
+- [`Unchecked`](@ref)
+
+Here the resulting `CDRView` aliases the runtime-resolved type's payload.
+`concurrency` is a [`Concurrency`](@ref) ([`Serial`](@ref) or [`Parallel`](@ref))
+as for the typed form. Warm-up is deferred to first sight of each runtime type, and
+`:execute` degrades to `:precompile` here (running a discovered handler on a
+synthesized sample is the manifest's job).
 
 ```julia
 sub = Subscription(node, "/chatter") do msg

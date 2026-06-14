@@ -96,9 +96,12 @@ from_wire_individual(itd) =
     from_wire_td(w) -> TypeDescriptionMsg
 
 Convert a decoded wire `type_description_interfaces/msg/TypeDescription` (e.g. from
-a `GetTypeDescription` reply) into the internal `TypeDescriptionMsg`, the form the
-integrity gate (`calculate_rihs01_hash`), `lift`, and the registry consume. Inverse
-of `to_wire_td`.
+a `GetTypeDescription` reply) into the internal `TypeDescriptionMsg`. Inverse of
+`to_wire_td`. The internal form is what these consume:
+
+- the integrity gate (`calculate_rihs01_hash`);
+- `lift`;
+- the registry.
 """
 from_wire_td(w) =
     TypeDescriptionMsg(from_wire_individual(w.type_description),
@@ -259,9 +262,13 @@ end
 """
     canonical_type(name, hash) -> Union{Type, Nothing}
 
-The single compiled `Interfaces` struct for a vendored wire type `(name, RIHS01)`,
-or `nothing` when that exact `(name, hash)` is not vendored. `@ros_import`/`@ros_cache`
-alias to it, so one wire type maps to one Julia struct process-wide.
+Resolve a vendored wire type `(name, RIHS01)` to its compiled `Interfaces` struct:
+
+- `Type` — the single compiled `Interfaces` struct for that `(name, RIHS01)`;
+- `nothing` — that exact `(name, hash)` is not vendored.
+
+`@ros_import`/`@ros_cache` alias to it, so one wire type maps to one Julia struct
+process-wide.
 """
 function canonical_type(name::AbstractString, hash::TypeHash)
     _canonical_entries()                        # ensure built
@@ -297,9 +304,12 @@ end
 
 Register every canonical vendored type (the `type_description_interfaces`
 bootstrap among them) into `ctx`'s registry, binding each to its compiled
-`Interfaces` struct + real RIHS01 — so the `~/get_type_description` server can
-answer for them and keyexpr-only resolution uses them directly. Best-effort: a
-failure is logged, never fatal (the generated types are compiled and usable).
+`Interfaces` struct + real RIHS01. This:
+
+- lets the `~/get_type_description` server answer for vendored types;
+- lets keyexpr-only resolution use them directly;
+- is best-effort — a failure is logged, never fatal, since the generated types
+  are compiled and usable.
 """
 function _register_canonical_types!(ctx)
     try

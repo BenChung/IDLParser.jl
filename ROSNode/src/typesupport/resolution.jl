@@ -10,9 +10,10 @@
     ResolveEntry(type, origin, tied)
 
 One `(wire-RIHS01 → Julia struct)` resolution in a module's `__ros_resolve__`.
-`origin` is the minting module (the package that generated `type`), named in the tie
-warning. `tied` marks an entry that settled a cross-module fork, so a closer dependent
-adopts it and skips re-deriving the pick.
+
+- `type`: the Julia struct this module resolves the wire type to.
+- `origin`: the minting module (the package that generated `type`), named in the tie warning.
+- `tied`: marks an entry that settled a cross-module fork, so a closer dependent adopts it and skips re-deriving the pick.
 """
 struct ResolveEntry
     type::Type
@@ -87,10 +88,10 @@ here), then add `mod`'s own freshly-minted `(rihs, T)` entries (own wins for `mo
 Idempotent across multiple `@ros_import`/`@ros_cache` calls in one module. The macros
 emit it at module top level so it runs, and bakes, at precompile.
 
-The closure pick is a global `argmin(string(type))` over all candidates for a wire type:
-with three or more forks the survivor is the globally smallest FQN regardless of
-`loaded_modules` iteration order (a `Dict`, unordered), so the deterministic pick by
-fully-qualified type string holds beyond two sources.
+The closure pick is a global `argmin(string(type))` over all candidates for a wire type.
+
+- Order-independent: with three or more forks the survivor holds regardless of `loaded_modules` iteration order (a `Dict`, unordered).
+- Deterministic survivor: the winner is the globally smallest fully-qualified type string, so the pick holds beyond two sources.
 """
 function _merge_resolve!(mod::Module, own)
     tbl = getglobal(mod, _RESOLVE_GLOBAL)::Dict{Symbol, ResolveEntry}
@@ -128,9 +129,11 @@ end
 """
     resolve_in_home(home::Module, rihs::Symbol) -> Union{Type, Nothing}
 
-The Julia struct `home`'s baked `__ros_resolve__` resolves wire type `rihs` (RIHS01
-string) to, or `nothing` when `home` and its closure never imported it. This is the
-per-Context resolution step, keyed by the Context's `home` module.
+Resolve wire type `rihs` (RIHS01 string) through `home`'s baked `__ros_resolve__`. This
+is the per-Context resolution step, keyed by the Context's `home` module.
+
+- a `Type`: the Julia struct `home`'s table resolves `rihs` to.
+- `nothing`: `home` and its closure never imported `rihs`.
 """
 function resolve_in_home(home::Module, rihs::Symbol)
     isdefined(home, _RESOLVE_GLOBAL) || return nothing

@@ -39,11 +39,14 @@ primary entry into the ROS 2 graph as this stack sees it. Each result is
 an [`EndpointInfo`](@ref) — the owning node, `kind`, topic, type, QoS, gid, and
 locality of one discovered endpoint.
 
-Filters combine conjunctively, and a `nothing` filter matches anything. `topic`
-matches the resolved fully-qualified name: a relative name resolves against the
-node first, so `endpoints(node; topic="chatter")` finds endpoints on `/chatter`.
-`kind` is an `EndpointKind` (`Publisher`, `Subscription`, `Service`, or
-`Client`). `node` and `namespace` match the owning node's name and namespace.
+Filters combine conjunctively, and a `nothing` filter matches anything:
+
+| Filter | Matches |
+|--------|---------|
+| `topic` | the resolved fully-qualified name; a relative name resolves against the node first, so `endpoints(node; topic="chatter")` finds endpoints on `/chatter` |
+| `kind` | an `EndpointKind`: `Publisher`, `Subscription`, `Service`, or `Client` |
+| `node` | the owning node's name |
+| `namespace` | the owning node's namespace |
 
 The query filters a snapshot of the index taken under the index lock, so it sees
 one consistent instant. Local entities are authoritative the instant they are
@@ -159,11 +162,12 @@ Return the distinct nodes seen in the graph, the ROS 2
 the owning-node fields carried on each endpoint (a node advertises its own
 presence as a topic-less endpoint shell), deduplicated by `(namespace, name)`.
 
-Endpoints with no node identity are skipped: the ros2dds bridge yields
-liveliness tokens whose `parse_liveliness` leaves the node blank, and there is
-no name to report for those. Each returned `NodeInfo` carries an empty enclave
-string: rmw_zenoh always writes the `%` (empty) sentinel into the token's
-enclave slot, so no non-default enclave survives the wire.
+- Endpoints with no node identity are skipped: the ros2dds bridge yields
+  liveliness tokens whose `parse_liveliness` leaves the node blank, and there is
+  no name to report for those.
+- Each returned `NodeInfo` carries an empty enclave string: rmw_zenoh always
+  writes the `%` (empty) sentinel into the token's enclave slot, so no
+  non-default enclave survives the wire.
 """
 function node_names(node_or_ctx)
     ctx = _ctx(node_or_ctx)
@@ -221,11 +225,13 @@ end
     service_is_ready(node, service_name) -> Bool
 
 Return `true` when a service server is present in the graph on the resolved
-service name, the ROS 2 `Client.service_is_ready` equivalent. The client
-form reads the resolved name and owning node off the handle's [`Entity`](@ref);
-the name form resolves `service_name` against the node. Readiness means a
-`Service`-kind endpoint exists on that name; local entities count, so our own
-service reads as ready the instant it is declared.
+service name, the ROS 2 `Client.service_is_ready` equivalent.
+
+- Client form: reads the resolved name and owning node off the handle's
+  [`Entity`](@ref).
+- Name form: resolves `service_name` against the node.
+- Readiness means a `Service`-kind endpoint exists on that name; local entities
+  count, so our own service reads as ready the instant it is declared.
 
 Reports graph liveliness: the same eventually-consistent view
 [`wait_for_service`](@ref) blocks on. For the stronger guarantee that Zenoh
@@ -257,13 +263,15 @@ Block the calling task until a matching service server is reachable, the ROS 2
 [`ShutdownException`](@ref) if the Context begins draining while the task is
 parked, so a blocked wait cooperatively unwinds and lets the drain proceed.
 
-The client form waits on a real routing match: the client's `Querier` has
-actually matched a server's queryable ([`service_matched`](@ref)), the strong
-guarantee that a subsequent [`call`](@ref) reaches a server. The name form has no
-querier handle, so it waits on graph liveliness ([`service_is_ready`](@ref)) — a
-`Service` endpoint on the resolved name; for a same-process server that becomes
-true the instant the service is declared, before routing settles. Prefer the
-client form whenever you hold the client.
+- Client form: waits on a real routing match — the client's `Querier` has
+  actually matched a server's queryable ([`service_matched`](@ref)), the strong
+  guarantee that a subsequent [`call`](@ref) reaches a server.
+- Name form: has no querier handle, so it waits on graph liveliness
+  ([`service_is_ready`](@ref)) — a `Service` endpoint on the resolved name; for a
+  same-process server that becomes true the instant the service is declared,
+  before routing settles.
+
+Prefer the client form whenever you hold the client.
 
 Both forms park on the discovery change stream and re-check on each event, which
 is why they exist: remotes and routing are eventually-consistent, so a client
@@ -655,23 +663,30 @@ Detection runs as a listener on the discovery change stream: when an endpoint
 is added, it is compared against standing endpoints of the complementary kind
 (our subscription versus their publisher, and vice versa) on the same topic —
 a new remote against our locals, a new local endpoint against the remotes
-already discovered. `f` fires once per distinct mismatch — keyed by a
-(topic, kinds, reason) signature, edge-triggered with no time throttle — so a
-flapping or hot-per-sample topic fans out exactly once per signature. The
-internal `@warn` is separately throttled (a logging concern only) and does not
-gate `f`. The per-sample backstop for wildcard subscriptions
-(`check_sample_type`) shares the signature, so a mismatch seen both on the wire
-and in the graph fires `f` once. Listeners run outside the detector lock; a
-throwing listener is logged and the others still run.
+already discovered.
 
-By default detection is change-driven and covers only endpoints that appear
-after registration: a mismatch already standing in the graph when `f` is
-registered does not fire retroactively, so register before the endpoints exist
-to catch them. Pass `scan=true` to also walk the standing graph snapshot once at
-registration and fire `f` for pre-existing mismatches (the watchdog/dashboard
-use case); the same per-signature edge-trigger applies, so a scanned mismatch is
-not fired again by a later change, and only the just-registered `f` receives the
-retroactive events.
+- `f` fires once per distinct mismatch — keyed by a (topic, kinds, reason)
+  signature, edge-triggered with no time throttle — so a flapping or
+  hot-per-sample topic fans out exactly once per signature.
+- The internal `@warn` is separately throttled (a logging concern only) and does
+  not gate `f`.
+- The per-sample backstop for wildcard subscriptions (`check_sample_type`)
+  shares the signature, so a mismatch seen both on the wire and in the graph
+  fires `f` once.
+- Listeners run outside the detector lock; a throwing listener is logged and the
+  others still run.
+
+Detection is change-driven and covers only endpoints that appear after
+registration:
+
+- `scan=false` (default): a mismatch already standing in the graph when `f` is
+  registered does not fire retroactively, so register before the endpoints exist
+  to catch them.
+- `scan=true`: also walks the standing graph snapshot once at registration and
+  fires `f` for pre-existing mismatches (the watchdog/dashboard use case); the
+  same per-signature edge-trigger applies, so a scanned mismatch is not fired
+  again by a later change, and only the just-registered `f` receives the
+  retroactive events.
 
 ```julia
 on_type_mismatch(node) do tm
@@ -699,17 +714,25 @@ covering reliability, durability, deadline, and liveliness (kind and lease).
 
 Detection runs on the discovery change stream and fires once per distinct
 signature, the same way [`on_type_mismatch`](@ref) does — edge-triggered, not
-time-throttled (only the internal `@warn` is throttled). The requester side is
-the subscription (or client) and the offered side is the publisher (or service);
-the check runs in the correct direction for whichever role is local. Listeners
-run outside the detector lock.
+time-throttled (only the internal `@warn` is throttled). The check runs in the
+DDS Request-vs-Offered direction for whichever role is local:
 
-By default detection is change-driven: an incompatibility already standing in
-the graph at registration does not fire retroactively, so register before the
-endpoints exist to catch them. Pass `scan=true` to also walk the standing graph
-snapshot once at registration and fire `f` for pre-existing incompatibilities;
-as in [`on_type_mismatch`](@ref) the per-signature edge-trigger applies and only
-the just-registered `f` receives the retroactive events.
+| Local role | Requested side | Offered side |
+|------------|----------------|--------------|
+| Subscription or Client | the local endpoint | the remote |
+| Publisher or Service | the remote | the local endpoint |
+
+Listeners run outside the detector lock.
+
+Detection is change-driven:
+
+- `scan=false` (default): an incompatibility already standing in the graph at
+  registration does not fire retroactively, so register before the endpoints
+  exist to catch them.
+- `scan=true`: also walks the standing graph snapshot once at registration and
+  fires `f` for pre-existing incompatibilities; as in [`on_type_mismatch`](@ref)
+  the per-signature edge-trigger applies and only the just-registered `f`
+  receives the retroactive events.
 """
 function on_qos_incompatible(f::Function, node_or_ctx; scan::Bool=false)
     ctx = _ctx(node_or_ctx)
@@ -725,11 +748,16 @@ end
 
 Per-sample type backstop: for a wildcard subscription, the concrete remote
 type only appears on the wire, not in a graph match — so on receipt, parse the
-sample's topic keyexpr and compare its `TypeInfo` to the
-subscription's. Returns a `TypeMismatch` (and lets the caller decide to drop/warn)
-or `nothing` when types agree or the key carries no type (ros2dds, EMPTY).
+sample's topic keyexpr and compare its `TypeInfo` to the subscription's.
 
-The subscription dispatch path calls this before decoding for weak-static
+- `TypeMismatch` with reason `:name` — the sample's type name differs from the
+  subscription's.
+- `TypeMismatch` with reason `:hash` — same type name, different RIHS01 version.
+- `nothing` — the types agree.
+- `nothing` — the key carries no type (ros2dds, EMPTY).
+
+The caller decides whether to drop or warn on a returned `TypeMismatch`. The
+subscription dispatch path calls this before decoding for weak-static
 subscriptions and routes a mismatch to the type-mismatch listeners; a hash
 mismatch means the bytes are decode-unsafe against the local struct.
 """
@@ -769,14 +797,17 @@ _remote_shell(local_endpoint, got::TypeInfo) =
     liveliness_changed(node_or_ctx, topic) -> (; alive, not_alive)
 
 A point-in-time count of live *remote* publishers on `topic` (resolved FQN),
-read straight from the discovery stream: `alive` is the number currently present
-in the graph. Liveliness rides the Zenoh tokens the index already tracks — a
-present token means alive, a withdrawn (DELETE) one means gone. For change
-*events*, register an [`on_graph_change`](@ref) listener filtered to the topic.
+read straight from the discovery stream. Liveliness rides the Zenoh tokens the
+index already tracks — a present token means alive, a withdrawn (DELETE) one
+means gone. For change *events*, register an [`on_graph_change`](@ref) listener
+filtered to the topic.
 
-`not_alive` is `0` here: the graph holds only live tokens (a withdrawn token is
-removed), so we report transitions via the change stream rather than a standing
-count. Kept in the return shape to match the ROS2 `LivelinessChanged` fields.
+The returned named tuple mirrors the ROS 2 `LivelinessChanged` fields:
+
+- `alive` — the number of remote publishers currently present in the graph.
+- `not_alive` — always `0`: the graph holds only live tokens (a withdrawn token
+  is removed), so transitions are reported via the change stream rather than a
+  standing count.
 """
 function liveliness_changed(node_or_ctx, topic::AbstractString)
     pubs = publishers_info(node_or_ctx, topic)
@@ -860,11 +891,17 @@ end
 
 Feed one received sample to the message-lost detector for `sub`: decode
 `(seq, _, gid)` and, if `seq` skipped ahead of the last value seen from that
-`gid`, fire the `on_message_lost` listeners and return the `MessageLost`. Returns
-`nothing` when in-order (or the very first message from a gid, or the sample
-carries no usable attachment). The subscription dispatch path calls this per
-sample, gated on `Entity._track_lost`, so the common no-listener path never
-decodes the attachment.
+`gid`, fire the `on_message_lost` listeners and return the `MessageLost`.
+
+Returns `nothing` when:
+
+- the message is in-order,
+- it is the very first message from a gid, or
+- the sample carries no usable attachment.
+
+The subscription dispatch path calls this per sample, gated on
+`Entity._track_lost`, so the common no-listener path never decodes the
+attachment.
 """
 function note_sequence!(sub, sample)
     e = _client_entity(sub)

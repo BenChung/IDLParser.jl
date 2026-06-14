@@ -179,9 +179,10 @@ and two members of the same mixin type stay distinct instances.
 Binds `N` to a `NodeKind` and registers it by name in the process-global
 node-kind registry (the `rclcpp_components_register_nodes` analog), so a container's
 `load_node` / `ros2 component load` can instantiate it from its name. Registration
-runs when the defining module's body is evaluated — scripts, the REPL, and `include`d
-modules; a precompiled package's kinds are absent from the registry at load
-(registering those is a known follow-up). Evaluates to the `NodeKind`. Bring the node
+runs when the defining module's body is evaluated (scripts, the REPL, and `include`d
+modules); a precompiled package registers its kinds at load through its
+[`ros_init!`](@ref)/`__init__` hook, so `load_node`-by-name works there too. Evaluates
+to the `NodeKind`. Bring the node
 up with `run(N; …)` or `add!(container, N; …)`.
 
 A member may remap its ports with brace syntax, `Mixin{port => target}` — the ROS
@@ -958,20 +959,26 @@ end
     run(N::NodeKind; …) -> ComponentNode
 
 Instantiate a node standalone: open a `Context` (unless `ctx` is
-given), build the node-core, construct the mixin(s) in DI order, autostart
-(configure → activate), and — when `block` (default) — `spin` until shutdown, closing
-an owned Context on exit. With `block=false` the returned node holds any owned
-Context, and `close` on the node closes it after member teardown; a caller-supplied
-`ctx` is never closed. `overrides` is a NamedTuple of mixin-local parameter values.
+given), build the node-core, construct the mixin(s) in DI order, and autostart
+(configure → activate). Lifetime depends on `block`:
+
+- `block=true` (default) — `spin` until shutdown, then close an owned Context on exit.
+- `block=false` — return the node holding any owned Context; `close` on the node closes
+  it after member teardown.
+- A caller-supplied `ctx` is never closed.
+
+`overrides` is a NamedTuple of mixin-local parameter values.
 `log_level` (a `LogLevel`, default `nothing` = the node default) sets the
 node's logger level ([`set_logger_level!`](@ref)) before any member code runs, so
 records from the construct/configure/activate hooks already honor it.
 
-`managed=true` makes the node-core a [`LifecycleNode`](@ref): the lifecycle control
-surface plus the managed-node dispatch gate ([`isactive`](@ref) — entities are silent
-unless the node is [`Active`](@ref)). It then starts `Unconfigured` and is driven
-externally (`ros2 lifecycle`) unless `autostart=true`. Unmanaged (default) autostarts
-and has no control surface or gate.
+The `managed` keyword selects the node-core kind:
+
+- `managed=true` — a [`LifecycleNode`](@ref): the lifecycle control surface plus the
+  managed-node dispatch gate ([`isactive`](@ref) — entities are silent unless the node
+  is [`Active`](@ref)). Starts `Unconfigured` and is driven externally (`ros2
+  lifecycle`), unless `autostart=true` brings it up.
+- `managed=false` (default) — autostarts, with no control surface or gate.
 """
 function Base.run(::Type{M}; name::AbstractString = _default_name(M),
                   namespace::Union{AbstractString, Nothing} = nothing,
@@ -1082,13 +1089,14 @@ populate it via [`add!`](@ref), then parks on `spin` until the Context drains. T
 same node code runs standalone under `run` or composed here; only the
 deploy-time wiring differs.
 
-Returns the live [`Container`](@ref). With `block=true` (default) `spin` installs a
-SIGINT handler for the duration — the first Ctrl-C drains gracefully, a second forces
-exit — and the call returns once the Context has drained, closing it. SIGTERM is not
-yet wired and terminates the process without draining. With `block=false` the call
-returns the running `Container` immediately, leaving you to drive it and `close(c)`
-it; the Context stays open until then. An exception during `f(c)` closes the Context
-and propagates.
+Returns the live [`Container`](@ref). Behavior depends on `block`:
+
+- `block=true` (default) — `spin` installs a SIGINT handler for the duration (the first
+  Ctrl-C drains gracefully, a second forces exit), and the call returns once the Context
+  has drained, closing it. SIGTERM is not yet wired and terminates the process without draining.
+- `block=false` — the call returns the running `Container` immediately, leaving you to
+  drive it and `close(c)` it; the Context stays open until then.
+- An exception during `f(c)` closes the Context and propagates.
 
 The container is itself a node named `name` (optionally under `namespace`) exposing
 the `~/_container/{load_node,unload_node,list_nodes}` services, so a running
@@ -1154,11 +1162,13 @@ in dependency order, wires the parameter services, and brings the node up. Unman
 by mixin-local name (`fps`), or by prefixed `var"member.field"` to target one member
 when two members share a field name.
 
-`ctx`, `block`, `peers`, and `localhost_only` are rejected with an `ArgumentError`:
-the container pins `ctx = c.ctx` and `block = false` (a foreign `ctx` would build a
-node the container tracks but whose Context it never closes; `block=true` would park
-`add!` on `spin`), and transport is fixed when `container` opens the Context, so
-`run`'s `peers`/`localhost_only` would have no effect here.
+These keywords are rejected with an `ArgumentError`, each fixed by the container:
+
+- `ctx` — pinned to `c.ctx`; a foreign `ctx` would build a node the container tracks
+  but whose Context it never closes.
+- `block` — pinned to `false`; `block=true` would park `add!` on `spin`.
+- `peers`, `localhost_only` — transport is fixed when `container` opens the Context, so
+  `run`'s values would have no effect here.
 
 ```julia
 container("fleet") do c

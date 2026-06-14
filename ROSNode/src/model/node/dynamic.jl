@@ -46,18 +46,26 @@ handler; …)` decodes a fixed `T` directly for the min-copy fast path.
 
 Keyword arguments:
 - `view::Union{Bool,ViewMode}`: how each sample reaches the handler — see
-  [`ViewMode`](@ref) ([`Owned`](@ref)/[`Checked`](@ref)/[`Unchecked`](@ref)).
-  Every mode applies as in the typed form; resolution crosses the world-age
-  boundary first, then `_dispatch_decoded` honors the mode unchanged.
+  [`ViewMode`](@ref). Every mode applies as in the typed form; resolution crosses
+  the world-age boundary first, then `_dispatch_decoded` honors the mode unchanged:
+    - [`Owned`](@ref)
+    - [`Checked`](@ref)
+    - [`Unchecked`](@ref)
 - `concurrency::Concurrency`: how decode+handler are scheduled per sample — see
-  [`Concurrency`](@ref) ([`Serial`](@ref)/[`Parallel`](@ref)). A single worker
+  [`Concurrency`](@ref) ([`Serial`](@ref) or [`Parallel`](@ref)). A single worker
   drains the buffer in arrival order across world-age re-entries, so [`Serial`](@ref)
   preserves total order even through first-sight `realize!` codegen.
-- `warmup::WarmupPolicy`: the warm-up policy (precompile/execute/off, sync/async)
-  that pre-JITs the encode/decode dispatch chain, defaulting to the node default.
-  Here it also replays this node's
-  interaction manifest to warm prior-run types ahead of the first message. The
-  handler can branch on [`is_warming`](@ref) to skip side effects during a warm pass.
+- `warmup::WarmupPolicy`: the warm-up policy that pre-JITs the encode/decode dispatch
+  chain, defaulting to the node default. Independent settings:
+
+    | Setting | Values        |
+    | ------- | ------------- |
+    | mode    | precompile / execute / off |
+    | timing  | sync / async  |
+
+  Here it also replays this node's interaction manifest to warm prior-run types
+  ahead of the first message. The handler can branch on [`is_warming`](@ref) to
+  skip side effects during a warm pass.
 
 ROS 2 topic/subscription model:
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html

@@ -25,15 +25,25 @@ const PARAMETER_SERVICE_NAMES = (
     describe_parameters(client::ParameterClient, names; timeout_ms=2000) -> Vector{ParameterDescriptor}
 
 The ROS 2 `DescribeParameters` service: a [`ParameterDescriptor`](@ref) per
-requested name. A declared name returns its schema descriptor; a live
-dynamic name returns a synthesized descriptor (its runtime type, no constraint,
-not read-only); an unknown name returns a `PARAMETER_NOT_SET` descriptor. The
-[`ParameterServer`](@ref) and [`CompositeParameterServer`](@ref) forms reflect
-locally; the [`ParameterClient`](@ref) form is the remote dual over the wire.
-The wire carries name, type, description, and read-only faithfully but encodes
-the numeric-range or choice-set constraint only as the human
-`additional_constraints` string (and carries no default), so a client-decoded
-descriptor reads back with `constraint === nothing` and `default === nothing`.
+requested name. Each name resolves to one of:
+
+- declared name → its schema descriptor.
+- live dynamic name → a synthesized descriptor: its runtime type, no constraint,
+  not read-only.
+- unknown name → a `PARAMETER_NOT_SET` descriptor.
+
+Forms:
+
+- [`ParameterServer`](@ref) and [`CompositeParameterServer`](@ref) — reflect locally.
+- [`ParameterClient`](@ref) — the remote dual over the wire.
+
+Wire fidelity:
+
+- name, type, description, and read-only travel faithfully.
+- the numeric-range or choice-set constraint travels only as the human
+  `additional_constraints` string; no default travels.
+- a client-decoded descriptor reads back with `constraint === nothing` and
+  `default === nothing`.
 """
 function describe_parameters(s::ParameterServer{P}, names) where {P}
     out = ParameterDescriptor[]
@@ -59,11 +69,13 @@ end
     get_parameter_types(client::ParameterClient, names; timeout_ms=2000) -> Vector{ParameterType}
 
 The ROS 2 `GetParameterTypes` service: the [`ParameterType`](@ref) tag of each
-requested name, flat over both tiers. An unknown name reads back as
-`PARAMETER_NOT_SET`. The [`ParameterServer`](@ref) form reflects locally (the
-declared field type, or the runtime type of a dynamic value); the
-[`ParameterClient`](@ref) form is the remote dual over the wire, raising
-[`ServiceError`](@ref) on a timeout or error reply.
+requested name, flat over both tiers.
+
+- unknown name → reads back as `PARAMETER_NOT_SET`.
+- [`ParameterServer`](@ref) form → reflects locally: the declared field type, or
+  the runtime type of a dynamic value.
+- [`ParameterClient`](@ref) form → the remote dual over the wire, raising
+  [`ServiceError`](@ref) on a timeout or error reply.
 """
 function get_parameter_types(s::ParameterServer{P}, names) where {P}
     map(names) do name
@@ -83,13 +95,15 @@ end
     get_parameters(server::CompositeParameterServer, names) -> Vector
     get_parameters(client::ParameterClient, names; timeout_ms=2000) -> Vector{Any}
 
-The ROS 2 `GetParameters` service: the current value of each requested name.
-Reads flat over both tiers; an unset or unknown name reads back as
-`nothing` (which the service maps to a `PARAMETER_NOT_SET` `ParameterValue`).
-The [`ParameterServer`](@ref) form reads locally — declared fields from the
-live atomic struct, dynamic ones from the side dict. The
-[`ParameterClient`](@ref) form is the remote dual: one wire call decoded back to
-native Julia values, raising [`ServiceError`](@ref) on a timeout or error reply.
+The ROS 2 `GetParameters` service: the current value of each requested name,
+flat over both tiers.
+
+- unset or unknown name → reads back as `nothing`, which the service maps to a
+  `PARAMETER_NOT_SET` `ParameterValue`.
+- [`ParameterServer`](@ref) form → reads locally: declared fields from the live
+  atomic struct, dynamic ones from the side dict.
+- [`ParameterClient`](@ref) form → the remote dual: one wire call decoded back to
+  native Julia values, raising [`ServiceError`](@ref) on a timeout or error reply.
 """
 function get_parameters(s::ParameterServer{P}, names) where {P}
     map(names) do name
@@ -110,19 +124,22 @@ end
     list_parameters(client::ParameterClient; prefixes=String[], depth=0, timeout_ms=2000) -> Vector{Symbol}
 
 The ROS 2 `ListParameters` service: the flat union of parameter names,
-optionally kept to those starting with one of `prefixes`. The
-[`ParameterServer`](@ref) form lists declared names then dynamic names; the
-[`CompositeParameterServer`](@ref) form lists every member's `<member>.<field>`;
-the [`ParameterClient`](@ref) form is the remote dual, raising
-[`ServiceError`](@ref) on a timeout or error reply.
+optionally kept to those starting with one of `prefixes`.
 
-A name matches a prefix by plain `startswith` — `"nav"` also matches
-`navigator.max_speed` — looser than rclcpp's separator-bounded match. `depth`
-bounds how far past each matched prefix (past the root when `prefixes` is
-empty) the listing reaches; `depth=0` is `DEPTH_RECURSIVE`, the full list.
-Levels count as rclcpp counts them — `.` separators in the post-prefix tail,
-the joining dot excluded — so an exact prefix match always survives and
-`depth=1` reaches a prefix's direct children.
+- [`ParameterServer`](@ref) form → declared names then dynamic names.
+- [`CompositeParameterServer`](@ref) form → every member's `<member>.<field>`.
+- [`ParameterClient`](@ref) form → the remote dual, raising [`ServiceError`](@ref)
+  on a timeout or error reply.
+
+Filtering semantics:
+
+- prefix match → plain `startswith` (`"nav"` also matches `navigator.max_speed`),
+  looser than rclcpp's separator-bounded match.
+- `depth` → how far past each matched prefix (past the root when `prefixes` is
+  empty) the listing reaches; `depth=0` is `DEPTH_RECURSIVE`, the full list.
+- level counting → as rclcpp counts: `.` separators in the post-prefix tail, the
+  joining dot excluded, so an exact prefix match always survives and `depth=1`
+  reaches a prefix's direct children.
 """
 function list_parameters(s::ParameterServer; prefixes=(), depth::Integer=0)
     _filter_names(parameter_names(s), prefixes, depth)
@@ -147,22 +164,26 @@ end
     set_parameters_atomically(client::ParameterClient, params; timeout_ms=2000) -> (successful::Bool, reason::String)
 
 The ROS 2 `SetParametersAtomically` service: apply all pairs as one transaction.
-Either every pair commits and the result is `(true, "")`, or the first
-rejection aborts the whole set and the result is `(false, reason)`. A
-constraint, read-only, or `validate` rejection (and an `ArgumentError`, e.g. an
-undeclared name) maps to the `(false, reason)` result; a value that fails to
-coerce to its declared field type throws instead, which a wire caller sees as
-[`ServiceError`](@ref) rather than a `SetParametersResult`.
+Outcomes:
 
-The [`ParameterServer`](@ref) form commits through one [`transaction`](@ref).
-The [`CompositeParameterServer`](@ref) form groups pairs by member, validates
-every member's candidate first, commits only if all pass, and surfaces the set
-as one combined `/parameter_events`; member servers lock independently, so a
-concurrent mutation racing the two phases can still leave earlier members
-committed while the call reports `(false, reason)`. The
-[`ParameterClient`](@ref) form is the remote dual; values are native Julia (the
-wire tag is inferred) and `params` may be a vector of `name => value`, a
-NamedTuple, or a Dict. Transport failure raises [`ServiceError`](@ref).
+- all pairs commit → `(true, "")`.
+- a constraint, read-only, or `validate` rejection (or an `ArgumentError`, e.g. an
+  undeclared name) → the first rejection aborts the whole set, result `(false, reason)`.
+- a value that fails to coerce to its declared field type → throws, which a wire
+  caller sees as [`ServiceError`](@ref) rather than a `SetParametersResult`.
+
+Forms:
+
+- [`ParameterServer`](@ref) form → commits through one [`transaction`](@ref).
+- [`CompositeParameterServer`](@ref) form → groups pairs by member, validates every
+  member's candidate first, commits only if all pass, and surfaces the set as one
+  combined `/parameter_events`.
+    - Member servers lock independently, so a concurrent mutation racing the two
+      phases can still leave earlier members committed while the call reports
+      `(false, reason)`.
+- [`ParameterClient`](@ref) form → the remote dual; values are native Julia (the
+  wire tag is inferred) and `params` may be a vector of `name => value`, a
+  NamedTuple, or a Dict. Transport failure raises [`ServiceError`](@ref).
 """
 function set_parameters_atomically(s::ParameterServer{P}, pairs) where {P}
     try
@@ -186,11 +207,15 @@ end
 
 The ROS 2 `SetParameters` service: apply each `name => value` pair as its own
 independent transaction, yielding one `(successful, reason)`
-`SetParametersResult` per pair. A pair that violates a constraint, hits
-the read-only gate, or fails `validate` fails on its own while the others may
-succeed; a value that fails to coerce to its declared field type throws instead
-of producing a per-pair result (a wire caller sees [`ServiceError`](@ref), with
-earlier pairs already committed). To apply all pairs all-or-nothing, use
+`SetParametersResult` per pair. Per-pair failure modes:
+
+- a pair that violates a constraint, hits the read-only gate, or fails `validate`
+  → fails on its own while the others may succeed.
+- a value that fails to coerce to its declared field type → throws instead of
+  producing a per-pair result; a wire caller sees [`ServiceError`](@ref), with
+  earlier pairs already committed.
+
+To apply all pairs all-or-nothing, use
 [`set_parameters_atomically`](@ref). The [`ParameterServer`](@ref) form applies
 locally; the [`ParameterClient`](@ref) form is the remote dual over the wire.
 """

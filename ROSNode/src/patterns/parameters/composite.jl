@@ -32,9 +32,11 @@ It reuses the schema-independent service core by implementing the same six
 reflection handlers plus [`parameter_names`](@ref). It has no node-level dynamic
 tier — [`dynamic_parameters`](@ref) on it raises `ArgumentError`, directing you
 to a member's own server. A node-level atomic set
-([`set_parameters_atomically`](@ref)) validates every affected member first and
-commits only if all pass, coalescing the per-member commits into one
-`/parameter_events`.
+([`set_parameters_atomically`](@ref)):
+
+- validates every affected member first;
+- commits only if all pass;
+- coalesces the per-member commits into one `/parameter_events`.
 """
 mutable struct CompositeParameterServer <: AbstractParameterServer
     const node::Any                                       # the shared node-core

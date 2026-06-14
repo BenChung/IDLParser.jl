@@ -29,13 +29,17 @@ https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html):
 - `:typedesc` — the raw wire `TypeDescription` JSON bundle at
   `<to>/<Name>.typedesc.json`; language-agnostic and reloadable by ROSNode.
 
-Throws `ArgumentError` when a requested name is not registered (discover or
-[`load_ament_type`](@ref) it first), when an unknown `format` is given, or when
-`:typedesc` is requested for an `:ament`-acquired entry — one parsed from local
-interface text, which carries no wire `TypeDescription`. The `:wire`, `:cache`,
-`:static`, and `:authored` entries all carry one and export as `:typedesc`
-fine. Name resolution ignores the hash version — the first registry entry
-matching the name is exported.
+Throws `ArgumentError` in three cases:
+
+- A requested name is not registered — discover or [`load_ament_type`](@ref) it
+  first.
+- An unknown `format` is given.
+- `:typedesc` is requested for an `:ament`-acquired entry — one parsed from local
+  interface text, which carries no wire `TypeDescription`. The `:wire`, `:cache`,
+  `:static`, and `:authored` entries all carry one and export as `:typedesc` fine.
+
+Name resolution ignores the hash version — the first registry entry matching the
+name is exported.
 """
 function export_typesupport(ctxlike, names; to::AbstractString=pwd(),
                             format::Symbol=:msg)
@@ -208,10 +212,15 @@ response message types are `Req` / `Resp`: the service type name (`pkg/srv/Base`
 keyed on the wire as `pkg::srv::dds_::Base_`) and the ROS2 service RIHS01 the
 service/client keyexpr must carry to match a peer. Built by stripping the
 `_Request` suffix off the request's qualified name and hashing the synthesized
-service type description. Returns `nothing` unless both message types are
-registered with their wire `TypeDescription`s and the vendored
-`service_msgs/msg/ServiceEventInfo` is available — the caller then falls back to
-the request type's own info (self-consistent locally, but not peer-compatible).
+service type description. Returns:
+
+- the service-level `TypeInfo` when both message types are registered with their
+  wire `TypeDescription`s and the vendored `service_msgs/msg/ServiceEventInfo` is
+  available.
+- `nothing` when either message type is unregistered, lacks its wire
+  `TypeDescription`, or `ServiceEventInfo` is unavailable. The caller then falls
+  back to the request type's own info (self-consistent locally, but not
+  peer-compatible).
 """
 function service_type_info_of(::Type{Req}, ::Type{Resp}) where {Req, Resp}
     re = _entry_of(Req)

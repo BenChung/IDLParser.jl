@@ -7,16 +7,18 @@
     Entity
 
 The generic close-able endpoint handle behind every endpoint pattern (publisher,
-subscription, service, client). It owns the wire entity (`ROSZenoh.EndpointEntity`:
-id, kind, topic, type info, QoS), the entity's liveliness token, the 16-byte
-`source_gid` stamped on its attachments, and its data route:
+subscription, service, client). It owns:
 
-- Publisher: a Zenoh publisher.
-- Subscription: a FIFO-channel Zenoh subscriber (the advanced variant for
-  transient_local, whose declaration issues the latched-history query) plus a
-  consumer task.
-- Service/Client: `nothing` — its queryable/querier is wired by the pattern
-  layer into the `wire` slot.
+- the wire entity (`ROSZenoh.EndpointEntity`: id, kind, topic, type info, QoS),
+- the entity's liveliness token,
+- the 16-byte `source_gid` stamped on its attachments,
+- its data route, which varies by pattern:
+  - Publisher: a Zenoh publisher.
+  - Subscription: a FIFO-channel Zenoh subscriber (the advanced variant for
+    transient_local, whose declaration issues the latched-history query) plus a
+    consumer task.
+  - Service/Client: `nothing` — its queryable/querier is wired by the pattern
+    layer into the `wire` slot.
 
 An `Entity` is built and registered by `make_entity`, which allocates the
 id, declares the liveliness token, and tracks the entity on its node; the pattern
@@ -243,15 +245,21 @@ decodes each sample to `msgtype` and runs `handler(msg)` under `concurrency`.
 Returns the entity.
 
 `view` selects the [`ViewMode`](@ref) the consumer threads into each delivery:
-[`Owned`](@ref) (default), [`Checked`](@ref), or [`Unchecked`](@ref). `true`
-(⇒ `Checked()`) and `false` (⇒ `Owned()`) are accepted as shorthand.
 
-`concurrency` is the per-sample handler scheduling: [`Serial`](@ref) (default) or
-[`Parallel`](@ref), defined by [`Concurrency`](@ref).
+- [`Owned`](@ref) — the default.
+- [`Checked`](@ref).
+- [`Unchecked`](@ref).
+- `true` — shorthand for `Checked()`.
+- `false` — shorthand for `Owned()`.
 
-`weak` is a keyexpr concern only: it widens the subscriber to a wildcard data
-keyexpr so off-type samples arrive for the per-sample backstop. It is unrelated to
-the `Context` `weak_types` type-revision trust flag, which governs whether a pinned
+`concurrency` is the per-sample handler scheduling, defined by [`Concurrency`](@ref):
+
+- [`Serial`](@ref) — the default.
+- [`Parallel`](@ref).
+
+`weak` widens the subscriber to a wildcard data keyexpr so off-type samples arrive
+for the per-sample backstop; it is a keyexpr concern only. It is unrelated to the
+`Context` `weak_types` type-revision trust flag, which governs whether a pinned
 type's RIHS01 is enforced against a diverging peer; the two are not coupled.
 """
 function declare_subscription!(e::Entity, msgtype::Type, handler;

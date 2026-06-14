@@ -165,11 +165,29 @@ _is_zero_uuid(id::GoalId) = all(==(0x00), id)
 """
     GoalState
 
-The ROS 2 goal lifecycle (`action_msgs/msg/GoalStatus`): `ACCEPTED` → `EXECUTING`
-→ {`SUCCEEDED`, `CANCELED`, `ABORTED`}, with `CANCELING` between `EXECUTING` and
-`CANCELED`. Integer values match the wire enum, so they publish directly to the
-`status` topic. `:unknown`/`:rejected` stay local — they label a handle but are
-never sent on the wire.
+The ROS 2 goal lifecycle (`action_msgs/msg/GoalStatus`). Integer values match the
+wire enum, so the wire-scoped states publish directly to the `status` topic.
+
+Transitions:
+
+```
+ACCEPTED → EXECUTING → SUCCEEDED
+                     → CANCELING → CANCELED
+                     → ABORTED
+```
+
+| State        | Wire value | Scope |
+|:-------------|:-----------|:------|
+| `ACCEPTED`   | 1          | wire  |
+| `EXECUTING`  | 2          | wire  |
+| `CANCELING`  | 3          | wire  |
+| `SUCCEEDED`  | 4          | wire  |
+| `CANCELED`   | 5          | wire  |
+| `ABORTED`    | 6          | wire  |
+| `:unknown`   | 0          | local |
+| `:rejected`  | —          | local |
+
+Local states label a handle and are never sent on the wire.
 
 See the ROS 2 actions concept: https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 """
@@ -213,21 +231,31 @@ struct Defer  <: GoalResponse end
 """
     accept() -> Accept
 
-The `on_goal` decision that accepts a goal and fires the server's `on_accepted`:
-the high-level `do`-block body runs immediately, while a low-level callback
-decides when. Return it from an `on_goal(request)` callback. One of the three
-goal-acceptance tokens with [`reject`](@ref) and [`defer`](@ref); the default
-`on_goal` returns `accept()`.
+The `on_goal` decision that accepts a goal and fires the server's `on_accepted`.
+Return it from an `on_goal(request)` callback. Execution path depends on the API
+level:
+
+- High-level: the `do`-block body runs immediately.
+- Low-level: the `on_accepted` callback decides when to execute.
+
+See also:
+
+- One of the three goal-acceptance tokens, with [`reject`](@ref) and [`defer`](@ref).
+- The default `on_goal` returns `accept()`.
 """
 accept() = Accept()
 
 """
     reject() -> Reject
 
-The `on_goal` decision that declines a goal: the server replies not-accepted and
-the client's [`send`](@ref) returns a handle in state `:rejected`. Return it from
-an `on_goal(request)` callback. One of the three goal-acceptance tokens with
-[`accept`](@ref) and [`defer`](@ref).
+The `on_goal` decision that declines a goal. Return it from an `on_goal(request)`
+callback. Effects:
+
+- Server: replies not-accepted.
+- Client: [`send`](@ref) returns a handle in state `:rejected`.
+
+See also: one of the three goal-acceptance tokens, with [`accept`](@ref) and
+[`defer`](@ref).
 """
 reject() = Reject()
 
@@ -236,9 +264,13 @@ reject() = Reject()
 
 The `on_goal` decision that accepts a goal but leaves it in the `ACCEPTED` state
 for the owner to run later with [`execute`](@ref) — the queue/orchestrator path.
-The server replies accepted but does not fire `on_accepted` for a deferred goal.
-Return it from an `on_goal(request)` callback. One of the three goal-acceptance tokens with
-[`accept`](@ref) and [`reject`](@ref).
+Return it from an `on_goal(request)` callback. Effects:
+
+- Server: replies accepted.
+- `on_accepted`: not fired (execute the goal explicitly with [`execute`](@ref)).
+
+See also: one of the three goal-acceptance tokens, with [`accept`](@ref) and
+[`reject`](@ref).
 """
 defer()  = Defer()
 

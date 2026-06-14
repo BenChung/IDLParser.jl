@@ -40,10 +40,15 @@ struct ParamSpec
 end
 
 """
-A declared port of a mixin. `kind` is `:publisher`/`:client` (HAS) or
-`:subscription`/`:service`/`:action`/`:timer` (DOES). `wire` overrides the topic/name
-(else the identifier is used); `reaction` is the dispatched handler (DOES) or `nothing`
-(HAS); `extra` carries kind-specific data (e.g. a timer's `rate`).
+A declared port of a mixin. `kind` is one of two categories:
+
+  - HAS — `:publisher`, `:client`: a typed handle the mixin holds, no authored handler.
+  - DOES — `:subscription`, `:service`, `:action`, `:timer`: a dispatched reaction.
+
+`wire` overrides the topic/name (else the identifier is used). The remaining fields:
+
+  - `reaction` — the dispatched handler for a DOES port, `nothing` for a HAS port.
+  - `extra` — kind-specific data (e.g. a timer's `rate`).
 """
 struct PortSpec
     name::Symbol
@@ -408,13 +413,17 @@ Declare a service server on mixin `M`, a DOES port, in either of
 `@ros_service`'s two type-sources. The service name defaults to the function name; a
 leading string literal overrides it (e.g. `"~/set_mode"`).
 
-Without a return annotation `f(m, req)` serves an **existing** service type:
-`req::SrvReqType` is a generated `*_Request`, and `f` returns the matching
-`*_Response`. With a `::@NamedTuple{…}` return the arguments after `m` are the
-**authored** request fields and the return is the response — the macro generates
-`f_Request`/`f_Response` (package from the module's `@ros_package`, else the
-snake-cased module name), registers them, and emits a splatting adapter that calls
-`f(m, fields…)` and converts the returned `@NamedTuple` to the response struct. Either
+The return annotation selects the type-source:
+
+  - **Existing type** — no return annotation: `f(m, req)` where `req::SrvReqType` is a
+    generated `*_Request`, and `f` returns the matching `*_Response`.
+  - **Authored inline** — a `::@NamedTuple{…}` return: the arguments after `m` are the
+    authored request fields and the return is the response. The macro generates
+    `f_Request`/`f_Response` (package from the module's `@ros_package`, else the
+    snake-cased module name), registers them, and emits a splatting adapter that calls
+    `f(m, fields…)` and converts the returned `@NamedTuple` to the response struct.
+
+Either
 way the framework materialises a `Service` on the node-core whose callback runs the
 handler with the live `m`; service dispatch honours lifecycle gating.
 
@@ -500,8 +509,9 @@ converted Result; a throw settles it ABORTED. The first argument must be the bar
 base; the handler needs a `::@NamedTuple{…}` return and exactly one `FeedbackSink`
 parameter.
 
-Known gap: the materialised action server does not consult the node lifecycle gate —
-it accepts goals, runs them, and publishes feedback/status in every lifecycle state.
+Action dispatch honours the node's lifecycle gating: a managed node only accepts and
+runs goals, and publishes feedback and status, while Active; requests to an inactive
+node get an error reply.
 
 ```julia
 @runs function fib(m::Counter, order::Int32,
@@ -662,7 +672,7 @@ Component hook you override to release what [`configure`](@ref) acquired (close 
 free handles). Default no-op on [`Component`](@ref). Runs at the cleanup/shutdown
 transition, driven by [`cleanup!`](@ref) / [`shutdown!`](@ref).
 
-Site-specific behavior of this hook:
+Framework guarantees:
 
   - Fires at most once per [`configure`](@ref), guarded on the member's materialised
     ports — only for a configured member, and a second teardown trigger is a no-op.
@@ -684,10 +694,11 @@ Component hook you override to recover or reset member state. Default no-op on
 enters.
 
 A throw here is caught and logged, so the remaining members still recover — but any
-member's throw means recovery failed and the node lands [`Finalized`](@ref). Known gap
-in the current fan-out: error processing runs only these hooks — member [`cleanup`](@ref)
-is skipped and ports stay open, so resources [`configure`](@ref) acquired persist on the
-error path.
+member's throw means recovery failed and the node lands [`Finalized`](@ref). On a
+recovered error the framework then runs the cleanup fan-out — each member's
+[`cleanup`](@ref) runs and its ports close — before the node lands [`Unconfigured`](@ref),
+releasing whatever [`configure`](@ref) acquired. On the [`Finalized`](@ref) path that
+fan-out is deferred until the node is closed.
 """
 on_error(::Component) = nothing
 
@@ -894,18 +905,20 @@ provides(::Type) = ()
     requires(::Type{M}) -> Tuple
 
 The dependencies mixin `M` declares. Defaults to the empty tuple `()`; override it to
-declare them. Each entry is either an `@interface` marker — resolved against sibling
-members' [`@provides`](@ref) evidence — or a concrete `@mixin` type, resolved against
-the sibling member that *is* that mixin (matched on its base, so a parametric mixin is
-named by its base too). At assembly the node resolver maps each requirement to the
+declare them. Each entry is one of two kinds:
+
+  - An `@interface` marker — resolved against sibling members' [`@provides`](@ref)
+    evidence. Consumed through the interface's methods and typically stored in a free
+    type parameter for type-stable access.
+  - A concrete `@mixin` type — resolved against the sibling member that *is* that mixin
+    (matched on its base, so a parametric mixin is named by its base too). Types the
+    injected dependency concretely: the consuming `construct` can annotate `deps…` with
+    the mixin type, no free type parameter needed.
+
+At assembly the node resolver maps each requirement to the
 single matching sibling (excluding `M` itself, so a mixin cannot satisfy its own
 requirement), forms a dependency edge, toposorts the members, and injects the resolved
 providers positionally into `construct(::Type{M}, node, deps…)` in `requires` order.
-
-A direct mixin requirement types the injected dependency concretely (the consuming
-`construct` can annotate `deps…` with the mixin type, no free type parameter needed);
-an interface requirement is consumed through its methods and is typically stored in a
-free parameter for type-stable access.
 
 Zero matches is an unsatisfied-dependency error; more than one is an ambiguity error
 (restructure so a single sibling satisfies it). Known gap: the pin-pair disambiguation

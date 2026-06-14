@@ -24,11 +24,16 @@ commit path under the server's mutation lock.
 
 Undeclared parameters live in a separate `Any`-typed side dict reached via
 [`dynamic_parameters`](@ref), gated by `allow_undeclared` (default off); with
-the gate off, a dynamic read or write raises `ArgumentError`. The two-argument
-form takes an already-built `initial::P`; the `{P}`-keyword form builds the
-initial value by overlaying `overrides` (startup CLI/launch/YAML) onto the
-schema defaults. A startup override of a `read_only` field is allowed —
-read-only blocks only runtime sets.
+the gate off, a dynamic read or write raises `ArgumentError`.
+
+Two constructor forms set the initial value:
+
+- two-argument — takes an already-built `initial::P`.
+- `{P}`-keyword — builds the initial value by overlaying `overrides` (startup
+  CLI/launch/YAML) onto the schema defaults.
+
+A startup override of a `read_only` field is allowed — read-only blocks only
+runtime sets.
 
 Typically reached as `node.parameters`. The six standard parameter services and
 `/parameter_events` are wired generically over `P` by
@@ -134,12 +139,21 @@ Base.propertynames(s::ParameterServer{P}) where {P} = fieldnames(P)
     parameter(server::ParameterServer, name::Symbol)
     parameter(client::ParameterClient, name; timeout_ms=2000)
 
-Read one parameter by `name` across both tiers. On a
-[`ParameterServer`](@ref) a declared field reads from the live atomic struct and
-a dynamic one from the side dict (when `allow_undeclared`); an undeclared name
-with the gate off raises `ArgumentError`. On a [`ParameterClient`](@ref) it is
-one remote `GetParameters` for the single name — an unset or unknown name reads
-back as `nothing`, and a timeout or error reply raises [`ServiceError`](@ref).
+Read one parameter by `name` across both tiers.
+
+On a [`ParameterServer`](@ref):
+
+- declared field — reads from the live atomic struct.
+- dynamic field — reads from the side dict, when `allow_undeclared`.
+- undeclared name with the gate off — raises `ArgumentError`.
+
+On a [`ParameterClient`](@ref) it is one remote `GetParameters` for the single
+name:
+
+- normal — returns the value.
+- unset or unknown name — reads back as `nothing`.
+- timeout or error reply — raises [`ServiceError`](@ref).
+
 This is the flat-namespace read the services and the composite resolver use.
 """
 function parameter(s::ParameterServer{P}, name::Symbol) where {P}
@@ -157,12 +171,15 @@ end
     parameter_names(client::ParameterClient; kwargs...) -> Vector{Symbol}
 
 The flat list of parameter names a node exposes — what `list` and
-`/parameter_events` reflect over. For a [`ParameterServer`](@ref) this is the
-union of declared field names (first, in schema order) and the live dynamic
-names (sorted, only when `allow_undeclared`). For a
-[`CompositeParameterServer`](@ref) it is every member's declared names as
-`<member>.<field>` in declared order. For a [`ParameterClient`](@ref) it
-forwards to a remote `ListParameters` ([`list_parameters`](@ref)).
+`/parameter_events` reflect over.
+
+- [`ParameterServer`](@ref) — the union of declared field names (first, in
+  schema order) and the live dynamic names (sorted, only when
+  `allow_undeclared`).
+- [`CompositeParameterServer`](@ref) — every member's declared names as
+  `<member>.<field>` in declared order.
+- [`ParameterClient`](@ref) — forwards to a remote `ListParameters`
+  ([`list_parameters`](@ref)).
 """
 function parameter_names(s::ParameterServer{P}) where {P}
     names = collect(Symbol, fieldnames(P))
@@ -246,13 +263,15 @@ with nothing committed.
 
 For a [`ParameterClient`](@ref) the same do-block shape drives a remote: `f`
 runs against a draft of the fetched current value, the candidate is checked
-locally first for fast feedback (field constraints, the read-only gate, and any
-`validate` method defined in the client process — rules defined only on the
-remote are enforced by the remote's authoritative re-validation), then pushed as
-one `set_parameters_atomically`. Returns the new `P` on success or raises
-[`ParameterRejection`](@ref) on a rejected set. A schemaless
-`ParameterClient{Nothing}` raises `ArgumentError` — use
-[`set_parameters_atomically`](@ref) instead.
+locally first for fast feedback, then pushed as one `set_parameters_atomically`.
+The local pre-check covers field constraints, the read-only gate, and any
+`validate` method defined in the client process; rules defined only on the
+remote are enforced by the remote's authoritative re-validation. Outcomes:
+
+- success — returns the new `P`.
+- rejected set — raises [`ParameterRejection`](@ref).
+- schemaless `ParameterClient{Nothing}` — raises `ArgumentError`; use
+  [`set_parameters_atomically`](@ref) instead.
 
 ```julia
 transaction(node.parameters) do p
@@ -371,16 +390,24 @@ end
     set_parameter!(server::ParameterServer, name::Symbol, value) -> P
     set_parameter!(client::ParameterClient, name, value; timeout_ms=2000) -> value
 
-Set one parameter by name, atomically. On a [`ParameterServer`](@ref) a
-declared field routes to the typed struct (value coerced to the field type) and
-an undeclared name to the dynamic dict (when `allow_undeclared`); it runs as a
-single-statement transaction and returns the whole committed schema struct `P`
-(for a dynamic name the returned struct does not carry that key — only the
-declared tier is part of `P`). On a [`ParameterClient`](@ref) it issues one
-`set_parameters_atomically` and returns the passed `value` on success, raising
-[`ParameterRejection`](@ref) if the remote rejects it (constraint, read-only, or
-`validate`) — the same exception the local form raises, so the failure contract
-is uniform local↔remote.
+Set one parameter by name, atomically.
+
+On a [`ParameterServer`](@ref) it runs as a single-statement transaction and
+returns the whole committed schema struct `P`:
+
+- declared field — routes to the typed struct, value coerced to the field type.
+- undeclared name — routes to the dynamic dict, when `allow_undeclared`; the
+  returned struct does not carry that key, since only the declared tier is part
+  of `P`.
+
+On a [`ParameterClient`](@ref) it issues one `set_parameters_atomically`:
+
+- success — returns the passed `value`.
+- remote rejects it (constraint, read-only, or `validate`) — raises
+  [`ParameterRejection`](@ref).
+
+This is the same exception the local form raises, so the failure contract is
+uniform local↔remote.
 """
 function set_parameter!(s::ParameterServer{P}, name::Symbol, value) where {P}
     transaction(s) do p

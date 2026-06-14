@@ -48,18 +48,23 @@ interface type
   server) reads from.
 - `td::Union{TypeDescriptionMsg, Nothing}` — the wire type description (main
   type plus its referenced closure), the source of truth for persistence and
-  the `~/get_type_description` service. Present for `:wire` and `:cache`
-  entries (the received blob) and for `:static` / `:authored` entries (the
-  baked or reflected description they were generated from); `nothing` for an
-  `:ament` entry, which is parsed straight from installed `.msg` / `.srv` /
-  `.action` text and so has no wire description.
+  the `~/get_type_description` service. Its content by provenance:
+
+  | provenance            | `td`                                                          |
+  |:----------------------|:--------------------------------------------------------------|
+  | `:wire` / `:cache`    | the received blob                                             |
+  | `:static` / `:authored` | the baked or reflected description it was generated from    |
+  | `:ament`              | `nothing` — parsed straight from installed `.msg` / `.srv` / `.action` text, so there is no wire description |
 - `provenance::Symbol` — where the type came from: `:static`, `:authored`,
   `:ament`, `:wire`, or `:cache`.
 - `mod::Union{Module, Nothing}` and `type` — the generated module and the
-  concrete struct within it, populated by `realize!` at first use (a
-  statically-interned entry arrives with them already bound to the compiled
-  type). Callers reach them via `Base.invokelatest`, since codegen runs in a
-  newer world age than the compiled dispatcher.
+  concrete struct within it. They are bound by one of two paths:
+
+  - dynamic entry — `nothing` at construction, populated by `realize!` at first use.
+  - statically-interned entry — already bound to the compiled type on arrival.
+
+  Callers reach them via `Base.invokelatest`, since codegen runs in a newer
+  world age than the compiled dispatcher.
 
 The convenience constructor defers codegen (`mod`/`type` start `nothing`) and
 defaults `provenance` to `:wire`.
@@ -88,10 +93,15 @@ Base.show(io::IO, e::RegistryEntry) =
 """
     split_ros_name(name) -> (package, qualifier, bare)
 
-Decompose a fully-qualified ROS2 type name `"<pkg>/<qual>/<Name>"` into its parts.
-A two-segment `"<pkg>/<Name>"` is read as `qualifier == "msg"` (the common
-abbreviation); a bare `"Name"` yields empty package/qualifier. The inverse of the
-`<pkg>/<qual>/<Name>` assembly the codegen and keyexpr layers build.
+Decompose a ROS2 type name into `(package, qualifier, bare)` by segment count:
+
+| input form              | package | qualifier            | bare     |
+|:------------------------|:--------|:---------------------|:---------|
+| `"<pkg>/<qual>/<Name>"` | `pkg`   | `qual`               | `Name`   |
+| `"<pkg>/<Name>"`        | `pkg`   | `"msg"` (the common abbreviation) | `Name`   |
+| `"Name"`                | `""`    | `""`                 | `Name`   |
+
+The inverse of the `<pkg>/<qual>/<Name>` assembly the codegen and keyexpr layers build.
 """
 function split_ros_name(name::AbstractString)
     parts = split(name, '/')

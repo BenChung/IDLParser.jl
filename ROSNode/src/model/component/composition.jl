@@ -47,9 +47,12 @@ The node kind registered under `name` — the `NodeKind` or `@mixin` type passed
 to [`register_node_kind!`](@ref) — or `nothing` when no kind carries that name.
 Thread-safe (guarded by the registry lock).
 
-The lookup is by the exact registered name; a container's load path additionally
-tolerates a namespaced spelling (`my_pkg::Talker`, `pkg/Talker`, `pkg.Talker`) by
-retrying on the last `::`/`/`/`.`-separated segment.
+Lookup proceeds in two steps:
+
+- the exact registered `name`;
+- a container's load path additionally tolerates a namespaced spelling
+  (`my_pkg::Talker`, `pkg/Talker`, `pkg.Talker`) by retrying on the last segment
+  after `::`, `/`, or `.`.
 """
 node_kind(name::AbstractString) = @lock _NODE_KINDS_LOCK get(_NODE_KINDS, String(name), nothing)
 
@@ -116,24 +119,41 @@ live `ComponentNode` and the container-unique id it is tracked under.
 This is the programmatic form of `ros2 component load`; the `~/_container/load_node`
 service (`composition_interfaces/srv/LoadNode`) drives the same path from the wire.
 
-Resolution tries `plugin_name` verbatim against the process-global registry, then its
-last `::`/`/`/`.`-separated segment; `package_name` is advisory and does not shard the
-registry. `name` defaults to the kind's name (the `@node` name, or the mixin type's
-snake-cased name) and `namespace` to the Context's namespace; pass either to override.
+Resolution matches `plugin_name` against the process-global registry in order:
 
-`parameters` is a `run` `overrides` NamedTuple. A key is mixin-local (`fps`, applying
-to every member that declares it) or member-prefixed (`var"camera.fps"`, targeting one
-member and winning over the mixin-local form). The prefix is the member's name within
-the node — a `@node` member's declared name, or the snake-cased mixin type for a mixin
-loaded directly as a node — independent of the node instance `name`.
+- `plugin_name` verbatim;
+- its last `::`/`/`/`.`-separated segment.
+
+`package_name` is advisory and does not shard the registry.
+
+Each keyword defaults from the kind and Context; pass either to override:
+
+- `name` — the kind's name (the `@node` name, or the mixin type's snake-cased name);
+- `namespace` — the Context's namespace.
+
+`parameters` is a `run` `overrides` NamedTuple, taking two key forms:
+
+| Key form        | Scope                                                        | Example          |
+|:----------------|:-------------------------------------------------------------|:-----------------|
+| mixin-local     | every member that declares it                                | `fps`            |
+| member-prefixed | one member, winning over the mixin-local form                | `var"camera.fps"` |
+
+The prefix is the member's name within the node — a `@node` member's declared name, or
+the snake-cased mixin type for a mixin loaded directly as a node — independent of the
+node instance `name`.
 
 The node is built by `run(K; ctx = c.ctx, block = false, …)` on the container's shared
 Context and autostarts (configure, then activate) like a standalone unmanaged node,
 then is registered for [`list_nodes`](@ref) / [`unload_node`](@ref) under a fresh
-1-based id. Throws `ArgumentError` when no kind is registered under `plugin_name`;
-assembly errors (a wire-name clobber, unsatisfied or ambiguous DI, a `construct` or
-`configure` exception) propagate from the underlying `run`. The wire
-`~/_container/load_node` service catches the same errors and returns them as a
+1-based id.
+
+Errors:
+
+- `ArgumentError` — no kind is registered under `plugin_name`;
+- assembly errors propagated from the underlying `run` — a wire-name clobber,
+  unsatisfied or ambiguous DI, or a `construct`/`configure` exception.
+
+The wire `~/_container/load_node` service catches both categories and returns them as a
 `success = false` response instead.
 
 ```julia
@@ -159,17 +179,23 @@ end
 """
     unload_node(c::Container, unique_id::Integer) -> Bool
 
-Close and forget the loaded node tracked under `unique_id` on container `c`, returning
-`true` when a node carried that id and `false` otherwise. This is the programmatic
-form of `ros2 component unload`; the `~/_container/unload_node` service
-(`composition_interfaces/srv/UnloadNode`) drives the same path.
+Close and forget the loaded node tracked under `unique_id` on container `c`:
 
-The id is popped from the container's loaded set and node list inside one critical
-section, so two concurrent unloads of the same id cannot both claim it (and
-double-close). The `close` — which runs each member's `cleanup` in reverse dependency
-order and tears down the node's entities, driving a managed node through its
-`LifecycleNode` shutdown — happens outside the lock. `close` is idempotent, so a later
-Context drain that also closes the node is a no-op.
+- `true` — a node carried that id;
+- `false` — no node carried that id.
+
+This is the programmatic form of `ros2 component unload`; the `~/_container/unload_node`
+service (`composition_interfaces/srv/UnloadNode`) drives the same path.
+
+Teardown runs in three phases:
+
+- the id is popped from the container's loaded set and node list inside one critical
+  section, so two concurrent unloads of the same id cannot both claim it (and
+  double-close);
+- `close` happens outside the lock, running each member's `cleanup` in reverse
+  dependency order and tearing down the node's entities, driving a managed node through
+  its `LifecycleNode` shutdown;
+- `close` is idempotent, so a later Context drain that also closes the node is a no-op.
 """
 function unload_node(c::Container, unique_id::Integer)
     uid = UInt64(unique_id)

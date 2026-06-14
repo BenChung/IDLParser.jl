@@ -85,8 +85,9 @@ graph lifecycle — adding the typed surface direct delivery needs:
 
   - `T`, the message type, and the QoS, for type + RxO matching;
   - the user `handler`;
-  - the `view`/`concurrency` policies (delivery mirrors the subscription dispatch
-    runtime exactly).
+  - the `view`/`concurrency` policies.
+
+Direct delivery mirrors the subscription dispatch runtime exactly.
 
 Held in the Context's local registry; one per intra-process-eligible
 [`SubscriptionHandle`](@ref).
@@ -215,11 +216,13 @@ end
 
 The `allowed_origin` an intra-process subscriber's Zenoh subscriber uses, threaded
 into `Base.open(session, …; allowed_origin = local_origin(ctx))` at the subscription
-declaration. Two cases:
+declaration. With the short-circuit on, the Zenoh loopback would otherwise
+double-deliver a same-session publication, so the local subscriber excludes it.
 
-  - short-circuit on: `REMOTE`, so a same-session publication arrives only via the
-    direct path (the Zenoh loopback would otherwise double-deliver it);
-  - short-circuit off: `ANY`, so every publication arrives over Zenoh.
+| short-circuit | returns  | effect                                                       |
+|:--------------|:---------|:-------------------------------------------------------------|
+| on            | `REMOTE` | a same-session publication arrives only via the direct path  |
+| off           | `ANY`    | every publication arrives over Zenoh                         |
 """
 local_origin(ctx::Context) =
     intra_process_enabled(ctx) ? Localities.REMOTE : Localities.ANY
@@ -259,20 +262,27 @@ end
     deliver_local(pub::PublisherHandle, msg) -> Bool
 
 Deliver `msg` to every same-Context subscriber that matches `pub`'s topic, type,
-and QoS — the intra-process short-circuit. Each matching subscriber's
-handler runs with `msg` owned (a `copy`, the default) or shared read-only
-(`view=true`), per *that subscriber's* `view` flag, scheduled by its `concurrency`
-policy. The CDR serialize, the Zenoh hop, and the decode are all skipped.
+and QoS — the intra-process short-circuit. The CDR serialize, the Zenoh hop, and
+the decode are all skipped. Each matching subscriber's handler receives `msg` per
+*that subscriber's* `view` flag:
+
+  - `view=false` (the default) — owned (a `copy`);
+  - `view=true` — shared read-only.
+
+The handler is scheduled by the subscriber's `concurrency` policy.
 
 Each sub's inbox is a QoS-depth ring: a full inbox (a slow same-process subscriber)
 drops the oldest queued message rather than blocking `publish` ([`_put_drop_oldest!`](@ref)),
 so a slow local sub never delays the wire `put`.
 
-Returns `true` if at least one local subscriber was delivered to. The caller
-(`publish`) **still** issues the Zenoh `put` afterwards so any *remote*
-subscribers are served (the local subs suppress their own loopback via
-`local_origin`, so they are not double-delivered). A no-op returning
-`false` when the short-circuit is disabled or no local sub matches.
+Returns:
+
+  - `true` — at least one local subscriber was delivered to;
+  - `false` — a no-op, when the short-circuit is disabled or no local sub matches.
+
+The caller (`publish`) **still** issues the Zenoh `put` afterwards so any *remote*
+subscribers are served. The local subs suppress their own loopback via
+`local_origin`, so they are not double-delivered.
 """
 function deliver_local(pub::PublisherHandle{T}, msg::T) where {T}
     e = pub.entity

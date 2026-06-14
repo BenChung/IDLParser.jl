@@ -183,14 +183,21 @@ window (50 ms backoffs) while the route stays unmatched; the first reply that
 lands is authoritative. Inspect the outcome with [`state`](@ref) (`:accepted` or
 `:rejected`), iterate [`feedback`](@ref), and block on `fetch` for the result.
 
-`:rejected` covers every no-acceptance outcome alike — an `on_goal` rejection, an
-error reply (server inactive), no server discovered within the window, and a
-Context drain mid-window — so a caller that must tell them apart checks
-[`action_server_matched`](@ref) or `is_shutdown` separately.
+`:rejected` covers every no-acceptance outcome alike:
 
-Throws `ArgumentError` if `client` is already closed, and [`NodeInactiveError`](@ref)
-if the client's node is a managed node that is not [`Active`](@ref) (probe
-[`isactive`](@ref)`(node)` first).
+- an `on_goal` rejection,
+- an error reply (server inactive),
+- no server discovered within the window, and
+- a Context drain mid-window.
+
+A caller that must tell them apart checks [`action_server_matched`](@ref) or
+`is_shutdown` separately.
+
+Throws:
+
+- `ArgumentError` if `client` is already closed.
+- [`NodeInactiveError`](@ref) if the client's node is a managed node that is not
+  [`Active`](@ref) (probe [`isactive`](@ref)`(node)` first).
 
 ```julia
 goal = send(client, Fibonacci_Goal(; order = 10))
@@ -344,11 +351,15 @@ end
 Block until the goal settles and return its `Result`. Backed by a write-once
 slot filled from one `get_result` request — single-fill, like the server-side
 [`respond!`](@ref): the first `fetch`/`feedback` starts it, every `fetch` returns
-that result. Raises an error if the goal was rejected, the server reported a
-failure, or the result never arrived (a Context drain ends the `get_result` retry
-early, surfacing as a timed-out-result error), or [`NodeInactiveError`](@ref) if
-the client's node is a managed node that is not [`Active`](@ref) when the
-`get_result` query starts (probe [`isactive`](@ref)`(node)` first).
+that result. Raises:
+
+- an error if the goal was rejected.
+- an error if the server reported a failure.
+- a timed-out-result error if the result never arrived (a Context drain ends the
+  `get_result` retry early, surfacing here).
+- [`NodeInactiveError`](@ref) if the client's node is a managed node that is not
+  [`Active`](@ref) when the `get_result` query starts (probe
+  [`isactive`](@ref)`(node)` first).
 """
 function Base.fetch(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     _ensure_result!(g)

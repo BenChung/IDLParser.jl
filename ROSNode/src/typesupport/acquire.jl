@@ -24,11 +24,15 @@ end
     entry_from_type_description(td::TypeDescriptionMsg, info::TypeInfo;
                                 provenance=:wire, verify=true) -> RegistryEntry
 
-Build a [`RegistryEntry`](@ref) from a wire `TypeDescriptionMsg`. With
-`verify=true` (the default) the hash gate runs first and a mismatch throws — a
-discovered type must hash-match the name it travels under. `lift` reconstructs the
-main IL; nested types survive as `RRef`s in its fields, and codegen resolves them
-from the referenced closure carried in `td`.
+Build a [`RegistryEntry`](@ref) from a wire `TypeDescriptionMsg`. A discovered
+type must hash-match the name it travels under, so `verify` gates on the RIHS01
+hash:
+
+- `true` (default) — the hash gate runs first and a mismatch throws.
+- `false` — the gate is skipped.
+
+`lift` reconstructs the main IL; nested types survive as `RRef`s in its fields,
+and codegen resolves them from the referenced closure carried in `td`.
 
 Codegen is deferred to `realize!` at first use, so registration stays cheap and
 discovery succeeds even for a type that later fails to generate.
@@ -52,10 +56,12 @@ Build (with the hash gate) and register a wire type description under
 landing point: a GetTypeDescription reply is verified, lifted, and registered in
 one call.
 
-**Caches only `:wire` provenance** (best-effort): the content-addressed JSON cache
-skips re-discovering dynamic types across runs. Ament- and vendor-acquired types are
-statically loadable and resolve by name, so they bypass the cache regardless of
-`cache`.
+Caching is best-effort and provenance-scoped:
+
+- `:wire` — cached in the content-addressed JSON cache, which skips
+  re-discovering dynamic types across runs.
+- `:ament`/vendor — bypasses the cache regardless of `cache`, since these types
+  are statically loadable and resolve by name.
 """
 function register_type_description!(reg::TypeRegistry, td::TypeDescriptionMsg,
                                     info::TypeInfo; provenance::Symbol=:wire,
@@ -352,11 +358,15 @@ The ament lookup is name-only, so its result is re-validated against `info`'s
 RIHS01 before it is trusted (the same revalidation the cache path runs). A real-hash
 mismatch is rejected with a diagnostic and returns `nothing` so the caller
 wire-discovers the peer's actual revision; the all-zero placeholder hash (an
-uncomparable cross-package ref) is accepted with a `@debug` note. The diagnostic is
-loud (`@warn`) under the `Context`'s default pinned trust and quiet (`@debug`) under
-`weak_types=true`. When the ament path fires the diagnostic, `warned[]` (if given) is
-set `true`, so a wire-suppression site owns the no-ament-file pinned-conflict case
-without double-warning.
+uncomparable cross-package ref) is accepted with a `@debug` note. The diagnostic
+loudness tracks the `Context`'s trust setting:
+
+- default pinned trust — loud (`@warn`).
+- `weak_types=true` — quiet (`@debug`).
+
+When the ament path fires the diagnostic, `warned[]` (if given) is set `true`, so
+a wire-suppression site owns the no-ament-file pinned-conflict case without
+double-warning.
 
 Returns `nothing` when none of the local sources resolves the type. The dynamic
 over-the-wire path (issuing a `GetTypeDescription` query) stays with the

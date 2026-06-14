@@ -64,12 +64,16 @@ module defines its own `__init__` (which the macros otherwise generate for you).
 Idempotent: entries are interned by type, so repeated absorbs of the same module
 are no-ops.
 
-It drains three module-local globals when present: `__ros_cache_dir__` (a
-`@ros_cache` opt-in directory), `__ros_authored_types__` (types authored with
-`@ros_message` / `@ros_service` / `@ros_action`, interned by reflection and
-folded into the module's resolve table), and `__ros_static_types__` (each
-`@ros_import` type paired with its canonical `TypeDescription` JSON). Each
-carries a precompiled ROS 2 interface type and its type-description bytes;
+It drains three module-local globals when present:
+
+- `__ros_cache_dir__` — the `@ros_cache` opt-in directory.
+- `__ros_authored_types__` — types authored with `@ros_message` /
+  `@ros_service` / `@ros_action`, interned by reflection and folded into the
+  module's resolve table.
+- `__ros_static_types__` — each `@ros_import` type paired with its canonical
+  `TypeDescription` JSON.
+
+Each carries a precompiled ROS 2 interface type and its type-description bytes;
 registration into a `Context` happens later, at `Context` creation. A per-type
 failure is logged and skipped so one bad declaration cannot abort the absorb.
 Returns `nothing`.

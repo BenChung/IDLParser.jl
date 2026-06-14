@@ -61,24 +61,26 @@ one wire type carry equal RIHS01 type hashes, hence identical CDR field layout �
 example two modules' separate aliases of `sensor_msgs/msg/Image`. `as` encodes `x` to
 its CDR bytes and decodes those bytes as `T`, handing the value across the
 nominal-type boundary with the same round-trip invariant the transport relies on.
-Returns `x` itself when `typeof(x) === T`, otherwise a fully-owned `T` (the decode
-copies every field out — see `decode_owned`).
+
+- `typeof(x) === T` — returns `x` itself (identity short-circuit).
+- otherwise — a fully-owned `T`; the decode copies every field out (see `decode_owned`).
 
 Layout compatibility is the caller's contract: pass only equal-RIHS01 types. The
-decode is positional, so a mismatched `T` either overruns the payload (an
-`EOFError`/`BoundsError`) or, when its fields happen to fit the bytes, decodes
-silently into garbage.
+decode is positional, so a mismatched `T` fails one of two ways:
+
+- overruns the payload — an `EOFError`/`BoundsError`.
+- decodes silently into garbage — when its fields happen to fit the bytes.
 
 Use it when a value built as one alias reaches code expecting another. Type
 resolution warns when two distinct Julia structs settle on one RIHS01 wire type at a
 common dependent; handing such a value across that boundary is the canonical case:
 `f(as(msg, ThatType))`.
 
-A borrowed `CDRView` (from `decode(...; view=true)`) takes its own method: the view
-stores its fields in one NamedTuple, so it cannot walk the encoder directly — it is
-copied out of its buffer first (`decode_owned`) and the owned value cast. `as` on a
-view therefore always returns an owned `T`, including when `T` is the view's own
-tag. For a zero-copy cast of a view to a sibling type use `CDRSerialization.retag`.
+A borrowed `CDRView` (from `decode(...; view=true)`) takes its own method:
+
+- it stores its fields in one NamedTuple, so it cannot walk the encoder directly — it is copied out of its buffer first (`decode_owned`) and the owned value cast.
+- `as` on a view therefore always returns an owned `T`, including when `T` is the view's own tag.
+- for a zero-copy cast of a view to a sibling type use `CDRSerialization.retag`.
 
 ```julia
 # Illustrative: ImageA and ImageB stand for two modules' aliases of
@@ -99,13 +101,16 @@ export as
 """
     decode(sample::Sample, ::Type{T}; view=false) -> T | CDRView{T}
 
-Materialize a `T` from a received `Sample`. Owned by default (`view=false`):
-every field is copied out, so the result is storable / forwardable / spawnable
-with no lifetime caveats (correctness first). `view=true` returns a
-`CDRView{T}` whose variable-length fields alias the payload bytes — only valid
-while the backing memory is live; the subscription dispatcher runs the
-view handler inside `with_memory` and hands us the borrowed memory through the
-`DenseVector{UInt8}` overload below.
+Materialize a `T` from a received `Sample`. The `view` keyword selects copy
+semantics (default owned, for correctness first):
+
+| `view`    | result       | lifetime                                  |
+|-----------|--------------|-------------------------------------------|
+| `false`   | owned `T`    | every field copied out — storable / forwardable / spawnable with no caveats |
+| `true`    | `CDRView{T}` | variable-length fields alias the payload bytes — valid only while the backing memory is live |
+
+The subscription dispatcher runs the view handler inside `with_memory` and hands
+us the borrowed memory through the `DenseVector{UInt8}` overload below.
 
 The owned form copies the payload once (`as_memory`) so the decoded message
 outlives the sample. Both forms parse the 4-byte CDR preamble via `CDRReader`.
@@ -122,9 +127,11 @@ end
 
 Decode `T` from a contiguous CDR payload (preamble included). The dispatcher's
 view path calls this with payload-aliasing memory (`unsafe_memory` of a
-`Borrowed`); the owned path with a copied `Memory`. `view=true` zero-copies the
-`Vector`-of-POD / string fields as `CDRArray` / `CDRString` aliases of `mem`;
-`view=false` (the default) materializes a fully-owned `T`.
+`Borrowed`); the owned path with a copied `Memory`. The `view` keyword selects
+the return:
+
+- `true` — zero-copies the `Vector`-of-POD / string fields as `CDRArray` / `CDRString` aliases of `mem`.
+- `false` (the default) — materializes a fully-owned `T`.
 
 Compact (`@cdr1_compat`) messages decode identically either way — `read` takes
 the single-load fast path (`iscompact`), and the value is plain bits with no
@@ -223,10 +230,11 @@ recovered reflectively from the type's module path: a generated type lives at
 ROS2 name `"<package>/<qualifier>/<Name>"`.
 
 The RIHS01 hash is a per-type value computed from the struct AST, which the
-generated Julia type does not carry — so this reflective method returns the zero
-placeholder (`TypeHash()`, the Humble sentinel): correct for keyexpr structure,
-but not for cross-version hash matching. A registered type carries its verified
-hash in its [`RegistryEntry`](@ref); recover it with `type_info_of`.
+generated Julia type does not carry. This shapes the hash returned here:
+
+- this reflective method returns the zero placeholder (`TypeHash()`, the Humble sentinel), since the AST is unavailable.
+- the placeholder is sufficient for keyexpr structure.
+- for cross-version hash matching, use a registered type's verified hash — carried in its [`RegistryEntry`](@ref) and recovered with `type_info_of`.
 """
 function type_info(::Type{T}) where {T}
     return TypeInfo(ros_type_name(T), TypeHash())

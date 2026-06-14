@@ -130,9 +130,13 @@ end
 Author a Julia struct as the ROS 2 message `pkg/msg/Name`, the reverse of `@ros_import`:
 the struct is the source of truth and its RIHS01 type hash is computed by reflecting its
 fields. `pkg` comes from `@ros_package`, or from an explicit `"pkg/msg/Name"` first
-argument (which also serves cross-package definitions and renames). An explicit name's
-qualifier must be `msg`, and an explicit define form's struct name must equal the ROS
-name — a differently-named Julia struct binds through the annotate form.
+argument (which also serves cross-package definitions and renames). The explicit form
+holds to two constraints:
+
+- the qualifier must be `msg`
+- in the define form the struct name must equal the ROS name
+
+A differently-named Julia struct binds through the annotate form.
 
 The struct lives at `pkg.msg.Name` inside the calling module, where service and action
 sections can reach it via `import ..msg: Name`. The define form also binds the bare `Name`
@@ -328,10 +332,13 @@ are specialized on `typeof(Name)`, so:
   - `ServiceClient(node, ke, Name)` plus `call(client; field=…)` mirrors it, taking
     request fields by keyword and returning the response as a `@NamedTuple`.
 
-Return the response named tuple for a reply-ok. To fail, `throw`: the exception is caught
-and turned into a `respond!(req, failed, message)`, which this package maps to a Zenoh
-query error reply under rmw_zenoh. The client raises a `ServiceError` carrying that
-message, so a blocked call never returns a plausible zeroed response.
+The handler's two settlement paths, mapped from handler outcome through server to client:
+
+- a normal return — the returned named tuple is the reply-ok response.
+- a `throw` — the exception is caught and turned into a `respond!(req, failed, message)`,
+  which this package maps to a Zenoh query error reply under rmw_zenoh; the client raises a
+  `ServiceError` carrying that message, so a blocked call never returns a plausible zeroed
+  response.
 
 ```julia
 @ros_package "example_interfaces"
@@ -468,8 +475,11 @@ plus `send(client; field=…)` dispatches a goal by keyword. Inside the handler,
 publishes one feedback message and acts as a cooperative cancellation checkpoint (it
 throws `Cancelled` if the goal is `CANCELING`); `goal_handle(fb)` recovers the server-side
 `GoalHandle`. How the handler ends the goal follows the [`respond!`](@ref) settlement
-three-way, specialized to action goals: a normal return ⇒ `SUCCEEDED`, a propagating
-`Cancelled` ⇒ `CANCELED`, any other thrown exception ⇒ `ABORTED`.
+three-way, specialized to action goals:
+
+- a normal return ⇒ `SUCCEEDED`
+- a propagating `Cancelled` ⇒ `CANCELED`
+- any other thrown exception ⇒ `ABORTED`
 
 ```julia
 @ros_package "my_robot_msgs"

@@ -10,10 +10,13 @@ An action orchestrator that runs one accepted goal at a time behind a bounded
 queue of `queue` pending goals — the common single-actuator pattern. It layers
 over the low-level [`ActionServer`](@ref) API.
 
-Wire it by setting `on_accepted = g -> submit!(sched, g)` (with the default
-`on_goal`, which accepts — `on_accepted` does not fire for a [`defer`](@ref)red
-goal), then drive execution with `execute!(sched) do goal … end`. The
-orchestrator methods:
+Wire it by setting `on_accepted = g -> submit!(sched, g)`, then drive execution
+with `execute!(sched) do goal … end`. The `on_accepted` hook:
+
+- fires for goals the default `on_goal` accepts.
+- stays quiet for a [`defer`](@ref)red goal.
+
+The orchestrator methods:
 
 - `submit!` enqueues an accepted goal (blocking when the queue is full, applying
   backpressure).
@@ -26,9 +29,13 @@ orchestrator methods:
 
 This is a per-goal admission gate over one orchestrator, distinct from
 the node-lifecycle gate [`isactive`](@ref); the two are independent. Only
-`SingleFlight` itself is exported; reach the orchestrator surface
-qualified: `ROSNode.submit!`, `ROSNode.execute!`, `ROSNode.pause`,
-`ROSNode.resume`, `ROSNode.active_goal`.
+`SingleFlight` itself is exported; reach the orchestrator surface qualified:
+
+- `ROSNode.submit!`
+- `ROSNode.execute!`
+- `ROSNode.pause`
+- `ROSNode.resume`
+- `ROSNode.active_goal`
 
 ```julia
 sched = SingleFlight(queue = 8)

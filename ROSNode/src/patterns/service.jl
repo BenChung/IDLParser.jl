@@ -260,11 +260,16 @@ empty when the handler returns, then the owned `Query` is finalized to send the
 final-ack. A handler that calls [`detach!`](@ref)`(req)` instead transfers
 settlement to another task — the at-return abort is suppressed and the owned
 `Query` lives past handler return until that task settles via the returned handle
-(the action-server pattern, ported to services). `detach_timeout` (seconds,
-default `60.0`; `0`/`Inf` ⇒ bounded only by drain) caps how long a detached
-request may stay unsettled: a sweeper force-aborts + finalizes it past the
-deadline with an `@error`, so a forgotten `respond!` cannot hang a client. `close`
-drains outstanding detached requests the same way.
+(the action-server pattern, ported to services). `detach_timeout` (seconds) caps
+how long a detached request may stay unsettled, so a forgotten `respond!` cannot
+hang a client:
+
+  - `60.0` (default) — a sweeper force-aborts + finalizes the request past the
+    deadline with an `@error`.
+  - `0` — no timeout; the request is bounded only by drain.
+  - `Inf` — same as `0`.
+
+`close` drains outstanding detached requests the same way.
 
 The request is fully owned by default (storable, forwardable, spawnable past the
 handler). `view=true` decodes it as a `CDRView` aliasing a private owned
@@ -470,9 +475,13 @@ end
 
 Settle a detached service request from a spawned task (see [`detach!`](@ref)).
 `status`/`payload` carry the same meaning as the in-handler `respond!`:
-`success` + a `Resp` replies-ok, `failed` + a message string error-replies. Settles
-the cell, then finalizes the owned `Query` (the final-ack) and drops the request
-from the detach registry. Returns `true`.
+
+  - `respond!(handle, success, resp)` — replies-ok with the `Resp`;
+  - `respond!(handle, failed, msg)` — a Zenoh query *error* reply carrying the
+    message string.
+
+Settles the cell, then finalizes the owned `Query` (the final-ack) and drops the
+request from the detach registry. Returns `true`.
 """
 function respond!(handle::ServiceRequestHandle, status::SettlementStatus, payload)
     ok = respond!(handle.cell, status, payload)
@@ -790,8 +799,11 @@ client gid), and resolve the single reply.
 
 Synchronously (`async=false`, the default) this blocks the calling task — it
 yields while the reply is in flight — and returns the decoded `Resp`. A failed
-invocation raises [`ServiceError`](@ref): an error reply (the wire form of a
-handler failure), a missing reply (no matching server), or a timeout.
+invocation raises [`ServiceError`](@ref):
+
+  - an error reply — the wire form of a handler failure;
+  - a missing reply — no matching server;
+  - a timeout.
 
 With `async=true` the same query+drain runs on a spawned task, returned as a raw
 `Task`; `fetch` it for the `Resp`. A failed async call surfaces through `fetch`
@@ -801,13 +813,15 @@ that unwrapping itself.
 
 `timeout_ms` bounds the wait by arming a cancellation timer on the in-flight get;
 it defaults to `60_000` (60 s), so every call is bounded unless the caller opts
-out. Passing `0` is truly unbounded — no timer, no backstop — and the call waits
-until the reply arrives or the Context drains. The synchronous path additionally
-applies a hard backstop — `timeout_ms/1000 + 2` seconds — and when it elapses
-cancels the in-flight get and raises [`ServiceError`](@ref), so a bounded caller
-can never hang even on a `Zenoh.get` that fails to honor its own timeout. The
-backstop is synchronous-only: an async call is bounded only by the cancellation
-timer and the transport's own query timeout.
+out. The mechanism depends on `timeout_ms` and `async`:
+
+| `timeout_ms`   | sync (`async=false`)                                              | async (`async=true`)                          |
+| -------------- | ---------------------------------------------------------------- | --------------------------------------------- |
+| `> 0`          | cancellation timer, plus a hard backstop of `timeout_ms/1000 + 2` seconds that cancels the in-flight get and raises [`ServiceError`](@ref) | cancellation timer and the transport's own query timeout |
+| `0`            | unbounded — no timer, no backstop; waits until the reply arrives or the Context drains | unbounded — no timer; bounded only by the transport's own query timeout |
+
+The hard backstop lets a bounded synchronous caller never hang even on a
+`Zenoh.get` that fails to honor its own timeout.
 
 Throws `ArgumentError` if `client` is closed or `req` is not the client's request
 type.
@@ -947,10 +961,14 @@ tears down the route and consumer.
 
 `view=true`/`view=false` are shorthand for `Checked()`/`Owned()`.
 
-`concurrency` is `Serial()` (default — one handler at a time on a single sticky task,
-preserving message order with no handler-side locks; the rclcpp single-threaded-executor
-model) or `Parallel(n)`, which runs up to `n` handlers across OS threads (order not
-preserved). A handler throw is logged, never fatal.
+`concurrency` schedules the handler bodies:
+
+  - `Serial()` (default) — one handler at a time on a single sticky task,
+    preserving message order with no handler-side locks; the rclcpp
+    single-threaded-executor model.
+  - `Parallel(n)` — up to `n` handlers across OS threads; order not preserved.
+
+A handler throw is logged, never fatal.
 
 `match=:exact` (default) subscribes to `T`'s exact type keyexpr, so the wire delivers
 only matching-type samples. `match=:weak` declares `T` in the graph but wildcard-matches

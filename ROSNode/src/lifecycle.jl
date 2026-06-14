@@ -148,11 +148,16 @@ observes (`~/get_state`, `~/transition_event`). Construction starts the node in
 design](https://design.ros2.org/articles/node_lifecycle.html) for the state machine.
 
 The six transition callbacks each take the `LifecycleNode` and run under the action
-three-way settlement: returning normally is SUCCESS (land in the target state);
-returning the [`failure`](@ref) token is FAILURE (a clean "can't right now" that
-reverts to the origin state); throwing is ERROR (`on_error` runs — its SUCCESS
-recovers to [`Unconfigured`](@ref), any other outcome — or any `on_shutdown` error —
-drops the node to [`Finalized`](@ref)). On the recovery edge, `on_cleanup` runs after
+three-way settlement:
+
+  - SUCCESS — the callback returns normally; the node lands in the target state.
+  - FAILURE — the callback returns the [`failure`](@ref) token, a clean "can't right
+    now"; the node reverts to the origin state.
+  - ERROR — the callback throws; `on_error` runs. Its SUCCESS recovers to
+    [`Unconfigured`](@ref); any other outcome — or any `on_shutdown` error — drops the
+    node to [`Finalized`](@ref).
+
+On the recovery edge, `on_cleanup` runs after
 a successful `on_error`, so recovery to `Unconfigured` is a true reset: ports close
 and cleanup hooks run. Keep `on_error` advisory and put resource release in
 `on_cleanup`, which runs on both the error-recovery and the normal teardown paths.
@@ -161,8 +166,13 @@ cleanly. A thrown `ShutdownException` propagates unchanged — it signals contex
 shutdown, not a callback error.
 
 While the node is not [`Active`](@ref), every application entity created on it is
-gated at dispatch ([`isactive`](@ref)): publishers drop, subscriptions and timers
-stay quiet, application services error-reply with "node inactive". The control
+gated at dispatch ([`isactive`](@ref)):
+
+  - publishers drop;
+  - subscriptions and timers stay quiet;
+  - application services error-reply with "node inactive".
+
+The control
 surface — the five `lifecycle_msgs` services plus the `~/transition_event` topic —
 stays live in every state, since an external manager must reach it precisely while
 the node is inactive. Create application entities against [`inner_node`](@ref)`(ln)`
@@ -312,20 +322,23 @@ state(ln::LifecycleNode) = @atomic ln._state
     isactive(node::Node) -> Bool
     isactive(entity::Entity) -> Bool
 
-The dispatch gate predicate: whether an entity fires right now. A
-[`LifecycleNode`](@ref) is active only in the [`Active`](@ref) state. A plain
-[`Node`](@ref) is active unless it is the wrapped node of some `LifecycleNode`, found
-through an identity-keyed registry (one lock-guarded lookup; an unmanaged node is
-absent and always active). An [`Entity`] follows its node's state, with one
-exception: the control surface of a managed node (the `lifecycle_msgs` services and
-the `~/transition_event` publisher) is always active, so an external manager can
-drive and observe an inactive node.
+The dispatch gate predicate: whether an entity fires right now.
+
+| Argument type | Active when | Exception |
+| --- | --- | --- |
+| [`LifecycleNode`](@ref) | in the [`Active`](@ref) state | — |
+| [`Node`](@ref) | not the wrapped node of some `LifecycleNode`, found through an identity-keyed registry (one lock-guarded lookup; an unmanaged node is absent and always active) | — |
+| [`Entity`](@ref) | its node is active | the control surface of a managed node (the `lifecycle_msgs` services and the `~/transition_event` publisher) is always active, so an external manager can drive and observe an inactive node |
 
 This single predicate is threaded into each data-plane dispatch site — publish,
 subscription delivery, timer tick, service handling — so while a managed node is
-not Active its application entities are silenced automatically: publishers drop,
-subscriptions and timers skip the handler, and services error-reply. Each call
-recomputes from the node's current atomic state.
+not Active its application entities are silenced automatically:
+
+  - publishers drop;
+  - subscriptions and timers skip the handler;
+  - services error-reply.
+
+Each call recomputes from the node's current atomic state.
 """
 isactive(ln::LifecycleNode) = state(ln) === Active()
 
@@ -403,11 +416,16 @@ The conventional place to create the node's entities (gated until
 [`Active`](@ref)) and acquire resources such as devices or files. Matches the ROS 2
 managed-node `configure` transition.
 
-Returns `:success` when the callback lands the node in [`Inactive`](@ref),
-`:failure` if the callback returns the [`failure`](@ref) token (the node stays
-[`Unconfigured`](@ref)), or `:error` if it throws (`on_error` runs). Holds the
-node's transition lock so it cannot interleave with a concurrent transition. Throws
-`ArgumentError` if the node is closed, or if it is not currently `Unconfigured`.
+Returns a [`TransitionResult`](@ref):
+
+  - `:success` — the callback lands the node in [`Inactive`](@ref).
+  - `:failure` — the callback returns the [`failure`](@ref) token; the node stays
+    [`Unconfigured`](@ref).
+  - `:error` — the callback throws; `on_error` runs.
+
+Holds the node's transition lock so it cannot interleave with a concurrent
+transition. Throws `ArgumentError` if the node is closed, or if it is not currently
+`Unconfigured`.
 """
 configure!(ln::LifecycleNode) =
     _drive!(ln, Unconfigured(), Inactive(), ln.on_configure,
@@ -421,10 +439,14 @@ The callback is usually empty: gating is automatic, so activation is the
 state flip that opens the dispatch gate. Matches the ROS 2 managed-node `activate`
 transition.
 
-Returns `:success` when the node lands in [`Active`](@ref), `:failure` if the
-callback returns [`failure`](@ref) (the node stays [`Inactive`](@ref)), or `:error`
-if it throws. Throws `ArgumentError` if the node is closed or not currently
-`Inactive`.
+Returns a [`TransitionResult`](@ref):
+
+  - `:success` — the node lands in [`Active`](@ref).
+  - `:failure` — the callback returns the [`failure`](@ref) token; the node stays
+    [`Inactive`](@ref).
+  - `:error` — the callback throws.
+
+Throws `ArgumentError` if the node is closed or not currently `Inactive`.
 
 On success, after the gate opens, each transient_local subscription on the node
 re-runs its latched-history query (the ROS 2 transient_local durability replay), so
@@ -463,9 +485,14 @@ Drive the `Active → Inactive` transition, running the `on_deactivate` callback
 Usually empty, since gating is automatic; the state flip re-silences the
 node's application entities. Matches the ROS 2 managed-node `deactivate` transition.
 
-Returns `:success` when the node lands in [`Inactive`](@ref), `:failure` if the
-callback returns [`failure`](@ref) (the node stays [`Active`](@ref)), or `:error` if
-it throws. Throws `ArgumentError` if the node is closed or not currently `Active`.
+Returns a [`TransitionResult`](@ref):
+
+  - `:success` — the node lands in [`Inactive`](@ref).
+  - `:failure` — the callback returns the [`failure`](@ref) token; the node stays
+    [`Active`](@ref).
+  - `:error` — the callback throws.
+
+Throws `ArgumentError` if the node is closed or not currently `Active`.
 """
 deactivate!(ln::LifecycleNode) =
     _drive!(ln, Active(), Inactive(), ln.on_deactivate,
@@ -479,10 +506,14 @@ The place to release what `on_configure` acquired — close entities, free
 devices — returning the node to a fresh [`Unconfigured`](@ref) state it can be
 reconfigured from. Matches the ROS 2 managed-node `cleanup` transition.
 
-Returns `:success` when the node lands in [`Unconfigured`](@ref), `:failure` if the
-callback returns [`failure`](@ref) (the node stays [`Inactive`](@ref)), or `:error`
-if it throws. Throws `ArgumentError` if the node is closed or not currently
-`Inactive`.
+Returns a [`TransitionResult`](@ref):
+
+  - `:success` — the node lands in [`Unconfigured`](@ref).
+  - `:failure` — the callback returns the [`failure`](@ref) token; the node stays
+    [`Inactive`](@ref).
+  - `:error` — the callback throws.
+
+Throws `ArgumentError` if the node is closed or not currently `Inactive`.
 """
 cleanup!(ln::LifecycleNode) =
     _drive!(ln, Inactive(), Unconfigured(), ln.on_cleanup,
@@ -499,12 +530,15 @@ managed node. Matches the ROS 2 managed-node `shutdown` transition; the
 (`TRANSITION_UNCONFIGURED_SHUTDOWN` / `TRANSITION_INACTIVE_SHUTDOWN` /
 `TRANSITION_ACTIVE_SHUTDOWN`).
 
-Returns `:success` once the node lands in [`Finalized`](@ref); a node already
-`Finalized` is a `:success` no-op (idempotent), even when closed. Returns `:error`
-if `on_shutdown` throws: `on_error` runs (cleanup), but the node lands in
-[`Finalized`](@ref) regardless of its outcome — shutdown is the terminal path, so
-error recovery cannot return the node to service. Throws `ArgumentError` if a
-non-`Finalized` node is closed.
+Returns a [`TransitionResult`](@ref):
+
+  - `:success` — the node lands in [`Finalized`](@ref). A node already `Finalized` is
+    a `:success` no-op (idempotent), even when closed.
+  - `:error` — `on_shutdown` throws. `on_error` runs (cleanup), but the node lands in
+    [`Finalized`](@ref) regardless of its outcome — shutdown is the terminal path, so
+    error recovery cannot return the node to service.
+
+Throws `ArgumentError` if a non-`Finalized` node is closed.
 """
 function shutdown!(ln::LifecycleNode)
     origin = state(ln)
@@ -706,13 +740,14 @@ _graph_descs() =
 """
     _wire_control_surface!(ln, msgs)
 
-Declare the always-live control surface: the `~/transition_event` topic and
-the five `lifecycle_msgs` services, each registered in `ln._control` so the
-dispatch gate exempts it, letting an external manager reach
-`change_state`/`get_state` while the node is inactive. The vendored `lifecycle_msgs`
-types are always in-package, so this always wires; `msgs` is accepted for
-source-compat but unused. Handlers are thin marshals over the transition drivers +
-`state(ln)`:
+Declare the always-live control surface: the `~/transition_event` topic and the five
+`lifecycle_msgs` services. Each is registered in `ln._control` so the dispatch gate
+exempts it, letting an external manager reach `change_state`/`get_state` while the
+node is inactive. The vendored `lifecycle_msgs` types are always in-package, so this
+always wires; `msgs` is accepted for source-compat but unused.
+
+Handlers are thin marshals over the transition drivers + `state(ln)`:
+
   - `~/change_state`             → `_apply_transition!(req.transition.id)`, `success`
   - `~/get_state`                → the live primary `State`
   - `~/get_available_states`     → the four primary `State`s

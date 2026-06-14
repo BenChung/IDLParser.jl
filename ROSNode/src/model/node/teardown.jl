@@ -3,9 +3,12 @@
 """
     close(entity::Entity)
 
-Undeclare the entity: close the data route (which stops the consumer task's
-iteration for a Subscription), withdraw the liveliness token, drop it from the
-discovery index, and detach any pattern-layer wiring (`entity.wire`). Idempotent.
+Undeclare the entity. Idempotent.
+
+- Close the data route — for a Subscription this stops the consumer task's iteration.
+- Withdraw the liveliness token.
+- Drop it from the discovery index.
+- Detach any pattern-layer wiring (`entity.wire`).
 """
 function Base.close(e::Entity)
     (@atomicswap e.open = false) || return nothing   # single-winner close latch
@@ -53,13 +56,21 @@ end
 
 Close `entity` and remove it from `node`'s tracked set, releasing it before the
 node itself is closed. Use this to reclaim a single publisher/subscription/service/
-client (undeclaring its route, withdrawing its liveliness token, and dropping it
-from the discovery index) while keeping the node alive; otherwise `close(node)`
-tears down every entity still tracked at that point.
+client while keeping the node alive:
 
-The entity is removed from `node.entities` first, then closed. If `node` does not
-track `entity` (it is owned by another node, or was already disposed), `dispose`
-is a no-op: the entity is left open. Returns `nothing`.
+- Undeclare its route.
+- Withdraw its liveliness token.
+- Drop it from the discovery index.
+
+To tear down every entity still tracked at that point, use `close(node)` instead.
+
+The entity is removed from `node.entities` first, then closed. `dispose` is a
+no-op that leaves the entity open when `node` does not track `entity`:
+
+- It is owned by another node.
+- It was already disposed.
+
+Returns `nothing`.
 """
 function dispose(node::Node, e::Entity)
     @lock node.lock begin

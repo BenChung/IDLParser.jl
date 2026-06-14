@@ -129,13 +129,20 @@ Per-field metadata for one declared parameter (ROS 2
 reflected over by the parameter services (`describe_parameters`,
 `get_parameter_types`, …).
 
-`constraint` is one of: `nothing` (no bound), a numeric `(lo, hi)` range tuple,
-or a tuple of allowed values (the `∈ choices` form). The tuple is untagged, so a
-choice set of exactly two numbers is indistinguishable from a range and is
-validated as one. On the wire the structured constraint travels only as the
-human `additional_constraints` string and no default travels at all, so a
-descriptor decoded by a remote [`ParameterClient`](@ref) carries both
-`constraint === nothing` and `default === nothing`.
+`constraint` is one of:
+
+- `nothing` — no bound.
+- `(lo, hi)` — a numeric range tuple.
+- a choices tuple — the allowed values, the `∈ choices` form. Untagged, so a
+  choice set of exactly two numbers is indistinguishable from a range and is
+  validated as one.
+
+Wire encoding loses the structured constraint and the default, so a descriptor
+decoded by a remote [`ParameterClient`](@ref) carries:
+
+- `constraint === nothing` — the structured constraint collapses to the human
+  `additional_constraints` string.
+- `default === nothing` — the default is not transmitted.
 """
 struct ParameterDescriptor
     name::Symbol
@@ -181,11 +188,14 @@ end
     readonly(default)
 
 Mark a [`@parameters`](@ref) field read-only inside the schema DSL:
-`field::T = default |> readonly`. Read-only blocks runtime sets — a
-runtime set raises [`ParameterRejection`](@ref) internally and returns a
-rejected `SetParametersResult` on the wire — while still permitting a startup
-override (CLI/launch/YAML), which goes through the constructor rather than a
-transaction. The marker is detected and stripped at macro expansion, so the
+`field::T = default |> readonly`. Read-only governs two paths:
+
+- Runtime sets: raises [`ParameterRejection`](@ref) internally and returns a
+  rejected `SetParametersResult` on the wire.
+- Startup overrides (CLI/launch/YAML): permitted — routed through the
+  constructor, not a transaction.
+
+The marker is detected and stripped at macro expansion, so the
 stored default is the bare value; a stray `readonly(x)` evaluated outside the
 DSL just wraps `x` in an inert holder.
 """

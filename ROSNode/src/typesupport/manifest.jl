@@ -108,8 +108,10 @@ end
 
 The recorded dynamic-type interactions for node `fqn`, the union of every run that
 wrote to its manifest. Startup warm (`_replay_manifest_warm`) consumes this to
-resolve and warm each type before the node goes live. Empty when persistence is off
-(`_cache_enabled()`) or the node has recorded none yet.
+resolve and warm each type before the node goes live. Empty in two cases:
+
+- persistence is off (`_cache_enabled()`)
+- the node has recorded no interactions yet
 
 The `hash` field of each entry is the RIHS01 type description hash that identifies
 the interface (`.msg`/`.srv`/`.action`). See
@@ -126,10 +128,14 @@ end
 
 Record that node `fqn` used dynamic type `(name, hash)` in `role` on `topic`.
 Append-only union: an already-present record (this run or a prior one) is a no-op,
-and a new one is appended to the node's manifest file. Returns `true` when the
-record is newly added, `false` when it was already present or when persistence is
-off (the same opt-in as the blob cache). A write failure is logged and the call
-still returns; the type is already live, so the manifest is an optimization.
+and a new one is appended to the node's manifest file. Returns:
+
+- `true` — record newly appended
+- `false` — record already present (this run or a prior one)
+- `false` — persistence is off (the same opt-in as the blob cache)
+
+A write failure is logged and the call still returns; the type is already live, so
+the manifest is an optimization.
 """
 function note_interaction!(fqn::AbstractString, role::Symbol, hash::TypeHash,
                            name::AbstractString, topic::AbstractString)

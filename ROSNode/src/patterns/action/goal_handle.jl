@@ -6,12 +6,15 @@
 """
     GoalHandle{A, G, R, F}
 
-A single accepted action goal, server-side. Carries the 16-byte
-`unique_identifier_msgs/UUID` goal id, the decoded goal request (a `Goal` struct,
-reachable as `goal.request`), the live goal state ([`state`](@ref)), and the
-write-once result cell ([`respond!`](@ref)) the handler settles. This is the
-user-facing verb surface for one goal; the server owns the result cache and
-`status` publication.
+A single accepted action goal, server-side. Carries:
+
+- the 16-byte `unique_identifier_msgs/UUID` goal id
+- the decoded goal request, a `Goal` struct reachable as `goal.request`
+- the live goal state ([`state`](@ref))
+- the write-once result cell ([`respond!`](@ref)) the handler settles
+
+This is the user-facing verb surface for one goal; the server owns the result
+cache and `status` publication.
 
 Cancellation is structured. Once an accepted cancel moves the goal to
 `CANCELING`, [`feedback!`](@ref) and [`checkpoint`](@ref) throw
@@ -63,13 +66,17 @@ goal_id(g::GoalHandle) = g.id
 """
     state(goal) -> Symbol
 
-The goal's current lifecycle state as a `Symbol`: `:accepted`, `:executing`,
-`:canceling`, `:succeeded`, `:canceled`, `:aborted`, or `:unknown`
-(`action_msgs/msg/GoalStatus`). The same accessor reads a server-side
-[`GoalHandle`](@ref) and a client-side dispatched-goal handle; the client side
-adds `:rejected` (the handle [`send`](@ref) returns when the server declines), a
-local symbol the server-side handle never reports — a rejected goal is never
-registered.
+The goal's current lifecycle state as a `Symbol`. The same accessor reads a
+server-side [`GoalHandle`](@ref) and a client-side dispatched-goal handle, with
+the symbol set differing by side:
+
+| Side               | States                                                                                                |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| Server (and shared) | `:accepted`, `:executing`, `:canceling`, `:succeeded`, `:canceled`, `:aborted`, `:unknown` (`action_msgs/msg/GoalStatus`) |
+| Client only        | adds `:rejected` — the symbol the handle [`send`](@ref) returns when the server declines               |
+
+`:rejected` is a client-local symbol the server-side handle never reports: a
+rejected goal is never registered.
 
 The Symbol surface keeps the wire `GoalStatus` enum internal and reads naturally
 at a call site (`state(goal) === :executing`).
@@ -182,10 +189,15 @@ status set:
 - [`canceled`](@ref) — an accepted cancel unwound the goal
 - [`aborted`](@ref) — the goal failed
 
-Filling the goal's write-once result `ResultCell` (the first-wins latch, cache
-delivery, `status` publication, and `get_result` release) is the shared
-single-fill contract of [`respond!`](@ref). Returns `true` if this call filled
-the cell.
+Filling the goal's write-once result `ResultCell` is the shared single-fill
+contract of [`respond!`](@ref). One fill drives:
+
+- the first-wins latch
+- cache delivery
+- `status` publication
+- `get_result` release
+
+Returns `true` if this call filled the cell.
 
 `respond!(goal, feedback, fb)` is the stream form (`feedback!` sugar), dispatched
 separately — it never touches the cell. The service tokens

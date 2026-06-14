@@ -27,11 +27,15 @@ goal.
 - Services: https://docs.ros.org/en/rolling/Concepts/Basic/About-Services.html
 - Actions:  https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 
-Filled exactly once: the first terminal write — explicit [`respond!`](@ref), the
-handler's return value, or the fail-safe wrapper — wins and runs `deliver`. The
-status it was filled with is observable via [`outcome`](@ref); later attempts are
-ignored ([`isfilled`](@ref) guards the return-value path) except an *explicit*
-second terminal `respond!`, which is the one hard error.
+Filled exactly once: the first terminal write wins and runs `deliver`, and the
+status it was filled with is observable via [`outcome`](@ref). The four paths to
+that first write:
+
+- explicit [`respond!`](@ref) — the authoritative write.
+- the handler's return value — fills only if still empty.
+- the fail-safe wrapper — fills only if still empty.
+- a second *explicit* terminal `respond!` — the one hard error; every other later
+  attempt is ignored ([`isfilled`](@ref) guards the return-value path).
 
 The lock makes concurrent settlement safe: a detached cleanup task can race the
 fail-safe wrapper, and only one wins.
@@ -93,9 +97,12 @@ The single settlement verb. The terminal tokens — service
 [`aborted`](@ref) — perform the *authoritative* write: the first one wins, runs
 `deliver`, and latches the cell. Returns `true` if this call filled it.
 
-An *explicit* second terminal `respond!` is the one hard error (it signals a
-double-settle bug); the return-value and fail-safe paths instead go through
-`fill!`, which silently ignores an already-full cell.
+Behavior on an already-full cell depends on the path:
+
+- explicit second terminal `respond!` — the one hard error; it signals a
+  double-settle bug.
+- return-value and fail-safe paths — go through `fill!`, which silently ignores
+  an already-full cell.
 
 [`feedback`](@ref) is not terminal — it never touches the cell; the Action layer
 dispatches it to the feedback stream before reaching settlement.
@@ -223,12 +230,13 @@ constructing a user result. Used by [`settle_handler!`](@ref)'s `finally` when
 even the synthesized default failed (a non-defaultable result type, a throwing
 `default_result`, or a delivery error on the normal path).
 
-It must not throw, so it swallows any delivery error: it latches the cell as
-aborted with a `nothing` payload and lets the Service/Action `deliver` closure
-recognize that as "send the status enum + zero-filled result bytes directly,
-not via the message constructor". A delivery that still
-fails is logged, not raised — at that point the cell is latched and the client's
-own result timeout is the remaining guard.
+It must not throw, so it swallows any delivery error. Two outcomes:
+
+- latches the cell as aborted with a `nothing` payload, which the Service/Action
+  `deliver` closure recognizes as "send the status enum + zero-filled result bytes
+  directly, not via the message constructor".
+- a delivery that still fails is logged, not raised — at that point the cell is
+  latched and the client's own result timeout is the remaining guard.
 """
 function force_abort!(cell::ResultCell)
     @lock cell.lock begin
@@ -256,8 +264,14 @@ on the cell's settlement condition, so it wakes the *instant* `respond!`/`fill!`
 `force_abort!` latches the cell — no poll latency on the action `get_result` path.
 
 `should_abandon()` is the cooperative bail-out, re-checked at most every `recheck`
-seconds: when it returns true the wait is abandoned and `wait_settled` returns
-`false`. Pass `() -> is_shutdown(ctx)` so a drain can't wedge a request task here.
+seconds:
+
+| `should_abandon()` | Effect                                        |
+|--------------------|-----------------------------------------------|
+| `true`             | abandon the wait; `wait_settled` returns `false` |
+| `false`            | keep waiting                                  |
+
+Pass `() -> is_shutdown(ctx)` so a drain can't wedge a request task here.
 `Threads.Condition` has no timed wait, so we arm a one-shot `Base.Timer` each
 iteration to re-notify ourselves — that bound also self-heals any missed `notify`.
 A full cell takes precedence over abandonment, so a goal that settles as we

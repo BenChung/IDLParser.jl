@@ -77,12 +77,17 @@ _sample_msg(::Type{T}, sample) where {T} =
 """
     _default_msg(::Type{T}) -> T
 
-Build a zero/empty instance of generated message type `T` for warm-up: each field
-gets its type's default — `0`/`false` for numbers, `""` for strings, a fixed array
-(`SArray`) of defaulted elements, an empty `Vector` for sequences, recursing into
-nested messages. The positional constructor handles both the `@cdr_fixed` and
-`@kwdef` struct forms. `warmup_sample` overrides this when the caller supplies a
-representative message.
+Build a zero/empty instance of generated message type `T` for warm-up. Each field
+gets its type's default:
+
+- `Number` — `0`/`false`.
+- `AbstractString` — `""`.
+- `StaticArray` (a fixed array) — an `SArray` of defaulted elements.
+- `AbstractVector` (a sequence) — an empty `Vector`.
+- nested message — recurse, building it field-by-field.
+
+The positional constructor handles both the `@cdr_fixed` and `@kwdef` struct forms.
+`warmup_sample` overrides this when the caller supplies a representative message.
 
 Generated from a ROS 2 interface (`.msg`) definition; see
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Interfaces.html

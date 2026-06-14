@@ -32,9 +32,9 @@ reflect over the schema. Parametric structs are rejected at expansion.
 Per-field annotations, on the right of the `=`:
 - a leading string literal is the field `description`;
 - `∈ lo..hi` is a numeric range constraint, stored as the tuple `(lo, hi)`;
-- `∈ (a, b, …)` (or a vector) is a choice set — stored as an untagged tuple, so
-  a choice set of exactly two numbers collides with the range representation and
-  is enforced as a range;
+- `∈ (a, b, …)` (or a vector) is a choice set, stored as an untagged tuple;
+  - edge case: a choice set of exactly two numbers shares the range
+    representation and is enforced as a range;
 - `|> readonly` marks the field read-only, blocking runtime sets while still
   permitting a startup override.
 
@@ -212,10 +212,11 @@ validate(_) = nothing
 Exception signaling a rejected parameter set, raised by a per-field
 constraint violation, a `read_only` runtime set, or a user [`validate`](@ref).
 Carries the human `reason` string that becomes the wire
-`SetParametersResult.reason`. A local caller of
-[`transaction`](@ref)/[`set_parameter!`](@ref) sees it raised; the service layer
-catches it into a `successful=false` reply, and a [`ParameterClient`](@ref)
-re-raises it on a rejected set so the failure contract is uniform local↔remote.
+`SetParametersResult.reason`. The failure contract is uniform local↔remote — each
+caller context surfaces the same rejection:
+- a local caller of [`transaction`](@ref)/[`set_parameter!`](@ref) sees it raised;
+- the service layer catches it into a `successful=false` reply;
+- a [`ParameterClient`](@ref) re-raises it on a rejected set.
 """
 struct ParameterRejection <: Exception
     reason::String
@@ -231,10 +232,13 @@ Base.showerror(io::IO, e::ParameterRejection) =
 
 The value-level rebuild primitive the transaction commit and the
 [`setproperties!`](@ref) sugar build on: a pure rebuild of an immutable
-schema value with `overrides` applied. A NamedTuple is a partial overlay — its
-named fields change, the rest copy from `base` — rebuilt through `P`'s keyword
-constructor, so each field is re-coerced to its declared type. A full `P` value
-is replace-all: the result is `overrides` itself.
+schema value with `overrides` applied. The `overrides` argument type selects the
+rebuild:
+
+| `overrides` | behavior |
+|:------------|:---------|
+| `NamedTuple` | partial overlay — its named fields change, the rest copy from `base` — rebuilt through `P`'s keyword constructor, so each field is re-coerced to its declared type |
+| `P` | replace-all: the result is `overrides` itself |
 """
 function setproperties(base::P, overrides::NamedTuple) where {P}
     fns = fieldnames(P)

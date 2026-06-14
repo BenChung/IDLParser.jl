@@ -29,8 +29,10 @@ Register a callback `f(batch::ParameterEventBatch)` for parameter changes
 
 On a [`ParameterServer`](@ref) the listener runs synchronously after each
 committed transaction, under the server's mutation lock; a throwing listener is
-logged and the commit proceeds. The batch's `changed` maps each moved parameter
-to its new value and `previous` holds the prior value.
+logged and the commit proceeds. The batch carries:
+
+  - `changed` — each moved parameter mapped to its new value;
+  - `previous` — the prior value.
 
 On a [`ParameterClient`](@ref) it subscribes the remote's `/parameter_events`
 and calls `f` per event from this client's target node, surfacing the event's
@@ -40,8 +42,10 @@ new and changed parameters. Client-side caveats:
     `batch.previous` is empty (the wire event carries only current values);
   - a remote's `deleted_parameters` (a parameter undeclaration) is not reported;
   - the node filter is an exact string compare of the event's `node` field against
-    the resolved `target`, so a remote whose published FQN differs (namespace or
-    normalization mismatch) has its events silently dropped;
+    the resolved `target`; a remote whose published FQN differs has its events
+    silently dropped. The FQN can differ by:
+      - a namespace mismatch;
+      - a normalization mismatch;
   - the subscription is reaped by `close(client)`.
 """
 function on_parameter_event(f, s::ParameterServer)
