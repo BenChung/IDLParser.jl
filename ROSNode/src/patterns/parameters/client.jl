@@ -119,63 +119,30 @@ _to_wire_params(ps) =
 # Same names and return types as the local server methods, plus the wire call and
 # `timeout_ms`, decoding the reply back to the identical Julia types.
 
-"""
-    get_parameters(client, names; timeout_ms=2000) -> Vector{Any}
-
-Remote `GetParameters`: the current value of each name (native Julia values;
-an unset/unknown name reads back as `nothing`). Mirrors the local server method.
-"""
 function get_parameters(c::ParameterClient, names; timeout_ms::Integer = 2000)
     req = _RCL_SRV.GetParameters_Request(names = String[String(n) for n in names])
     resp = call(_svc(c, :get_parameters), req; timeout_ms = timeout_ms)
     return Any[_from_param_value(v) for v in resp.values]
 end
 
-"""
-    get_parameter_types(client, names; timeout_ms=2000) -> Vector{ParameterType}
-
-Remote `GetParameterTypes`: the [`ParameterType`](@ref) of each name
-(`PARAMETER_NOT_SET` for an unknown).
-"""
 function get_parameter_types(c::ParameterClient, names; timeout_ms::Integer = 2000)
     req = _RCL_SRV.GetParameterTypes_Request(names = String[String(n) for n in names])
     resp = call(_svc(c, :get_parameter_types), req; timeout_ms = timeout_ms)
     return ParameterType[_ptype(t) for t in resp.types]
 end
 
-"""
-    set_parameters_atomically(client, params; timeout_ms=2000) -> (successful, reason)
-
-Remote `SetParametersAtomically`: apply all of `params` as one transaction,
-returning the `SetParametersResult` as a `(successful::Bool, reason::String)` tuple.
-`params` is any `_param_pairs`-able form — a vector of `name => value`, a
-NamedTuple, or a Dict; values are native Julia (the wire tag is inferred).
-"""
 function set_parameters_atomically(c::ParameterClient, params; timeout_ms::Integer = 2000)
     req = _RCL_SRV.SetParametersAtomically_Request(parameters = _to_wire_params(_param_pairs(params)))
     resp = call(_svc(c, :set_parameters_atomically), req; timeout_ms = timeout_ms)
     return (resp.result.successful, resp.result.reason)
 end
 
-"""
-    set_parameters(client, params; timeout_ms=2000) -> Vector{Tuple{Bool,String}}
-
-Remote `SetParameters`: each pair is its own transaction, so each gets an
-independent `(successful, reason)` result. Use `set_parameters_atomically` to apply
-all pairs as a single all-or-nothing transaction.
-"""
 function set_parameters(c::ParameterClient, params; timeout_ms::Integer = 2000)
     req = _RCL_SRV.SetParameters_Request(parameters = _to_wire_params(_param_pairs(params)))
     resp = call(_svc(c, :set_parameters), req; timeout_ms = timeout_ms)
     return Tuple{Bool, String}[(r.successful, r.reason) for r in resp.results]
 end
 
-"""
-    list_parameters(client; prefixes=String[], depth=0, timeout_ms=2000) -> Vector{Symbol}
-
-Remote `ListParameters`: the parameter names, optionally prefix-filtered
-(`depth=0` is `DEPTH_RECURSIVE`).
-"""
 function list_parameters(c::ParameterClient; prefixes = String[], depth::Integer = 0,
                          timeout_ms::Integer = 2000)
     req = _RCL_SRV.ListParameters_Request(prefixes = String[String(p) for p in prefixes],
@@ -184,14 +151,6 @@ function list_parameters(c::ParameterClient; prefixes = String[], depth::Integer
     return Symbol[Symbol(n) for n in resp.result.names]
 end
 
-"""
-    describe_parameters(client, names; timeout_ms=2000) -> Vector{ParameterDescriptor}
-
-Remote `DescribeParameters`: a [`ParameterDescriptor`](@ref) per name. The
-wire form carries name/type/description/read-only faithfully. The wire encodes the
-numeric-range and choice-set `constraint` only as the human `additional_constraints`
-string, so the structured `constraint` field reads back as `nothing`.
-"""
 function describe_parameters(c::ParameterClient, names; timeout_ms::Integer = 2000)
     req = _RCL_SRV.DescribeParameters_Request(names = String[String(n) for n in names])
     resp = call(_svc(c, :describe_parameters), req; timeout_ms = timeout_ms)
@@ -209,28 +168,15 @@ end
 # server uses; `c[:name]` / `c[:name] = v` are indexing sugar, an explicit remote
 # lookup distinct from the server's cheap `server.name` field read.
 
-"""
-    parameter(client, name; timeout_ms=2000)
-
-Read one remote parameter by `name` — `get_parameters` for a single name.
-"""
 parameter(c::ParameterClient, name; timeout_ms::Integer = 2000) =
     get_parameters(c, (name,); timeout_ms = timeout_ms)[1]
 
-"""
-    set_parameter!(client, name, value; timeout_ms=2000) -> value
-
-Set one remote parameter, atomically. Raises [`ParameterRejection`](@ref) if
-the remote rejects it (constraint / read-only / `validate`) — the same exception the
-local `set_parameter!` raises, so the failure contract is uniform local↔remote.
-"""
 function set_parameter!(c::ParameterClient, name, value; timeout_ms::Integer = 2000)
     ok, reason = set_parameters_atomically(c, (Symbol(name) => value,); timeout_ms = timeout_ms)
     ok || throw(ParameterRejection(reason))
     return value
 end
 
-"The remote parameter names — `list_parameters`."
 parameter_names(c::ParameterClient; kwargs...) = list_parameters(c; kwargs...)
 
 Base.getindex(c::ParameterClient, name::Union{Symbol, AbstractString}) = parameter(c, name)
@@ -293,21 +239,6 @@ Base.propertynames(d::_ClientDraft{P}) where {P} = fieldnames(P)
 _descriptor_map(::Type{P}) where {P} =
     Dict{Symbol, ParameterDescriptor}(d.name => d for d in descriptors(P))
 
-"""
-    transaction(client::ParameterClient{P}) do p … end -> P
-
-Remote mutation with the same do-block shape as the server's [`transaction`](@ref):
-runs `f` against a draft of the fetched current value, then pushes the diff
-as one `set_parameters_atomically`. The client validates the candidate locally first
-(per-field constraints + read-only gate + user `validate`) for fast feedback, then
-the remote re-validates authoritatively — the outcome is uniform with the local path:
-
-- on success — returns the new `P`.
-- on a rejected set — raises [`ParameterRejection`](@ref).
-
-Requires a typed client (a typed [`ParameterClient`](@ref)`{P}`); schemaless remotes use
-`set_parameters_atomically` directly.
-"""
 function transaction(f, c::ParameterClient{P}; timeout_ms::Integer = 2000) where {P}
     P === Nothing &&
         throw(ArgumentError("transaction requires a typed ParameterClient{P}; for a schemaless remote use set_parameters_atomically"))
@@ -324,17 +255,6 @@ end
 
 # ── remote events ─────────────────────────────────────────────────────────────────
 
-"""
-    on_parameter_event(f, client::ParameterClient) -> f
-
-Watch the remote's parameter changes: subscribe `/parameter_events`, filter to
-this client's `target`, and call `f(batch::ParameterEventBatch)` per event. The
-remote analog of the server-side `on_parameter_event`.
-
-- a typed client coerces the changed values to their field types.
-- `batch.previous` is always empty — the wire event carries only current values.
-- the subscription is reaped by `close(client)`.
-"""
 function on_parameter_event(f, c::ParameterClient{P}) where {P}
     sub = Subscription(c.node, "/parameter_events", _ParameterEvent) do ev
         String(ev.node) == c.target || return nothing

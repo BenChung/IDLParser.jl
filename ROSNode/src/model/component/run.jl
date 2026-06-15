@@ -43,23 +43,15 @@ Base.show(io::IO, c::ComponentNode) =
 """
     parameters(node::ComponentNode) -> NamedTuple
 
-The node-level, member-namespaced parameter aggregation:
-`parameters(node).camera` is member `camera`'s live snapshot. Heterogeneous (one
-entry per member, keyed by member name in declared order) — for iterating a whole
-node, where `parameters(m)` is the type-stable per-mixin view. The flat
-`<member>.<field>` wire namespace these views live under is owned by
-[`CompositeParameterServer`](@ref).
+The node-level parameter aggregation: one entry per member, keyed by member name in
+declared order, each value the member's per-mixin snapshot (see
+[`parameters(m::Component)`](@ref)). So `parameters(node).camera` is member `camera`'s
+live snapshot, and the result is heterogeneous — for iterating a whole node, where
+`parameters(m)` is the type-stable per-mixin view. The flat `<member>.<field>` wire
+namespace these views live under is owned by [`CompositeParameterServer`](@ref).
 """
 parameters(c::ComponentNode) = (; (nm => parameters(c.members[nm]) for nm in c.order)...)
 
-"""
-    entities(node::ComponentNode) -> NamedTuple
-
-The node-level, member-namespaced handle aggregation:
-`entities(node).camera.image` is member `camera`'s `image` port (so two members'
-`image` handles don't collide). Member ports must be materialised first (after the
-node is configured), like the per-mixin [`entities`](@ref).
-"""
 entities(c::ComponentNode) = (; (nm => entities(c.members[nm]) for nm in c.order)...)
 
 inner_node(c::ComponentNode) = c.node
@@ -1072,7 +1064,13 @@ mutable struct Container
 end
 Base.show(io::IO, c::Container) = print(io, "Container(", c.name, ", ", length(c.nodes), " nodes)")
 inner_context(c::Container) = c.ctx
-"The container's own management node (hosts the `~/_container/*` composition services)."
+"""
+    inner_node(c::Container) -> Node
+
+The container's own management node, hosting the `~/_container/{load_node,unload_node,list_nodes}`
+composition services. The accessor returning the wrapped [`Node`](@ref); see
+[`inner_node(::LifecycleNode)`](@ref) for the analogous unwrap on a managed node.
+"""
 inner_node(c::Container) = c.node
 Base.close(c::Container) = close(c.ctx)
 

@@ -61,7 +61,7 @@ The zero-copy `view` modes pair with a static typed subscription, `Subscription(
 CurrentModule = ROSNode
 ```
 
-### View modes and concurrency
+### View modes, concurrency, and matching
 
 ```@docs
 ViewMode
@@ -71,6 +71,9 @@ Unchecked
 Concurrency
 Serial
 Parallel
+MatchPolicy
+ExactMatch
+WeakMatch
 ```
 
 ### Graph introspection
@@ -87,6 +90,7 @@ service_is_ready
 wait_for_service
 wait_for_action_server
 wait_for_graph_change
+on_graph_change
 ```
 
 ### Delivery events

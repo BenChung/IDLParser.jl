@@ -34,7 +34,7 @@ end
 function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          qos::QosProfile=default_qos(),
                          congestion_control=nothing, priority=nothing,
-                         warmup::Union{Symbol, Nothing}=nothing,
+                         warmup::Union{Symbol, WarmupMode, Nothing}=nothing,
                          warmup_sync::Union{Bool, Nothing}=nothing,
                          warmup_sample=nothing) where {T}
     name = resolve_name(node, topic)
@@ -115,7 +115,16 @@ Base.show(io::IO, pub::PublisherHandle{T}) where {T} =
     print(io, "Publisher(", pub.entity.endpoint.topic, ", ", nameof(T),
           isopen(pub) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle)."
+"""
+    entity(pub::PublisherHandle)
+    entity(sub::SubscriptionHandle)
+    entity(sub::DynamicSubscriptionHandle)
+    entity(s::ServiceHandle)
+    entity(c::ServiceClient) -> Entity
+
+The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle) wrapped by
+the handle.
+"""
 entity(pub::PublisherHandle) = pub.entity
 
 # ── Subscription ──────────────────────────────────────────────────────────────
@@ -137,12 +146,11 @@ function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T
                             qos::QosProfile=default_qos(), view::Union{Bool, ViewMode}=Owned(),
                             concurrency::Concurrency=Serial(),
                             force_relatch::Bool=false,
-                            match::Symbol=:exact,
-                            warmup::Union{Symbol, Nothing}=nothing,
+                            match::Union{Symbol, MatchPolicy}=ExactMatch(),
+                            warmup::Union{Symbol, WarmupMode, Nothing}=nothing,
                             warmup_sync::Union{Bool, Nothing}=nothing,
                             warmup_sample=nothing) where {T}
-    match in (:exact, :weak) ||
-        throw(ArgumentError("Subscription `match` must be :exact or :weak, got :$match"))
+    weak = _is_weak(_match_policy(match))
     view = _view_mode(view)
     name = resolve_name(node, topic)
     ent = make_entity(node, Subscription, name, type_info_of(T); qos=qos)
@@ -151,7 +159,7 @@ function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T
     # arrive as bare payloads with null attachment and timestamp; force_relatch bypasses
     # the dedup to re-deliver every latched sample for accumulating handlers.
     declare_subscription!(ent, T, handler; view=view, concurrency=concurrency,
-                          force_relatch=force_relatch, weak = match === :weak)
+                          force_relatch=force_relatch, weak = weak)
     pol = _resolve_warmup(node, warmup, warmup_sync)
     _warmup!(pol, () -> _warm_subscription(pol, ent, T, handler, view, warmup_sample))
     return SubscriptionHandle{T}(ent)
@@ -163,7 +171,6 @@ Base.show(io::IO, sub::SubscriptionHandle{T}) where {T} =
     print(io, "Subscription(", sub.entity.endpoint.topic, ", ", nameof(T),
           isopen(sub) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle)."
 entity(sub::SubscriptionHandle) = sub.entity
 
 # ── DynamicSubscription: the keyexpr-only variant ─────────────────────────────
@@ -195,7 +202,7 @@ function _make_dynamic_subscription(handler, node::Node, topic::AbstractString;
                                     qos::QosProfile=default_qos(),
                                     view::Union{Bool, ViewMode}=Owned(),
                                     concurrency::Concurrency=Serial(),
-                                    warmup::Union{Symbol, Nothing}=nothing,
+                                    warmup::Union{Symbol, WarmupMode, Nothing}=nothing,
                                     warmup_sync::Union{Bool, Nothing}=nothing)
     # Per-sample realize! runs Core.eval codegen on the dispatch worker task, never on
     # a foreign libzenohc callback thread: codegen on this caller's task, with the
@@ -218,7 +225,6 @@ Base.show(io::IO, sub::DynamicSubscriptionHandle) =
     print(io, "Subscription(", sub.entity.endpoint.topic, ", dynamic",
           isopen(sub) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle)."
 entity(sub::DynamicSubscriptionHandle) = sub.entity
 
 # ── enum-instance call-methods: the constructor spelling ──────────────────────
@@ -257,11 +263,10 @@ Keyword arguments shaping the route:
 - `congestion_control` — passes through to the Zenoh publisher.
 - `priority` — passes through to the Zenoh publisher.
 
-`warmup`, `warmup_sync`, and `warmup_sample` select the warm-up policy
-(precompile/execute/off, sync/async) that pre-JITs the encode/decode dispatch chain
-so the first real `publish` runs at full speed. Under `:execute` the synthesized
-publish compiles the path with the wire `put` suppressed. Each defaults to the
-node's policy.
+`warmup`, `warmup_sync`, and `warmup_sample` select the warm-up policy (a
+[`WarmupPolicy`](@ref)) that pre-JITs the encode/decode dispatch chain so the first
+real `publish` runs at full speed. Under [`Execute`](@ref) the synthesized publish
+compiles the path with the wire `put` suppressed. Each defaults to the node's policy.
 
 ```julia
 pub = Publisher(node, "/chatter", std_msgs.msg.String)
@@ -315,8 +320,8 @@ the receive thread, so codegen's GC completes while the receiver keeps draining.
 Here the resulting `CDRView` aliases the runtime-resolved type's payload.
 `concurrency` is a [`Concurrency`](@ref) ([`Serial`](@ref) or [`Parallel`](@ref))
 as for the typed form. Warm-up is deferred to first sight of each runtime type, and
-`:execute` degrades to `:precompile` here (running a discovered handler on a
-synthesized sample is the manifest's job).
+[`Execute`](@ref) degrades to [`Precompile`](@ref) here (running a discovered handler
+on a synthesized sample is the manifest's job).
 
 ```julia
 sub = Subscription(node, "/chatter") do msg

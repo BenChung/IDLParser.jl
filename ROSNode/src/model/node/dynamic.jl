@@ -55,17 +55,11 @@ Keyword arguments:
   [`Concurrency`](@ref) ([`Serial`](@ref) or [`Parallel`](@ref)). A single worker
   drains the buffer in arrival order across world-age re-entries, so [`Serial`](@ref)
   preserves total order even through first-sight `realize!` codegen.
-- `warmup::WarmupPolicy`: the warm-up policy that pre-JITs the encode/decode dispatch
-  chain, defaulting to the node default. Independent settings:
-
-    | Setting | Values        |
-    | ------- | ------------- |
-    | mode    | precompile / execute / off |
-    | timing  | sync / async  |
-
-  Here it also replays this node's interaction manifest to warm prior-run types
-  ahead of the first message. The handler can branch on [`is_warming`](@ref) to
-  skip side effects during a warm pass.
+- `warmup::WarmupPolicy`: the warm-up policy ([`WarmupMode`](@ref) plus a sync flag)
+  that pre-JITs the encode/decode dispatch chain, defaulting to the node default. Here
+  it also replays this node's interaction manifest to warm prior-run types ahead of the
+  first message. The handler can branch on [`is_warming`](@ref) to skip side effects
+  during a warm pass.
 
 ROS 2 topic/subscription model:
 https://docs.ros.org/en/rolling/Concepts/Basic/About-Topics.html
@@ -178,7 +172,7 @@ function _spawn_dynamic_consumer(e::Entity, handler, view::ViewMode, concurrency
     # the codecs of types used on prior runs ahead of the first message to keep the
     # JIT off the hot path. Concurrent with the receiver/worker; the `warmlk`-guarded
     # `warmed` set makes whichever path warms a type first win, the other skip it.
-    warmup.mode === :off ||
+    warmup.mode isa NoWarmup ||
         _spawn_manifest_warm(e, handler, warmed, warmlk, warmup)
     # `worker` needs no handle: the scheduler roots it while it runs, and the
     # receiver's `finally close(buf)` ends its drain loop on route close.
@@ -354,7 +348,7 @@ function _resolve_and_build!(e::Entity, h::SampleHolder,
         # Record for the next-run manifest warm, and mark `warmed` so the manifest-replay task
         # skips a type the worker already built (coordination only; the FW build warmed the
         # codec, the manifest task only `precompile`s).
-        if warmup.mode !== :off
+        if !(warmup.mode isa NoWarmup)
             @lock warmlk (Tnew in warmed || push!(warmed, Tnew))
             note_interaction!(e.node.fqn, :subscription, info.hash, info.name, e.endpoint.topic)
         end

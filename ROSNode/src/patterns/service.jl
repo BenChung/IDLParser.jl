@@ -300,7 +300,7 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
                        qos::QosProfile=default_qos(), view::Bool=false,
                        concurrency::Concurrency=Serial(),
                        detach_timeout::Real=60.0,
-                       warmup::Union{Symbol, Nothing}=nothing,
+                       warmup::Union{Symbol, WarmupMode, Nothing}=nothing,
                        warmup_sync::Union{Bool, Nothing}=nothing,
                        warmup_sample=nothing) where {Srv}
     Req  = request_type(Srv)
@@ -386,8 +386,9 @@ const _ACTIVE_SERVICE_WIRE = Base.ScopedValues.ScopedValue{Any}(nothing)
 """
     respond!(req, status::SettlementStatus, payload) -> Bool
 
-The service-handler spelling of the settlement verb [`respond!`](@ref) (an action
-goal settles via `respond!(goal, …)`). This domain's two statuses:
+The service-handler form of the settlement verb (see [`respond!`](@ref) for the
+write-once cell contract; an action goal settles via `respond!(goal, …)`). This
+domain's two statuses:
 
   - `respond!(req, failed, msg)` (`failed` aliases [`failure`](@ref)) — a Zenoh
     query *error* reply carrying `msg`, so the client's [`call`](@ref) raises
@@ -622,7 +623,6 @@ Base.show(io::IO, s::ServiceHandle{Req}) where {Req} =
     print(io, "Service(", s.entity.endpoint.topic, ", ", _strip_suffix(string(nameof(Req)), "_Request"),
           isopen(s) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle)."
 entity(s::ServiceHandle) = s.entity
 
 # ── ServiceClient + call ──────────────────────────────────────────────────────
@@ -706,7 +706,7 @@ end
 
 function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
                        qos::QosProfile=default_qos(),
-                       warmup::Union{Symbol, Nothing}=nothing,
+                       warmup::Union{Symbol, WarmupMode, Nothing}=nothing,
                        warmup_sync::Union{Bool, Nothing}=nothing) where {Srv}
     Req  = request_type(Srv)
     Resp = response_type(Srv)
@@ -744,7 +744,6 @@ Base.show(io::IO, c::ServiceClient{Req}) where {Req} =
           _strip_suffix(string(nameof(Req)), "_Request"),
           isopen(c) ? "" : ", closed", ")")
 
-"The underlying generic [`Entity`](@ref) (id/token/route/graph lifecycle)."
 entity(c::ServiceClient) = c.entity
 
 """
@@ -948,32 +947,19 @@ opens a FIFO-channel Zenoh subscriber sized to the QoS history depth and spawns 
 consumer task. The handle is tracked on `node` (reaped by `close(node)`); `close(sub)`
 tears down the route and consumer.
 
-`view` (a [`ViewMode`](@ref)) selects how each message reaches the handler:
+The delivery and scheduling knobs are each a small type family, documented centrally:
 
-  - `Owned()` (default) — a fully-owned decoded message, free to store, forward, or
-    spawn beyond the handler.
-  - `Checked()` — a zero-copy `CDRView` aliasing the payload, valid for the handler's
-    duration; `collect`/`decode_owned` to keep it. A guard throws `BorrowError`
-    if the view (or a `CDRString` from it) is read after the handler returns.
-  - `Unchecked()` — the same zero-copy view at the zero-allocation tier with the guard
-    removed. Validate under `Checked()`, then switch; an escaping `Unchecked` view is
-    undefined behaviour.
-
-`view=true`/`view=false` are shorthand for `Checked()`/`Owned()`.
-
-`concurrency` schedules the handler bodies:
-
-  - `Serial()` (default) — one handler at a time on a single sticky task,
-    preserving message order with no handler-side locks; the rclcpp
-    single-threaded-executor model.
-  - `Parallel(n)` — up to `n` handlers across OS threads; order not preserved.
+  - `view` — a [`ViewMode`](@ref): [`Owned`](@ref) (default), [`Checked`](@ref), or
+    [`Unchecked`](@ref); `true`/`false` are shorthand for `Checked()`/`Owned()`.
+  - `concurrency` — a [`Concurrency`](@ref): [`Serial`](@ref) (default) or
+    [`Parallel`](@ref).
+  - `match` — a [`MatchPolicy`](@ref): [`ExactMatch`](@ref) (default) or
+    [`WeakMatch`](@ref); `:exact`/`:weak` are shorthand. Under [`WeakMatch`](@ref) an
+    off-type sample fires `on_type_mismatch` and is dropped.
+  - `warmup`/`warmup_sync`/`warmup_sample` — a [`WarmupPolicy`](@ref) precompiling the
+    decode + handler-dispatch chain before the first message.
 
 A handler throw is logged, never fatal.
-
-`match=:exact` (default) subscribes to `T`'s exact type keyexpr, so the wire delivers
-only matching-type samples. `match=:weak` declares `T` in the graph but wildcard-matches
-the topic, routing an off-type sample to a per-sample backstop: a wire type or version
-other than `T` fires `on_type_mismatch` and the sample is dropped.
 
 `force_relatch=true` is the transient-local (durability) escape hatch: re-deliver
 the latched history on every managed-node Active transition regardless of novelty, for
@@ -981,9 +967,7 @@ idempotent handlers that rebuild state from latched inputs. The default deduplic
 re-latch replays by payload novelty.
 
 `qos` carries the ROS 2 QoS profile; `durability=:transient_local` opens an Advanced
-subscriber that replays the publisher's latched history on join. `warmup`/`warmup_sync`/
-`warmup_sample` drive precompilation of the decode + handler-dispatch chain, so it is
-already compiled when the first real message arrives.
+subscriber that replays the publisher's latched history on join.
 
 While a managed node is outside the [`Active`](@ref) lifecycle state, the handler does
 not fire — this is the delivery point of the [`isactive`](@ref) dispatch gate.

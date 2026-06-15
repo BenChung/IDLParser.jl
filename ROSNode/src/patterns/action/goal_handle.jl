@@ -182,25 +182,20 @@ end
 """
     respond!(goal, status, payload) -> Bool
 
-Settle the goal with a terminal `status` and the result `payload`. The action
-status set:
+Settle an action `goal` with a terminal `status` and the result `payload`, the
+action-layer form of the settlement verb (see [`respond!`](@ref) for the
+write-once cell contract). The action status set:
 
 - [`succeeded`](@ref) — the goal completed
 - [`canceled`](@ref) — an accepted cancel unwound the goal
 - [`aborted`](@ref) — the goal failed
 
-Filling the goal's write-once result `ResultCell` is the shared single-fill
-contract of [`respond!`](@ref). One fill drives:
+A single fill of the goal's `ResultCell` drives the first-wins latch, cache
+delivery, `status` publication, and `get_result` release. Returns `true` if this
+call filled the cell.
 
-- the first-wins latch
-- cache delivery
-- `status` publication
-- `get_result` release
-
-Returns `true` if this call filled the cell.
-
-`respond!(goal, feedback, fb)` is the stream form (`feedback!` sugar), dispatched
-separately — it never touches the cell. The service tokens
+`respond!(goal, feedback, fb)` is the stream form ([`feedback!`](@ref) sugar),
+dispatched separately — it never touches the cell. The service tokens
 ([`success`](@ref)/[`failure`](@ref)) have no goal status and raise
 `ArgumentError`.
 """

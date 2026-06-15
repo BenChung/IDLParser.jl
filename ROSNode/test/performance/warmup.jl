@@ -51,7 +51,8 @@ const _Time = ROSNode.Interfaces.builtin_interfaces.msg.Time   # all-fixed (@cdr
     end
 
     @testset "WarmupPolicy validation" begin
-        @test WarmupPolicy(:precompile, false).mode === :precompile
+        @test WarmupPolicy(:precompile, false).mode === ROSNode.Precompile()   # symbol shorthand
+        @test WarmupPolicy(ROSNode.Execute(), true).mode === ROSNode.Execute() # WarmupMode form
         @test WarmupPolicy(:execute, true).sync == true
         @test_throws ArgumentError WarmupPolicy(:nonsense, false)
     end

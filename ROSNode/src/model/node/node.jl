@@ -31,14 +31,12 @@ export Node, Entity, dispose
 """
     Node(ctx, name; namespace=nothing, enclave=nothing, serve_type_description=true,
          warmup=:precompile, warmup_sync=false)
+    Node(ctx, name, ::Type{P}; overrides=(;), allow_undeclared=false, kwargs...) -> Node
 
 A ROS 2 node sharing Context `ctx`'s Zenoh session. The node is the identity
 under which publishers, subscriptions, services, clients, timers, and parameters
 are created, and the naming root for relative/private name resolution; see
-https://docs.ros.org/en/rolling/Concepts/Basic/About-Nodes.html. The parameter
-server itself is attached by the schema form `Node(ctx, name, P)`, reached
-as `node.parameters`; this two-positional-arg form leaves `node.parameters ===
-nothing`.
+https://docs.ros.org/en/rolling/Concepts/Basic/About-Nodes.html.
 
 `name` is the bare node name and must be non-empty. `namespace` defaults to the
 Context's namespace; the fully-qualified name is `namespace/name`, validated at
@@ -60,10 +58,20 @@ encode/decode dispatch chain for entities created on the node:
 
 | Keyword | Accepted values | Effect |
 |---|---|---|
-| `warmup` | `:precompile`, `:execute`, `:off` | Selects the warm-up mode. |
+| `warmup` | a [`WarmupMode`](@ref) (or `:precompile`/`:execute`/`:off`) | Selects the warm-up mode. |
 | `warmup_sync` | `false`, `true` | Runs the warm-up asynchronously or synchronously. |
 
 Each entity constructor's own `warmup`/`warmup_sync` keywords override per-endpoint.
+
+# Parameter schema form
+
+`Node(ctx, name, ::Type{P})` builds a node with a declared parameter schema `P` (a
+[`@parameters`](@ref) struct). It is equivalent to `Node(ctx, name; kwargs...)` plus a
+`ParameterServer{P}` attached at `node.parameters`, with the six standard parameter
+services and `/parameter_events` wired so the node is driveable by any ROS 2 parameter
+client. `overrides` overlays startup values (CLI/launch/YAML) onto the schema defaults;
+`allow_undeclared` opens the dynamic tier. Remaining `kwargs` forward to the base
+constructor. The two-positional-arg form leaves `node.parameters === nothing`.
 
 Every entity created against the node is tracked and dies with it. `close(node)`
 tears down in order:
@@ -119,7 +127,7 @@ function Node(ctx::Context, name::AbstractString;
               namespace::Union{AbstractString, Nothing}=nothing,
               enclave::Union{AbstractString, Nothing}=nothing,
               serve_type_description::Bool=true,
-              warmup::Symbol=:precompile, warmup_sync::Bool=false)
+              warmup::Union{Symbol, WarmupMode}=:precompile, warmup_sync::Bool=false)
     ns  = _normalize_namespace(namespace === nothing ? ctx.namespace : String(namespace))
     enc = enclave === nothing ? ctx.enclave : String(enclave)
     nm  = String(name)

@@ -4,12 +4,12 @@
 # stall. Construction holds every concrete type (`T`, the route type `R`, the handler
 # closure), so the anchors below pin warm-up at the innermost type-specialized frame.
 #
-# Two depths (the `warmup` knob, a `WarmupPolicy`):
-#   • :precompile (default) — `precompile(...)`-anchor the chain: caches the reachable
+# Two depths (the `warmup` knob, a `WarmupPolicy`'s `WarmupMode`):
+#   • Precompile() (default) — `precompile(...)`-anchor the chain: caches the reachable
 #     inference tree and codegens the named frame and its inlined callees,
 #     side-effect-free, needing no message instance. Native codegen of deep
 #     non-inlined user callees still defers to the first real message.
-#   • :execute (opt-in) — additionally run the handler once on a sample message under
+#   • Execute() (opt-in) — additionally run the handler once on a sample message under
 #     the `_WARMUP` scope (`is_warming()` true), reaching full native depth including
 #     the handler body. `@effectful` skips non-ROS effects (still compiled) and
 #     outbound ROS ops null-route just before the wire op.
@@ -32,7 +32,7 @@ using StaticArrays: StaticArray
 # `_warmup!` only chooses off / inline (sync) / background (async). A background warm
 # touches only already-constructed, type-stable state, so it races nothing.
 function _warmup!(policy::WarmupPolicy, warm)
-    policy.mode === :off && return nothing
+    policy.mode isa NoWarmup && return nothing
     if policy.sync
         warm()
     else
@@ -43,7 +43,7 @@ end
 
 # An entity's effective policy: an explicit `warmup`/`warmup_sync` kwarg overrides the
 # node default, `nothing` inherits it.
-function _resolve_warmup(node::Node, mode::Union{Symbol, Nothing}, sync::Union{Bool, Nothing})
+function _resolve_warmup(node::Node, mode::Union{Symbol, WarmupMode, Nothing}, sync::Union{Bool, Nothing})
     mode === nothing && sync === nothing && return node.warmup
     WarmupPolicy(mode === nothing ? node.warmup.mode : mode,
                  sync === nothing ? node.warmup.sync : sync)
@@ -113,7 +113,7 @@ _default_field(::Type{S}) where {S} =
 function _warm_publisher(policy::WarmupPolicy, pub::PublisherHandle{T, R}, sample) where {T, R}
     precompile(encode, (T,))
     precompile(publish, (PublisherHandle{T, R}, T))
-    if policy.mode === :execute
+    if policy.mode isa Execute
         _run_warm(pub.entity.endpoint.topic) do
             publish(pub, _sample_msg(T, sample))
         end
@@ -138,7 +138,7 @@ function _warm_subscription(policy::WarmupPolicy, e::Entity, ::Type{T}, handler:
         precompile(_invoke_owned, (Entity, T, H))
     end
     precompile(handler, (T,))
-    if policy.mode === :execute
+    if policy.mode isa Execute
         _run_warm(e.endpoint.topic) do
             buf = as_memory(encode(_sample_msg(T, sample)), UInt8)
             if _is_view(view)
@@ -174,7 +174,7 @@ function _warm_service(policy::WarmupPolicy, e::Entity, ::Type{Req}, ::Type{Resp
     precompile(decode_view, (Memory{UInt8}, Type{Req}))
     precompile(handler, (Req,))
     precompile(encode, (Resp,))
-    if policy.mode === :execute
+    if policy.mode isa Execute
         _run_warm(e.endpoint.topic) do
             resp = handler(_sample_msg(Req, sample))
             resp isa Resp && encode(resp)

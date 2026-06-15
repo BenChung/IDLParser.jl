@@ -712,18 +712,24 @@ end
 
 """
     entities(m::Component) -> NamedTuple
+    entities(node::ComponentNode) -> NamedTuple
 
-The mixin's materialised port handles, keyed by port identifier:
-`entities(m).image` is the live `Publisher`, `entities(m).tick` the `Timer`,
-`entities(m).<service>` the `Service`. Drive each through its own typed methods
-(`publish`, …).
+The materialised port handles as a `NamedTuple`. Drive each handle through its own
+typed methods (`publish`, …). The ports must be materialised first (after the node
+is configured); reading before then errors with a clear message, and reactions run
+only after materialisation.
 
-Resolved reflectively through the mixin's hidden runtime binding, so the struct stays
-state-only. Reading it before the ports are materialised (before the node is
-configured) errors with a clear message; reactions run only after materialisation.
-First materialisation generates a type-stable per-type method
-(`entities(m::M)::PortsNT`), so `entities(m).field` is an inlinable typed field load
-against the captured concrete NamedTuple type.
+- `entities(m::Component)` — one mixin's handles, keyed by port identifier:
+  `entities(m).image` is the live `Publisher`, `entities(m).tick` the `Timer`,
+  `entities(m).<service>` the `Service`. Resolved reflectively through the mixin's
+  hidden runtime binding, so the struct stays state-only. First materialisation
+  generates a type-stable per-type method (`entities(m::M)::PortsNT`), so
+  `entities(m).field` is an inlinable typed field load against the captured concrete
+  NamedTuple type.
+- `entities(node::ComponentNode)` — every member's handles aggregated and namespaced
+  by member name in declared order: `entities(node).camera.image` is member
+  `camera`'s `image` port, so two members' `image` handles don't collide. Each value
+  is the corresponding per-mixin view.
 """
 entities(m::Component) = _ports_value(m)
 

@@ -23,6 +23,8 @@ export QosProfile, TypeInfo, EndpointKind, default_qos,
        succeeded, canceled, aborted, feedback,
        Concurrency, Serial, Parallel,
        ViewMode, Owned, Checked, Unchecked,
+       MatchPolicy, ExactMatch, WeakMatch,
+       WarmupPolicy, WarmupMode, Precompile, Execute, NoWarmup,
        is_warming, @effectful
 
 # ── exceptions ───────────────────────────────────────────────────────────
@@ -344,6 +346,50 @@ _view_mode(v::Bool) = v ? Checked() : Owned()
 _is_view(::Owned) = false
 _is_view(::ViewMode) = true
 
+# ── subscription match policy (the `match=` knob) ────────────────────────────
+
+"""
+    MatchPolicy
+
+Sealed abstract supertype for how a subscription admits publishers of a topic — the
+`match=` knob:
+
+  - [`ExactMatch`](@ref) (default; `:exact`) — admit only publishers whose type hash
+    matches the subscription's exactly.
+  - [`WeakMatch`](@ref) (`:weak`) — also admit a publisher advertising the topic
+    under a different (or absent) type hash, decoding best-effort.
+"""
+abstract type MatchPolicy end
+
+"""
+    ExactMatch()
+
+Default [`MatchPolicy`](@ref): admit only publishers whose type hash matches the
+subscription's. `:exact` is shorthand for `ExactMatch()`.
+"""
+struct ExactMatch <: MatchPolicy end
+
+"""
+    WeakMatch()
+
+[`MatchPolicy`](@ref) that also admits a publisher advertising the topic under a
+different or absent type hash, decoding best-effort. `:weak` is shorthand for
+`WeakMatch()`.
+"""
+struct WeakMatch <: MatchPolicy end
+
+Base.show(io::IO, ::ExactMatch) = print(io, "ExactMatch()")
+Base.show(io::IO, ::WeakMatch)  = print(io, "WeakMatch()")
+
+# `match=` accepts the MatchPolicy structs or the Symbol shorthand.
+_match_policy(m::MatchPolicy) = m
+function _match_policy(m::Symbol)
+    m === :exact && return ExactMatch()
+    m === :weak  && return WeakMatch()
+    throw(ArgumentError("Subscription `match` must be :exact or :weak (or a `MatchPolicy`), got :$m"))
+end
+_is_weak(m::MatchPolicy) = m isa WeakMatch
+
 # ── small shared helpers ─────────────────────────────────────────────────
 
 """
@@ -411,33 +457,80 @@ macro effectful(expr)
     end
 end
 
+# ── warm-up mode (the `mode` of a `WarmupPolicy`) ────────────────────────────
+# Three depths, as flag structs dispatched on (like `ViewMode`/`Concurrency`) so the
+# choice is type-stable and self-describing; `:precompile`/`:execute`/`:off` stay
+# accepted as shorthands.
+
+"""
+    WarmupMode
+
+Sealed abstract supertype selecting how an entity's dispatch chain is warmed — the
+`mode` of a [`WarmupPolicy`](@ref), on a depth-versus-cost curve:
+
+  - [`Precompile`](@ref) (default; `:precompile`) — a side-effect-free
+    `precompile`-anchor of the dispatch chain.
+  - [`Execute`](@ref) (`:execute`) — additionally run the handler once on a sample
+    message at full native depth, side effects suppressed.
+  - [`NoWarmup`](@ref) (`:off`) — no warm-up.
+"""
+abstract type WarmupMode end
+
+"""
+    Precompile()
+
+Default [`WarmupMode`](@ref): a side-effect-free `precompile`-anchor of the dispatch
+chain — caches the inference tree and codegens the named frame and its inlined
+callees, needing no message instance. `:precompile` is shorthand for `Precompile()`.
+"""
+struct Precompile <: WarmupMode end
+
+"""
+    Execute()
+
+[`WarmupMode`](@ref) that additionally runs the handler once on a synthesized sample
+message under the warm-up scope ([`is_warming`](@ref) true), reaching full native
+depth including the handler body; outbound ROS effects null-route and
+[`@effectful`](@ref) blocks skip. `:execute` is shorthand for `Execute()`.
+"""
+struct Execute <: WarmupMode end
+
+"""
+    NoWarmup()
+
+[`WarmupMode`](@ref) that disables warm-up: the first message JITs the dispatch
+chain. `:off` is shorthand for `NoWarmup()`.
+"""
+struct NoWarmup <: WarmupMode end
+
+Base.show(io::IO, ::Precompile) = print(io, "Precompile()")
+Base.show(io::IO, ::Execute)    = print(io, "Execute()")
+Base.show(io::IO, ::NoWarmup)   = print(io, "NoWarmup()")
+
+# `mode`/`warmup=` accept the WarmupMode structs or the Symbol shorthand.
+_warmup_mode(m::WarmupMode) = m
+function _warmup_mode(m::Symbol)
+    m === :precompile && return Precompile()
+    m === :execute    && return Execute()
+    m === :off        && return NoWarmup()
+    throw(ArgumentError("warmup mode must be :precompile, :execute, or :off (or a `WarmupMode`), got :$m"))
+end
+
 """
     WarmupPolicy(mode, sync)
 
-Per-entity warm-up policy.
-
-`mode` selects how the dispatch chain is warmed:
-
-  - `:precompile` (default) — a side-effect-free `precompile`-anchor of the
-    dispatch chain.
-  - `:execute` — run the handler once on a sample message with side effects
-    suppressed, reaching full native depth.
-  - `:off` — no warm-up.
-
-`sync` selects when the warm-up runs:
+Per-entity warm-up policy. `mode` is a [`WarmupMode`](@ref) (or its `:precompile` /
+`:execute` / `:off` shorthand) selecting how the dispatch chain is warmed; `sync`
+selects when:
 
   - `false` (default) — warms on a background task; zero construction latency.
-  - `true` — blocks the constructor until warm; first message guaranteed
-    compiled (hard real-time).
+  - `true` — blocks the constructor until warm; first message guaranteed compiled
+    (hard real-time).
 """
 struct WarmupPolicy
-    mode::Symbol
+    mode::WarmupMode
     sync::Bool
-    function WarmupPolicy(mode::Symbol, sync::Bool)
-        mode in (:precompile, :execute, :off) ||
-            throw(ArgumentError("warmup mode must be :precompile, :execute, or :off, got :$mode"))
-        new(mode, sync)
-    end
 end
+WarmupPolicy(mode, sync::Bool) = WarmupPolicy(_warmup_mode(mode), sync)
 
-const _DEFAULT_WARMUP = WarmupPolicy(:precompile, false)
+const _DEFAULT_WARMUP = WarmupPolicy(Precompile(), false)

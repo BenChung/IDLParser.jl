@@ -393,16 +393,6 @@ end
 # the six standard services + `/parameter_events` so the node is driveable by any
 # ROS2 parameter client (rclcpp/rclpy/hiroz) — and by our own `ParameterClient`.
 
-"""
-    Node(ctx, name, ::Type{P}; overrides=(;), allow_undeclared=false, kwargs...) -> Node
-
-Construct a node with a declared parameter schema `P` (a [`@parameters`](@ref)
-struct). Equivalent to `Node(ctx, name; kwargs...)` plus a `ParameterServer{P}`
-attached at `node.parameters`, with the six standard parameter services and
-`/parameter_events` wired (`wire_parameter_services!`). `overrides` overlays
-startup values (CLI/launch/YAML) onto the schema defaults; `allow_undeclared` opens
-the dynamic tier. Remaining `kwargs` forward to the base [`Node`](@ref) constructor.
-"""
 function Node(ctx::Context, name::AbstractString, ::Type{P};
               overrides::NamedTuple=(;), allow_undeclared::Bool=false,
               kwargs...) where {P}

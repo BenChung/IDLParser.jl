@@ -85,5 +85,9 @@ It bakes, into the consuming package's precompile image:
 
 ```@docs
 WarmupPolicy
+WarmupMode
+Precompile
+Execute
+NoWarmup
 @precompile_nodes
 ```

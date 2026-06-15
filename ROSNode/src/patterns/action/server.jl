@@ -103,7 +103,7 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                              concurrency::Concurrency = Serial(),
                              body::Union{Function, Nothing} = nothing,
                              qos::QosProfile = default_qos(),
-                             warmup::Union{Symbol, Nothing} = nothing,
+                             warmup::Union{Symbol, WarmupMode, Nothing} = nothing,
                              warmup_sync::Union{Bool, Nothing} = nothing) where {A}
     support = ActionTypeSupport(A)
     G = goal_type(support); R = result_type(support); F = feedback_type(support)
