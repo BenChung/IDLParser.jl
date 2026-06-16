@@ -72,4 +72,33 @@ using SHA: sha256
         @test length(bytes) == 33
         @test bytes[17] == 0x10   # VarInt(16) prefix precedes the gid bytes
     end
+
+    @testset "encode_attachment — byte-identical to the generic serializer" begin
+        # The hand-rolled single-pass encoder must match `Zenoh.serialize` of the
+        # `(i64, i64, Vector{UInt8})` tuple byte-for-byte, or a C++/Rust rmw_zenoh
+        # peer mis-reads the attachment. Cover the int64 and gid edge cases.
+        refbytes(s, t, g) = collect(ROSZenoh.Zenoh.as_memory(
+            ROSZenoh.Zenoh.serialize((Int64(s), Int64(t), collect(g))), UInt8))
+        ourbytes(s, t, g) = collect(ROSZenoh.Zenoh.as_memory(
+            encode_attachment(s, t, g), UInt8))
+
+        gid0 = ntuple(_ -> 0x00, 16)
+        gidF = ntuple(_ -> 0xff, 16)
+        gidI = ntuple(i -> UInt8(i), 16)
+        seqs = Int64[0, 1, -1, 42, 256, typemax(Int64), typemin(Int64),
+                     0x0102030405060708 % Int64]
+        tss  = Int64[0, 1, -1, 1_700_000_000_000_000_000, typemax(Int64), typemin(Int64)]
+        for s in seqs, t in tss, g in (gid0, gidF, gidI)
+            @test ourbytes(s, t, g) == refbytes(s, t, g)
+        end
+    end
+
+    @testset "encode_attachment — round-trips through decode_attachment" begin
+        gidI = ntuple(i -> UInt8(i), 16)
+        for s in (Int64(0), Int64(-1), typemax(Int64), typemin(Int64)),
+            t in (Int64(0), typemax(Int64), Int64(1_700_000_000_000_000_000)),
+            g in (ntuple(_ -> 0x00, 16), ntuple(_ -> 0xff, 16), gidI)
+            @test decode_attachment(encode_attachment(s, t, g)) == (s, t, g)
+        end
+    end
 end

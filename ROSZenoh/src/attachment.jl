@@ -91,8 +91,27 @@ nodes (see [RMW / middleware vendors](https://docs.ros.org/en/rolling/Concepts/I
 emitted as a length-prefixed `[u8;16]` to match zenoh-ext's fixed-array encoding
 (the VarInt(16) prefix — see file header).
 """
-encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8}) =
-    Zenoh.serialize((Int64(seq), Int64(ts), collect(gid)))
+# Fixed 33-byte payload, so build it in one pass instead of routing through the
+# generic ZSerializer/MemBuf/collect path. Layout matches the zenoh-ext
+# serialization of `(i64, i64, [u8;16])` byte-for-byte: two LE Int64s, then the
+# gid's VarInt(16) length prefix (16 < 128 ⇒ the single byte 0x10) and 16 bytes.
+# Bytes are stored LE explicitly, independent of host endianness. The Memory is
+# pinned by `ZBytes` until zenoh's deleter fires, so it outlives the borrowing
+# `put`/`reply`.
+function encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8})
+    buf = Memory{UInt8}(undef, 33)
+    s = Int64(seq) % UInt64
+    t = Int64(ts) % UInt64
+    @inbounds for i in 1:8
+        buf[i] = (s >> (8 * (i - 1))) % UInt8
+        buf[8 + i] = (t >> (8 * (i - 1))) % UInt8
+    end
+    @inbounds buf[17] = 0x10                      # VarInt(16) length prefix
+    @inbounds for i in 1:16
+        buf[17 + i] = gid[i]
+    end
+    return Zenoh.ZBytes(buf)
+end
 
 """
     decode_attachment(sample) -> (seq::Int64, ts::Int64, gid::NTuple{16,UInt8})

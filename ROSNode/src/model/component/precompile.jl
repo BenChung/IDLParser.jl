@@ -14,7 +14,7 @@
 # `_assemble`/`load_node` — the real entry point (reached via `invokelatest` / the container
 # service) — not the positional method, which would read green while the kw path stays unbaked.
 function _component_precompile_specs()
-    return Tuple{Any, Tuple}[
+    specs = Tuple{Any, Tuple}[
         # assembly planning (the composed-`NodeKind` path)
         (_members_plan,   (NodeKind,)),
         (_resolve_di,     (Vector{NodeMember},)),
@@ -55,6 +55,15 @@ function _component_precompile_specs()
         (Core.kwcall, (NamedTuple{(:name, :namespace, :parameters), Tuple{String, String, NamedTuple{(), Tuple{}}}},
                        typeof(load_node), Container, String, String)),
     ]
+    # Every `@node` wires a `CompositeParameterServer` (a fixed, non-parametric type), so its six
+    # parameter services' construction + handler bodies + the `/parameter_events` publisher bake
+    # ONCE here for every composed node — the per-node param wiring was the largest launch phase the
+    # per-mixin bake couldn't touch. The named `_ParamSvcHandler` (not a `do`-block) is what makes
+    # them precompilable by name.
+    append!(specs, _parameter_service_specs(CompositeParameterServer))
+    # The timer tick gate/dispatch wrapper (fixed type), so the first `@every` fire doesn't JIT it.
+    push!(specs, (_fire!, (Timer{ROS},)))
+    return specs
 end
 
 @compile_workload begin

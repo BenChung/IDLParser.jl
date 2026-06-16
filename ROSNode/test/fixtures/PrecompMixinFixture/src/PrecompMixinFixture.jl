@@ -22,18 +22,34 @@ end
 @hears function ingest(m::Counter, msg::Ping)
     m.n = Int(msg.seq)
 end
+# Publisher + service ports too, so the bake exercises `_anchor_construction!`'s publisher
+# send-path and service codec anchors (the subprocess check probes their MIs survive).
+@publishes Counter out :: Ping
+@serves "~/q" function q(m::Counter, x::Int64)::@NamedTuple{ok::Bool}
+    (ok = x > 0,)
+end
 
 @mixin struct Other
     x::Float64 = 1.0
+end
+
+# An action mixin: its handle type isn't statically derivable, so `_finalize_module!` gates it
+# out of the entities-accessor bake — but `_anchor_action_codecs!` runs before that gate and
+# bakes its goal/result/feedback + wrapper codecs. Exercises the action-codec bake survival.
+@mixin struct Mover end
+@runs function move(m::Mover, n::Int64,
+                    fb::FeedbackSink{@NamedTuple{k::Int64}})::@NamedTuple{done::Bool}
+    (done = true,)
 end
 
 # A composed node kind — its name must resolve via `node_kind` at runtime (registered
 # by `ros_init!` for the precompiled case).
 @node Rig = ["a" => Counter, "b" => Other]
 
-# Bake the mixins' typed accessors + reaction-handler specialisations into THIS package's
-# precompile image. Asserted to survive in the fresh-subprocess check (the `__P_…__` /
-# `__entitiesnt_…__` markers exist after a load that doesn't re-run this body).
+# Bake the mixins' typed accessors + reaction/construction/action specialisations into THIS
+# package's precompile image. Asserted to survive in the fresh-subprocess check (the
+# `__ros_pschema_…__` / `__ros_entities_…__` markers AND the baked MIs exist after a load that
+# doesn't re-run this body).
 @precompile_nodes
 
 # BYO `__init__`: defined ABOVE the macros, so they step aside; the user keeps ROSNode

@@ -462,6 +462,23 @@ Timer(node, period; clock::ClockSource=ROS()) =
 # land in later-included files — late-bound, fine at tick time.
 _timer_active(node) = node isa Node ? isactive(node) : true
 
+# One tick: the gate (live + Active) then the guarded user callback. Named (not the anonymous
+# `Base.Timer` `do`-block it used to be) so `precompile(_fire!, (Timer{C},))` bakes the gate +
+# dispatch site ahead of the first fire; the remaining `_ -> _fire!(t)` is a trivial forward. The
+# `t.f()` itself is a dynamic call (`f::Function`), so its concrete target compiles at first fire —
+# but that target is the warmed reaction, already anchored.
+function _fire!(t::Timer)
+    (@atomic t.open) || return nothing
+    _timer_active(t.clk.node) || return nothing
+    try
+        t.f()
+    catch err
+        err isa ShutdownException && return nothing
+        @error "ROSNode.Timer callback threw" exception=(err, catch_backtrace())
+    end
+    return nothing
+end
+
 # Wall-clock timers (Steady/System): a `Base.Timer` re-arming each period. The
 # handler runs the user `f` guarding against its throws so one bad tick can't
 # kill the timer task.
@@ -469,16 +486,7 @@ function _start!(t::Timer{C}) where {C<:Union{Steady,System}}
     # no-op while armed: replacing a live impl orphans it, double-firing each period
     t.impl !== nothing && isopen(t.impl) && return t
     secs = t.period.ns / 1e9
-    t.impl = Base.Timer(secs; interval=secs) do _
-        (@atomic t.open) || return
-        _timer_active(t.clk.node) || return
-        try
-            t.f()
-        catch err
-            err isa ShutdownException && return
-            @error "ROSNode.Timer callback threw" exception=(err, catch_backtrace())
-        end
-    end
+    t.impl = Base.Timer(_ -> _fire!(t), secs; interval=secs)
     t
 end
 
@@ -490,16 +498,7 @@ function _start!(t::Timer{ROS})
     # no-op while armed: replacing a live impl orphans it, double-firing each period
     t.impl !== nothing && isopen(t.impl) && return t
     secs = t.period.ns / 1e9
-    t.impl = Base.Timer(secs; interval=secs) do _
-        (@atomic t.open) || return
-        _timer_active(t.clk.node) || return
-        try
-            t.f()
-        catch err
-            err isa ShutdownException && return
-            @error "ROSNode.Timer callback threw" exception=(err, catch_backtrace())
-        end
-    end
+    t.impl = Base.Timer(_ -> _fire!(t), secs; interval=secs)
     t
 end
 

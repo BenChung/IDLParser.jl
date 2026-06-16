@@ -251,14 +251,18 @@ function _finalize_module!(mod::Module)
     for M in getfield(mod, :__mixin_bases__)
         try
             _ensure_schema!(M)                          # __ros_pschema_<M>__ + descriptors/pschema
+            # Action codecs first: accessor-independent, so they bake even for an action-bearing
+            # mixin — which the `nt` gate below skips entirely (its action handle type isn't
+            # statically derivable).
+            _anchor_action_codecs!(M)
             nt = _entities_accessor_from_specs!(M)      # __ros_entities_<M>__ + entities(m::M)
             # Bake handlers + the construction path only once a typed accessor exists. A mixin
             # with a non-derivable port (action/client) keeps the generic `entities`, so it warms
             # at first `run`; baking here would compile against the generic accessor and be
             # invalidated when materialise emits the typed one.
             if nt !== nothing
-                _anchor_reactions!(M)       # message handlers + decode/dispatch chain
-                _anchor_construction!(M)    # endpoint/materialise/param-server build path
+                _anchor_reactions!(M)       # message handlers + decode/dispatch + service codec
+                _anchor_construction!(M)    # endpoint/materialise/param-server + publish path
             end
         catch err
             @debug "_finalize_module!: skipped a mixin bake" mod mixin = M exception = err
@@ -670,6 +674,18 @@ function _anchor_reactions!(::Type{M}) where {M}
             end
         elseif p.kind === :service
             precompile(p.reaction, (M, p.msgtype))
+            # The request decode + response encode the server runs around the handler. A
+            # component service builds with `warmup = :off`, so its own `_warm_service` is
+            # suppressed — this is the only place that codec is anchored (offline bake + the
+            # runtime member warm). Guarded: a hand-rolled service type that `request_type`/
+            # `response_type` can't resolve degrades to the handler-only warm.
+            try
+                Req = request_type(p.msgtype); Resp = response_type(p.msgtype)
+                precompile(decode_owned, (Memory{UInt8}, Type{Req}))
+                precompile(decode_view,  (Memory{UInt8}, Type{Req}))
+                precompile(encode, (Resp,))
+            catch
+            end
         elseif p.kind === :timer
             precompile(p.reaction, (M,))
         elseif p.kind === :action
@@ -701,55 +717,115 @@ function _cb_type(cb, @nospecialize(reaction), ::Type{M}) where {M}
     (length(rts) == 1 && isconcretetype(only(rts))) ? only(rts) : nothing
 end
 
-# Anchor the per-mixin CONSTRUCTION path — `precompile`-only, no session, no run. Where
-# `_anchor_reactions!` bakes the message *handlers*, this bakes the machinery that *builds*
-# a member at `run`: the endpoint constructors on the mixin's message types, the materialise
-# frame, the typed `ParameterServer{P_M}` + its service wiring, and the lifecycle hooks. That
-# path is the dominant first-`run` cost and is reached at runtime only through the `Any`-typed
-# member dispatch (`cnode.members[nm]`), so it is never statically reachable from ROSNode's own
-# precompile image — only this base-type bake (in the consumer's `@precompile_nodes`) anchors it.
+# The `(callable, argtypes)` anchors for a mixin's CONSTRUCTION path — the machinery that
+# *builds* a member at `run` (endpoint constructors on its message types, the materialise frame,
+# the typed `ParameterServer{P_M}` + service wiring, lifecycle hooks), as opposed to the message
+# *handlers* `_anchor_reactions!` bakes. That path is the dominant first-`run` cost and is reached
+# at runtime only through the `Any`-typed member dispatch (`cnode.members[nm]`), so it is never
+# statically reachable from ROSNode's own precompile image — only this base-type bake (in the
+# consumer's `@precompile_nodes`) anchors it.
 #
-# Concrete `M` only: a parametric mixin's instantiation is chosen by `construct`, unknown at the
+# Returned as a list, not emitted inline, so the drift test (`component_entities_static.jl`)
+# consumes the SAME source and cannot fall behind a renamed/re-aritied builder. Empty for a
+# non-concrete `M`: a parametric mixin's instantiation is chosen by `construct`, unknown at the
 # module-end bake, so it keeps warming at first `run`. The endpoint builders are anchored on the
 # concrete `_sub_cb`/`_timer_cb` closure types (the materialise path's `p.reaction` is `Any`, so
-# inference can't reach them on its own — the function-barrier reason `_sub_cb` exists). Guarded
-# so a quirk in one mixin can't break the package's precompile.
-function _anchor_construction!(::Type{M}) where {M}
-    isconcretetype(M) || return nothing
-    try
-        P = pschema(M)
-        # typed parameter server + the six standard parameter services (their fixed
-        # rcl_interfaces codecs are baked into ROSNode's image by the warm-up workload).
-        precompile(ParameterServer, (Node, P))
-        precompile(_build_pserver,  (Node, Type{P}, NamedTuple{(), Tuple{}}))
-        precompile(wire_parameter_services!, (ParameterServer{P},))
-        for p in mixin_spec(M).ports
-            if p.kind === :publisher
-                precompile(_make_publisher, (Node, String, Type{p.msgtype}))
-            elseif p.kind === :subscription || p.kind === :service
-                # The materialise path builds these with `warmup = :off` (a `Symbol`), so the
-                # heavy builder body specialises on that kwarg type — anchor the matching
-                # `Core.kwcall`. The `EndpointKind` functor branches on its value, so its kwcall
-                # infers both inner builders; pin the inner builder's kwsorter too.
-                H = _cb_type(_sub_cb, p.reaction, M)
-                H === nothing && continue
-                inner = p.kind === :subscription ? _make_subscription : _make_service
-                kw = NamedTuple{(:warmup,), Tuple{Symbol}}
-                precompile(Core.kwcall, (kw, EndpointKind,  H, Node, String, Type{p.msgtype}))
-                precompile(Core.kwcall, (kw, typeof(inner), H, Node, String, Type{p.msgtype}))
-            elseif p.kind === :timer
-                H = _cb_type(_timer_cb, p.reaction, M)
-                H === nothing || precompile(_paused_timer, (Node, Duration, H))
-            end
+# inference can't reach them on its own — the function-barrier reason `_sub_cb` exists).
+function _construction_precompile_specs(::Type{M}) where {M}
+    specs = Tuple{Any, Any}[]
+    isconcretetype(M) || return specs
+    P = pschema(M)
+    # typed parameter server + the six standard parameter services (their fixed rcl_interfaces
+    # codecs are baked into ROSNode's image by the warm-up workload).
+    push!(specs, (ParameterServer, (Node, P)))
+    push!(specs, (_build_pserver,  (Node, Type{P}, NamedTuple{(), Tuple{}})))
+    # A mixin-as-node (`run(MyMixin)`) wires a `ParameterServer{P}`; bake its six services'
+    # construction + handler bodies here (the `@node` path's `CompositeParameterServer` is baked
+    # once in ROSNode's image). The named `_ParamSvcHandler` makes them precompilable by name.
+    append!(specs, _parameter_service_specs(ParameterServer{P}))
+    for p in mixin_spec(M).ports
+        if p.kind === :publisher
+            # the send path the first publish JITs: the builder, then encode + the monomorphic
+            # publish over the plain `Zenoh.Publisher` route (a component publisher carries no
+            # per-port QoS, so the route type is always `Zenoh.Publisher` — see `_handle_type`).
+            push!(specs, (_make_publisher, (Node, String, Type{p.msgtype})))
+            push!(specs, (encode, (p.msgtype,)))
+            push!(specs, (publish, (PublisherHandle{p.msgtype, Zenoh.Publisher}, p.msgtype)))
+        elseif p.kind === :subscription || p.kind === :service
+            # The materialise path builds these with `warmup = :off` (a `Symbol`), so the heavy
+            # builder body specialises on that kwarg type — anchor the matching `Core.kwcall`. The
+            # `EndpointKind` functor branches on its value, so its kwcall infers both inner
+            # builders; pin the inner builder's kwsorter too.
+            H = _cb_type(_sub_cb, p.reaction, M)
+            H === nothing && continue
+            inner = p.kind === :subscription ? _make_subscription : _make_service
+            kw = NamedTuple{(:warmup,), Tuple{Symbol}}
+            push!(specs, (Core.kwcall, (kw, EndpointKind,  H, Node, String, Type{p.msgtype})))
+            push!(specs, (Core.kwcall, (kw, typeof(inner), H, Node, String, Type{p.msgtype})))
+        elseif p.kind === :timer
+            H = _cb_type(_timer_cb, p.reaction, M)
+            H === nothing || push!(specs, (_paused_timer, (Node, Duration, H)))
         end
-        # the materialise frame specialised on `M` + its schema, plus the member lifecycle
-        # hooks the fan-out invokes dynamically.
-        precompile(_materialize_ports!, (Node, M, Symbol, Vector{PortSpec}, P, Dict{Symbol, String}))
-        for h in (configure, activate, deactivate, cleanup, on_error)
-            precompile(h, (M,))
+    end
+    # the materialise frame specialised on `M` + its schema, plus the member lifecycle hooks the
+    # fan-out invokes dynamically.
+    push!(specs, (_materialize_ports!, (Node, M, Symbol, Vector{PortSpec}, P, Dict{Symbol, String})))
+    for h in (configure, activate, deactivate, cleanup, on_error)
+        push!(specs, (h, (M,)))
+    end
+    return specs
+end
+
+# `precompile`-only, no session, no run. Guarded so a quirk in one mixin (a `pschema`/spec that
+# can't resolve) can't break the package's precompile.
+function _anchor_construction!(::Type{M}) where {M}
+    try
+        for (f, ts) in _construction_precompile_specs(M)
+            precompile(f, ts)
         end
     catch err
         @debug "_anchor_construction!: skipped a construction bake" mixin = M exception = err
+    end
+    return nothing
+end
+
+# The `(callable, argtypes)` anchors for a mixin's action members' first-goal CODEC path: goal
+# decode, result/feedback encode, and the three wire service wrappers' codecs (SendGoal /
+# GetResult / CancelGoal) — the same set `_warm_action` warms. Keyed on the action type via the
+# reaction, so it is independent of the entities accessor AND of `M`'s concreteness: it runs even
+# for an action-bearing mixin, which `_finalize_module!` otherwise skips entirely (its action
+# handle type isn't statically derivable, so `_ports_nt_type` returns `nothing`). The handler +
+# dispatch still warm at first `run` via `_make_action_server`'s `_warm_action`; this just moves
+# the codec offline. Built per port under its own guard so a not-yet-generated wrapper drops only
+# that port's anchors. Returned as a list so the drift test consumes the same source.
+function _action_codec_precompile_specs(::Type{M}) where {M}
+    specs = Tuple{Any, Any}[]
+    for p in mixin_spec(_base(M)).ports
+        (p.kind === :action && p.reaction !== nothing) || continue
+        try
+            support = ActionTypeSupport(typeof(p.reaction))
+            A = action_type(support)
+            push!(specs, (decode_owned, (Memory{UInt8}, Type{goal_type(support)})))
+            push!(specs, (encode, (result_type(support),)))
+            push!(specs, (encode, (feedback_type(support),)))
+            push!(specs, (decode_owned, (Memory{UInt8}, Type{_send_goal_request_type(A)})))
+            push!(specs, (encode, (_send_goal_response_type(A),)))
+            push!(specs, (decode_owned, (Memory{UInt8}, Type{_get_result_request_type(A)})))
+            push!(specs, (encode, (_get_result_response_type(A),)))
+            push!(specs, (encode, (_feedback_message_type(A),)))
+            push!(specs, (decode_owned, (Memory{UInt8}, Type{_CancelGoal_Request})))
+            push!(specs, (encode, (_CancelGoal_Response,)))
+        catch err
+            @debug "_action_codec_precompile_specs: skipped an action port" mixin = M port = p.name exception = err
+        end
+    end
+    return specs
+end
+
+# `precompile`-only anchoring of the action codec specs above.
+function _anchor_action_codecs!(::Type{M}) where {M}
+    for (f, ts) in _action_codec_precompile_specs(M)
+        precompile(f, ts)
     end
     return nothing
 end

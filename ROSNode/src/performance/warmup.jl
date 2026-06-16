@@ -168,10 +168,10 @@ end
 # the response, warming the reply path to depth.
 function _warm_service(policy::WarmupPolicy, e::Entity, ::Type{Req}, ::Type{Resp},
                        handler::H, sample) where {Req, Resp, H}
-    # `decode_request` branches to `decode_view`/`decode_owned` over the query payload;
-    # warm both.
+    # `_decode_and_serve` branches to `decode_owned` (over a copied `Memory`) or
+    # `decode_view` (over the borrowed `PayloadView`); warm both.
     precompile(decode_owned, (Memory{UInt8}, Type{Req}))
-    precompile(decode_view, (Memory{UInt8}, Type{Req}))
+    precompile(decode_view, (Zenoh.PayloadView, Type{Req}))
     precompile(handler, (Req,))
     precompile(encode, (Resp,))
     if policy.mode isa Execute
@@ -230,8 +230,8 @@ end
         # The six standard parameter services + /parameter_events ride every node that
         # calls `wire_parameter_services!`, and their request/response codecs are over
         # fixed `rcl_interfaces` types — so bake that shared codec layer once here rather
-        # than re-JITing it at the first node with parameters. The per-node service
-        # *construction* + handler closures stay `@precompile_nodes`' job.
+        # than re-JITing it at the first node with parameters. The per-mixin `ParameterServer{P_M}`
+        # service *construction* is schema-specific and stays `@precompile_nodes`' job.
         let RCL = Interfaces.rcl_interfaces.srv
             for (ReqT, RespT) in ((RCL.DescribeParameters_Request,        RCL.DescribeParameters_Response),
                                   (RCL.GetParameterTypes_Request,         RCL.GetParameterTypes_Response),
@@ -245,6 +245,18 @@ end
             end
             precompile(encode, (Interfaces.rcl_interfaces.msg.ParameterEvent,))
         end
+        # The composed-`@node` façade wiring is non-parametric — `CompositeParameterServer`
+        # holds its members in a runtime field, not a type parameter — so its construction +
+        # six-service wiring + `/parameter_events` aggregation is one specialisation shared by
+        # every composed node. Bake it here rather than re-JITing the whole wiring at the first
+        # composed node's `run` (the per-mixin `ParameterServer{P}` form stays per-schema).
+        precompile(CompositeParameterServer, (Node, Vector{Pair{Symbol, ParameterServer}}))
+        precompile(wire_parameter_services!, (CompositeParameterServer,))
+        precompile(_wire_composite_events!,  (CompositeParameterServer,))
+        # The action server `encode`s a `GoalStatusArray` onto `~/_action/status` on the first
+        # goal accept and each transition. Fixed `action_msgs` type, so bake the status-snapshot
+        # encode (transitively its nested `GoalStatus`/`GoalInfo`) once here instead of per node.
+        precompile(encode, (Interfaces.action_msgs.msg.GoalStatusArray,))
         # Re-bake the PEG grammar combinators with Zenoh loaded. ROSMessages bakes them
         # in its Zenoh-free pkgimage, but Zenoh's `pointer(::GuardedPayloadView)`
         # specialization (GuardedPayloadView <: DenseVector) invalidates them at load,

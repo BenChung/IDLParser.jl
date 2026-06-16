@@ -272,11 +272,10 @@ hang a client:
 `close` drains outstanding detached requests the same way.
 
 The request is fully owned by default (storable, forwardable, spawnable past the
-handler). `view=true` decodes it as a `CDRView` aliasing a private owned
-copy of the payload — variable-length fields stay views over that copy, and the
-view remains valid for as long as it is reachable, since the copy is owned. The
-copy is taken because the borrowed query payload must not be aliased past the
-handler.
+handler). `view=true` decodes it as a zero-copy `CDRView` aliasing the borrowed
+query payload — variable-length fields stay views over those bytes, valid only
+for the handler's extent. The view must not escape the handler; copy out
+(`decode_owned`) anything that must outlive it.
 
 `concurrency` (a [`Concurrency`](@ref): [`Serial`](@ref)`()`, the default, or
 [`Parallel`](@ref)`(n)`) schedules the handler bodies: `Serial` serves on the
@@ -360,8 +359,14 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
     # Sticky so Serial handlers run on the node's one cooperative thread.
     t = Task() do
         try
-            while true
-                serve(take!(qable))
+            # Node logger installed once per consumer task so a plain `@info` in a
+            # handler routes to /rosout without a per-request `with_logger` scope.
+            # Serial handlers run inline under it; Parallel ones are spawned from
+            # within this scope and inherit its logstate.
+            _with_node_logger(e.node) do
+                while true
+                    serve(take!(qable))
+                end
             end
         catch err
             # Closing the queryable disconnects its channel; the drain throws
@@ -510,23 +515,19 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
                       handler, view::Bool) where {Req, Resp}
     cell = nothing                          # hoisted so the `finally` can read its detach state
     try
-        req = _decode_request(query, Req, view)
+        p = payload(query)
+        p === nothing && throw(ArgumentError("service request carried no payload"))
         cell = ResultCell{Query, Resp}(query, _service_deliver(e, query, Resp))
         # The `isactive` dispatch gate: an inactive managed node's application services
         # error-reply here rather than run the handler; infra services are exempt. The
         # owned query's final-ack still rides the `finally` below.
         isactive(e) || _is_infra_service(e.endpoint.topic) ||
             (reply_err(query, "node inactive"); return)
-        # Run under the node logger so a plain `@info` in the handler routes to /rosout,
-        # and bind the cell + wire in scope so `respond!`/`detach!` reach them.
-        settle_handler!(cell,
-                        () -> Base.ScopedValues.with(_ACTIVE_SERVICE_CELL => cell,
-                                                     _ACTIVE_SERVICE_WIRE => e.wire) do
-                            _with_node_logger(() -> handler(req), e.node)
-                        end;
-                        success_status = success,
-                        default_result = () -> _zero_response(Resp),
-                        log_id = e.endpoint.topic)
+        # Decode the request and run the handler. The `view` path decodes the request
+        # over the borrowed query payload and confines it to the handler's extent (the
+        # owned `Query`, held until the `finally` below, keeps the bytes live); the
+        # owned path copies the payload out and decodes a self-contained request.
+        _decode_and_serve(e, query, p, Req, Resp, handler, cell, view)
     catch err
         # A pre-settlement escape (decode failure, framework bug) has no cell to
         # carry it, so log and error-reply directly to keep the caller from hanging.
@@ -552,23 +553,38 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
     nothing
 end
 
-# Decode the request from the query payload. A query with no payload is a protocol
-# error: a ROS request always carries a CDR body, even an empty Request.
-function _decode_request(query::Query, ::Type{Req}, view::Bool) where {Req}
-    p = payload(query)
-    p === nothing && throw(ArgumentError("service request carried no payload"))
-    return decode_request(p, Req, view)
+# Decode the request from the borrowed query payload `p` and run the handler under the
+# fail-safe wrapper, with the cell + wire bound in scope so `respond!`/`detach!` reach
+# them. Branching on the runtime `view` Bool keeps each arm's decode single-return-type:
+#   owned — copy the payload into owned `Memory` and decode a self-contained request,
+#           safe to keep/forward/spawn past the handler.
+#   view  — decode a `CDRView` directly over the borrowed payload (no copy), valid only
+#           inside `with_payload_memory`'s scope; the handler runs inside it, and the
+#           owned `Query` (held until `_serve_query`'s `finally`) keeps the bytes live.
+function _decode_and_serve(e::Entity, query::Query, p, ::Type{Req}, ::Type{Resp},
+                           handler, cell, view::Bool) where {Req, Resp}
+    if view
+        with_payload_memory(p) do mem
+            _run_handler!(e, cell, Resp, handler, decode_view(mem, Req))
+        end
+    else
+        _run_handler!(e, cell, Resp, handler, decode_owned(Zenoh.as_memory(p, UInt8), Req))
+    end
+    nothing
 end
 
-# Copy the borrowed query payload into owned `Memory` first — it must not be aliased
-# past the handler. `view=true` then returns a `CDRView` over that owned copy, valid
-# for as long as the view is reachable since the copy outlives the query.
-# TODO(view): zero-copy directly over the borrowed query payload.
-function decode_request(p, ::Type{Req}, view::Bool) where {Req}
-    mem = Zenoh.as_memory(p, UInt8)
-    # Branch on the runtime `view` Bool so each arm calls a single-return-type
-    # `decode_view`/`decode_owned`, keeping the result inferable to one concrete type.
-    return view ? decode_view(mem, Req) : decode_owned(mem, Req)
+# Run the user handler on the decoded `req` under `settle_handler!`, with the cell +
+# wire bound so `respond!`/`detach!` reach them. The node logger is installed once on
+# the consumer task (`_spawn_service_consumer`).
+function _run_handler!(e::Entity, cell, ::Type{Resp}, handler, req) where {Resp}
+    settle_handler!(cell,
+                    () -> Base.ScopedValues.with(_ACTIVE_SERVICE_CELL => cell,
+                                                 _ACTIVE_SERVICE_WIRE => e.wire) do
+                        handler(req)
+                    end;
+                    success_status = success,
+                    default_result = () -> _zero_response(Resp),
+                    log_id = e.endpoint.topic)
 end
 
 # The cell's `deliver`: map a settled (status, payload) onto a Zenoh reply on the
@@ -861,7 +877,11 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
             Base.Timer(_ -> (try; Zenoh.cancel(tok); catch; end), timeout_ms / 1000) :
             nothing
         try
-            gh = Base.get(querier; payload=bytes, attachment=attach, cancellation=tok)
+            # `capacity=1`: a service call settles on the first reply, so a one-slot
+            # reply ring/channel suffices (vs. the default 16-slot ~4 KB buffer). A
+            # redundant `:all_complete` server's later reply drop-oldest-evicts the
+            # consumed first one — harmless, since the call already returned on it.
+            gh = Base.get(querier; capacity=1, payload=bytes, attachment=attach, cancellation=tok)
             return _resolve_reply(gh, Resp, e.endpoint.topic)
         finally
             # Stop the timer so it can't fire post-return. The token drops via its

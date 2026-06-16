@@ -73,6 +73,30 @@ end
         end
     end
 
+    # `view=true` decodes the request directly over the borrowed query payload (no
+    # owned copy). The string field is a `CDRString` aliasing those bytes, valid for
+    # the handler's extent; reading it in-handler must round-trip the request.
+    @testset "view=true request round trip" begin
+        _sstep("view: server (view=true) + client")
+        _sctx() do ctx
+            node = Node(ctx, "srv_view")
+            seen = Channel{String}(4)
+            Service(node, "/view", DoThing_Request; view = true) do req
+                put!(seen, String(req.command))          # read the borrowed view in-handler
+                return DoThing_Response(; ok = true, detail = "viewed " * String(req.command))
+            end
+            client = ServiceClient(node, "/view", DoThing_Request)
+            sleep(0.4)
+            _sstep("view: call")
+            resp = call(client, DoThing_Request(; command = "peek"); timeout_ms = 4000)
+            @test resp isa DoThing_Response
+            @test resp.ok
+            @test resp.detail == "viewed peek"
+            @test isready(seen) && take!(seen) == "peek"  # borrowed view decoded correctly
+            close(client)
+        end
+    end
+
     # An explicit `respond!(req, failed, msg)` settles the request as a failure → a
     # Zenoh query *error* reply, so the client's `call` raises `ServiceError` (it
     # must NOT get a plausible zeroed Response). The user's message surfaces.

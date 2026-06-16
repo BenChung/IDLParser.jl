@@ -319,48 +319,70 @@ the multi-schema [`CompositeParameterServer`](@ref) supply the six reflection
 handlers + `parameter_names`, so one wiring serves a plain node and a composed
 (member-prefixed) one alike.
 """
+# The six standard parameter services share one handler shape — a server `s` plus a request — so
+# they were anonymous `do`-blocks. Naming them (a callable struct keyed by an op marker) is what
+# lets `precompile` bake their construction + bodies BY NAME: the per-node param wiring is otherwise
+# the dominant un-bakeable launch cost, six gensym closures the bake can't reach. The server type is
+# a free parameter so the SAME anchors cover the `@node` path (one fixed `CompositeParameterServer`,
+# baked once in ROSNode's image) and the mixin-as-node `ParameterServer{P}` (per-package).
+struct _ParamSvcHandler{Op, S <: AbstractParameterServer}
+    s::S
+end
+_ParamSvcHandler{Op}(s::S) where {Op, S <: AbstractParameterServer} = _ParamSvcHandler{Op, S}(s)
+
+(h::_ParamSvcHandler{:describe})(req) = _RCL_SRV.DescribeParameters_Response(;
+    descriptors = _WireDescriptor[_to_descriptor(d) for d in describe_parameters(h.s, req.names)])
+(h::_ParamSvcHandler{:get_types})(req) = _RCL_SRV.GetParameterTypes_Response(;
+    types = UInt8[UInt8(t) for t in get_parameter_types(h.s, req.names)])
+(h::_ParamSvcHandler{:get})(req) = _RCL_SRV.GetParameters_Response(;
+    values = _ParameterValue[_to_param_value(v) for v in get_parameters(h.s, req.names)])
+function (h::_ParamSvcHandler{:list})(req)
+    names = list_parameters(h.s; prefixes = req.prefixes, depth = req.depth)
+    return _RCL_SRV.ListParameters_Response(;
+        result = _ListParametersResult(; names = String[String(n) for n in names], prefixes = String[]))
+end
+function (h::_ParamSvcHandler{:set})(req)
+    pairs = [(Symbol(p.name), _from_param_value(p.value)) for p in req.parameters]
+    return _RCL_SRV.SetParameters_Response(;
+        results = _SetParametersResult[_to_set_result(r) for r in set_parameters(h.s, pairs)])
+end
+function (h::_ParamSvcHandler{:set_atomic})(req)
+    pairs = [(Symbol(p.name), _from_param_value(p.value)) for p in req.parameters]
+    ok, reason = set_parameters_atomically(h.s, pairs)
+    return _RCL_SRV.SetParametersAtomically_Response(;
+        result = _SetParametersResult(; successful = ok, reason = reason))
+end
+
 function wire_parameter_services!(s::AbstractParameterServer)
     node = s.node
-
-    push!(s.services, Service(node, "~/describe_parameters", _RCL_SRV.DescribeParameters_Request) do req
-        descs = describe_parameters(s, req.names)
-        return _RCL_SRV.DescribeParameters_Response(;
-            descriptors = _WireDescriptor[_to_descriptor(d) for d in descs])
-    end)
-
-    push!(s.services, Service(node, "~/get_parameter_types", _RCL_SRV.GetParameterTypes_Request) do req
-        return _RCL_SRV.GetParameterTypes_Response(;
-            types = UInt8[UInt8(t) for t in get_parameter_types(s, req.names)])
-    end)
-
-    push!(s.services, Service(node, "~/get_parameters", _RCL_SRV.GetParameters_Request) do req
-        return _RCL_SRV.GetParameters_Response(;
-            values = _ParameterValue[_to_param_value(v) for v in get_parameters(s, req.names)])
-    end)
-
-    push!(s.services, Service(node, "~/list_parameters", _RCL_SRV.ListParameters_Request) do req
-        names = list_parameters(s; prefixes = req.prefixes, depth = req.depth)
-        return _RCL_SRV.ListParameters_Response(;
-            result = _ListParametersResult(;
-                names = String[String(n) for n in names], prefixes = String[]))
-    end)
-
-    push!(s.services, Service(node, "~/set_parameters", _RCL_SRV.SetParameters_Request) do req
-        pairs = [(Symbol(p.name), _from_param_value(p.value)) for p in req.parameters]
-        results = set_parameters(s, pairs)
-        return _RCL_SRV.SetParameters_Response(;
-            results = _SetParametersResult[_to_set_result(r) for r in results])
-    end)
-
-    push!(s.services, Service(node, "~/set_parameters_atomically", _RCL_SRV.SetParametersAtomically_Request) do req
-        pairs = [(Symbol(p.name), _from_param_value(p.value)) for p in req.parameters]
-        ok, reason = set_parameters_atomically(s, pairs)
-        return _RCL_SRV.SetParametersAtomically_Response(;
-            result = _SetParametersResult(; successful = ok, reason = reason))
-    end)
-
+    push!(s.services, Service(_ParamSvcHandler{:describe}(s),   node, "~/describe_parameters",       _RCL_SRV.DescribeParameters_Request))
+    push!(s.services, Service(_ParamSvcHandler{:get_types}(s),  node, "~/get_parameter_types",       _RCL_SRV.GetParameterTypes_Request))
+    push!(s.services, Service(_ParamSvcHandler{:get}(s),        node, "~/get_parameters",             _RCL_SRV.GetParameters_Request))
+    push!(s.services, Service(_ParamSvcHandler{:list}(s),       node, "~/list_parameters",            _RCL_SRV.ListParameters_Request))
+    push!(s.services, Service(_ParamSvcHandler{:set}(s),        node, "~/set_parameters",             _RCL_SRV.SetParameters_Request))
+    push!(s.services, Service(_ParamSvcHandler{:set_atomic}(s), node, "~/set_parameters_atomically",  _RCL_SRV.SetParametersAtomically_Request))
     s._events_pub = Publisher(node, "/parameter_events", _ParameterEvent)
     return s
+end
+
+# `(callable, argtypes)` anchors for the six parameter services' construction + handler bodies over
+# a concrete server type `S`, plus the `/parameter_events` publisher. Emitter and drift guard
+# consume this one list. Baked once for `CompositeParameterServer` (every `@node`) and per-`P` for a
+# mixin-as-node `ParameterServer{P}`.
+function _parameter_service_specs(::Type{S}) where {S <: AbstractParameterServer}
+    specs = Tuple{Any, Any}[(wire_parameter_services!, (S,))]
+    for (op, ReqT) in ((:describe,   _RCL_SRV.DescribeParameters_Request),
+                       (:get_types,  _RCL_SRV.GetParameterTypes_Request),
+                       (:get,        _RCL_SRV.GetParameters_Request),
+                       (:list,       _RCL_SRV.ListParameters_Request),
+                       (:set,        _RCL_SRV.SetParameters_Request),
+                       (:set_atomic, _RCL_SRV.SetParametersAtomically_Request))
+        H = _ParamSvcHandler{op, S}
+        push!(specs, (_make_service, (H, Node, String, Type{ReqT})))
+        push!(specs, (H, (ReqT,)))
+    end
+    push!(specs, (_make_publisher, (Node, String, Type{_ParameterEvent})))
+    return specs
 end
 
 # Assemble `rcl_interfaces/msg/ParameterEvent` from the post-commit batch and

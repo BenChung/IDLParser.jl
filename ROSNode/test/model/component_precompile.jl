@@ -31,7 +31,8 @@ const B = PrecompMixinFixture.Byo
 @testset "precompiled @mixin declarations survive to runtime" begin
     sp = ROSNode.mixin_spec(F.Counter)
     @test [p.name for p in sp.params] == [:fps, :label]
-    @test Set((p.name, p.kind) for p in sp.ports) == Set([(:tick, :timer), (:ingest, :subscription)])
+    @test Set((p.name, p.kind) for p in sp.ports) ==
+          Set([(:tick, :timer), (:ingest, :subscription), (:out, :publisher), (:q, :service)])
 
     ingest = only(p for p in sp.ports if p.name == :ingest)
     @test ingest.msgtype === F.Ping                     # @hears carries the authored type
@@ -76,6 +77,28 @@ const B = PrecompMixinFixture.Byo
         ingestp = only(p for p in sp.ports if p.kind === :subscription)  # @hears handler
         @test cached(tickp.reaction, (F.Counter,))
         @test cached(ingestp.reaction, (F.Counter, ingestp.msgtype))
+
+        # The wire CODECS the bake anchors over the fixture's own message/service types — the
+        # dominant first-message JIT, anchored by `_anchor_reactions!` — are in the cache right
+        # after LOAD with no run, proving the codec bake rode the pkgimage (not just that the
+        # signatures resolve, which `precompile()` forces even on a degenerate path — the MF1 trap).
+        # NB: the endpoint-BUILDER MIs (`_make_publisher`/`_materialize_ports!`/`ParameterServer`)
+        # that `_anchor_construction!` precompiles do NOT survive into a consuming package's image
+        # (external ROSNode methods specialised on the package's types are inferred-only or pruned,
+        # unlike the `@generated` codecs and the package-owned handlers) — so the construction tier
+        # is verified by signature-resolution in component_entities_static.jl, not cache-presence.
+        @test cached(ROSNode.decode_owned, (Memory{UInt8}, Type{ingestp.msgtype}))   # @hears decode
+        srvp = only(p for p in sp.ports if p.kind === :service)                      # @serves codec
+        @test cached(ROSNode.decode_owned, (Memory{UInt8}, Type{ROSNode.request_type(srvp.msgtype)}))
+        @test cached(ROSNode.encode, (ROSNode.response_type(srvp.msgtype),))
+
+        # The accessor-gated `Mover` action mixin: its goal/result/feedback codecs ride the image
+        # too (over fixture-generated action types), proving the accessor-independent action bake.
+        moverp   = only(p for p in ROSNode.mixin_spec(F.Mover).ports if p.kind === :action)
+        msupport = ROSNode.ActionTypeSupport(typeof(moverp.reaction))
+        @test cached(ROSNode.decode_owned, (Memory{UInt8}, Type{ROSNode.goal_type(msupport)}))
+        @test cached(ROSNode.encode, (ROSNode.result_type(msupport),))
+        @test cached(ROSNode.encode, (ROSNode.feedback_type(msupport),))
     end
 
     @testset "BYO __init__ keeps ROSNode initializing" begin

@@ -15,12 +15,25 @@
 
 using ROSNode
 using ROSNode: Context, Node, Subscription, Publisher, publish, QosProfile,
-               logger, set_logger_level!, Fatal, WireKeyValue
+               logger, set_logger_level!, Fatal, WireKeyValue,
+               Service, ServiceClient, call, wait_for_service, Serial, Parallel
 import Logging
 using Logging: LogLevel, @logmsg
 using Test
 
 const _RLogMsg = ROSNode.LogMsg
+
+# Self-contained echo service for the service-handler /rosout test (no sourced ROS2).
+# The handler does a plain @info, so serving it must route that to the node's /rosout.
+module _RosoutSvc
+    using ROSNode
+    @ros_package "rosout_test_msgs"
+    @ros_service function Echo(key::String, value::String)::@NamedTuple{key::String, value::String}
+        @info "in handler" key = key
+        (key = key, value = value)
+    end
+end
+
 const _EP = isdefined(Main, :ROS_TEST_EP) ? Main.ROS_TEST_EP :
             get(ENV, "ROS_TEST_EP", "tcp/localhost:7447")
 _rosctx(f::Function) = Context(f; peers = [_EP], localhost_only = true)
@@ -137,6 +150,41 @@ end
             @test !Logging.shouldlog(lg, Logging.Info, Main, :g, :id)   # Info now gated
             @test Logging.shouldlog(lg, Logging.Warn, Main, :g, :id)
             @test !Logging.shouldlog(logger(talker, "child"), Logging.Info, Main, :g, :id)  # inherits /talker
+        end
+    end
+
+    # ── live: a service handler's plain @info routes to /rosout ────────────────
+    # The consumer task installs the node logger once (not per request); a Serial
+    # handler runs inline under it, a Parallel handler is spawned from within its
+    # scope and must inherit the logstate. Verify both reach /rosout.
+    @testset "service handler /rosout ($(nameof(typeof(conc))))" for conc in (Serial(), Parallel(2))
+        _rosctx() do ctx
+            srvnode  = Node(ctx, "srvlog")
+            listener = Node(ctx, "srvlog_listener")
+            logs = Channel{Any}(32)
+
+            rsub = Subscription(listener, "/rosout", _RLogMsg;
+                                qos = QosProfile(reliability = :reliable, depth = 50)) do m
+                put!(logs, m)
+            end
+
+            # 3-arg authored form: the @ros_service function is marker + handler.
+            srv = Service(srvnode, "/logsvc", _RosoutSvc.Echo; concurrency = conc)
+            cli = ServiceClient(srvnode, "/logsvc", _RosoutSvc.Echo)
+            @test wait_for_service(cli; timeout = 5)
+            sleep(0.5)   # /rosout route up
+
+            resp = call(cli; key = "k", value = "v")
+            @test resp.key == "k"
+
+            log = _recv_match(logs, 4.0; pred = m -> occursin("in handler", m.msg))
+            @test log !== nothing
+            if log !== nothing
+                @test log.name == srvnode.fqn
+                @test log.level == 0x14                       # INFO
+                @test occursin("in handler (key=k)", log.msg)
+            end
+            close(cli); close(srv)
         end
     end
 end
