@@ -699,6 +699,7 @@ function _anchor_reactions!(::Type{M}) where {M}
                 precompile(decode_owned, (Memory{UInt8}, Type{Req}))           # view=false: copied Memory
                 precompile(decode_view,  (Zenoh.PayloadView, Type{Req}))       # view=true: borrowed PayloadView
                 precompile(encode, (Resp,))
+                precompile(service_type_info_of, (Type{Req}, Type{Resp}))      # service-level wire type identity
             catch
             end
         elseif p.kind === :timer
@@ -1000,7 +1001,7 @@ end
 
 # ── assembly (the one path) ──────────────────────────────────────────────────────
 
-function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
+function _assemble(ctx::Context, @nospecialize(K), name, namespace, @nospecialize(overrides);
                    managed::Bool, autostart::Bool,
                    log_level::Union{LogLevel, Nothing} = nothing,
                    warmup::Union{Symbol, WarmupMode} = :off, warmup_sync::Bool = false)

@@ -77,25 +77,29 @@ intra_process_enabled(::Context) = _INTRA_PROCESS[]
 # Context don't contend on a global lock.
 
 """
-    LocalSubscription{T}
+    LocalSubscription{T, H}
 
 A same-Context subscription as the intra-process short-circuit sees it. Wraps the
 backing [`Entity`](@ref) — which owns the id, liveliness token, data route, and
 graph lifecycle — adding the typed surface direct delivery needs:
 
   - `T`, the message type, and the QoS, for type + RxO matching;
-  - the user `handler`;
+  - the user `handler`, whose concrete type is the second parameter `H`;
   - the `view`/`concurrency` policies.
 
-Direct delivery mirrors the subscription dispatch runtime exactly.
+`H` pins the handler's concrete type so the per-message `handler(payload)` in
+`_invoke_local` dispatches statically — the registry stores these as an abstract
+`Vector{LocalSubscription}`, but each worker drains one concrete instance, so the
+hot loop stays monomorphic. Direct delivery mirrors the subscription dispatch
+runtime exactly.
 
 Held in the Context's local registry; one per intra-process-eligible
 [`SubscriptionHandle`](@ref).
 """
-struct LocalSubscription{T}
+struct LocalSubscription{T, H}
     entity::Entity
     qos::QosProfile
-    handler::Any
+    handler::H
     view::Bool
     concurrency::Concurrency
     # Per-endpoint queue draining off the publisher's task, so the handler never
@@ -146,7 +150,7 @@ function register_local_subscription!(e::Entity, ::Type{T}, handler;
     ctx = e.node.context
     intra_process_enabled(ctx) || return e
     inbox = Channel{Any}(max(1, _fifo_capacity(e.endpoint.qos)))
-    ls = LocalSubscription{T}(e, e.endpoint.qos, handler, view, concurrency, inbox)
+    ls = LocalSubscription{T, typeof(handler)}(e, e.endpoint.qos, handler, view, concurrency, inbox)
     reg = _registry(ctx)
     @lock reg.lock begin
         subs = get!(() -> LocalSubscription[], reg.by_topic, e.endpoint.topic)
@@ -318,13 +322,21 @@ function deliver_local(pub::PublisherHandle{T}, msg::T) where {T}
 end
 
 # Hand the message to the handler as the subscriber's declared type `S`, owned or
-# shared per the sub's `view` flag (`_ipc_own`/`_ipc_share` cross-materialize when
-# the publisher's struct is a sibling alias of `S`). A handler throw is logged, never
-# fatal; only ShutdownException unwinds.
-function _invoke_local(ls::LocalSubscription{S}, msg) where {S}
+# shared per the sub's `view` flag. The inbox is `Channel{Any}` (it may carry a sibling
+# alias), so the common case — the publisher's struct IS `S` — takes a monomorphic fast
+# path: `msg isa S` narrows the value to `S`, so the payload is concrete and the
+# `handler::H` call dispatches statically with no per-message runtime dispatch. A sibling
+# alias of the same wire type (distinct Julia struct, equal RIHS01) falls to the
+# cross-materializing slow path (`_ipc_own`/`_ipc_share`), inherently dynamic on the
+# `Any`-typed value but rare. A handler throw is logged, never fatal; only
+# ShutdownException unwinds.
+function _invoke_local(ls::LocalSubscription{S, H}, msg) where {S, H}
     try
-        payload = ls.view ? _ipc_share(S, msg) : _ipc_own(S, msg)
-        ls.handler(payload)
+        if msg isa S
+            ls.handler(ls.view ? msg : _ipc_copy(msg))                  # same alias: concrete
+        else
+            ls.handler(ls.view ? _ipc_share(S, msg) : _ipc_own(S, msg)) # cross-alias: rare
+        end
     catch err
         err isa ShutdownException && return
         @error "intra-process handler threw" topic=ls.entity.endpoint.topic exception=(err, catch_backtrace())

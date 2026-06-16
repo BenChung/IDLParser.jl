@@ -1020,6 +1020,7 @@ end
 # overrunning task keeps running detached rather than being hard-killed mid-cleanup, so
 # the drain moves on. Exceptions from `f` are logged. Wall-clock primitives are spelled
 # `Base.` since a bare `Timer` would resolve to ROSNode's clock `Timer`.
+#
 function _run_bounded(f, ::Context, what::AbstractString, secs::Real)
     t = @async try
         f()
@@ -1076,19 +1077,16 @@ role). Returns once the drain has fully completed.
 | `false` (the default) | exactly `wait(ctx)`; Julia's default Ctrl-C handling applies. |
 | `true` | a Ctrl-C (and, when deployed, SIGTERM) drains gracefully (see below). |
 
-Under `handle_signals=true` the graceful drain is reached differently depending on how the
-process runs, because Julia delivers SIGINT differently:
-
-- **Interactive (REPL).** Ctrl-C arrives as a catchable `InterruptException`: the first
-  requests a graceful drain and re-parks until it finishes, a second forces `exit(130)`.
-- **Deployed (`julia -m`, a script).** SIGINT (and SIGTERM, which `ros2 launch` escalates
-  to) *exits* the process, and an `atexit` hook runs the drain. Throwing an
-  `InterruptException` here would deliver it to an arbitrary task and abort before draining.
-
-Either way the drain runs every `on_shutdown` hook and member `cleanup`, so teardown is
-consistent across exit paths. The `atexit` drain is also a backstop for a normal or
-error exit. Signal state is restored when `spin` returns, so a library embedding ROSNode
-keeps its own handling.
+Under `handle_signals=true`, `exit_on_sigint(false)` makes Ctrl-C a catchable
+`InterruptException`, and the spin task catches it: the first interrupt requests a
+graceful drain (and keeps spinning until it finishes), a second forces `exit(130)`. The
+spin task polls rather than parking, so it is reliably the task Julia delivers the
+interrupt to — the drain therefore runs while the runtime is fully alive (the same way
+in the REPL and deployed), never through process exit, where the teardown scheduler can
+deadlock. The drain runs every `on_shutdown` hook and member `cleanup`. An `atexit` hook
+is the backstop for the other exit paths (a normal return, an error, or SIGTERM — which
+`ros2 launch` escalates to). Signal state is restored when `spin` returns, so a library
+embedding ROSNode keeps its own handling.
 
 ```julia
 @context(peers = ["tcp/localhost:7447"]) do ctx
@@ -1111,17 +1109,23 @@ function spin(ctx::Context; handle_signals::Bool=false)
     nothing
 end
 
-# Park on the drain. A first interrupt requests the drain and re-parks; a second forces
-# `exit(130)`. Interactively, `exit_on_sigint(false)` delivers a real Ctrl-C here as an
-# `InterruptException`; deployed, SIGINT exits the process and the atexit hook drains
-# instead (see `_install_signal_handlers!`), so this catch then only fires for a
-# programmatically delivered interrupt.
+# Park on the drain, catching Ctrl-C. A first interrupt requests the drain and keeps
+# polling; a second forces `exit(130)`.
+#
+# We POLL on a short `sleep` rather than parking on `wait(ctx)`. Under
+# `exit_on_sigint(false)` Julia throws the SIGINT `InterruptException` into the task
+# running on thread 0 at the next safepoint — but a task fully parked in `wait` is never
+# that task, so the signal lands on no one and is lost (the process just ignores Ctrl-C).
+# A task that wakes ~20×/s is reliably the one Julia interrupts, so the spin task itself
+# proactively and deterministically catches Ctrl-C and turns it into a drain that runs
+# while the runtime is fully alive — never the exit→atexit teardown path, where the
+# scheduler/libuv loop can deadlock. The poll also lets a programmatic `request_shutdown`
+# (or a managed-node shutdown) wake us within one tick.
 function _park_until_drained(ctx::Context)
     interrupted = false
-    while true
+    while (@atomic ctx._state) !== shutdown_done
         try
-            wait(ctx)
-            return nothing
+            sleep(0.05)
         catch err
             err isa InterruptException || rethrow()
             if !interrupted
@@ -1134,6 +1138,7 @@ function _park_until_drained(ctx::Context)
             end
         end
     end
+    return nothing
 end
 
 # Signal handling scoped to the spin call: install handlers, run `f`, restore on return,
@@ -1153,24 +1158,19 @@ function _with_signal_handlers(f, ctx::Context)
     end
 end
 
-# How a Ctrl-C / SIGTERM becomes a graceful drain depends on how the process is run, because
-# Julia delivers SIGINT differently and only the REPL routes it to a predictable task:
-#
-#  - Interactive (REPL): `exit_on_sigint(false)` makes Ctrl-C a catchable `InterruptException`
-#    delivered to the spinning task, which `_park_until_drained` turns into a drain. Reliable
-#    only because the REPL's eval task is the deterministic interrupt target.
-#  - Non-interactive (`julia -m`, a script): `exit_on_sigint(false)` would throw the
-#    `InterruptException` into whatever task is on thread 0 — usually a transient callback with
-#    no handler — aborting the process ("error thrown and no exception handler available")
-#    before it can drain. So let SIGINT *exit* the process (`exit_on_sigint(true)`) and drain
-#    from the `atexit` hook; this also covers SIGTERM, which `ros2 launch` escalates to.
-#    `julia -m` leaves `exit_on_sigint` at false (unlike a plain script), so set it explicitly.
-#
-# The atexit hook is the teardown backstop for every exit path (signal, error, normal exit),
-# registered in both modes so a clean shutdown always runs the drain.
+# Ctrl-C handling, uniform across REPL and deployed (`julia -m`/script): set
+# `exit_on_sigint(false)` and let the polling `_park_until_drained` catch the
+# `InterruptException` and drive a graceful drain while the runtime is alive. This avoids
+# the exit→atexit teardown path (where the scheduler can deadlock) entirely, and needs no
+# OS-specific signal handler. The atexit hook is kept only as a backstop for non-Ctrl-C
+# exits (a normal return, an error, or SIGTERM) so a clean shutdown still always drains.
 function _install_signal_handlers!(ctx::Context)
     _register_atexit_drain!(ctx)
-    Base.exit_on_sigint(isinteractive() ? false : true)
+    # `false`: deliver Ctrl-C as a catchable `InterruptException` rather than exiting the
+    # process. The drain then runs from the spin task while the runtime is fully alive
+    # (see `_park_until_drained`), avoiding the exit→atexit path whose teardown scheduler
+    # can deadlock. The same setting works in the REPL (its default) and deployed.
+    Base.exit_on_sigint(false)
     return nothing
 end
 

@@ -48,7 +48,10 @@ function _encode_to_vector(msg)
     calc = CDRSizeCalculator()
     CDRSerialization.addValue!(calc, msg)
     buf = Vector{UInt8}(undef, position(calc))
-    write(CDRWriter(buf), msg)      # CDRWriter emits the CDR_LE preamble into buf[1:4]
+    # Declare the wire kind (mirrors `_ros_reader`'s `CDRReader(mem, Val(CDR_LE))`) so the
+    # writer type is concrete here and `write` dispatches statically — a runtime-kind
+    # `CDRWriter(buf)` is abstract and would dispatch + box on every encode.
+    write(CDRWriter(buf, Val(CDR_LE)), msg)   # also emits the CDR_LE preamble into buf[1:4]
     return buf
 end
 
