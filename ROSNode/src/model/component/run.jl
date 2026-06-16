@@ -268,6 +268,21 @@ function _finalize_module!(mod::Module)
             @debug "_finalize_module!: skipped a mixin bake" mod mixin = M exception = err
         end
     end
+    # Re-bake the type-agnostic assembly/lifecycle scaffolding (`_assemble`, `_resolve_wires`,
+    # `_check_clobbers`, `_resolve_di`, `_member_*`, …) into THIS module's image. ROSNode bakes
+    # these once in its own image (`_component_precompile_specs`), but a consumer's `@mixin` defs
+    # supersede the generic `mixin_spec(::Type)`/`requires(::Type)`/`provides(::Type)`/`construct`
+    # fallbacks those frames specialised against — INVALIDATING ROSNode's copies the moment this
+    # module loads. Re-running the specs here (after the module's mixin methods exist) compiles
+    # versions whose backedges already include those methods, so they ride this package's image
+    # un-invalidated and the first `run` doesn't recompile the whole assembly path.
+    try
+        for (f, ts) in _component_precompile_specs()
+            precompile(f, ts)
+        end
+    catch err
+        @debug "_finalize_module!: skipped scaffolding re-anchor" mod exception = err
+    end
     return nothing
 end
 
@@ -681,8 +696,8 @@ function _anchor_reactions!(::Type{M}) where {M}
             # `response_type` can't resolve degrades to the handler-only warm.
             try
                 Req = request_type(p.msgtype); Resp = response_type(p.msgtype)
-                precompile(decode_owned, (Memory{UInt8}, Type{Req}))
-                precompile(decode_view,  (Memory{UInt8}, Type{Req}))
+                precompile(decode_owned, (Memory{UInt8}, Type{Req}))           # view=false: copied Memory
+                precompile(decode_view,  (Zenoh.PayloadView, Type{Req}))       # view=true: borrowed PayloadView
                 precompile(encode, (Resp,))
             catch
             end

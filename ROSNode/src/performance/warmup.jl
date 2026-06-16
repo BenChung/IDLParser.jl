@@ -131,7 +131,9 @@ function _warm_subscription(policy::WarmupPolicy, e::Entity, ::Type{T}, handler:
     # consumer borrows, in this subscription's view mode.
     precompile(_dispatch_decoded, (Entity, SampleHolder, Type{T}, H, typeof(view)))
     if _is_view(view)
-        precompile(decode_view, (Memory{UInt8}, Type{T}))
+        # the receive path borrows the sample as a `Zenoh.PayloadView` (a `DenseVector{UInt8}`),
+        # NOT a `Memory` — anchor that specialization or the first real message JITs the decode.
+        precompile(decode_view, (Zenoh.PayloadView, Type{T}))
     else
         precompile(decode_owned, (Memory{UInt8}, Type{T}))
         precompile(_decode_on_consumer, (Entity, SampleHolder, Type{T}))
@@ -156,9 +158,10 @@ end
 # types ahead of the first message. Precompile-only.
 function _warm_dynamic(::Type{T}, handler::H) where {T, H}
     # The dynamic worker decodes via `decode_view`/`decode_owned` per the sub's `view`
-    # flag, so warm both.
+    # flag, so warm both — `decode_view` over the borrowed `Zenoh.PayloadView` (the receive
+    # buffer), `decode_owned` over the copied `Memory`.
     precompile(decode_owned, (Memory{UInt8}, Type{T}))
-    precompile(decode_view, (Memory{UInt8}, Type{T}))
+    precompile(decode_view, (Zenoh.PayloadView, Type{T}))
     precompile(handler, (T,))
     nothing
 end
@@ -226,6 +229,9 @@ end
             z = encode(msg)
             decode_owned(as_memory(z, UInt8), T)
             decode_view(as_memory(z, UInt8), T)
+            # the live receive path decodes a view over a `Zenoh.PayloadView`, not a `Memory`;
+            # anchor that specialization (can't synthesize a borrowed payload here, so precompile it).
+            precompile(decode_view, (Zenoh.PayloadView, T))
         end
         # The six standard parameter services + /parameter_events ride every node that
         # calls `wire_parameter_services!`, and their request/response codecs are over
@@ -239,11 +245,21 @@ end
                                   (RCL.ListParameters_Request,            RCL.ListParameters_Response),
                                   (RCL.SetParameters_Request,             RCL.SetParameters_Response),
                                   (RCL.SetParametersAtomically_Request,   RCL.SetParametersAtomically_Response))
-                precompile(decode_owned, (Memory{UInt8}, Type{ReqT}))
-                precompile(decode_view,  (Memory{UInt8}, Type{ReqT}))
+                precompile(decode_owned, (Memory{UInt8}, Type{ReqT}))          # view=false: copied Memory
+                precompile(decode_view,  (Zenoh.PayloadView, Type{ReqT}))      # view=true: borrowed PayloadView
                 precompile(encode,       (RespT,))
+                precompile(service_type_info_of, (Type{ReqT}, Type{RespT}))    # service-level type identity
             end
             precompile(encode, (Interfaces.rcl_interfaces.msg.ParameterEvent,))
+        end
+        # Every node hosts `~/get_type_description` (dynamic type discovery, `serve_type_description`),
+        # so its codec + service-type identity over the fixed `type_description_interfaces` types bake
+        # once here rather than JITing at the first node's bring-up.
+        let TD = Interfaces.type_description_interfaces.srv
+            precompile(decode_owned, (Memory{UInt8}, Type{TD.GetTypeDescription_Request}))
+            precompile(decode_view,  (Zenoh.PayloadView, Type{TD.GetTypeDescription_Request}))
+            precompile(encode, (TD.GetTypeDescription_Response,))
+            precompile(service_type_info_of, (Type{TD.GetTypeDescription_Request}, Type{TD.GetTypeDescription_Response}))
         end
         # The composed-`@node` façade wiring is non-parametric — `CompositeParameterServer`
         # holds its members in a runtime field, not a type parameter — so its construction +

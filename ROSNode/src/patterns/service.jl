@@ -381,13 +381,12 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
     return t
 end
 
-# The active request's result cell, bound by `_serve_query` over the handler's
-# extent so `respond!(req, …)` can reach it — the handler holds the decoded
-# request, not the cell.
-const _ACTIVE_SERVICE_CELL = Base.ScopedValues.ScopedValue{Any}(nothing)
-# The owning service's wire, bound alongside so `detach!` can register the
-# handed-off cell on the detach registry.
-const _ACTIVE_SERVICE_WIRE = Base.ScopedValues.ScopedValue{Any}(nothing)
+# The active request's `(result cell, owning wire)`, bound by `_serve_query` over the
+# handler's extent so `respond!(req, …)`/`detach!(req)` reach them — the handler holds
+# the decoded request, not the cell. A single scoped value (carrying the pair) rather
+# than two: one `with` binding instead of two halves the per-request dynamic-scope
+# allocation, and only the handler frame ever reads it.
+const _ACTIVE_SERVICE = Base.ScopedValues.ScopedValue{Any}(nothing)
 
 """
     respond!(req, status::SettlementStatus, payload) -> Bool
@@ -415,11 +414,11 @@ end
 ```
 """
 function respond!(@nospecialize(req), status::SettlementStatus, payload)
-    cell = _ACTIVE_SERVICE_CELL[]
-    cell === nothing && throw(ArgumentError(
+    active = _ACTIVE_SERVICE[]
+    active === nothing && throw(ArgumentError(
         "respond!(req, status, payload) called outside a Service handler \
          (an action goal settles via respond!(goal, …))"))
-    return respond!(cell::ResultCell, status, payload)
+    return respond!(active[1]::ResultCell, status, payload)
 end
 
 """
@@ -466,10 +465,11 @@ end
 ```
 """
 function detach!(@nospecialize(req))
-    cell = _ACTIVE_SERVICE_CELL[]
-    wire = _ACTIVE_SERVICE_WIRE[]
-    (cell === nothing || wire === nothing) && throw(ArgumentError(
+    active = _ACTIVE_SERVICE[]
+    active === nothing && throw(ArgumentError(
         "detach!(req) called outside a Service handler"))
+    cell = active[1]
+    wire = active[2]
     c = cell::ResultCell
     w = wire::_ServiceWire
     # One-shot: a second detach! just hands back the handle (already registered).
@@ -578,8 +578,7 @@ end
 # the consumer task (`_spawn_service_consumer`).
 function _run_handler!(e::Entity, cell, ::Type{Resp}, handler, req) where {Resp}
     settle_handler!(cell,
-                    () -> Base.ScopedValues.with(_ACTIVE_SERVICE_CELL => cell,
-                                                 _ACTIVE_SERVICE_WIRE => e.wire) do
+                    () -> Base.ScopedValues.with(_ACTIVE_SERVICE => (cell, e.wire)) do
                         handler(req)
                     end;
                     success_status = success,

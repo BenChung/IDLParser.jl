@@ -24,6 +24,7 @@ include("attachment.jl")
 
 export ZenohId, TypeHash, TypeInfo, QosProfile, Duration,
        NodeEntity, EndpointEntity, EndpointKind,
+       PublisherKind, SubscriptionKind, ServiceKind, ClientKind,
        Publisher, Subscription, Service, Client,
        KeyExprFormat, RmwZenoh, Ros2DDS,
        topic_keyexpr, parse_topic_keyexpr, liveliness_keyexpr, parse_liveliness,
