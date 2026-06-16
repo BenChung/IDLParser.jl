@@ -778,6 +778,15 @@ function _construction_precompile_specs(::Type{M}) where {M}
             inner = p.kind === :subscription ? _make_subscription : _make_service
             kw = NamedTuple{(:warmup,), Tuple{Symbol}}
             push!(specs, (Core.kwcall, (kw, typeof(inner), H, Node, String, Type{p.msgtype})))
+            # a service's consumer-task setup (the handler reaches `_spawn_service_consumer` as an
+            # abstract `Function`; view=false ⇒ Bool, Serial concurrency).
+            if p.kind === :service
+                try
+                    Req = request_type(p.msgtype); Resp = response_type(p.msgtype)
+                    push!(specs, (_spawn_service_consumer, (Entity, Type{Req}, Type{Resp}, Function, Bool, Serial)))
+                catch
+                end
+            end
         elseif p.kind === :timer
             H = _cb_type(_timer_cb, p.reaction, M)
             H === nothing || push!(specs, (_paused_timer, (Node, Duration, H)))
@@ -993,7 +1002,8 @@ end
 
 function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
                    managed::Bool, autostart::Bool,
-                   log_level::Union{LogLevel, Nothing} = nothing)
+                   log_level::Union{LogLevel, Nothing} = nothing,
+                   warmup::Union{Symbol, WarmupMode} = :off, warmup_sync::Bool = false)
     order, bytype, edges = _members_plan(K)
     composed = K isa NodeKind            # the construction path drives prefixing, not member count
     declared = composed ? Symbol[m.name for m in K.members] : copy(order)  # listing/view order
@@ -1004,6 +1014,7 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
 
     if managed
         ln = LifecycleNode(ctx, name; namespace = namespace,
+            warmup = warmup, warmup_sync = warmup_sync,
             on_configure  = _ -> _members_configure!(cnref[], order),
             on_activate   = _ -> _members_activate!(cnref[], order),
             on_deactivate = _ -> (foreach(reverse(order)) do nm
@@ -1016,7 +1027,7 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, overrides;
         node = inner_node(ln)
     else
         ln = nothing
-        node = Node(ctx, name; namespace = namespace)
+        node = Node(ctx, name; namespace = namespace, warmup = warmup, warmup_sync = warmup_sync)
     end
     # Before any member code (construct/configure/activate), so a requested level
     # governs the node's logging from the start.
@@ -1123,6 +1134,9 @@ given), build the node-core, construct the mixin(s) in DI order, and autostart
 `log_level` (a `LogLevel`, default `nothing` = the node default) sets the
 node's logger level ([`set_logger_level!`](@ref)) before any member code runs, so
 records from the construct/configure/activate hooks already honor it.
+`warmup`/`warmup_sync` (default `:off`) set the node's [`WarmupPolicy`](@ref) — opt into a
+runtime warm-up of the dispatch chain for an un-precompiled node or a parametric mixin the
+[`@precompile_nodes`](@ref) bake can't reach; deployed nodes rely on that offline bake instead.
 
 The `managed` keyword selects the node-core kind:
 
@@ -1140,11 +1154,12 @@ function Base.run(::Type{M}; name::AbstractString = _default_name(M),
                   localhost_only::Bool = false,
                   managed::Bool = false, autostart::Bool = !managed,
                   log_level::Union{LogLevel, Nothing} = nothing,
+                  warmup::Union{Symbol, WarmupMode} = :off, warmup_sync::Bool = false,
                   block::Bool = true) where {M <: Component}
     _check_runnable(M, "run")
     _ensure_schema!(M)
     return _run(ctx, M, name, namespace, overrides, peers, localhost_only, managed, autostart,
-                log_level, block)
+                log_level, warmup, warmup_sync, block)
 end
 
 function Base.run(k::NodeKind; name::AbstractString = String(k.name),
@@ -1155,26 +1170,27 @@ function Base.run(k::NodeKind; name::AbstractString = String(k.name),
                   localhost_only::Bool = false,
                   managed::Bool = false, autostart::Bool = !managed,
                   log_level::Union{LogLevel, Nothing} = nothing,
+                  warmup::Union{Symbol, WarmupMode} = :off, warmup_sync::Bool = false,
                   block::Bool = true)
     for mem in k.members
         _check_runnable(mem.mixin, "@node member `$(mem.name)`")
         _ensure_schema!(mem.mixin)
     end
     return _run(ctx, k, name, namespace, overrides, peers, localhost_only, managed, autostart,
-                log_level, block)
+                log_level, warmup, warmup_sync, block)
 end
 
 # Shared run body: open/own the Context, assemble (under `invokelatest` so freshly
 # generated `P_M` methods are visible), then spin/close when blocking.
 function _run(ctx, @nospecialize(K), name, namespace, overrides, peers, localhost_only,
-              managed, autostart, log_level, block)
+              managed, autostart, log_level, warmup, warmup_sync, block)
     owns = ctx === nothing
     ctx = owns ? Context(; peers = collect(String, peers), localhost_only = localhost_only) : ctx
     local cnode
     try
         cnode = Base.invokelatest(_assemble, ctx, K, name, namespace, overrides;
                                   managed = managed, autostart = autostart,
-                                  log_level = log_level)
+                                  log_level = log_level, warmup = warmup, warmup_sync = warmup_sync)
     catch err
         owns && close(ctx)
         rethrow()

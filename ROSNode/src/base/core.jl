@@ -469,20 +469,22 @@ end
 Sealed abstract supertype selecting how an entity's dispatch chain is warmed — the
 `mode` of a [`WarmupPolicy`](@ref), on a depth-versus-cost curve:
 
-  - [`Precompile`](@ref) (default; `:precompile`) — a side-effect-free
-    `precompile`-anchor of the dispatch chain.
+  - [`NoWarmup`](@ref) (`:off`) — no warm-up; the node default (warming is baked offline
+    by [`@precompile_nodes`](@ref) instead of run at construction).
+  - [`Precompile`](@ref) (`:precompile`) — a side-effect-free `precompile`-anchor of the
+    dispatch chain.
   - [`Execute`](@ref) (`:execute`) — additionally run the handler once on a sample
     message at full native depth, side effects suppressed.
-  - [`NoWarmup`](@ref) (`:off`) — no warm-up.
 """
 abstract type WarmupMode end
 
 """
     Precompile()
 
-Default [`WarmupMode`](@ref): a side-effect-free `precompile`-anchor of the dispatch
+A [`WarmupMode`](@ref): a side-effect-free `precompile`-anchor of the dispatch
 chain — caches the inference tree and codegens the named frame and its inlined
 callees, needing no message instance. `:precompile` is shorthand for `Precompile()`.
+Opt-in (the node default is [`NoWarmup`](@ref)).
 """
 struct Precompile <: WarmupMode end
 

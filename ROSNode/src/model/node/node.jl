@@ -30,7 +30,7 @@ export Node, Entity, dispose
 
 """
     Node(ctx, name; namespace=nothing, enclave=nothing, serve_type_description=true,
-         warmup=:precompile, warmup_sync=false)
+         warmup=:off, warmup_sync=false)
     Node(ctx, name, ::Type{P}; overrides=(;), allow_undeclared=false, kwargs...) -> Node
 
 A ROS 2 node sharing Context `ctx`'s Zenoh session. The node is the identity
@@ -54,12 +54,18 @@ Construction performs these steps:
   node advertises; a failure declaring it is logged and construction continues.
 
 `warmup` and `warmup_sync` set the node-default `WarmupPolicy` that pre-JITs the
-encode/decode dispatch chain for entities created on the node:
+encode/decode dispatch chain for entities created on the node. **Default `:off`**: the
+deployment path is to bake the dispatch chain into the package image at precompile with
+[`@precompile_nodes`](@ref), which is paid once offline and — unlike the runtime warm — does
+not spawn background compilation that contends with the node's own bring-up. Opt into a
+runtime warm (`:precompile`/`:execute`) for an un-precompiled node (REPL/script), a parametric
+mixin whose concrete instantiation `@precompile_nodes` can't bake, or a dynamic subscription's
+manifest replay.
 
 | Keyword | Accepted values | Effect |
 |---|---|---|
-| `warmup` | a [`WarmupMode`](@ref) (or `:precompile`/`:execute`/`:off`) | Selects the warm-up mode. |
-| `warmup_sync` | `false`, `true` | Runs the warm-up asynchronously or synchronously. |
+| `warmup` | a [`WarmupMode`](@ref) (or `:precompile`/`:execute`/`:off`) | Warm-up mode; default `:off`. |
+| `warmup_sync` | `false`, `true` | Runs an opted-in warm-up asynchronously or synchronously. |
 
 Each entity constructor's own `warmup`/`warmup_sync` keywords override per-endpoint.
 
@@ -127,7 +133,7 @@ function Node(ctx::Context, name::AbstractString;
               namespace::Union{AbstractString, Nothing}=nothing,
               enclave::Union{AbstractString, Nothing}=nothing,
               serve_type_description::Bool=true,
-              warmup::Union{Symbol, WarmupMode}=:precompile, warmup_sync::Bool=false)
+              warmup::Union{Symbol, WarmupMode}=:off, warmup_sync::Bool=false)
     ns  = _normalize_namespace(namespace === nothing ? ctx.namespace : String(namespace))
     enc = enclave === nothing ? ctx.enclave : String(enclave)
     nm  = String(name)

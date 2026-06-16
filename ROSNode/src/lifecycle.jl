@@ -237,6 +237,7 @@ function LifecycleNode(ctx::Context, name::AbstractString;
                        namespace::Union{AbstractString, Nothing}=nothing,
                        enclave::Union{AbstractString, Nothing}=nothing,
                        autostart::Bool=false,
+                       warmup::Union{Symbol, WarmupMode}=:off, warmup_sync::Bool=false,
                        on_configure::Function = _lc_noop,
                        on_activate::Function = _lc_noop,
                        on_deactivate::Function = _lc_noop,
@@ -244,7 +245,8 @@ function LifecycleNode(ctx::Context, name::AbstractString;
                        on_shutdown::Function = _lc_noop,
                        on_error::Function = _lc_noop,
                        msgs = nothing)
-    node = Node(ctx, name; namespace=namespace, enclave=enclave)
+    node = Node(ctx, name; namespace=namespace, enclave=enclave,
+                warmup=warmup, warmup_sync=warmup_sync)
     ln = LifecycleNode(node, on_configure, on_activate, on_deactivate, on_cleanup,
                        on_shutdown, on_error, Unconfigured(), ReentrantLock(),
                        nothing, Base.IdSet{Entity}(), true)

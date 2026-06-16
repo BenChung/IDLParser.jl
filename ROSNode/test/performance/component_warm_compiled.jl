@@ -90,7 +90,7 @@ using ._WarmTypes: Sink, Spin
 
     @testset "startup — component reaction path compiled after bring-up (Zenoh session)" begin
         _wcctx() do ctx
-            n = run(Spin; ctx = ctx, name = "warmspin", block = false)
+            n = run(Spin; ctx = ctx, name = "warmspin", warmup = :precompile, block = false)
             m = only(values(n.members))
             M = typeof(m)
             p = only(p for p in mixin_spec(M).ports if p.kind === :subscription)

@@ -131,7 +131,10 @@ const _KIND_CODE = Dict{EndpointKind, String}(
 )
 const _CODE_KIND = Dict(v => k for (k, v) in _KIND_CODE)
 
-kind_code(k::EndpointKind) = _KIND_CODE[k]
+# `@nospecialize`: each kind is now its own singleton type (not one `@enum` type), so without
+# this `kind_code` would compile a separate specialisation per kind at every entity build. It is
+# a `Dict` lookup, so one shared specialisation costs nothing.
+kind_code(@nospecialize(k::EndpointKind)) = _KIND_CODE[k]
 parse_kind_code(s::AbstractString) = get(_CODE_KIND, String(s), nothing)
 
 """

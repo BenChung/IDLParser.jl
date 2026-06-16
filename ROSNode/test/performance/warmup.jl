@@ -75,7 +75,7 @@ const _Time = ROSNode.Interfaces.builtin_interfaces.msg.Time   # all-fixed (@cdr
     # ── live: :precompile is delivery-transparent (regression) ────────────────
     @testset ":precompile does not break delivery" begin
         _wuctx() do ctx
-            node = Node(ctx, "warm_pre")                  # default warmup = :precompile
+            node = Node(ctx, "warm_pre"; warmup = :precompile)   # opt in (node default is :off)
             got  = Channel{Any}(8)
             sub  = Subscription(node, "/wp", WireKeyValue) do m
                 put!(got, m)

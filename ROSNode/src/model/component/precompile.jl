@@ -30,10 +30,11 @@ function _component_precompile_specs()
         # run entry (both namespace variants × both log-level variants — the `ros2 component
         # load --log-level` path passes a `LogLevel`, the bare run/load a `Nothing`) + teardown
         # + node-level aggregate views
-        (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Bool)),
-        (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Bool)),
-        (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Bool)),
-        (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Bool)),
+        # positional tail: …, log_level, warmup (`Symbol`, default `:off`), warmup_sync (`Bool`), block
+        (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
+        (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
+        (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
+        (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
         (Base.close, (ComponentNode,)),
         (parameters, (ComponentNode,)),
         (entities,   (ComponentNode,)),
@@ -48,9 +49,9 @@ function _component_precompile_specs()
         # kwarg entry points via `Core.kwcall` (the real entry, not the positional method).
         # `_assemble` in both log-level variants; `load_node` with its actual keywords
         # (`name`/`namespace`/`parameters`) — its `#load_node#` body delegates to `run`.
-        (Core.kwcall, (NamedTuple{(:managed, :autostart, :log_level), Tuple{Bool, Bool, Nothing}},
+        (Core.kwcall, (NamedTuple{(:managed, :autostart, :log_level, :warmup, :warmup_sync), Tuple{Bool, Bool, Nothing, Symbol, Bool}},
                        typeof(_assemble), Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}})),
-        (Core.kwcall, (NamedTuple{(:managed, :autostart, :log_level), Tuple{Bool, Bool, LogLevel}},
+        (Core.kwcall, (NamedTuple{(:managed, :autostart, :log_level, :warmup, :warmup_sync), Tuple{Bool, Bool, LogLevel, Symbol, Bool}},
                        typeof(_assemble), Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}})),
         (Core.kwcall, (NamedTuple{(:name, :namespace, :parameters), Tuple{String, String, NamedTuple{(), Tuple{}}}},
                        typeof(load_node), Container, String, String)),

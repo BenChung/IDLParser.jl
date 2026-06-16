@@ -378,8 +378,11 @@ function _parameter_service_specs(::Type{S}) where {S <: AbstractParameterServer
                        (:set,        _RCL_SRV.SetParameters_Request),
                        (:set_atomic, _RCL_SRV.SetParametersAtomically_Request))
         H = _ParamSvcHandler{op, S}
+        RespT = response_type(ReqT)
         push!(specs, (_make_service, (H, Node, String, Type{ReqT})))
         push!(specs, (H, (ReqT,)))
+        # the consumer-task setup `_make_service` spawns (view=false ⇒ Bool, Serial concurrency)
+        push!(specs, (_spawn_service_consumer, (Entity, Type{ReqT}, Type{RespT}, H, Bool, Serial)))
     end
     push!(specs, (_make_publisher, (Node, String, Type{_ParameterEvent})))
     return specs

@@ -32,6 +32,11 @@ mutable struct ActionClient{A, G, R, F}
     const name::String                   # resolved action FQN
     const support::ActionTypeSupport{A, G, R, F}
     const qos::QosProfile
+    # The three SERVICE-level `TypeInfo`s (send_goal/get_result/cancel_goal), computed
+    # ONCE here — a pure function of `A`. Recomputing it per `send`/`get_result` was the
+    # dominant action-call allocation (~56 KB/goal of RIHS/keyexpr derivation). `nothing`
+    # when the Goal/Result types lack registered wire descriptions (the action-TI fallback).
+    const _service_tis::Any
     # Stable per-client gid + per-request seq for the rmw_zenoh request attachment.
     # A native queryable reads the request's (sequence_number, source_timestamp,
     # source_gid) to stamp its reply and hard-panics on an absent attachment, so the
@@ -54,7 +59,8 @@ function ActionClient(node::Node, name::AbstractString, ::Type{A};
     G = goal_type(support); R = result_type(support); F = feedback_type(support)
     fqn = resolve_name(node, name; kind=:service)
     gid = ROSZenoh.entity_gid(node.entity.z_id, next_entity_id!(node.context))
-    client = ActionClient{A, G, R, F}(node, fqn, support, qos, gid, 0, true, nothing, ReentrantLock())
+    client = ActionClient{A, G, R, F}(node, fqn, support, qos, _action_service_tis(A, support),
+                                      gid, 0, true, nothing, ReentrantLock())
     _warmup!(_resolve_warmup(node, warmup, warmup_sync), () -> _warm_client(client))
     return client
 end
@@ -81,7 +87,7 @@ _request_attachment(client::ActionClient) =
 # type's own, is what routes against a native rmw_zenoh peer. The action-typed info
 # is the Julia-to-Julia path when the service hashes can't be synthesized.
 function _client_service_ti(client::ActionClient{A}, kind::Symbol) where {A}
-    tis = _action_service_tis(A, client.support)
+    tis = client._service_tis           # cached at construction (was recomputed per call)
     tis === nothing ? type_info(A) : getfield(tis, kind)
 end
 

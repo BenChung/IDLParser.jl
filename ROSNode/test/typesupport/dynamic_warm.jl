@@ -89,7 +89,7 @@ _mkhash(seed::Integer) = TypeHash(0x01, ntuple(i -> UInt8((seed + i) % 256), 32)
             ROSNode.enable_project_cache!(dir)
             empty!(ROSNode._MANIFESTS)
             _dwctx() do ctx
-                node = Node(ctx, "rec")                    # default warmup = :precompile
+                node = Node(ctx, "rec"; warmup = :precompile)   # opt in (node default is :off); replay records on first sight
                 got  = Channel{Any}(8)
                 sub  = Subscription(node, "/kv") do msg; put!(got, msg); end
                 @test sub isa DynamicSubscriptionHandle

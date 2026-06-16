@@ -31,7 +31,13 @@ using StaticArrays: StaticArray
 # ── the dispatcher ─────────────────────────────────────────────────────────────
 # `_warmup!` only chooses off / inline (sync) / background (async). A background warm
 # touches only already-constructed, type-stable state, so it races nothing.
-function _warmup!(policy::WarmupPolicy, warm)
+#
+# `@nospecialize warm`: the thunk is built at every endpoint/member construction, but its
+# body must NOT be inferred there — that would pull the whole `_warm_*` machinery into the
+# foreground inference of construction even when warm-up is off (the default). Nospecializing
+# makes the `warm()` call dynamic, so the thunk is inferred/compiled only if it actually runs
+# (on the background task, off the foreground), and not at all when the mode is `NoWarmup`.
+function _warmup!(policy::WarmupPolicy, @nospecialize(warm))
     policy.mode isa NoWarmup && return nothing
     if policy.sync
         warm()
@@ -260,6 +266,10 @@ end
             precompile(decode_view,  (Zenoh.PayloadView, Type{TD.GetTypeDescription_Request}))
             precompile(encode, (TD.GetTypeDescription_Response,))
             precompile(service_type_info_of, (Type{TD.GetTypeDescription_Request}, Type{TD.GetTypeDescription_Response}))
+            # the consumer-task setup (its handler reaches `_spawn_service_consumer` as an abstract
+            # `Function`, view=false ⇒ Bool, Serial concurrency)
+            precompile(_spawn_service_consumer, (Entity, Type{TD.GetTypeDescription_Request},
+                                                 Type{TD.GetTypeDescription_Response}, Function, Bool, Serial))
         end
         # The composed-`@node` façade wiring is non-parametric — `CompositeParameterServer`
         # holds its members in a runtime field, not a type parameter — so its construction +
