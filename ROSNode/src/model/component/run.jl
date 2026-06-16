@@ -752,15 +752,16 @@ function _construction_precompile_specs(::Type{M}) where {M}
             push!(specs, (encode, (p.msgtype,)))
             push!(specs, (publish, (PublisherHandle{p.msgtype, Zenoh.Publisher}, p.msgtype)))
         elseif p.kind === :subscription || p.kind === :service
-            # The materialise path builds these with `warmup = :off` (a `Symbol`), so the heavy
-            # builder body specialises on that kwarg type — anchor the matching `Core.kwcall`. The
-            # `EndpointKind` functor branches on its value, so its kwcall infers both inner
-            # builders; pin the inner builder's kwsorter too.
+            # The materialise path passes `p.reaction` (typed `Any` in the spec), so the
+            # construction call there isn't inferable on its own — anchor the inner builder on the
+            # concrete `_sub_cb` closure type `H`. It's built with `warmup = :off` (a `Symbol`), so
+            # the heavy builder body specialises on that kwarg type; pin the matching `Core.kwcall`.
+            # (The `SubscriptionKind`/`ServiceKind` construction methods now dispatch by type, so
+            # the thin functor forward is inferable and needs no anchor of its own.)
             H = _cb_type(_sub_cb, p.reaction, M)
             H === nothing && continue
             inner = p.kind === :subscription ? _make_subscription : _make_service
             kw = NamedTuple{(:warmup,), Tuple{Symbol}}
-            push!(specs, (Core.kwcall, (kw, EndpointKind,  H, Node, String, Type{p.msgtype})))
             push!(specs, (Core.kwcall, (kw, typeof(inner), H, Node, String, Type{p.msgtype})))
         elseif p.kind === :timer
             H = _cb_type(_timer_cb, p.reaction, M)

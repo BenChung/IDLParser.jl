@@ -101,9 +101,29 @@ TypeInfo(name::AbstractString, hash::TypeHash) = TypeInfo(String(name), hash)
 # Endpoint kind. Two-letter codes (`MP`, `MS`, `SS`, `SC`) are the on-wire
 # encoding shared by both formatters. Nodes use `NN`, handled separately at
 # parse time.
-@enum EndpointKind Publisher Subscription Service Client
+#
+# Each kind is a distinct singleton TYPE with a const instance (`Publisher`/…), not an
+# `@enum` value. Construction dispatches on the kind — `Publisher(node, topic, T)` in
+# ROSNode resolves by the instance's type — so the builder is chosen statically and the
+# whole construction path is inferable; an `@enum` forces a runtime `=== Publisher` branch
+# the compiler can't fold (which made node/parameter-service wiring un-bakeable by
+# `precompile`). The instances stay plain values, so `e.kind === Publisher`, the wire-code
+# maps below, and `EndpointEntity.kind` are all unchanged.
+abstract type EndpointKind end
+struct PublisherKind    <: EndpointKind end
+struct SubscriptionKind <: EndpointKind end
+struct ServiceKind      <: EndpointKind end
+struct ClientKind       <: EndpointKind end
+const Publisher    = PublisherKind()
+const Subscription = SubscriptionKind()
+const Service      = ServiceKind()
+const Client       = ClientKind()
+Base.show(io::IO, ::PublisherKind)    = print(io, "Publisher")
+Base.show(io::IO, ::SubscriptionKind) = print(io, "Subscription")
+Base.show(io::IO, ::ServiceKind)      = print(io, "Service")
+Base.show(io::IO, ::ClientKind)       = print(io, "Client")
 
-const _KIND_CODE = Dict(
+const _KIND_CODE = Dict{EndpointKind, String}(
     Publisher    => "MP",
     Subscription => "MS",
     Service      => "SS",

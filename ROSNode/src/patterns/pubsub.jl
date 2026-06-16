@@ -1,5 +1,5 @@
-# The pub/sub pattern layer. `Publisher` and `Subscription` are `EndpointKind` enum
-# values; this file gives them call-methods so `Publisher(node, topic, T)` and
+# The pub/sub pattern layer. `Publisher` and `Subscription` are `EndpointKind` singleton
+# instances; this file gives them call-methods so `Publisher(node, topic, T)` and
 # `Subscription(node, topic, T) do msg … end` read as constructors, following the
 # `Timer(f, …)` precedent. Each handle wraps a generic `Entity` for the
 # id/token/route/graph lifecycle and adds the typed surface.
@@ -227,11 +227,12 @@ Base.show(io::IO, sub::DynamicSubscriptionHandle) =
 
 entity(sub::DynamicSubscriptionHandle) = sub.entity
 
-# ── enum-instance call-methods: the constructor spelling ──────────────────────
-# `Publisher`/`Subscription` are `EndpointKind` values of one type, so a single
-# call-method per arity on `EndpointKind` branches on the value to its builder. The
-# do-block form desugars to a function-first call, so the handler-carrying arity
-# takes `f` first, following the `Timer(f, …)` precedent.
+# ── per-kind call-methods: the constructor spelling ──────────────────────────
+# `Publisher`/`Subscription` are const singleton instances of distinct `EndpointKind`
+# types, so each builder is a call-method dispatched on the kind's TYPE — not one
+# method branching `=== Publisher` on a shared value (which the compiler can't fold,
+# making construction un-inferable). The do-block form desugars to a function-first call,
+# so the handler-carrying arity takes `f` first, following the `Timer(f, …)` precedent.
 
 """
     Publisher(node::Node, topic, ::Type{T};
@@ -241,7 +242,7 @@ entity(sub::DynamicSubscriptionHandle) = sub.entity
 Declare a publisher for ROS 2 message type `T` on `topic` and return a long-lived
 `PublisherHandle{T}`. Send messages with [`publish`](@ref).
 
-`Publisher` is the `EndpointKind` enum value (re-exported from ROSZenoh); this
+`Publisher` is the `EndpointKind` singleton instance (re-exported from ROSZenoh); this
 call-method gives it the constructor spelling `Publisher(node, topic, T)`,
 paralleling `Timer(f, …)`. The kind is fixed by the spelling; a bare
 `Subscription(node, topic, T)` in this 3-arg position raises an `ArgumentError`
@@ -273,11 +274,14 @@ pub = Publisher(node, "/chatter", std_msgs.msg.String)
 publish(pub, std_msgs.msg.String(data = "hello"))
 ```
 """
-(k::EndpointKind)(node::Node, topic::AbstractString, ::Type{T}; kwargs...) where {T} =
-    k === Publisher ? _make_publisher(node, topic, T; kwargs...) :
-    k === Subscription ?
-        throw(ArgumentError("Subscription requires a handler: `Subscription(node, topic, T) do msg … end`")) :
-        throw(ArgumentError("$(k) is not a pub/sub kind (see Service/Client for request/reply)"))
+# Per-kind dispatch (not a `=== Publisher` branch on one shared value): the builder is chosen by
+# the kind's TYPE, so `Publisher(node, topic, T)` is statically resolvable and inferable.
+(::PublisherKind)(node::Node, topic::AbstractString, ::Type{T}; kwargs...) where {T} =
+    _make_publisher(node, topic, T; kwargs...)
+(::SubscriptionKind)(node::Node, topic::AbstractString, ::Type{T}) where {T} =
+    throw(ArgumentError("Subscription requires a handler: `Subscription(node, topic, T) do msg … end`"))
+(k::EndpointKind)(::Node, ::AbstractString, ::Type) =
+    throw(ArgumentError("$(k) is not a pub/sub kind (see Service/Client for request/reply)"))
 
 # Arg2 is the Node here, vs the typed handler-form in service.jl (handler, node, …),
 # so this dynamic arity stays unambiguous against the other EndpointKind call-methods.
@@ -292,7 +296,7 @@ incoming sample, returning a [`DynamicSubscriptionHandle`](@ref). Use it
 when the topic's type is unknown ahead of time (a recorder, a bridge); graduate to
 `Subscription(node, topic, T)` once the type is known for the min-copy fast path.
 
-This call-method is the type-less spelling of the `Subscription` enum value,
+This call-method is the type-less spelling of the `Subscription` kind,
 distinct from the typed `Subscription(node, topic, T) do … end`; `Subscription` is
 the only kind with a type-less form — a `Service` needs its type to know
 request/response. The data route wildcard-matches every type published on the
@@ -329,10 +333,11 @@ sub = Subscription(node, "/chatter") do msg
 end
 ```
 """
-(k::EndpointKind)(handler, node::Node, topic::AbstractString; kwargs...) =
-    k === Subscription ? _make_dynamic_subscription(handler, node, topic; kwargs...) :
-        throw(ArgumentError("$(k) has no type-less form; only `Subscription(node, topic) do … end` \
-                             omits the type (e.g. Service needs `Service(node, name, SrvType) do … end`)"))
+(::SubscriptionKind)(handler, node::Node, topic::AbstractString; kwargs...) =
+    _make_dynamic_subscription(handler, node, topic; kwargs...)
+(k::EndpointKind)(handler, ::Node, ::AbstractString) =
+    throw(ArgumentError("$(k) has no type-less form; only `Subscription(node, topic) do … end` \
+                         omits the type (e.g. Service needs `Service(node, name, SrvType) do … end`)"))
 
 # The typed handler-form call-method `Subscription(node, topic, T) do msg … end`
 # lives once in service.jl, where it fans Subscription → `_make_subscription` and

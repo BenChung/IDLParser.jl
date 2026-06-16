@@ -10,6 +10,7 @@
 # (Publisher/Subscription/Service/Client) come along so dispatch on kind reads
 # naturally here too.
 using ROSZenoh: QosProfile, TypeInfo, EndpointKind, default_qos,
+                PublisherKind, SubscriptionKind, ServiceKind, ClientKind,
                 Publisher, Subscription, Service, Client
 # Borrowed-payload escape error: the borrowed-view path lets it surface to user
 # code, so it belongs in ROSNode's exported vocabulary.

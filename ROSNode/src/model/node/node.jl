@@ -4,7 +4,7 @@
 # here and dies with it.
 #
 # Naming: `Publisher`/`Subscription`/`Service`/`Client` here are the `EndpointKind`
-# enum instances re-exported by core.jl; the pattern layer (separate files) owns the
+# singleton instances re-exported by core.jl; the pattern layer (separate files) owns the
 # user-facing constructors of the same spelling. This file stays kind-agnostic — it
 # takes an `EndpointKind` tag and builds the wire entity from it.
 

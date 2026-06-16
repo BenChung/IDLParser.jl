@@ -960,7 +960,7 @@ Declare a subscription for ROS 2 message type `T` on `topic` and start its dispa
 runtime, returning a `SubscriptionHandle{T}`. The `do`-block handler runs once per
 received message.
 
-`Subscription` is the `EndpointKind` enum value (re-exported from ROSZenoh); this
+`Subscription` is the `EndpointKind` singleton instance (re-exported from ROSZenoh); this
 call-method gives it the constructor spelling. The `do`-block desugars to a
 function-first call, so the handler leads the argument list. Construction resolves the
 name, builds the endpoint, declares the liveliness token and graph entry, then
@@ -999,8 +999,12 @@ sub = Subscription(node, "/chatter", std_msgs.msg.String) do msg
 end
 ```
 """
-(k::EndpointKind)(handler, node::Node, name::AbstractString, ::Type{T}; kwargs...) where {T} =
-    k === Subscription ? _make_subscription(handler, node, name, T; kwargs...) :
-    k === Service      ? _make_service(handler, node, name, T; kwargs...) :
-        throw(ArgumentError("$(k) does not take a handler in this position \
-                             (Subscription/Service do; Publisher/Client do not)"))
+# Per-kind dispatch on the handler-form: type-resolved builders, so the do-block construction
+# (and the parameter-service wiring built on it) is inferable and `precompile`-bakeable.
+(::SubscriptionKind)(handler, node::Node, name::AbstractString, ::Type{T}; kwargs...) where {T} =
+    _make_subscription(handler, node, name, T; kwargs...)
+(::ServiceKind)(handler, node::Node, name::AbstractString, ::Type{T}; kwargs...) where {T} =
+    _make_service(handler, node, name, T; kwargs...)
+(k::EndpointKind)(handler, ::Node, ::AbstractString, ::Type) =
+    throw(ArgumentError("$(k) does not take a handler in this position \
+                         (Subscription/Service do; Publisher/Client do not)"))

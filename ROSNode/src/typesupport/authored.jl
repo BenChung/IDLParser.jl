@@ -433,10 +433,10 @@ end
 
 # `Service(node, name, f::Function)` — the function is marker + handler. 3-arg, distinct
 # from the 4-arg do-block method and the `Publisher`/`Subscription` `::Type` 3-arg method.
-(k::EndpointKind)(node::Node, name::AbstractString, f::F; kwargs...) where {F<:Function} =
-    k === Service ?
-        _make_service(_authored_service_adapter(f), node, name, F; kwargs...) :
-        throw(ArgumentError("$(k)(node, name, ::Function) is only valid for Service"))
+(::ServiceKind)(node::Node, name::AbstractString, f::F; kwargs...) where {F<:Function} =
+    _make_service(_authored_service_adapter(f), node, name, F; kwargs...)
+(k::EndpointKind)(::Node, ::AbstractString, ::Function) =
+    throw(ArgumentError("$(k)(node, name, ::Function) is only valid for Service"))
 
 ServiceClient(node::Node, name::AbstractString, f::F; kwargs...) where {F<:Function} =
     ServiceClient(node, name, typeof(f); kwargs...)
