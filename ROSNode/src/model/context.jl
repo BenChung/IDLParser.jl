@@ -60,8 +60,8 @@ end
 
 Identity of a discovered node: its `name`, `namespace`, and security `enclave`.
 This is the shape `node_names` returns from a graph query. `node_names`
-currently reports `enclave` as `""`. The enclave is unrecoverable from
-rmw_zenoh liveliness tokens, which always carry `%` on the wire.
+reports `enclave` as `""`: the enclave is unrecoverable from rmw_zenoh
+liveliness tokens, which always carry `%` on the wire.
 """
 struct NodeInfo
     name::String
@@ -671,8 +671,8 @@ resolution:
   (`namespace`/`name`).
 
 The resolved name then passes through the remap rules (an ordered exact-match
-`from => to` table on the node/context, empty until `--ros-args` parsing lands)
-and is charset/structure-validated: leading slash, no empty `//` token, no
+`from => to` table on the node/context, honored when populated and empty by
+default) and is charset/structure-validated: leading slash, no empty `//` token, no
 trailing slash, each token starting with a letter or underscore and containing
 only letters, digits, and underscores.
 
@@ -683,7 +683,7 @@ Returns the validated FQN. Throws `ArgumentError` for:
 - a resolved name that fails validation.
 
 `kind` (`:topic`/`:service`/`:node`) is
-carried for kind-scoped remap rules and leaves the algorithm unchanged today.
+carried for kind-scoped remap rules and does not change the resolution algorithm.
 
 The first argument may be a `Context` (relative names resolve against its
 default namespace; private `~` names need a node) or a node exposing
@@ -1074,16 +1074,21 @@ role). Returns once the drain has fully completed.
 | value | behavior |
 |-------|----------|
 | `false` (the default) | exactly `wait(ctx)`; Julia's default Ctrl-C handling applies. |
-| `true` | signal handling is scoped to this call (see below). |
+| `true` | a Ctrl-C (and, when deployed, SIGTERM) drains gracefully (see below). |
 
-Under `handle_signals=true`:
+Under `handle_signals=true` the graceful drain is reached differently depending on how the
+process runs, because Julia delivers SIGINT differently:
 
-- a first Ctrl-C requests a graceful drain and re-parks until it finishes.
-- a second Ctrl-C during the drain forces `exit(130)`.
+- **Interactive (REPL).** Ctrl-C arrives as a catchable `InterruptException`: the first
+  requests a graceful drain and re-parks until it finishes, a second forces `exit(130)`.
+- **Deployed (`julia -m`, a script).** SIGINT (and SIGTERM, which `ros2 launch` escalates
+  to) *exits* the process, and an `atexit` hook runs the drain. Throwing an
+  `InterruptException` here would deliver it to an arbitrary task and abort before draining.
 
-The
-handlers are removed when `spin` returns, so a library embedding ROSNode keeps
-its own handlers.
+Either way the drain runs every `on_shutdown` hook and member `cleanup`, so teardown is
+consistent across exit paths. The `atexit` drain is also a backstop for a normal or
+error exit. Signal state is restored when `spin` returns, so a library embedding ROSNode
+keeps its own handling.
 
 ```julia
 @context(peers = ["tcp/localhost:7447"]) do ctx
@@ -1106,9 +1111,11 @@ function spin(ctx::Context; handle_signals::Bool=false)
     nothing
 end
 
-# Park on the drain, turning SIGINT into a graceful shutdown. With `exit_on_sigint(false)`
-# set, Julia delivers a Ctrl-C as an `InterruptException` into this task at its `wait`
-# yield-point: the first requests the drain and re-parks, a second hard-exits.
+# Park on the drain. A first interrupt requests the drain and re-parks; a second forces
+# `exit(130)`. Interactively, `exit_on_sigint(false)` delivers a real Ctrl-C here as an
+# `InterruptException`; deployed, SIGINT exits the process and the atexit hook drains
+# instead (see `_install_signal_handlers!`), so this catch then only fires for a
+# programmatically delivered interrupt.
 function _park_until_drained(ctx::Context)
     interrupted = false
     while true
@@ -1119,18 +1126,18 @@ function _park_until_drained(ctx::Context)
             err isa InterruptException || rethrow()
             if !interrupted
                 interrupted = true
-                @info "SIGINT — draining; press Ctrl-C again to force exit"
+                @info "interrupt — draining; interrupt again to force exit"
                 request_shutdown(ctx; reason="SIGINT")
             else
-                @warn "second SIGINT — forcing exit"
+                @warn "second interrupt — forcing exit"
                 exit(130)
             end
         end
     end
 end
 
-# Signal handling scoped to the spin call: install handlers, run `f`, remove them on
-# return, so a library embedding ROSNode keeps its own handlers.
+# Signal handling scoped to the spin call: install handlers, run `f`, restore on return,
+# so a library embedding ROSNode keeps its own handlers.
 function _with_signal_handlers(f, ctx::Context)
     installed = false
     try
@@ -1146,14 +1153,60 @@ function _with_signal_handlers(f, ctx::Context)
     end
 end
 
-# Route Ctrl-C through Julia's scheduler rather than a raw sigaction: `exit_on_sigint(false)`
-# makes Julia deliver SIGINT to the spin task as an `InterruptException`, which
-# `_park_until_drained` turns into a graceful shutdown. Only SIGINT is wired today.
-function _install_signal_handlers!(::Context)
-    Base.exit_on_sigint(false)
+# How a Ctrl-C / SIGTERM becomes a graceful drain depends on how the process is run, because
+# Julia delivers SIGINT differently and only the REPL routes it to a predictable task:
+#
+#  - Interactive (REPL): `exit_on_sigint(false)` makes Ctrl-C a catchable `InterruptException`
+#    delivered to the spinning task, which `_park_until_drained` turns into a drain. Reliable
+#    only because the REPL's eval task is the deterministic interrupt target.
+#  - Non-interactive (`julia -m`, a script): `exit_on_sigint(false)` would throw the
+#    `InterruptException` into whatever task is on thread 0 — usually a transient callback with
+#    no handler — aborting the process ("error thrown and no exception handler available")
+#    before it can drain. So let SIGINT *exit* the process (`exit_on_sigint(true)`) and drain
+#    from the `atexit` hook; this also covers SIGTERM, which `ros2 launch` escalates to.
+#    `julia -m` leaves `exit_on_sigint` at false (unlike a plain script), so set it explicitly.
+#
+# The atexit hook is the teardown backstop for every exit path (signal, error, normal exit),
+# registered in both modes so a clean shutdown always runs the drain.
+function _install_signal_handlers!(ctx::Context)
+    _register_atexit_drain!(ctx)
+    Base.exit_on_sigint(isinteractive() ? false : true)
     return nothing
 end
-_remove_signal_handlers!(::Context) = (Base.exit_on_sigint(true); nothing)
+
+# Restore the interactivity-appropriate `exit_on_sigint` default (no query API exists for the
+# prior value): the REPL runs with it false, a deployed process with it true. The atexit hook
+# can't be unregistered, but `close` is idempotent so a stale hook is a no-op.
+_remove_signal_handlers!(::Context) = (Base.exit_on_sigint(!isinteractive()); nothing)
+
+# One process-wide atexit hook drains every Context that registered for it. A `WeakKeyDict`
+# lets a GC'd Context drop out (the hook holds no strong ref to it), and `close` is idempotent
+# so a Context already drained by `spin`/`close` costs nothing here.
+const _ATEXIT_DRAIN = WeakKeyDict{Context, Nothing}()
+const _ATEXIT_DRAIN_LOCK = ReentrantLock()
+const _ATEXIT_INSTALLED = Ref(false)
+
+function _register_atexit_drain!(ctx::Context)
+    @lock _ATEXIT_DRAIN_LOCK begin
+        _ATEXIT_DRAIN[ctx] = nothing
+        if !_ATEXIT_INSTALLED[]
+            _ATEXIT_INSTALLED[] = true
+            atexit(_drain_registered_at_exit)
+        end
+    end
+    return nothing
+end
+
+function _drain_registered_at_exit()
+    for c in (@lock _ATEXIT_DRAIN_LOCK collect(keys(_ATEXIT_DRAIN)))
+        try
+            close(c)
+        catch err
+            @error "atexit: draining Context failed" exception = (err, catch_backtrace())
+        end
+    end
+    return nothing
+end
 
 # ── node ↔ context plumbing ────────────────────────────────────────────────
 # The Node holds its Context; accept either a Context directly or anything

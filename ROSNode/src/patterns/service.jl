@@ -274,8 +274,9 @@ hang a client:
 The request is fully owned by default (storable, forwardable, spawnable past the
 handler). `view=true` decodes it as a `CDRView` aliasing a private owned
 copy of the payload — variable-length fields stay views over that copy, and the
-view remains valid for as long as it is reachable, since the copy is owned
-(zero-copy over the borrowed wire buffer itself is a pending refinement).
+view remains valid for as long as it is reachable, since the copy is owned. The
+copy is taken because the borrowed query payload must not be aliased past the
+handler.
 
 `concurrency` (a [`Concurrency`](@ref): [`Serial`](@ref)`()`, the default, or
 [`Parallel`](@ref)`(n)`) schedules the handler bodies: `Serial` serves on the

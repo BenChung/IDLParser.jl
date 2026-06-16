@@ -143,11 +143,11 @@ end
         end
     end
 
-    # (6) SIGINT → graceful drain. `exit_on_sigint(false)` (set while spinning) makes
-    # a Ctrl-C arrive as an InterruptException thrown into the spin task; the park
-    # loop catches it and drives request_shutdown. We simulate the OS delivery with
-    # `schedule(t, InterruptException(); error=true)` so the graceful path is tested
-    # deterministically — no interactive signal needed. (The second-Ctrl-C
+    # (6) Interrupt → graceful drain. `_park_until_drained` catches an `InterruptException`
+    # delivered to the spin task and drives request_shutdown (the interactive Ctrl-C path;
+    # deployed, a real SIGINT instead exits and drains via the atexit hook). We simulate the
+    # delivery with `schedule(t, InterruptException(); error=true)` so the graceful path is
+    # tested deterministically — no interactive signal needed. (The second-interrupt
     # `exit(130)` path is not unit-tested here: it ends the process.)
     @testset "handle_signals: Ctrl-C drives a graceful drain" begin
         ctx = _sdctx()

@@ -252,11 +252,14 @@ function _finalize_module!(mod::Module)
         try
             _ensure_schema!(M)                          # __ros_pschema_<M>__ + descriptors/pschema
             nt = _entities_accessor_from_specs!(M)      # __ros_entities_<M>__ + entities(m::M)
-            # Bake handlers only once a typed accessor exists. A mixin with a non-derivable
-            # port (action/client) keeps the generic `entities`, so its handlers warm at
-            # first `run`; baking here would compile against the generic accessor and be
+            # Bake handlers + the construction path only once a typed accessor exists. A mixin
+            # with a non-derivable port (action/client) keeps the generic `entities`, so it warms
+            # at first `run`; baking here would compile against the generic accessor and be
             # invalidated when materialise emits the typed one.
-            nt === nothing || _anchor_reactions!(M)
+            if nt !== nothing
+                _anchor_reactions!(M)       # message handlers + decode/dispatch chain
+                _anchor_construction!(M)    # endpoint/materialise/param-server build path
+            end
         catch err
             @debug "_finalize_module!: skipped a mixin bake" mod mixin = M exception = err
         end
@@ -691,6 +694,66 @@ function _anchor_reactions!(::Type{M}) where {M}
     return nothing
 end
 
+# The concrete materialised-callback closure type for a reaction — the `_sub_cb`/`_timer_cb`
+# the materialise path actually invokes — or `nothing` if it isn't a single concrete type.
+function _cb_type(cb, @nospecialize(reaction), ::Type{M}) where {M}
+    rts = Base.return_types(cb, (typeof(reaction), M))
+    (length(rts) == 1 && isconcretetype(only(rts))) ? only(rts) : nothing
+end
+
+# Anchor the per-mixin CONSTRUCTION path — `precompile`-only, no session, no run. Where
+# `_anchor_reactions!` bakes the message *handlers*, this bakes the machinery that *builds*
+# a member at `run`: the endpoint constructors on the mixin's message types, the materialise
+# frame, the typed `ParameterServer{P_M}` + its service wiring, and the lifecycle hooks. That
+# path is the dominant first-`run` cost and is reached at runtime only through the `Any`-typed
+# member dispatch (`cnode.members[nm]`), so it is never statically reachable from ROSNode's own
+# precompile image — only this base-type bake (in the consumer's `@precompile_nodes`) anchors it.
+#
+# Concrete `M` only: a parametric mixin's instantiation is chosen by `construct`, unknown at the
+# module-end bake, so it keeps warming at first `run`. The endpoint builders are anchored on the
+# concrete `_sub_cb`/`_timer_cb` closure types (the materialise path's `p.reaction` is `Any`, so
+# inference can't reach them on its own — the function-barrier reason `_sub_cb` exists). Guarded
+# so a quirk in one mixin can't break the package's precompile.
+function _anchor_construction!(::Type{M}) where {M}
+    isconcretetype(M) || return nothing
+    try
+        P = pschema(M)
+        # typed parameter server + the six standard parameter services (their fixed
+        # rcl_interfaces codecs are baked into ROSNode's image by the warm-up workload).
+        precompile(ParameterServer, (Node, P))
+        precompile(_build_pserver,  (Node, Type{P}, NamedTuple{(), Tuple{}}))
+        precompile(wire_parameter_services!, (ParameterServer{P},))
+        for p in mixin_spec(M).ports
+            if p.kind === :publisher
+                precompile(_make_publisher, (Node, String, Type{p.msgtype}))
+            elseif p.kind === :subscription || p.kind === :service
+                # The materialise path builds these with `warmup = :off` (a `Symbol`), so the
+                # heavy builder body specialises on that kwarg type — anchor the matching
+                # `Core.kwcall`. The `EndpointKind` functor branches on its value, so its kwcall
+                # infers both inner builders; pin the inner builder's kwsorter too.
+                H = _cb_type(_sub_cb, p.reaction, M)
+                H === nothing && continue
+                inner = p.kind === :subscription ? _make_subscription : _make_service
+                kw = NamedTuple{(:warmup,), Tuple{Symbol}}
+                precompile(Core.kwcall, (kw, EndpointKind,  H, Node, String, Type{p.msgtype}))
+                precompile(Core.kwcall, (kw, typeof(inner), H, Node, String, Type{p.msgtype}))
+            elseif p.kind === :timer
+                H = _cb_type(_timer_cb, p.reaction, M)
+                H === nothing || precompile(_paused_timer, (Node, Duration, H))
+            end
+        end
+        # the materialise frame specialised on `M` + its schema, plus the member lifecycle
+        # hooks the fan-out invokes dynamically.
+        precompile(_materialize_ports!, (Node, M, Symbol, Vector{PortSpec}, P, Dict{Symbol, String}))
+        for h in (configure, activate, deactivate, cleanup, on_error)
+            precompile(h, (M,))
+        end
+    catch err
+        @debug "_anchor_construction!: skipped a construction bake" mixin = M exception = err
+    end
+    return nothing
+end
+
 # Runtime warm: anchor the member's handlers against its concrete `typeof(m)` once the typed
 # accessors exist. Honours `node.warmup` via `_warmup!` (off / inline-sync / background).
 # Subscriptions' own per-port warm is `:off`ed in `_materialize_ports!`; timers and services
@@ -1094,9 +1157,9 @@ deploy-time wiring differs.
 
 Returns the live [`Container`](@ref). Behavior depends on `block`:
 
-- `block=true` (default) — `spin` installs a SIGINT handler for the duration (the first
-  Ctrl-C drains gracefully, a second forces exit), and the call returns once the Context
-  has drained, closing it. SIGTERM is not yet wired and terminates the process without draining.
+- `block=true` (default) — `spin` handles signals for the duration (interactively, the first
+  Ctrl-C drains gracefully and a second forces exit; deployed, SIGINT and SIGTERM exit and
+  drain via an atexit hook), and the call returns once the Context has drained, closing it.
 - `block=false` — the call returns the running `Container` immediately, leaving you to
   drive it and `close(c)` it; the Context stays open until then.
 - An exception during `f(c)` closes the Context and propagates.
@@ -1107,8 +1170,8 @@ container accepts `ros2 component load/unload/list` and the `ComposableNodeConta
 launch action.
 
 `intra_process=true` (default) enables the intra-process short-circuit (same-Context
-publisher↔subscriber pairs bypass serialize/Zenoh/decode) through `set_intra_process!` —
-a process-global switch today.
+publisher↔subscriber pairs bypass serialize/Zenoh/decode) through `set_intra_process!`,
+a process-global switch.
 
 ```julia
 container("vision") do c

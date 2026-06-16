@@ -349,9 +349,10 @@ _wall_ns(::Clock, d::Duration) = d.ns
     sleep(clock::Clock, dur)
     sleep(node, dur)
 
-Sleep `dur` (a `Duration` or `Dates.Period`) on `clock`'s timeline. Sim-aware on
-the ROS clock and interruptible on `close(ctx)` (raises `ShutdownException`).
-A `node` first argument uses its ROS clock.
+Sleep `dur` (a `Duration` or `Dates.Period`) on `clock`'s timeline. Blocks the
+wall span (the ROS clock sleeps wall time, not simulated `/clock` time) and is
+interruptible on `close(ctx)` (raises `ShutdownException`). A `node` first
+argument uses its ROS clock.
 """
 function Base.sleep(c::Clock, dur)
     ns = _wall_ns(c, Duration(_to_ns(dur)))
@@ -433,7 +434,7 @@ Fire `f()` every `period` (a `Duration` or `Dates.Period`) on `clock`. The
 backing implementation depends on the clock:
 
 - `Steady()`/`System()` — a wall-driven `Base.Timer` task.
-- `ROS()` — under sim it tracks `/clock` (TODO).
+- `ROS()` — a wall-driven `Base.Timer`; it fires on wall time, not simulated `/clock` time.
 
 `close(timer)` stops it; it also dies with the node.
 """

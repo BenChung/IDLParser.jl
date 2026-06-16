@@ -328,10 +328,10 @@ Declare a client port (a service or action client) on mixin `M` for type `T`.
 The wire name defaults to the port identifier `name`; `on "…"` overrides it. This is a
 HAS port — a handle the mixin drives from its reactions and awaits a reply on.
 
-Construct the client directly for now — `ServiceClient(node, name, T)` or
-`ActionClient(node, name, A)` against the node-core: `@uses` records a `:client` port
-spec, but port materialisation does not yet build a handle for the kind — it warns and
-skips, so `entities(m).name` is absent until materialisation is wired.
+Construct the client directly — `ServiceClient(node, name, T)` or
+`ActionClient(node, name, A)` against the node-core. `@uses` records a `:client` port
+spec, but port materialisation does not build a handle for the kind: it warns and skips,
+so `entities(m).name` holds no client handle.
 
 ```julia
 @uses Detector planner :: NavigateToPose on "/planner"
@@ -909,8 +909,8 @@ subtyping (a mixin may provide any number) and not method existence.
 
 The method signatures after the name are documentation only: the macro discards them,
 and a provider satisfies the interface by defining the methods and declaring
-`@provides M Name` — the resolver trusts the declaration (an expansion-time backing
-check is a later increment).
+`@provides M Name` — the resolver trusts the declaration, with no check that the methods
+actually exist.
 
 ```julia
 @interface PoseSource  last_pose(_)::Pose
@@ -953,9 +953,9 @@ requirement), forms a dependency edge, toposorts the members, and injects the re
 providers positionally into `construct(::Type{M}, node, deps…)` in `requires` order.
 
 Zero matches is an unsatisfied-dependency error; more than one is an ambiguity error
-(restructure so a single sibling satisfies it). Known gap: the pin-pair disambiguation
-(an entry `I => :member` or `I => MixinType`) is not yet honored — a `Pair` entry
-raises an error directing you to restructure.
+(restructure so a single sibling satisfies it). Pin-pair disambiguation (an entry
+`I => :member` or `I => MixinType`) is unsupported — a `Pair` entry raises an error
+directing you to restructure.
 """
 requires(::Type) = ()
 
@@ -966,8 +966,8 @@ Declare that mixin `M` provides the given interfaces — emits the Holy-trait
 evidence `provides(::Type{M}) = (Interface₁, …)`. A mixin may provide any number of
 interfaces.
 
-The declaration is taken on trust: a check that `M` defines each interface's methods
-is a later increment. The node assembler reads this evidence to resolve
+The declaration is taken on trust, with no check that `M` actually defines each
+interface's methods. The node assembler reads this evidence to resolve
 siblings' [`requires`](@ref) to providers.
 
 ```julia

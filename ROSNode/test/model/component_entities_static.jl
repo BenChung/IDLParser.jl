@@ -54,3 +54,31 @@ using ._StaticEnt: Probe
         end
     end
 end
+
+# Drift guard for the `@precompile_nodes` CONSTRUCTION anchors (`_anchor_construction!`).
+# Unlike the tier-2 scaffolding anchors, these are built per-mixin from the specs, so a
+# renamed/re-aritied builder silently de-anchors (the bake quietly stops covering the
+# materialise/param path, reading green). Pure: resolves signatures, opens no session.
+@testset "construction-path precompile anchors resolve" begin
+    R = ROSNode
+    R._ensure_schema!(Probe)
+    @test R._entities_accessor_from_specs!(Probe) !== nothing
+    @test R._anchor_construction!(Probe) === nothing      # runs clean on a concrete mixin
+
+    P = R.pschema(Probe)
+    specs = mixin_spec(Probe).ports
+    # the materialise frame + typed parameter-server build path
+    @test precompile(R._materialize_ports!, (R.Node, Probe, Symbol, Vector{R.PortSpec}, P, Dict{Symbol, String}))
+    @test precompile(R.ParameterServer, (R.Node, P))
+    @test precompile(R._build_pserver, (R.Node, Type{P}, NamedTuple{(), Tuple{}}))
+    @test precompile(R.wire_parameter_services!, (R.ParameterServer{P},))
+    # per-kind endpoint builders, on the concrete reaction-closure types
+    pub = only(p for p in specs if p.kind === :publisher)
+    @test precompile(R._make_publisher, (R.Node, String, Type{pub.msgtype}))
+    tmr = only(p for p in specs if p.kind === :timer)
+    @test precompile(R._paused_timer, (R.Node, R.Duration, R._cb_type(R._timer_cb, tmr.reaction, Probe)))
+    # the sub/service builders are reached with `warmup = :off`; the kwcall anchor bakes the
+    # `#f#` body ONLY when the keyword name is one the target declares (else just the kwsorter).
+    @test :warmup in reduce(union, (Base.kwarg_decl(m) for m in methods(R._make_subscription)); init = Symbol[])
+    @test :warmup in reduce(union, (Base.kwarg_decl(m) for m in methods(R._make_service)); init = Symbol[])
+end

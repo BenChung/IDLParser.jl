@@ -227,6 +227,24 @@ end
             decode_owned(as_memory(z, UInt8), T)
             decode_view(as_memory(z, UInt8), T)
         end
+        # The six standard parameter services + /parameter_events ride every node that
+        # calls `wire_parameter_services!`, and their request/response codecs are over
+        # fixed `rcl_interfaces` types — so bake that shared codec layer once here rather
+        # than re-JITing it at the first node with parameters. The per-node service
+        # *construction* + handler closures stay `@precompile_nodes`' job.
+        let RCL = Interfaces.rcl_interfaces.srv
+            for (ReqT, RespT) in ((RCL.DescribeParameters_Request,        RCL.DescribeParameters_Response),
+                                  (RCL.GetParameterTypes_Request,         RCL.GetParameterTypes_Response),
+                                  (RCL.GetParameters_Request,             RCL.GetParameters_Response),
+                                  (RCL.ListParameters_Request,            RCL.ListParameters_Response),
+                                  (RCL.SetParameters_Request,             RCL.SetParameters_Response),
+                                  (RCL.SetParametersAtomically_Request,   RCL.SetParametersAtomically_Response))
+                precompile(decode_owned, (Memory{UInt8}, Type{ReqT}))
+                precompile(decode_view,  (Memory{UInt8}, Type{ReqT}))
+                precompile(encode,       (RespT,))
+            end
+            precompile(encode, (Interfaces.rcl_interfaces.msg.ParameterEvent,))
+        end
         # Re-bake the PEG grammar combinators with Zenoh loaded. ROSMessages bakes them
         # in its Zenoh-free pkgimage, but Zenoh's `pointer(::GuardedPayloadView)`
         # specialization (GuardedPayloadView <: DenseVector) invalidates them at load,

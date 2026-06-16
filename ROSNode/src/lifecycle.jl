@@ -362,7 +362,8 @@ from a client owned by a managed node that is not [`Active`](@ref). A node
 administratively brought down should not address a remote peer, so the call is gated
 at entry (an already in-flight call completes under its own timeout). Probe liveness
 first with [`isactive`](@ref)`(node)`; a standalone client on an unmanaged node is
-always active and never gates. Service [`call`](@ref) is not gated at entry today.
+always active and never gates. Service [`call`](@ref) is not gated at entry, so a
+request issued from an inactive node's client still goes out.
 """
 struct NodeInactiveError <: Exception
     msg::String
