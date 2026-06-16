@@ -93,6 +93,9 @@ try
         # §14.1 Context drain/shutdown root — hook ordering, bounded slow hook,
         # idempotent request_shutdown, reverse undeclare, wait/spin unblock.
         _section("context_shutdown", "model/context_shutdown.jl")
+        # Revise-safety: replaying a declaration macro's expansion (what Revise does on a
+        # reaction/struct edit) must not duplicate ports/params or roster entries. Pure-logic.
+        _section("component_revise", "model/component_revise.jl")
         # §4.4/§7 component layer — multi-mixin node-level parameter namespacing
         # (member-prefixed ros2 param) + dynamic LoadNode/ros2 component composition.
         _section("component_namespacing", "model/component_namespacing.jl")

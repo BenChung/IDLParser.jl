@@ -221,7 +221,12 @@ macro node(assign)
         if !isdefined($modu, :__node_kinds__)
             $(esc(:__node_kinds__)) = $(Tuple{String, Any})[]
         end
-        push!($(esc(:__node_kinds__)), ($(string(N)), $(esc(N))))
+        # Replace-by-name so a Revise re-eval of this `@node` refreshes the roster entry
+        # rather than appending a stale duplicate of the same kind.
+        let nk = $(esc(:__node_kinds__)), e = ($(string(N)), $(esc(N)))
+            local i = findfirst(x -> x[1] == e[1], nk)
+            i === nothing ? push!(nk, e) : (nk[i] = e)
+        end
         # Install ROSNode's load hook unless the module brings its own `__init__` (then
         # call `ROSNode.ros_init!(@__MODULE__)` from it).
         if !isdefined($modu, :__init__)

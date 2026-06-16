@@ -88,10 +88,26 @@ function _check_decl_key(::Type{M}) where {M}
     return nothing
 end
 
-_add_param!(::Type{M}, p::ParamSpec) where {M} =
-    (_check_decl_key(M); push!(mixin_spec(M).params, p); nothing)
-_add_port!(::Type{M}, p::PortSpec) where {M} =
-    (_check_decl_key(M); push!(mixin_spec(M).ports, p); nothing)
+# Replace-by-name, not append. Revise re-evaluates a declaration's whole top-level
+# expression when its body is edited — for `@hears`/`@every`/`@serves`/`@runs` that
+# expression also carries this registration, so a plain `push!` would double the
+# port/param on every reaction edit and clash at assembly (two publishers on one wire).
+# A name is unique within a mixin (it keys `entities(m)` / the parameter schema), so an
+# existing same-name entry is the prior definition — overwrite it in place.
+function _add_param!(::Type{M}, p::ParamSpec) where {M}
+    _check_decl_key(M)
+    ps = mixin_spec(M).params
+    i = findfirst(q -> q.name === p.name, ps)
+    i === nothing ? push!(ps, p) : (ps[i] = p)
+    return nothing
+end
+function _add_port!(::Type{M}, p::PortSpec) where {M}
+    _check_decl_key(M)
+    ps = mixin_spec(M).ports
+    i = findfirst(q -> q.name === p.name, ps)
+    i === nothing ? push!(ps, p) : (ps[i] = p)
+    return nothing
+end
 
 # ── the per-instance runtime binding (the hidden `__rt__`) ──────────────────────
 # Each constructed mixin carries a back-ref to its node-core plus its materialised
@@ -193,8 +209,12 @@ macro mixin(structexpr)
         Base.@kwdef $newstruct
         # Spec store + dispatch, both `const`/method in this module so they ride its
         # precompile image. `@param`/`@publishes`/… run as later top-level statements, so
-        # `mixin_spec` is already visible when they push onto the spec.
-        const $specsym = $(MixinSpec)()
+        # `mixin_spec` is already visible when they push onto the spec. Reuse an existing
+        # spec rather than resetting it: under Revise a struct-body edit re-evaluates only
+        # this `@mixin` expression, not the separate `@param`/`@publishes` statements, so a
+        # fresh `MixinSpec()` here would drop every port/param until the next full reload.
+        const $specsym = isdefined(@__MODULE__, $(QuoteNode(specsym))) ?
+            getfield(@__MODULE__, $(QuoteNode(specsym)))::$(MixinSpec) : $(MixinSpec)()
         $(GlobalRef(@__MODULE__, :mixin_spec))(::$(Type){$base}) = $specsym
         $(GlobalRef(@__MODULE__, :ismixin))(::$(Type){$base}) = true
         # Module-local roster of mixin bases, drained by `ros_init!` at load to generate
@@ -202,7 +222,13 @@ macro mixin(structexpr)
         if !isdefined(@__MODULE__, :__mixin_bases__)
             global __mixin_bases__ = $(Any)[]
         end
-        push!(__mixin_bases__, $base)
+        # Replace-by-name: a Revise re-eval of this `@mixin` must not append a duplicate
+        # base (which re-bakes the schema/anchors at load). Keyed by name, not identity,
+        # because redefining the struct yields a NEW type — replacing the prior entry keeps
+        # the roster pointing at the live type for the next load's schema gen/registration.
+        let mb = __mixin_bases__, j = findfirst(b -> nameof(b) === nameof($base), mb)
+            j === nothing ? push!(mb, $base) : (mb[j] = $base)
+        end
         # Register the loadable kind immediately for the REPL/script case; a precompiled
         # package defers to `ros_init!`, since a top-level mutation of ROSNode's registry
         # would not survive precompile.
