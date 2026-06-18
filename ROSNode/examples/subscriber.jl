@@ -1,7 +1,7 @@
 # Minimal subscriber: prints every std_msgs/String received on /chatter.
 #
 #     zenohd -l tcp/localhost:7447 &
-#     julia --project=. ROSNode/examples/subscriber.jl
+#     julia --project=ROSNode ROSNode/examples/subscriber.jl   # from the workspace root
 #
 # Pair it with `publisher.jl` (or `ros2 topic pub /chatter std_msgs/msg/String …`).
 

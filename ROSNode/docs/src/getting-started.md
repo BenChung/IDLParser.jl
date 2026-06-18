@@ -4,16 +4,16 @@ ROSNode brings ROS 2 publish/subscribe, services, and actions to Julia over Zeno
 
 ## Adding ROSNode
 
-ROSNode ships as part of this workspace. Activate the workspace project and load the package:
+ROSNode is a member of this workspace. Activate its project to resolve the package and its dependencies:
 
 ```julia
 using ROSNode
 ```
 
-Run any example with the workspace project active so ROSNode and its dependencies resolve:
+From the workspace root, run any example against the `ROSNode` member project:
 
 ```sh
-julia --project=. ROSNode/examples/publisher.jl
+julia --project=ROSNode ROSNode/examples/publisher.jl
 ```
 
 ## Starting a router
@@ -24,7 +24,13 @@ ROSNode is built on Zenoh and mirrors `rmw_zenoh`, whose discovery is **router-b
 zenohd -l tcp/localhost:7447 &
 ```
 
-The `peers = ["tcp/localhost:7447"]` argument to `@context` selects that router. Omit `peers` (and set `localhost_only` / `domain_id` as needed) to use environment discovery. `localhost_only = true` confines discovery to the configured router; omit it to reach peers on other hosts.
+`@context` takes three discovery knobs; see the [`Context`](@ref) docstring for the full catalog:
+
+- `peers = ["tcp/localhost:7447"]` adds connect endpoints, dialing that router.
+- `localhost_only = true` disables multicast scouting and defaults the connect endpoint to the loopback router. The default `false` reaches peers on other hosts.
+- `domain_id` selects the ROS 2 domain.
+
+Omit all three to discover from the environment.
 
 ## Running the examples
 
@@ -33,17 +39,17 @@ Start a router, then run the two halves in separate Julia processes pointed at t
 ```sh
 zenohd -l tcp/localhost:7447 &
 
-julia --project=. ROSNode/examples/publisher.jl     # in one terminal
-julia --project=. ROSNode/examples/subscriber.jl    # in another
+julia --project=ROSNode ROSNode/examples/publisher.jl     # in one terminal
+julia --project=ROSNode ROSNode/examples/subscriber.jl    # in another
 ```
 
-The publisher logs `published "hello world N"` once a second; the subscriber logs a matching `heard "hello world N"` for each one as it arrives.
+The publisher emits a `published` `@info` record once a second, carrying `msg.data = "hello world N"`; the subscriber emits a matching `heard` record for each one as it arrives, carrying `msg.data` and its `String` type.
 
 Examples that bundle both halves (`service.jl`, `action.jl`, `parameters.jl`) take a role argument to split across two processes — the `ROLE` env var or the first CLI arg, defaulting to `both`:
 
 ```sh
-julia --project=. ROSNode/examples/service.jl server    # serve only (Ctrl-C to stop)
-julia --project=. ROSNode/examples/service.jl client    # call only (needs a server)
+julia --project=ROSNode ROSNode/examples/service.jl server    # serve only (Ctrl-C to stop)
+julia --project=ROSNode ROSNode/examples/service.jl client    # call only (needs a server)
 ```
 
 Run each with no argument to drive both halves in one self-contained process: point it at the router and go.

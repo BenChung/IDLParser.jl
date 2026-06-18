@@ -2,7 +2,7 @@
 #
 # Run a Zenoh router first (rmw_zenoh's discovery is router-based), then:
 #     zenohd -l tcp/localhost:7447 &
-#     julia --project=. ROSNode/examples/publisher.jl
+#     julia --project=ROSNode ROSNode/examples/publisher.jl   # from the workspace root
 #
 # Pair it with `subscriber.jl`, or with a real ROS2 `ros2 topic echo /chatter`
 # (with rmw_zenoh and a matching router/domain).

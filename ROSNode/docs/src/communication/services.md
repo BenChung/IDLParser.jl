@@ -22,6 +22,20 @@ using ROSNode
 end
 ```
 
+### Server options
+
+`Service` takes keywords that tune the route and the handler's execution:
+
+| Keyword | Default | Controls |
+|---|---|---|
+| `qos` | `default_qos()` | the route's ROS 2 QoS policies |
+| `view` | `false` | decode the request as a zero-copy `CDRView` aliasing the borrowed payload, valid only within the handler |
+| `concurrency` | `Serial()` | handler scheduling — `Serial()` on the node's one cooperative thread, `Parallel(n)` on up to `n` OS threads |
+| `detach_timeout` | `60.0` | seconds a [`detach!`](@ref)ed request may stay unsettled before a sweeper force-aborts it; `0` or `Inf` waits only on drain |
+| `warmup` | node policy | warm-up policy that pre-JITs the decode → handler → encode chain |
+
+The two blocks run as a pair: the server above serves until Ctrl-C, and a second process runs the client below against it.
+
 The client constructs a `ServiceClient` over the same request type, waits for a server to route-match, then calls. `call` blocks for the reply:
 
 ```julia

@@ -29,12 +29,16 @@ end
 
 # action: bare namespace is the handle; sections by short name
 server = ActionServer(node, "/fibonacci", Fibonacci) do goal
+    seq = Int32[0, 1]   # elides the per-step extension loop
     feedback!(goal, Fibonacci.Feedback(partial_sequence = seq))
     Fibonacci.Result(sequence = seq)
 end
 ```
 
-`from=` accepts one directory or a vector of source roots. Add `as Alias` to rename a binding when leaf names would clash, and list several interfaces in one macro call.
+One `@ros_import` call handles several interfaces, with these knobs:
+
+- `from=` accepts one directory or a vector of source roots.
+- `as Alias` renames a message binding when leaf names would clash. It applies to messages only; a service or action has no single struct to bind, so an `as` on either errors.
 
 Drop `from=` to resolve a name from the vendored tree and the local ROS 2 environment:
 
@@ -46,7 +50,7 @@ ROSNode searches three sources for each name, in order:
 
 1. the `from=` source roots, when given;
 2. ROSNode's vendored interface tree;
-3. the local ROS 2 install, scanned in turn: `AMENT_PREFIX_PATH` (a sourced workspace), then `CMAKE_PREFIX_PATH`, then the `/opt/ros/<distro>` system installs (`rolling`, `jazzy`, `kilted`, `lyrical`, `humble`).
+3. the local ROS 2 install, scanned in turn: roots registered with [`add_search_path!`](@ref) (highest precedence), then `AMENT_PREFIX_PATH` (a sourced workspace), then `CMAKE_PREFIX_PATH`, then the `/opt/ros/<distro>` system installs (`rolling`, `jazzy`, `kilted`, `lyrical`, `humble`).
 
 Because `from=` roots come first, a local package can supply a new type or override a vendored or environment one.
 
@@ -63,11 +67,7 @@ A ROS interface's wire type is identified by its name plus its RIHS01 hash, deri
 
 That shared identity is what makes ROSNode wire-compatible with ROS 2 — see [Interoperating with ROS 2](../interop/ros2.md) for the `ros2` CLI commands that exercise it.
 
-## Next
-
-Carry one of these types onto a channel in [Topics](../communication/topics.md). For how a type's value reaches your handler, see [The Runtime Model](runtime-model.md).
-
-## API reference
+`as` casts a value to a sibling type that shares its RIHS01, copying the field values into the target type:
 
 ```@meta
 CurrentModule = ROSNode
@@ -76,3 +76,7 @@ CurrentModule = ROSNode
 ```@docs
 as
 ```
+
+## Next
+
+Carry one of these types onto a channel in [Topics](../communication/topics.md). For how a type's value reaches your handler, see [The Runtime Model](runtime-model.md).

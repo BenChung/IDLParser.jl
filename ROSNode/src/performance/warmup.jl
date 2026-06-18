@@ -271,6 +271,44 @@ end
             precompile(_spawn_service_consumer, (Entity, Type{TD.GetTypeDescription_Request},
                                                  Type{TD.GetTypeDescription_Response}, Function, Bool, Serial))
         end
+        # Each of the seven standard services above spawns a consumer task whose body is
+        # `while true; serve(take!(qable)); end` → `_serve_query(…, handler, view)`. When that
+        # task is first scheduled at a node's bring-up, inferring the loop drags in the WHOLE
+        # serve tree (request decode → handler → `ResultCell`/`ScopedValues` settle → response
+        # encode) — profiled as the single largest first-`run` framework cost (~3.4 s; see
+        # examples/startup/STARTUP-REPORT.md). The codec anchors above don't reach it: the serve
+        # tree keys on the *concrete* handler type and the owned-query type, which those lines
+        # never name. Anchor the concrete `_serve_query` per service — inference dominates, and
+        # `precompile` caches inference — so it bakes here once for every node rather than
+        # re-inferring at the first node's bring-up. (The earlier abstract-`Function` anchor for
+        # get_type_description is why this was missed.)
+        let RCL = Interfaces.rcl_interfaces.srv,
+            TD = Interfaces.type_description_interfaces.srv,
+            Q  = Zenoh.Query{Base.RefValue{Zenoh.LibZenohC.z_owned_query_t}}
+            for (Op, ReqT, RespT) in ((:describe,   RCL.DescribeParameters_Request,      RCL.DescribeParameters_Response),
+                                      (:get_types,  RCL.GetParameterTypes_Request,       RCL.GetParameterTypes_Response),
+                                      (:get,        RCL.GetParameters_Request,           RCL.GetParameters_Response),
+                                      (:list,       RCL.ListParameters_Request,          RCL.ListParameters_Response),
+                                      (:set,        RCL.SetParameters_Request,           RCL.SetParameters_Response),
+                                      (:set_atomic, RCL.SetParametersAtomically_Request, RCL.SetParametersAtomically_Response))
+                # param services hold a concrete `_ParamSvcHandler{Op, CompositeParameterServer}`
+                precompile(_serve_query, (Entity, Q, Type{ReqT}, Type{RespT},
+                                          _ParamSvcHandler{Op, CompositeParameterServer}, Bool))
+            end
+            # get_type_description's handler is held abstractly (`Function`) at runtime
+            precompile(_serve_query, (Entity, Q, Type{TD.GetTypeDescription_Request},
+                                      Type{TD.GetTypeDescription_Response}, Function, Bool))
+        end
+        # /rosout: the node logger encodes an `rcl_interfaces.msg.Log` on the first record, which
+        # fires during bring-up. Fixed type → bake the encode here (the lazy `_rosout_publisher!`
+        # builder is anchored in introspection.jl, where it is defined).
+        precompile(encode, (Interfaces.rcl_interfaces.msg.Log,))
+        # Discovery: every endpoint a node declares loops back through the liveliness consumer,
+        # which parses the token + QoS off the fixed `RmwZenoh` format. Anchoring `parse_liveliness`
+        # bakes that parse subtree (it calls `decode_qos` internally); `parse_topic_keyexpr` is the
+        # service/topic-name parse the graph introspection runs.
+        precompile(parse_liveliness,    (RmwZenoh, String))
+        precompile(parse_topic_keyexpr, (RmwZenoh, String))
         # The composed-`@node` façade wiring is non-parametric — `CompositeParameterServer`
         # holds its members in a runtime field, not a type parameter — so its construction +
         # six-service wiring + `/parameter_events` aggregation is one specialisation shared by

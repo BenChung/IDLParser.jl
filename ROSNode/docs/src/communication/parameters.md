@@ -24,22 +24,25 @@ The annotations on each field shape how peers may drive it:
 - `∈ (a, b, c)` constrains a field to that choice set.
 - `|> readonly` blocks runtime sets; startup overrides still apply.
 
-Legal field types are the ROS 2 parameter value set — `Bool`, `Int64`, `Float64`, `String`, `Symbol`, and `Vector`s of those. The macro generates an immutable struct, so reads stay type-stable.
+Legal field types are the ROS 2 parameter value set: the scalars `Bool`, `Int64`, `Float64`, `String`, and `Symbol` (string-with-choices sugar), plus the array types `Vector{Bool}`, `Vector{Int64}`, `Vector{Float64}`, `Vector{String}`, and `Vector{UInt8}` (the byte array). The macro generates an immutable struct, so reads stay type-stable.
 
 ## The server
 
 `Node(ctx, name, Schema)` attaches a typed parameter server at `node.parameters` and wires the six standard `rcl_interfaces` parameter services plus `/parameter_events`. The node is driveable by any ROS 2 parameter client. `overrides` overlays startup values (CLI, launch, or YAML) onto the schema defaults:
 
 ```julia
-server = Node(ctx, "client_demo_server", DemoParams; overrides = (max_speed = 50,))
-@info "serving" max_speed = server.parameters.max_speed mode = server.parameters.mode
+node = Node(ctx, "client_demo_server", DemoParams; overrides = (max_speed = 50,))
+@info "serving" max_speed = node.parameters.max_speed mode = node.parameters.mode
 ```
 
-`server.parameters` is the live `DemoParams` value; field access reads the current setting, typed.
+`node.parameters` is the `ParameterServer{DemoParams}`; field access forwards to the live `DemoParams` value, reading the current setting, typed.
 
 ## The client
 
-`ParameterClient` drives a node's parameters from another node. Pass the schema to share it as a typed lens, so `fetch` and `transaction` are type-stable; drop it to drive a node by its parameter services alone, where values come back dynamically as `Any`/`NamedTuple`:
+`ParameterClient` drives a node's parameters from another node, in one of two modes:
+
+- Pass the schema to share it as a typed lens, so `fetch` and `transaction` are type-stable.
+- Drop the schema to drive a node by its parameter services alone, where values come back dynamically as `Any`/`NamedTuple`.
 
 ```julia
 node   = Node(ctx, "client_demo")

@@ -274,8 +274,6 @@ pub = Publisher(node, "/chatter", std_msgs.msg.String)
 publish(pub, std_msgs.msg.String(data = "hello"))
 ```
 """
-# Per-kind dispatch (not a `=== Publisher` branch on one shared value): the builder is chosen by
-# the kind's TYPE, so `Publisher(node, topic, T)` is statically resolvable and inferable.
 (::PublisherKind)(node::Node, topic::AbstractString, ::Type{T}; kwargs...) where {T} =
     _make_publisher(node, topic, T; kwargs...)
 (::SubscriptionKind)(node::Node, topic::AbstractString, ::Type{T}) where {T} =

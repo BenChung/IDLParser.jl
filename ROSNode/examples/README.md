@@ -40,17 +40,19 @@ ROSNode is built on Zenoh and mirrors `rmw_zenoh`, whose discovery is
 ```sh
 zenohd -l tcp/localhost:7447 &
 
-julia --project=. ROSNode/examples/publisher.jl     # in one terminal
-julia --project=. ROSNode/examples/subscriber.jl    # in another
+julia --project=ROSNode ROSNode/examples/publisher.jl     # in one terminal
+julia --project=ROSNode ROSNode/examples/subscriber.jl    # in another
 ```
 
 `service.jl`, `action.jl`, and `parameters.jl` each run both halves in one process,
 so they're self-contained — just point them at the router. `parameters.jl` needs no
 sourced ROS2 at all (its `rcl_interfaces` types are vendored).
 
-The `peers = ["tcp/localhost:7447"]` argument to `@context` selects that router;
-drop it (and set `localhost_only` / `domain_id` as needed) to use environment
-discovery instead.
+The `peers = ["tcp/localhost:7447"]` argument to `@context` adds that connect
+endpoint, dialing the router; drop it (and set `localhost_only` / `domain_id` as
+needed) to discover from the environment instead. `localhost_only = true` disables
+multicast scouting and defaults to the loopback router; the default `false` reaches
+peers on other hosts.
 
 ## Interop with ROS2
 

@@ -5,7 +5,7 @@ A component is a node authored as a collection of `@mixin`s — each a cohesive 
 This page assembles a `Vehicle` node from two mixins. A `Sensor` publishes telemetry on a timer and provides a battery reading; a `Guard` requires that reading and serves a "safe to fly?" query. `@node` composes them; `run` brings the node up. The full example lives in `examples/component.jl`.
 
 !!! warning "`import` the framework generics — a bare `using` silently shadows them"
-    The lifecycle hooks (`configure`, `activate`, `deactivate`, `cleanup`, `on_error`) and the assembly generics (`construct`, `requires`, `provides`) are **ROSNode functions you add methods to**. Bring them in with `import`, not plain `using`:
+    The lifecycle hooks (`configure`, `activate`, `deactivate`, `cleanup`, `on_error`) and the assembly generics (`construct`, `requires`) are **ROSNode functions you add methods to**. Bring them in with `import`, not plain `using`:
 
     ```julia
     using ROSNode
@@ -17,6 +17,27 @@ This page assembles a `Vehicle` node from two mixins. A `Sensor` publishes telem
     Members authored by the macros — `@hears`/`@serves`/`@every`/`@runs`/`@uses` reactions and `@param`/`@provides`/`@interface` — are macro-emitted and need no import.
 
 ## The mixin — state plus the entities authored onto it
+
+The mixins and their authored types live in a module that names the ROS package the inline-authored service belongs to; the message type is authored in its own package module. `run` and the ground-station client see them through `Drone.*` and `Msgs.Telemetry`:
+
+```julia
+module Msgs
+    using ROSNode
+    @ros_package "drone_msgs"
+    @ros_message struct Telemetry
+        battery::Float64
+        altitude::Float64
+    end
+end
+
+module Drone
+    using ROSNode
+    using ..Msgs: Telemetry
+    @ros_package "drone"            # names the inline-authored service type below
+    import ROSNode: configure, requires, construct   # the generics this module extends
+    # ── mixins authored below ──
+end
+```
 
 `@mixin` declares one chunk. The struct holds private state; entities attach to the mixin type itself, keeping the struct state-only:
 
@@ -90,7 +111,7 @@ construct(::Type{Guard}, node, src) = Guard(battery_src = src)   # injected ⇒ 
 @param Guard min_battery::Float64 = 20.0
 ```
 
-`construct` dispatches on the mixin being built — the bare base `Guard`, which covers every `Guard{B}`; reactions annotate the base the same way (`safe(g::Guard, …)`). The dependency is used through its interface method — `battery(g.battery_src)` in the service handler above. Omitting a zero-dep `construct` makes the dependency required: the mixin loads only composed in a `@node`. Providing one makes it optional — `construct(::Type{Guard}, node) = Guard(battery_src = NullBattery())` picks a null-object default so `run(Guard)` works standalone.
+`construct` dispatches on the mixin being built — the bare base `Guard`, which covers every `Guard{B}`; reactions annotate the base the same way (`safe(g::Guard, …)`). The dependency is used through its interface method — `battery(g.battery_src)` in the service handler above. Omitting a zero-dep `construct` makes the dependency required: the mixin loads only composed in a `@node`. Providing one makes it optional — a zero-dep `construct(::Type{Guard}, node) = Guard(battery_src = …)` picks a default battery source (your own null-object stand-in that answers `battery`) so `run(Guard)` works standalone.
 
 `requires` and `construct` are two of the ROSNode generics you extend, so they need the `import` (or a qualified `ROSNode.construct(…) = …`) from the warning at the top of the page — a bare `using`-shadowed definition is silently never called.
 
@@ -210,7 +231,17 @@ Those calls drive one state machine — the same one a `ros2 lifecycle` orchestr
 <div class="rosnode-statechart" data-machine="lifecycle"></div>
 ```
 
-While a managed node is in any state other than `Active`, its publishers, subscriptions, timers, and services are gated at dispatch: publishers drop, subscriptions and timers don't fire, services error-reply. Action servers are gated the same way: goal, cancel, and result requests error-reply, and feedback/status publications drop. `deactivate` goes one step further and cooperatively cancels any goals still in flight — each executing body sees the cancel signal and settles `CANCELED`, and a body that ignores it is left running detached after a bounded wait — so a node bounced to `Inactive` does not keep working against state the orchestrator may have invalidated. Outbound client ports gate too: a `call`/`send` or goal dispatch from a client on a node that is not `Active` raises a catchable error, so probe `isactive(node)` first. The control surface stays live throughout, as do the parameter services and `~/get_type_description` — an orchestrator drives transitions and tunes parameters on an inactive node. `activate`/`deactivate` therefore carry only work beyond that automatic gating — pre-rolling a device, flushing a buffer.
+While a managed node is in any state other than `Active`, the framework gates each port at dispatch:
+
+| Port | Gating while not `Active` |
+|------|---------------------------|
+| Publisher | the publish drops |
+| Subscription, timer | the reaction doesn't fire |
+| Service | the request gets an error reply |
+| Action server | goal, cancel, and result requests get an error reply; feedback and status publications drop |
+| Action client (`send`/`fetch`/`cancel`) | the call raises `NodeInactiveError` — probe `isactive(node)` first |
+
+The service client is the exception: `call` issues regardless of the node's state and blocks to its own timeout, so guard it on `isactive(node)` yourself when that matters. `deactivate` goes one step further and cooperatively cancels any goals still in flight — each executing body sees the cancel signal and settles `CANCELED`, and a body that ignores it is left running detached after a bounded wait — so a node bounced to `Inactive` does not keep working against state the orchestrator may have invalidated. The control surface stays live throughout, as do the parameter services and `~/get_type_description` — an orchestrator drives transitions and tunes parameters on an inactive node. `activate`/`deactivate` therefore carry only work beyond that automatic gating — pre-rolling a device, flushing a buffer.
 
 In a multi-mixin node the hooks fan out in dependency order: `configure`, `activate`, and `on_error` run providers first, `deactivate` and `cleanup` in reverse. In `Vehicle`, the `Sensor` configures before the `Guard` it was injected into, and cleans up after it.
 
@@ -244,7 +275,7 @@ The same `Vehicle` runs either way — standalone or composed. Deploy-time wirin
 The example uses `@publishes`, `@serves`, and `@every`. The mixin surface has three more verified members, each mirroring its primitive layer:
 
 - `@hears` declares a subscription reaction — a handler dispatched on the mixin for each message on a topic.
-- `@uses` declares a client port — a [service](../communication/services.md) or action client the mixin drives from its reactions.
+- `@uses` records a client-port spec naming a [service](../communication/services.md) or action client the mixin depends on. Port materialisation builds no handle for it yet, so construct the client directly against the node-core — `ServiceClient(node, name, T)` or `ActionClient(node, name, A)` — and drive it from the mixin's reactions.
 - `@runs` inline-authors an action server from a function signature, the way `@serves` authors a service.
 
 ## See also

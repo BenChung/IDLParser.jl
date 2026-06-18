@@ -30,7 +30,7 @@ using StaticArrays: StaticArray   # fixed arrays (`T[N]`) generate as SArray; th
 # `using ROSNode` + `Base.fetch` clash; reached as `fetch(goal)` since we add the
 # method to Base. Likewise `pause` (Base) is a `SingleFlight` method, not exported.
 export ActionServer, ActionClient, GoalHandle,
-       feedback!, checkpoint, iscancelled, succeed, abort, execute,
+       feedback!, feedback, checkpoint, iscancelled, succeed, abort, execute,
        send, cancel, state, action_server_matched,
        accept, reject, defer,
        SingleFlight

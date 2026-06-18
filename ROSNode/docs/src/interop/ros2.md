@@ -4,13 +4,17 @@ ROSNode mirrors `rmw_zenoh` on the wire. With `rmw_zenoh` selected and a matchin
 
 ## Wire identity (RIHS01)
 
-A ROS interface's wire type is its name plus its RIHS01 hash, derived from the field layout. Two definitions sharing both the interface name and the RIHS01 hash are the same wire type. This identity lets imported, authored, and runtime-discovered Julia types interoperate with each other and with ROS 2: an authored interface carries the same RIHS01 as the equivalent `.msg`/`.srv`/`.action`, so it speaks for its imported twin and for a stock C++/Python endpoint alike.
-
-See [Interface Types](../foundations/interface-types.md) for how imported and discovered types resolve, and [Authoring Interfaces in Julia](../advanced/authoring.md) for the authored forms.
+A shared RIHS01 hash is what lets a ROSNode entity and a stock C++/Python endpoint speak the same wire type — see [Interface Types](../foundations/interface-types.md) for how the hash is derived and matched across imported, authored, and runtime-discovered types.
 
 ## Talking to ROS 2 from the command line
 
-With a router running and `rmw_zenoh` selected, the `ros2` CLI reaches ROSNode entities the same way it reaches any node.
+The `ros2` CLI reaches ROSNode entities the same way it reaches any node, once the ROS 2 side joins the same Zenoh fabric and domain:
+
+1. Select the Zenoh RMW: `export RMW_IMPLEMENTATION=rmw_zenoh_cpp`.
+2. Start its router so both sides have a meeting point: `ros2 run rmw_zenoh_cpp rmw_zenohd`.
+3. Match `ROS_DOMAIN_ID` on both sides (default `0`).
+
+A domain or RMW mismatch produces silence — no traffic and no diagnostic.
 
 Topics — echo what a `Publisher` sends, or feed a `Subscription` ([Topics](../communication/topics.md)):
 
@@ -47,7 +51,7 @@ ros2 lifecycle get /vehicle
 
 ## Where imported types come from
 
-`@ros_import` statically generates an interface by name from ROSNode's vendored tree or, inside a sourced ROS 2 environment, from `AMENT_PREFIX_PATH`. The `from=` argument adds local source roots, so your own packages resolve alongside the vendored tree:
+`@ros_import` statically generates an interface by name from ROSNode's vendored tree or, inside a sourced ROS 2 environment, from `AMENT_PREFIX_PATH`. The `from=` argument adds local source roots that are searched first, so your own packages resolve ahead of — and can shadow — the vendored and ament trees:
 
 ```julia
 @ros_import "std_msgs/msg/String" from="interfaces"
@@ -57,7 +61,7 @@ See [Interface Types](../foundations/interface-types.md) for the full import sur
 
 ## Reaching peers on other hosts
 
-`peers` selects the router; omit `localhost_only` so discovery reaches peers on other hosts. See [Getting Started](../getting-started.md) for the router command and the discovery options.
+The default `Context` already reaches peers on other hosts: `localhost_only` is `false`, so multicast scouting stays on. Add `peers=["tcp/host:7447"]` to dial a router directly. See [Getting Started](../getting-started.md) for the router command and the discovery options.
 
 ## See also
 

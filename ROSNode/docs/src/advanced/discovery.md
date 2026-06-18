@@ -12,7 +12,7 @@ sub = Subscription(node, "/chatter") do msg
 end
 ```
 
-`msg` is the real decoded struct with type-stable field access, so `msg.data` is fast and concrete. The framework resolves the wire type in order: the home table, then the project cache, then ament, then a wire `GetTypeDescription` query to the publisher.
+`msg` is the real decoded struct with type-stable field access, so `msg.data` is fast and concrete. The framework resolves the wire type in order: the home table, then the type registry, then the project cache, then ament, then a wire `GetTypeDescription` query to the publisher.
 
 The home table is the entry point. `@context` binds the calling module as the Context's resolution home (see [The Runtime Model](../foundations/runtime-model.md)), and a wire type resolves against that module's imported structs first. A module that has imported `Reading` lands *its* `Reading` deterministically; the later stages cover types the home has never seen.
 
@@ -39,11 +39,16 @@ The first sample of a new type pays codegen and JIT for the decode→handler cha
 
 `warmup_sync = true` blocks construction until the codec is warm — the choice for hard real-time, where the first sample must already be hot.
 
-`@effectful expr` marks a genuine side effect. An `:execute` warm-up run skips the marked expression while still compiling it, so warming a handler with `:execute` records no fabricated data. Mark effects this way and they stay safe the moment a static subscription enables `:execute`.
+`@effectful expr` marks a genuine side effect. An `:execute` warm-up run skips the marked expression while still compiling it, so warming a handler with `:execute` records no fabricated data. On a dynamic subscription, which stays compile-only, the guard is inert; marking effects this way keeps them safe the moment a static subscription enables `:execute`.
 
 ## A recorder
 
-A generic recorder buffers readings off `/readings` without importing the type. The publisher half stands in for some other node on the graph, publishing `sensor_demo/msg/Reading`; split it into a second process (or a real ROS 2 node) and the subscriber discovers the type over the wire with the same code:
+A generic recorder buffers readings off `/readings` without importing the type. The publisher half stands in for some other node on the graph, publishing `sensor_demo/msg/Reading`; split it into a second process (or a real ROS 2 node) and the subscriber discovers the type over the wire with the same code. This example ships runnable as `examples/warming.jl`. Run it from the ROSNode project so `--project=.` activates the ROSNode environment; the `from = "interfaces"` root resolves against the script's directory, `examples/interfaces/`. Start a router first so both processes meet:
+
+```sh
+zenohd -l tcp/localhost:7447 &
+julia --project=. examples/warming.jl   # then run it again to see the startup warm
+```
 
 ```julia
 using ROSNode
@@ -75,7 +80,7 @@ using ROSNode
 end
 ```
 
-Run 1 discovers `Reading` and warms its codec on first sight, recording the type into `ros_typesupport/manifests/_recorder.tsv`. Run 2 replays that manifest at startup and warms the codec, so the first publish lands on a hot path.
+With `@ros_import` present, Run 1 resolves `Reading` from the home table and warms its codec on first sight, recording the type into `ros_typesupport/manifests/_recorder.tsv`. Drop the `@ros_import` and split the publisher into a second process, and Run 1 instead fetches `Reading` over the wire on first sight. Either way, Run 2 replays that manifest at startup and warms the codec, so the first publish lands on a hot path.
 
 ## Graduating to a static type
 

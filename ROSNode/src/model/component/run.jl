@@ -626,7 +626,7 @@ end
 # to every member that declares it; a prefixed key (`var"camera.fps"` — the form a
 # composed node's wire `Parameter.name` carries, and the disambiguator when two
 # members share a field name) targets one member and wins over the mixin-local form.
-function _member_overrides(::Type{M}, member::Symbol, overrides::NamedTuple) where {M}
+function _member_overrides(@nospecialize(M::Type), member::Symbol, @nospecialize(overrides::NamedTuple))
     fns = fieldnames(pschema(M))
     out = Dict{Symbol, Any}()
     for (k, v) in pairs(overrides)
@@ -682,6 +682,13 @@ function _anchor_reactions!(::Type{M}) where {M}
             if length(rts) == 1 && isconcretetype(only(rts))
                 H = only(rts)
                 T = p.msgtype
+                # The consumer task body the worker actually runs: a Serial component sub spawns
+                # one `_consume_loop` over a plain `Zenoh.SubscriberHandler` with no novelty gate
+                # (`Nothing`). Anchoring it bakes the receive→dispatch wrappers — `_consume_loop`
+                # → `_dispatch_decoded` → `_run`/`with_payload_memory` → `decode_owned`/handler —
+                # the loop the first message JITs. The leaf anchors below stay (they also serve the
+                # warm path); this is the wrapper the leaf-only anchors didn't cover.
+                precompile(_consume_loop, (Entity, Type{T}, H, Owned, Zenoh.SubscriberHandler, Nothing))
                 precompile(_dispatch_decoded, (Entity, SampleHolder, Type{T}, H, Owned))
                 precompile(decode_owned, (Memory{UInt8}, Type{T}))
                 precompile(_decode_on_consumer, (Entity, SampleHolder, Type{T}))

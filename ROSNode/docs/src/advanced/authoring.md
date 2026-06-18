@@ -17,7 +17,7 @@ module Msgs
 end
 ```
 
-`Chatter` registers as `demo_msgs/msg/Chatter`. Publish and subscribe it by its Julia name; passing the type explicitly resolves it straight from the registry:
+`Chatter` registers as `demo_msgs/msg/Chatter`. Publish and subscribe it by its Julia name; passing the type explicitly resolves it straight from the registry. The endpoint snippets below run inside a `node` from [The Runtime Model](../foundations/runtime-model.md):
 
 ```julia
 pub = Publisher(node, "/chatter", Msgs.Chatter)
@@ -73,7 +73,11 @@ end
 
 ## Actions
 
-An action is a function with a `FeedbackSink` parameter: the goal fields are parameters, the `FeedbackSink{@NamedTuple{…}}` parameter is the feedback channel, and the `@NamedTuple` return type is the result. Calling the sink publishes a Feedback message and checkpoints cancellation — a canceling goal throws there and settles CANCELED. Returning the result settles SUCCEEDED; throwing settles ABORTED:
+An action is a function with a `FeedbackSink` parameter: the goal fields are parameters, the `FeedbackSink{@NamedTuple{…}}` parameter is the feedback channel, and the `@NamedTuple` return type is the result. Calling the sink publishes a Feedback message and checkpoints cancellation. How the body ends drives the [goal settlement three-way](../communication/actions.md#Goal-states):
+
+- return the result → `:succeeded`,
+- let a cancellation checkpoint in the sink throw → `:canceled`,
+- throw anything else → `:aborted`.
 
 ```julia
 module Act
@@ -98,12 +102,14 @@ server = ActionServer(node, "/fibonacci", Act.Fibonacci)
 
 client = ActionClient(node, "/fibonacci", Act.Fibonacci)
 if wait_for_action_server(client; timeout = 5)
-    gh = send(client; order = Int32(8))       # goal fields as kwargs; blocks until accepted
-    for fb in feedback(gh)
+    gh = send(client; order = Int32(8))       # goal fields as kwargs; blocks until the server accepts or rejects
+    for fb in feedback(gh)                     # empty stream if the goal was rejected
         @info "feedback" fb.partial_sequence
     end
-    result = fetch(gh)                        # settled — result is a NamedTuple
-    @info "result" result.sequence
+    if state(gh) != :rejected
+        result = fetch(gh)                    # settled — result is a NamedTuple (fetch raises on a rejected goal)
+        @info "result" result.sequence
+    end
 end
 ```
 

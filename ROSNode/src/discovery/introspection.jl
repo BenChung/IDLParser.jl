@@ -840,3 +840,13 @@ end
 
 # `_ctx`, `registry`, `lookup_type`, `now`, and `to_msg` are defined elsewhere in
 # the module and in scope here.
+
+# The node logger lazily builds its `/rosout` publisher on the first log record, which fires
+# during a node's bring-up. Fixed `rcl_interfaces.msg.Log` route, so anchor the builder here
+# (it lives in this file, included after performance/warmup.jl) — the matching `encode(Log)`
+# bakes in warmup.jl's workload. Keeps the first-`run` /rosout init off the critical path.
+@setup_workload begin
+    @compile_workload begin
+        precompile(_rosout_publisher!, (Node,))
+    end
+end

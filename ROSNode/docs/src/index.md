@@ -2,6 +2,8 @@
 
 ROSNode is a pure-Julia ROS 2 client library built on Zenoh. It mirrors `rmw_zenoh` on the wire, so its nodes interoperate with C++ and Python ROS 2 nodes sharing the same router and `ROS_DOMAIN_ID`.
 
+The `peers` endpoint points at a running Zenoh router (`zenohd`); start one first. `from="interfaces"` adds a local directory of interface files as a search root, so `std_msgs/msg/String` resolves from `interfaces/std_msgs/msg/String.msg` without a sourced ROS environment. This snippet shows the API shape; for a runnable talker see `examples/publisher.jl`.
+
 ```julia
 using ROSNode
 
@@ -14,7 +16,7 @@ using ROSNode
 end
 ```
 
-ROSNode also resolves message types at runtime. A type-less subscription discovers the concrete wire type from the publisher and decodes it on the fly, handing the handler a real typed struct — with no `@ros_import`:
+ROSNode also resolves message types at runtime. A type-less subscription reads each sample's `(name, hash)` and resolves the concrete wire type — from the registry, the project cache, ament, or a wire query, in that order — then decodes it on the fly, handing the handler a real typed struct, with no `@ros_import`:
 
 ```julia
 using ROSNode

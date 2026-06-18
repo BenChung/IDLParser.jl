@@ -22,6 +22,8 @@ end
 
 Those four pieces — Context, Node, the entities, and spin — appear in every program. Topics, services, and actions each fill in the entity step with their own constructors.
 
+The `from="interfaces"` argument tells `@ros_import` where to find the `std_msgs/msg/String` definition: it adds a local source root holding the `.msg` files. Drop it to resolve a name from the vendored tree and a sourced ROS 2 environment. See [Interface Types](interface-types.md) for how `@ros_import` and `from=` resolve names.
+
 ## Contexts
 
 A `Context` owns the Zenoh session, discovery, and shutdown. The `@context do ctx … end` form drains in-flight work and closes the session on exit, and binds the calling module as the type-resolution home so wire types resolve against that module's imported structs.
@@ -62,7 +64,13 @@ ROSNode mirrors `rmw_zenoh`, whose discovery is router-based. The `peers` keywor
 end
 ```
 
-Omit `peers` (and set `localhost_only` / `domain_id` as needed) to use environment discovery. `localhost_only = true` confines discovery to the configured router; omit it to reach peers on other hosts. `domain_id` partitions discovery so contexts on different domains stay isolated.
+Omit `peers` (and set `localhost_only` / `domain_id` as needed) to use environment discovery:
+
+| Knob | Effect | Default |
+|------|--------|---------|
+| `peers` | Sets the routers/peers to connect to (Zenoh `connect/endpoints`). | none (environment discovery) |
+| `localhost_only` | `true` disables multicast scouting and, absent explicit `peers`, connects to the loopback router `tcp/localhost:7447`. | `false` (reaches peers on other hosts) |
+| `domain_id` | Partitions discovery so contexts on different domains stay isolated. | `ROS_DOMAIN_ID`, else `0` |
 
 ```julia
 @context(localhost_only = true, domain_id = 0) do ctx
@@ -101,7 +109,8 @@ next_entity_id!
 EndpointInfo
 NodeInfo
 GraphIndex
-EndpointKind
+PublisherKind
+SubscriptionKind
 ```
 
 ### Node

@@ -17,7 +17,7 @@ import Zenoh   # `Zenoh.cancel` is qualified — ROSNode's own `cancel` (action 
 using ROSZenoh: ROSZenoh
 
 export Service, ServiceClient, ServiceHandle, call, request_type, response_type,
-       service_matched
+       service_matched, respond!, detach!, ServiceRequestHandle, ServiceError
 
 # ── service-type reflection ──────────────────────────────────────────────────
 

@@ -34,7 +34,7 @@ end
 
 The feedback field is `partial_sequence`, matching `action_tutorials_interfaces`. The action is wire-compatible with ROS 2 (see [Interoperating with ROS 2](../interop/ros2.md)).
 
-The client sends a goal, streams feedback until the goal settles, then reads the cached result. `send` blocks until the server accepts or rejects and returns a goal handle.
+The client sends a goal, streams feedback until the goal settles, then reads the cached result. `send` blocks on the server's reply and returns a [`ClientGoal`](@ref ROSNode.ClientGoal) handle. The handle reports `:accepted` once the server takes the goal, and `:rejected` for every other outcome alike: the server declined it, no server appeared within the retry window, or a Context drain ended the window.
 
 ```julia
 using ROSNode
@@ -61,7 +61,7 @@ using ROSNode
 end
 ```
 
-`wait_for_action_server` returns `true` once a server route-matches within the timeout, gating `send` on a reachable server. The feedback loop drives the result protocol behind the scenes, so iterating it is the whole client lifecycle.
+[`wait_for_action_server`](@ref) returns `true` once a server route-matches within the timeout, gating `send` on a reachable server. The [`feedback`](@ref) loop drives the result protocol behind the scenes, so iterating it is the whole client lifecycle.
 
 ## Goal states
 
@@ -80,7 +80,9 @@ Call `cancel(gh)` on the client to cancel a running goal. The server's next `fee
 ```julia
 gh = send(client, Fibonacci.Goal(order = Int32(8)))
 cancel(gh)                       # request cancellation
-state(gh)                        # :canceling, then :canceled once it settles
+state(gh)                        # :canceling once the server replies
+fetch(gh)                        # drives the goal to its terminal state
+state(gh)                        # :canceled
 ```
 
 ## Next
@@ -97,6 +99,7 @@ CurrentModule = ROSNode
 ActionServer
 ActionClient
 GoalHandle
+ClientGoal
 send
 state
 fetch

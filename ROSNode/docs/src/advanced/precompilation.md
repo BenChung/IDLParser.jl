@@ -22,7 +22,7 @@ Every endpoint warms its own dispatch chain at construction under a [`WarmupPoli
 The mode chooses how deep warming reaches, cheapest first:
 
 - `:precompile` (the default) `precompile`-anchors the decode→handler chain: it caches the inference tree and codegens the type-specialized frame, side-effect-free and with no message instance.
-- `:execute` additionally runs the handler once on a sample message, reaching full native depth. Outbound ROS operations (`publish`/`call`) null-route, and side effects marked with [`@effectful`](@ref) are skipped, so warming fabricates no data.
+- `:execute` additionally runs the handler once on a synthesized sample message, reaching full native depth. Outbound ROS operations (`publish`/`call`) null-route, and side effects marked with [`@effectful`](@ref) are skipped, so warming emits no real traffic and touches no external state.
 - `:off` skips warm-up.
 
 The sync flag chooses when warming happens:
@@ -42,7 +42,12 @@ Subscription(node, "/cmd_vel", geometry_msgs.msg.Twist;
 end
 ```
 
-A handler written for live data may reject a synthesized sample, so an `:execute` warm-up runs it under a warm scope ([`is_warming`](@ref) is true) and swallows throws: a synthesizer mismatch degrades to compile-only with a warning. Pass `warmup_sample` a representative message when the default builder can't synthesize a realistic one.
+A handler written for live data may reject a synthesized sample, so an `:execute` warm-up tolerates one:
+
+- it runs the handler under a warm scope where [`is_warming`](@ref) is true, and
+- a throw degrades that handler to compile-only with a warning.
+
+Pass `warmup_sample` a representative message when the default builder can't synthesize a realistic one.
 
 Warm-up reaches your handler only when the chain is monomorphic — a static, typed subscription. A dynamic subscription resolves its type per sample, so it warms the codec and replays a discovered-type manifest at startup instead; see [Runtime Type Discovery](discovery.md).
 
@@ -53,6 +58,7 @@ A component declared in a precompiled package bakes its per-mixin machinery into
 ```julia
 module Vehicle
 using ROSNode
+@ros_import "std_msgs/msg/Bool"
 
 @mixin struct Drive end
 @param Drive max_speed::Float64 = 2.0
@@ -70,6 +76,8 @@ It bakes, into the consuming package's precompile image:
 
 - each mixin's typed `parameters(m)` and `entities(m)` accessors, and
 - its reaction handlers, compiled against those accessors, together with the codec and dispatch frames they specialize.
+
+The bake reaches a mixin whose ports all have a statically derivable handle type. A mixin with an action server or client keeps the generic accessor and warms at first `run` instead, since its handle type materializes only then.
 
 `@precompile_nodes` is opt-in and side-effect-free: it runs only `precompile` and codegen, never your reactions, and fires only at precompile. A component without it still works — the same accessors and specializations generate lazily on the first `run`.
 
