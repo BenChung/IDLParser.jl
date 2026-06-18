@@ -283,6 +283,54 @@ function _finalize_module!(mod::Module)
     catch err
         @debug "_finalize_module!: skipped scaffolding re-anchor" mod exception = err
     end
+    # Per-`@node` static-DI bake: the loop above anchors each mixin BASE, which misses a
+    # parametric mixin (`Guard{B}`) — its instantiation is fixed only once a node resolves DI.
+    # A declared `@node` is static, so we resolve that here (§ `_anchor_node_plan!`) and anchor
+    # the construction + reaction path on each member's exact instantiation. Also bakes the
+    # planning (DI/toposort/wire-remap) specialised on this node's member types.
+    if isdefined(mod, :__node_kinds__)
+        for (_, K) in getfield(mod, :__node_kinds__)
+            K isa NodeKind || continue
+            try
+                _anchor_node_plan!(K)
+            catch err
+                @debug "_finalize_module!: skipped a node-plan bake" mod node = K exception = err
+            end
+        end
+    end
+    return nothing
+end
+
+# Bake the static assembly of a declared `@node`. The plan — DI resolution, toposort, and wire
+# remaps — is a pure function of the `NodeKind` (its members' `requires`/`provides`/`construct`
+# methods, all defined by the time `@precompile_nodes` runs), so we compute it here and, walking
+# the resolved order, derive each member's CONCRETE instantiation from `construct`'s return type
+# given its already-resolved deps. That recovers the exact shape — `Guard{Sensor}`, not the base
+# `Guard` — letting the per-member anchors cover a parametric mixin the base-mixin bake skips
+# (`_anchor_construction!(Guard)` is empty for the non-concrete base, so its construct/materialise/
+# reaction path otherwise JITs at first `run`). Running `_members_plan`/`_resolve_wires` also bakes
+# the planning machinery specialised on this node's member types. Inference/precompile only — no
+# `construct`/`configure` is executed (it may touch user state), only its return type is queried.
+function _anchor_node_plan!(K::NodeKind)
+    order, bytype, edges = _members_plan(K)   # bakes _resolve_di/_toposort for these member types
+    _resolve_wires(K)                          # bakes wire-remap resolution for these ports
+    concrete = Dict{Symbol, Any}()
+    for nm in order
+        M = bytype[nm]
+        deptypes = Any[concrete[d] for d in edges[nm]]
+        rts = Base.return_types(construct, (Type{M}, Node, deptypes...))
+        Tc = (length(rts) == 1 && isconcretetype(only(rts))) ? only(rts) : M
+        concrete[nm] = Tc
+        # The base mixin is already anchored by the `__mixin_bases__` loop; only a parametric
+        # instantiation (`Tc` ≠ the declared base, e.g. `Guard{Sensor}`) needs anchoring here on
+        # its exact type. A `construct` that isn't type-stable leaves `Tc` non-concrete → skip
+        # (it falls back to the runtime member warm).
+        (Tc === M || !isconcretetype(Tc)) && continue
+        _ensure_schema!(_base(Tc))
+        _anchor_action_codecs!(Tc)
+        _anchor_reactions!(Tc)
+        _anchor_construction!(Tc)
+    end
     return nothing
 end
 
@@ -750,10 +798,13 @@ end
 #
 # Returned as a list, not emitted inline, so the drift test (`component_entities_static.jl`)
 # consumes the SAME source and cannot fall behind a renamed/re-aritied builder. Empty for a
-# non-concrete `M`: a parametric mixin's instantiation is chosen by `construct`, unknown at the
-# module-end bake, so it keeps warming at first `run`. The endpoint builders are anchored on the
-# concrete `_sub_cb`/`_timer_cb` closure types (the materialise path's `p.reaction` is `Any`, so
-# inference can't reach them on its own — the function-barrier reason `_sub_cb` exists).
+# non-concrete `M`. A parametric mixin's instantiation (e.g. `Guard{Sensor}`) is not known from
+# the base alone, but `_anchor_node_plan!` resolves it from each `@node`'s static DI and calls
+# this on the concrete type — so the specs key the mixin metadata on `_base(M)` (defined on the
+# base only) while the anchored signatures use the concrete `M`. The endpoint builders are
+# anchored on the concrete `_sub_cb`/`_timer_cb` closure types (the materialise path's
+# `p.reaction` is `Any`, so inference can't reach them on its own — the function-barrier reason
+# `_sub_cb` exists).
 function _construction_precompile_specs(::Type{M}) where {M}
     specs = Tuple{Any, Any}[]
     isconcretetype(M) || return specs
@@ -766,7 +817,7 @@ function _construction_precompile_specs(::Type{M}) where {M}
     # construction + handler bodies here (the `@node` path's `CompositeParameterServer` is baked
     # once in ROSNode's image). The named `_ParamSvcHandler` makes them precompilable by name.
     append!(specs, _parameter_service_specs(ParameterServer{P}))
-    for p in mixin_spec(M).ports
+    for p in mixin_spec(_base(M)).ports
         if p.kind === :publisher
             # the send path the first publish JITs: the builder, then encode + the monomorphic
             # publish over the plain `Zenoh.Publisher` route (a component publisher carries no

@@ -14,7 +14,7 @@ The `ros2` CLI reaches ROSNode entities the same way it reaches any node, once t
 2. Start its router so both sides have a meeting point: `ros2 run rmw_zenoh_cpp rmw_zenohd`.
 3. Match `ROS_DOMAIN_ID` on both sides (default `0`).
 
-A domain or RMW mismatch produces silence — no traffic and no diagnostic.
+A domain or RMW mismatch produces silence — no traffic and no diagnostic — because `domain_id` leads every keyexpr, so mismatched domains never meet (see [Addressing & Key Expressions](../foundations/addressing.md)).
 
 Topics — echo what a `Publisher` sends, or feed a `Subscription` ([Topics](../communication/topics.md)):
 

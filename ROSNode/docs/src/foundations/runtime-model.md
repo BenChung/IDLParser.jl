@@ -72,6 +72,8 @@ Omit `peers` (and set `localhost_only` / `domain_id` as needed) to use environme
 | `localhost_only` | `true` disables multicast scouting and, absent explicit `peers`, connects to the loopback router `tcp/localhost:7447`. | `false` (reaches peers on other hosts) |
 | `domain_id` | Partitions discovery so contexts on different domains stay isolated. | `ROS_DOMAIN_ID`, else `0` |
 
+ROSNode stamps `domain_id` into every topic keyexpr and the liveliness subscription, so contexts on different domains never meet — see [Addressing & Key Expressions](addressing.md) for how names become keyexprs.
+
 ```julia
 @context(localhost_only = true, domain_id = 0) do ctx
     # ...

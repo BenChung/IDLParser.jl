@@ -292,8 +292,17 @@ end
                                       (:set,        RCL.SetParameters_Request,           RCL.SetParameters_Response),
                                       (:set_atomic, RCL.SetParametersAtomically_Request, RCL.SetParametersAtomically_Response))
                 # param services hold a concrete `_ParamSvcHandler{Op, CompositeParameterServer}`
-                precompile(_serve_query, (Entity, Q, Type{ReqT}, Type{RespT},
-                                          _ParamSvcHandler{Op, CompositeParameterServer}, Bool))
+                H = _ParamSvcHandler{Op, CompositeParameterServer}
+                precompile(_serve_query, (Entity, Q, Type{ReqT}, Type{RespT}, H, Bool))
+                # The consumer task body (`_service_consume_loop`, now named): anchor it on the
+                # concrete Serial scheduler closure so each service's first schedule doesn't
+                # re-infer the loop + node-logger scope. The scheduler closure type isn't
+                # nameable, so derive it with `return_types`.
+                Ss = Base.return_types(_service_scheduler, (Serial, Entity, Type{ReqT}, Type{RespT}, H, Bool))
+                if length(Ss) == 1 && isconcretetype(only(Ss))
+                    precompile(_service_scheduler, (Serial, Entity, Type{ReqT}, Type{RespT}, H, Bool))
+                    precompile(_service_consume_loop, (only(Ss), Zenoh.QueryableHandler, Entity))
+                end
             end
             # get_type_description's handler is held abstractly (`Function`) at runtime
             precompile(_serve_query, (Entity, Q, Type{TD.GetTypeDescription_Request},

@@ -20,6 +20,7 @@ makedocs(;
         "Foundations" => [
             "The Runtime Model" => "foundations/runtime-model.md",
             "Interface Types" => "foundations/interface-types.md",
+            "Addressing & Key Expressions" => "foundations/addressing.md",
         ],
         "Communication" => [
             "Topics" => "communication/topics.md",

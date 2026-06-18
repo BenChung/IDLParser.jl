@@ -356,29 +356,40 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
                                  view::Bool, concurrency::Concurrency) where {Req, Resp}
     qable = (e.wire::_ServiceWire).queryable
     serve = _service_scheduler(concurrency, e, Req, Resp, handler, view)
-    # Sticky so Serial handlers run on the node's one cooperative thread.
-    t = Task() do
-        try
-            # Node logger installed once per consumer task so a plain `@info` in a
-            # handler routes to /rosout without a per-request `with_logger` scope.
-            # Serial handlers run inline under it; Parallel ones are spawned from
-            # within this scope and inherit its logstate.
-            _with_node_logger(e.node) do
-                while true
-                    serve(take!(qable))
-                end
-            end
-        catch err
-            # Closing the queryable disconnects its channel; the drain throws
-            # ShutdownException as the normal teardown exit.
-            err isa ShutdownException && return
-            isopen(e) &&
-                @error "service consumer task failed" service=e.endpoint.topic exception=(err, catch_backtrace())
-        end
-    end
+    # Sticky so Serial handlers run on the node's one cooperative thread. The loop body is a
+    # NAMED function (not an inline `Task() do … end`) so it can be `precompile`d by name —
+    # its `serve`→`_serve_query` serve tree is baked into ROSNode's image, and an anonymous
+    # task closure would re-infer that whole tree at first schedule (the startup-profile
+    # finding; see examples/startup/STARTUP-REPORT.md). Mirrors `dispatch.jl`'s `_consume_loop`.
+    t = Task(() -> _service_consume_loop(serve, qable, e))
     t.sticky = true
     schedule(t)
     return t
+end
+
+# One service consumer's serve loop: serve queries off `qable` until the queryable's channel
+# closes on drain. Named (not the `Task` do-block it replaced) so `precompile(_service_consume_loop,
+# (typeof(serve), QueryableHandler, Entity))` bakes the loop + the node-logger scope + the
+# `serve`→`_serve_query` tree it calls, keeping the seven standard services' first schedule off
+# the bring-up critical path.
+function _service_consume_loop(serve, qable, e::Entity)
+    try
+        # Node logger installed once per consumer task so a plain `@info` in a handler routes
+        # to /rosout without a per-request `with_logger` scope. Serial handlers run inline under
+        # it; Parallel ones are spawned from within this scope and inherit its logstate.
+        _with_node_logger(e.node) do
+            while true
+                serve(take!(qable))
+            end
+        end
+    catch err
+        # Closing the queryable disconnects its channel; the drain throws ShutdownException as
+        # the normal teardown exit.
+        err isa ShutdownException && return
+        isopen(e) &&
+            @error "service consumer task failed" service=e.endpoint.topic exception=(err, catch_backtrace())
+    end
+    return nothing
 end
 
 # The active request's `(result cell, owning wire)`, bound by `_serve_query` over the

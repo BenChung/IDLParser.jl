@@ -159,6 +159,17 @@ The ground station is a plain node subscribing to `/vehicle/telemetry`. The vehi
 
 ## Inspecting the resolved wiring
 
+A port's **wire name** defaults to the identifier you wrote:
+
+- `@hears`, `@serves`, `@every`, `@runs` — the reaction's name.
+- `@publishes`, `@uses` — the declared port name.
+
+An `on "topic"` clause or a [`@node`](@ref) remap overrides that default. The wire name then resolves against the node's namespace to the topic on the wire — a relative `foo` on node `/vehicle` lands on `/foo`:
+
+```
+@hears function foo   →   wire name  foo   →   topic  /foo
+```
+
 `describe_wiring` prints each member's ports and the fully-qualified ROS name each resolves to — the quick way to confirm two ports share a name before chasing a silent non-delivery:
 
 ```julia
@@ -179,6 +190,8 @@ The middle column is each port's authored wire name (after any [`@node`](@ref) r
 - a relative name (`foo`) resolves under the node's namespace — `/foo`;
 - a private name (`~/foo`) resolves under the node's own name — `/vehicle/foo`;
 - an absolute name (`/foo`) stands as written.
+
+The resolved name is what the entity uses on the wire as a Zenoh key expression; see [Addressing & Key Expressions](../foundations/addressing.md) for the keyexpr it becomes.
 
 Two ports connect only when they resolve to the same name. A `@hears function foo` (relative `foo`) and a `@publishes … on "~/foo"` (private) therefore land on different topics — `describe_wiring` shows the split as `→ /foo` against `→ /vehicle/foo`.
 

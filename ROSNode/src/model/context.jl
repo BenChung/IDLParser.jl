@@ -213,14 +213,15 @@ environment variable when left `nothing`, with the kwarg winning:
 | `namespace` | `ROS_NAMESPACE` |
 | `enclave` | `ROS_ENCLAVE` |
 
-The namespace is normalized to a leading-slash, no-trailing-slash form (empty
-becomes `/`). `domain_id` is stamped into every
-data-plane topic keyexpr and scopes the liveliness subscription, so topic
-traffic and graph discovery both stay within the domain. `home` binds a module
-whose baked `__ros_resolve__` table this Context resolves wire types through,
-so every keyexpr-only subscription sees one consistent picture; leave it
-`nothing` for content-canonical resolution only. `format` selects the keyexpr
-dialect (`RmwZenoh()` for rmw_zenoh, the primary target).
+`namespace`, `domain_id`, and `format` shape how names become Zenoh key
+expressions — namespace normalization, domain scoping, and the wire dialect
+(`RmwZenoh()`, the primary target, or `Ros2DDS()`). See
+[Addressing & Key Expressions](@ref).
+
+`home` binds the module whose baked `__ros_resolve__` table this Context
+resolves wire types through, so every keyexpr-only subscription resolves against
+one consistent picture; leave it `nothing` to resolve types by content alone
+(see [Runtime Type Discovery](@ref)).
 
 `weak_types` sets the process-wide type-revision trust. Left `false` (the
 default), a pinned type (registered via `@ros_import`/`@ros_cache` or authored
