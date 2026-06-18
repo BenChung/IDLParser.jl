@@ -89,18 +89,20 @@ end
 #   Unchecked — bare isbits `PayloadView`: zero-copy and zero-alloc, requiring the
 #               handler to confine the view to the borrow scope (an escaping view is
 #               UB). The production tier; validate with `Checked`.
-@inline _run(sample, ::Type{T}, handler, ::Owned) where {T} =
-    with_payload_memory(sample) do mem
-        handler(decode_owned(mem, T))
-    end
-@inline _run(sample, ::Type{T}, handler, ::Checked) where {T} =
-    with_payload_memory_checked(sample) do mem
-        handler(decode_view(mem, T))
-    end
-@inline _run(sample, ::Type{T}, handler, ::Unchecked) where {T} =
-    with_payload_memory(sample) do mem
-        handler(decode_view(mem, T))
-    end
+# The receive-callback bodies as NAMED callables, not anonymous `do mem … end` blocks: a
+# do-block is a fresh closure type per call site `precompile` can't name, so
+# `with_payload_memory(::callback, ::ZBytes)` re-JITed at the first message even though `T` and
+# the handler are statically known. Named, they anchor by name on the known `(T, H)` (see
+# `_anchor_reactions!`). Allocation-neutral vs the closures they replace — the alloc microbench
+# (`examples/alloc/bench_micro.jl`) reports identical bytes (Unchecked 0 B, Owned = decode only).
+struct _OwnedRun{T, H}; handler::H; end
+struct _ViewRun{T, H};  handler::H; end
+@inline (r::_OwnedRun{T})(mem) where {T} = r.handler(decode_owned(mem, T))
+@inline (r::_ViewRun{T})(mem)  where {T} = r.handler(decode_view(mem, T))
+
+@inline _run(sample, ::Type{T}, handler::H, ::Owned)     where {T, H} = with_payload_memory(_OwnedRun{T, H}(handler), sample)
+@inline _run(sample, ::Type{T}, handler::H, ::Checked)   where {T, H} = with_payload_memory_checked(_ViewRun{T, H}(handler), sample)
+@inline _run(sample, ::Type{T}, handler::H, ::Unchecked) where {T, H} = with_payload_memory(_ViewRun{T, H}(handler), sample)
 
 # Owned decode on the consumer task, returning the materialized message (`nothing`
 # if decode threw — logged and skipped). The `Parallel(Inf)` owned path decodes

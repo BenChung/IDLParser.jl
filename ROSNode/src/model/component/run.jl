@@ -741,6 +741,11 @@ function _anchor_reactions!(::Type{M}) where {M}
                 precompile(decode_owned, (Memory{UInt8}, Type{T}))
                 precompile(_decode_on_consumer, (Entity, SampleHolder, Type{T}))
                 precompile(_invoke_owned, (Entity, T, H))
+                # The Owned receive callback handed to Zenoh's (non-inlined) `with_payload_memory`
+                # — a named `_OwnedRun{T,H}`, so the trampoline is anchorable. The `AbstractSample`
+                # method (the consumer's `SampleHolder`) dispatches to the borrowed-`ZBytes` one.
+                precompile(with_payload_memory, (_OwnedRun{T, H}, SampleHolder))
+                precompile(with_payload_memory, (_OwnedRun{T, H}, Zenoh.ZBytes{Ptr{Zenoh.LibZenohC.z_loaned_bytes_t}}))
             end
         elseif p.kind === :service
             precompile(p.reaction, (M, p.msgtype))

@@ -12,7 +12,7 @@
 
 using Zenoh: Zenoh, Keyexpr, Query, Queryable, Querier, reply, reply_err, is_ok, sample,
              error_payload, payload, matching_status, MatchingListener,
-             CancellationToken
+             CancellationToken, ReusableGet
 import Zenoh   # `Zenoh.cancel` is qualified — ROSNode's own `cancel` (action goals) would clash
 using ROSZenoh: ROSZenoh
 
@@ -668,6 +668,35 @@ mutable struct _ClientWire
     const querier::Querier
     listener::Union{MatchingListener, Nothing}
     const lock::ReentrantLock
+    # Free-list of reusable request/reply gets over `querier`, the `call` transport.
+    # A `ReusableGet` is single-in-flight, so `call` acquires one per in-flight call and
+    # releases it after; idle ones are pooled (capped) for reuse. Guarded by `lock`.
+    const pool::Vector{ReusableGet}
+    closing::Bool                # set in close(); release then closes rather than pools
+end
+# 3-arg form keeps existing call sites (incl. the action client's match-probe wires,
+# which never call — their pool stays empty).
+_ClientWire(querier::Querier, listener, lock::ReentrantLock) =
+    _ClientWire(querier, listener, lock, ReusableGet[], false)
+
+# Cap on idle pooled gets; bursts beyond this close on release rather than accumulate.
+const _RG_POOL_CAP = 8
+
+# Acquire a reusable get for one `call` (pop a pooled one or declare a fresh one over the
+# wire's querier), and release it back (pool it, or close it if the pool is full/closing).
+function _acquire_rg!(w::_ClientWire)
+    @lock w.lock (isempty(w.pool) ? ReusableGet(w.querier; capacity = 1) : pop!(w.pool))
+end
+function _release_rg!(w::_ClientWire, rg::ReusableGet)
+    doclose = @lock w.lock begin
+        if w.closing || length(w.pool) >= _RG_POOL_CAP
+            true
+        else
+            push!(w.pool, rg); false
+        end
+    end
+    doclose && (try; close(rg); catch; end)
+    nothing
 end
 
 # Ground-truth routing-match predicate for a wire (`matching_status` is a live poll).
@@ -693,8 +722,11 @@ function Base.close(w::_ClientWire)
     @lock w.lock begin
         w.listener === nothing || (try; close(w.listener); catch; end)
         w.listener = nothing
+        w.closing = true                         # in-flight gets close on release
+        for rg in w.pool; (try; close(rg); catch; end); end
+        empty!(w.pool)
     end
-    try; close(w.querier); catch; end
+    try; close(w.querier); catch; end            # after the gets — they borrow it
     nothing
 end
 
@@ -742,11 +774,13 @@ function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
     sti = something(service_type_info_of(Req, Resp), type_info_of(Req))
     ent = make_entity(node, Client, sname, sti; qos=qos)
     # The call transport: a Querier on the service keyexpr, in `entity.wire`.
-    # `:all_complete` fans to every complete server like rmw_zenoh clients; the
-    # first reply settles the call.
+    # `:all_complete` fans to every complete server like rmw_zenoh clients; the first
+    # reply settles the call. `timeout_ms=0` (none) leaves bounding to `call`'s per-call
+    # CancellationToken (so `timeout_ms>0` is honored exactly and `timeout_ms=0` waits
+    # until the reply or Context drain, as documented).
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
-    querier = Querier(ctx.session, Keyexpr(tk); target=:all_complete)
+    querier = Querier(ctx.session, Keyexpr(tk); target=:all_complete, timeout_ms=0)
     ent.wire = _ClientWire(querier, nothing, ReentrantLock())
     client = ServiceClient{Req, Resp}(ent, 0)
     # Warm the call codec like the server endpoints. Inherits `node.warmup`, so a
@@ -839,15 +873,14 @@ that unwrapping itself.
 
 `timeout_ms` bounds the wait by arming a cancellation timer on the in-flight get;
 it defaults to `60_000` (60 s), so every call is bounded unless the caller opts
-out. The mechanism depends on `timeout_ms` and `async`:
+out. For `timeout_ms > 0` a `Base.Timer` cancels the get at the deadline, so the
+call resolves to a [`ServiceError`](@ref) rather than hanging; `timeout_ms == 0`
+arms no timer and waits until the reply arrives or the Context drains.
 
-| `timeout_ms`   | sync (`async=false`)                                              | async (`async=true`)                          |
-| -------------- | ---------------------------------------------------------------- | --------------------------------------------- |
-| `> 0`          | cancellation timer, plus a hard backstop of `timeout_ms/1000 + 2` seconds that cancels the in-flight get and raises [`ServiceError`](@ref) | cancellation timer and the transport's own query timeout |
-| `0`            | unbounded — no timer, no backstop; waits until the reply arrives or the Context drains | unbounded — no timer; bounded only by the transport's own query timeout |
-
-The hard backstop lets a bounded synchronous caller never hang even on a
-`Zenoh.get` that fails to honor its own timeout.
+Each call runs over a pooled, reusable request/reply primitive
+([`Zenoh.ReusableGet`](@ref)) declared on the client's `Querier`, so the per-call
+transport apparatus is reused rather than rebuilt — only the request encode, the
+reply decode, and (for a non-default timeout) a token clone allocate.
 
 Throws `ArgumentError` if `client` is closed or `req` is not the client's request
 type.
@@ -865,92 +898,73 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
         throw(ArgumentError("call on a closed ServiceClient"))
     e = client.entity
 
-    bytes = encode(req)
-    # During :execute warm-up `encode` above runs but there is no server, so return a
+    # The request CDR bytes and the attachment, as `Vector{UInt8}`s `call!` aliases
+    # zero-copy (kept alive — captured by `run`, `GC.@preserve`d inside `call!` — until
+    # it returns).
+    bytes = _encode_to_vector(req)
+    # During :execute warm-up the encode above runs but there is no server, so return a
     # default `Resp` (the caller's continuation still compiles) without issuing the query.
     if _WARMUP[]
         return async ? Threads.@spawn(_default_msg(Resp)) : _default_msg(Resp)
     end
-    querier = (e.wire::_ClientWire).querier
+    w = e.wire::_ClientWire
     seq = (@atomic client.seq += 1)
     ts = nanoseconds(Dates.now(e.node, System()))      # request-time wall ns
-    attach = encode_attachment(seq, ts, gid(e))
+    attach = ROSZenoh.attachment_bytes(seq, ts, gid(e))
 
-    # A querier get carries no per-call timeout in libzenoh, so bound it with a
-    # `CancellationToken`: cancel ends the in-flight get and the drain completes
-    # cleanly. A deadline timer arms the token when `timeout_ms > 0`, and the sync
-    # backstop cancels on its own deadline. `timeout_ms == 0` is truly unbounded.
-    tok = CancellationToken()
+    # One pooled `ReusableGet` per in-flight call (single-in-flight), released after. The
+    # pooled apparatus is reused across calls — no per-call `Channel`/drain task/reply
+    # `Ref`. Per-call timeout rides a `CancellationToken` armed by a `Base.Timer` only
+    # when `timeout_ms > 0`; the querier is `timeout_ms=0`, so the token is the sole
+    # bound. `call!` returns `nothing` on cancel / no reply (→ `ServiceError`); a wedged
+    # get is bounded by the firing token, so no spawned backstop is needed.
+    rg = _acquire_rg!(w)
     run = function ()
+        tok = timeout_ms > 0 ? CancellationToken() : nothing
         # `Base.Timer` qualified — ROSNode's own ROS `Timer` shadows the name here.
-        timer = timeout_ms > 0 ?
-            Base.Timer(_ -> (try; Zenoh.cancel(tok); catch; end), timeout_ms / 1000) :
-            nothing
+        timer = tok === nothing ? nothing :
+                Base.Timer(_ -> (try; Zenoh.cancel(tok); catch; end), timeout_ms / 1000)
         try
-            # `capacity=1`: a service call settles on the first reply, so a one-slot
-            # reply ring/channel suffices (vs. the default 16-slot ~4 KB buffer). A
-            # redundant `:all_complete` server's later reply drop-oldest-evicts the
-            # consumed first one — harmless, since the call already returned on it.
-            gh = Base.get(querier; capacity=1, payload=bytes, attachment=attach, cancellation=tok)
-            return _resolve_reply(gh, Resp, e.endpoint.topic)
+            h = Zenoh.call!(rg; payload=bytes, attachment=attach, cancellation=tok)
+            return _resolve_holder(h, Resp, e.endpoint.topic)   # decodes (copies out) before reuse
         finally
-            # Stop the timer so it can't fire post-return. The token drops via its
-            # finalizer — closing it here could race a firing `cancel`.
+            # Stop the timer so it can't fire post-return. The token drops via its finalizer.
             timer === nothing || close(timer)
         end
     end
 
-    async && return Threads.@spawn run()
-
-    # Hard backstop: run the reply-drain on a task and wait at most `timeout_ms` + 2s.
-    # A `Zenoh.get` that ignores its own timeout (wedged, or I/O thread starved) would
-    # otherwise block the caller forever, so on the deadline we cancel the token (the
-    # abandoned get/drain terminates) and raise `ServiceError`. This coexists with the
-    # CancellationToken deadline above — removing it as redundant reopens the hang.
-    fut = Threads.@spawn run()
-    # Explicit `timeout_ms == 0` is truly unbounded: wait forever for the reply.
-    deadline = timeout_ms == 0 ? Inf : timeout_ms / 1000 + 2.0
-    if timedwait(() -> istaskdone(fut), deadline; pollint=0.01) === :ok
-        # `fetch` on a failed task throws `TaskFailedException`; unwrap it so the
-        # caller sees the `ServiceError` the contract promises, not the task wrapper.
-        try
-            return fetch(fut)
-        catch err
-            err isa TaskFailedException &&
-                throw(current_exceptions(err.task)[end].exception)
-            rethrow()
-        end
+    # The spawned closure keeps `bytes`/`attach`/`rg` alive across the call; release on
+    # completion (whichever path). Async surfaces a failure through `fetch` as a
+    # `TaskFailedException`; the sync path returns/raises directly.
+    if async
+        return Threads.@spawn (try; run(); finally; _release_rg!(w, rg); end)
     end
-    try; Zenoh.cancel(tok); catch; end
-    throw(ServiceError("service $(e.endpoint.topic) did not reply within \
-                        $(round(deadline; digits=1))s (timeout_ms=$(timeout_ms), default 60000); \
-                        no server, slow handler, or transport contention. \
-                        Raise timeout_ms, or pass 0 to wait unbounded."))
+    try
+        return run()
+    finally
+        _release_rg!(w, rg)
+    end
+end
+
+# Resolve a `ReusableGet.call!` outcome: `nothing` (timeout / no server) and an error
+# reply both raise `ServiceError`; an ok reply decodes the owned `Resp` — copied out
+# before the holder's reusable slot is recycled by the next `call!`.
+function _resolve_holder(h, ::Type{Resp}, service::AbstractString) where {Resp}
+    h === nothing &&
+        throw(ServiceError("no reply from service $(service) (timeout or no server)"))
+    is_ok(h) && return decode_owned(sample(h), Resp)
+    msg = try
+        String(error_payload(h))
+    catch
+        "service replied with an error"
+    end
+    throw(ServiceError(msg))
 end
 
 # A non-`Req` payload is the common "wrong request type for this service"
 # mistake; name it rather than letting a MethodError surface.
 call(client::ServiceClient{Req}, req; kwargs...) where {Req} =
     throw(ArgumentError("call: expected a $(Req), got a $(typeof(req))"))
-
-# Drain the GetHandler for the single reply. The first reply settles the call: ok →
-# decode the owned Response, error → raise ServiceError. A missing reply (timeout or
-# no server) also raises, so a blocked caller never returns a fabricated response.
-function _resolve_reply(gh, ::Type{Resp}, service::AbstractString) where {Resp}
-    for r in gh
-        if is_ok(r)
-            return decode_owned(sample(r), Resp)
-        else
-            msg = try
-                String(error_payload(r))
-            catch
-                "service replied with an error"
-            end
-            throw(ServiceError(msg))
-        end
-    end
-    throw(ServiceError("no reply from service $(service) (timeout or no server)"))
-end
 
 # ── enum-instance call-method: the do-block spelling ──────────────────────────
 # `Service`/`Subscription` are `EndpointKind` values, so `Service(node, name, T) do

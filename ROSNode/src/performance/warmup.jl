@@ -318,6 +318,51 @@ end
         # service/topic-name parse the graph introspection runs.
         precompile(parse_liveliness,    (RmwZenoh, String))
         precompile(parse_topic_keyexpr, (RmwZenoh, String))
+        # Zenoh's own @compile_workload bakes the generic entity-declare path, but the
+        # kwarg-sorter body / option-builder / declare-closure frames specialize on the EXACT
+        # kwarg-NamedTuple shape, and ROSNode declares through shapes the generic workload never
+        # names. Bake them here by replaying ROSNode's actual declare call expressions against a
+        # no-connect session (multicast off + no connect endpoint ⇒ ~0.3 ms open, router-free,
+        # deterministic). The `_advanced_*_kwargs(qos)...` splat is load-bearing: it lowers to a
+        # `#…#kwsorter(::Base.Pairs)` frame distinct from a direct literal-kwarg `Core.kwcall`, so
+        # the call must be byte-for-byte `declare_publisher!`/`declare_subscription!`'s, both QoS
+        # variants (volatile ⇒ plain, transient_local ⇒ Advanced). Teardown is synchronous: `close`
+        # defers a buffered sub's teardown to a `@spawn`'d finalizer precompilation won't run, so
+        # drive `_teardown_buffered_sub!` directly to leave no AsyncCondition open. Best-effort —
+        # a sandbox that can't open a session still builds.
+        try
+            # Timestamping on (matches Zenoh's own proven workload config): the AdvancedPublisher
+            # declare needs it, and a no-connect peer never reaches the wire so it costs nothing.
+            s  = Base.open(Config(; str =
+                "{mode:\"peer\",scouting:{multicast:{enabled:false}},timestamping:{enabled:true}}"))
+            ke = Keyexpr("rosnode/_precompile")
+            # The every-startup declares first and unconditionally — `declare_publisher!`'s plain
+            # publisher and `declare_subscription!`'s buffered (`:fifo`) open, both at ROSNode's
+            # exact volatile-QoS kwarg shape (the `_advanced_*_kwargs(qos)...` splat is the live one).
+            pub = ZPublisher(s, ke; reliability = Reliabilities.RELIABLE,
+                             congestion_control = nothing, priority = nothing,
+                             _advanced_pub_kwargs(default_qos())...)
+            close(pub)
+            sub = Base.open(s, ke; channel = :fifo, capacity = _fifo_capacity(default_qos()),
+                            allowed_origin = Zenoh.Localities.ANY, _advanced_sub_kwargs(default_qos())...)
+            close(sub)
+            Zenoh._teardown_buffered_sub!(sub)
+            # context.jl `_start_discovery!`: the keepall (`history=true`) liveliness subscriber.
+            lv = LivelinessSubscriberHandler(s, ke; channel = :fifo, capacity = 1024, history = true)
+            close(lv)
+            Zenoh._teardown_buffered_sub!(lv)
+            # transient_local ⇒ AdvancedPublisher: rarer opt-in, and its declare is the one that can
+            # fail in a constrained sandbox — isolate it so a throw can't skip the declares above.
+            try
+                apub = ZPublisher(s, ke; reliability = Reliabilities.RELIABLE,
+                                  congestion_control = nothing, priority = nothing,
+                                  _advanced_pub_kwargs(QosProfile(durability = :transient_local))...)
+                close(apub)
+            catch
+            end
+            close(s)
+        catch
+        end
         # The composed-`@node` façade wiring is non-parametric — `CompositeParameterServer`
         # holds its members in a runtime field, not a type parameter — so its construction +
         # six-service wiring + `/parameter_events` aggregation is one specialisation shared by

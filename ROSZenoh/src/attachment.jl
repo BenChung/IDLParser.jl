@@ -98,8 +98,10 @@ emitted as a length-prefixed `[u8;16]` to match zenoh-ext's fixed-array encoding
 # Bytes are stored LE explicitly, independent of host endianness. The Memory is
 # pinned by `ZBytes` until zenoh's deleter fires, so it outlives the borrowing
 # `put`/`reply`.
-function encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8})
-    buf = Memory{UInt8}(undef, 33)
+# Fill `buf[1:33]` with the attachment wire bytes. Shared by the `ZBytes` form
+# (`put`/`reply`) and the `Vector` form (`attachment_bytes`, for callers that alias the
+# bytes zero-copy). `buf` is any 33-element `UInt8` `DenseVector` (`Memory` or `Vector`).
+@inline function _fill_attachment!(buf, seq::Integer, ts::Integer, gid::NTuple{16, UInt8})
     s = Int64(seq) % UInt64
     t = Int64(ts) % UInt64
     @inbounds for i in 1:8
@@ -110,8 +112,21 @@ function encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8})
     @inbounds for i in 1:16
         buf[17 + i] = gid[i]
     end
-    return Zenoh.ZBytes(buf)
+    return buf
 end
+
+encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16, UInt8}) =
+    Zenoh.ZBytes(_fill_attachment!(Memory{UInt8}(undef, 33), seq, ts, gid))
+
+"""
+    attachment_bytes(seq, ts, gid::NTuple{16,UInt8}) -> Vector{UInt8}
+
+The same 33-byte rmw_zenoh attachment as [`encode_attachment`](@ref), as a raw
+`Vector{UInt8}` for callers that alias the bytes zero-copy (e.g. `Zenoh.call!` on a
+`ReusableGet`), rather than wrapping them in a `ZBytes`.
+"""
+attachment_bytes(seq::Integer, ts::Integer, gid::NTuple{16, UInt8}) =
+    _fill_attachment!(Vector{UInt8}(undef, 33), seq, ts, gid)
 
 """
     decode_attachment(sample) -> (seq::Int64, ts::Int64, gid::NTuple{16,UInt8})
