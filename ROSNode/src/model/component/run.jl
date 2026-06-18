@@ -755,6 +755,24 @@ function _anchor_reactions!(::Type{M}) where {M}
                 precompile(decode_view,  (Zenoh.PayloadView, Type{Req}))       # view=true: borrowed PayloadView
                 precompile(encode, (Resp,))
                 precompile(service_type_info_of, (Type{Req}, Type{Resp}))      # service-level wire type identity
+                # The SERVE TREE around the handler — the same `ScopedValues.Scope{ResultCell{Query,
+                # Resp}}` + `_serve_query`/`_decode_and_serve`/`settle_handler!` cluster baked for the
+                # fixed parameter services in ROSNode's image, but keyed on THIS user service's
+                # `Resp` (it depends on `Resp`, not the handler — so the abstract-`Function` handler
+                # the component service stores still bakes it). Plus the consumer task body on the
+                # concrete `_sub_cb` scheduler closure. Without this, the first request JITs the whole
+                # ~400 ms tree (the dominant first-`run` cost on a service-bearing mixin; see
+                # examples/startup/STARTUP-REPORT.md). The owned-query type is the FIFO queryable's.
+                Q = Zenoh.Query{Base.RefValue{Zenoh.LibZenohC.z_owned_query_t}}
+                precompile(_serve_query,            (Entity, Q, Type{Req}, Type{Resp}, Function, Bool))
+                precompile(_spawn_service_consumer, (Entity, Type{Req}, Type{Resp}, Function, Bool, Serial))
+                Hs = _cb_type(_sub_cb, p.reaction, M)   # the concrete `_sub_cb` handler closure
+                if Hs !== nothing
+                    Ss = Base.return_types(_service_scheduler, (Serial, Entity, Type{Req}, Type{Resp}, Hs, Bool))
+                    if length(Ss) == 1 && isconcretetype(only(Ss))
+                        precompile(_service_consume_loop, (only(Ss), Zenoh.QueryableHandler, Entity))
+                    end
+                end
             catch
             end
         elseif p.kind === :timer
