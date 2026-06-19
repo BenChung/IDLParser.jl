@@ -517,39 +517,55 @@ function action_protocol_decls(name::AbstractString; package::AbstractString="")
 end
 
 """
+    InterfaceMarker
+
+Supertype of the empty tag struct generated for each service/action (`Foo`). The short-name
+section aliases (`Foo.Request`, `Foo.Goal`, …) resolve through the *single*
+`Base.getproperty(::Type{<:InterfaceMarker}, ::Symbol)` method below — NOT a per-marker
+overload.
+
+This is a precompile fix: a `getproperty(::Type{Foo}, ::Symbol)` method makes the generic
+`getproperty(::DataType, ::Symbol)` non-exhaustive, invalidating its compiled callers. Generated
+*per* interface (in ROSNode's own type generation), each one re-invalidates the `getproperty(::
+DataType,::Symbol)` callers on the node bring-up path — measured at ~58 ms of forced recompilation
+(`precompile_blockers`, the #1 startup-path invalidation blocker). One method, defined here in
+ROSMessages (loaded before ROSNode), is present when ROSNode's image is built, so those callers
+bake accounting for it and are not invalidated at load.
+"""
+abstract type InterfaceMarker end
+
+# `Foo.Request`/`Foo.Goal`/… → the sibling section struct `Foo_<short>` in `Foo`'s own module,
+# reconstructed by name (constant-folds when `M`/`s` are literals — the common case, `Fibonacci.
+# Goal`). Falls back to `getfield` so DataType introspection (`Foo.name`/`Foo.parameters`) works.
+# Name/module read via `getfield` on the `Core.TypeName`, NOT `nameof`/`parentmodule`: those go
+# through `M.name` (getproperty), which would re-enter this method and stack-overflow (every
+# introspection of a marker type dispatches here).
+@inline function Base.getproperty(::Type{M}, s::Symbol) where {M <: InterfaceMarker}
+    tn = getfield(M, :name)::Core.TypeName
+    sect = Symbol(getfield(tn, :name), :_, s)
+    pm = getfield(tn, :module)
+    return isdefined(pm, sect) ? getfield(pm, sect) : getfield(M, s)
+end
+
+"""
     namespace_alias_decls(kind, name) -> Vector{Expr}
 
-Julia-side namespacing for a service/action: a `<name>` tag struct with a
-`getproperty` that maps short names to the generated section structs, so
-`Foo.Request`/`Foo.Goal` read better than the `Foo_Request`/`Foo_Goal`
-structs. The ROS/wire type names stay unchanged. Splice the returned exprs
-*inside* the generated `<pkg>.<kind>` module, after the section structs, where
-`parentmodule(@__MODULE__)` resolves to that enclosing module — see
-`_inject_namespaces!`. A `msg` (a single, already-short struct) yields an empty
-vector.
+Julia-side namespacing for a service/action: a `<name>` tag struct (subtyping
+[`InterfaceMarker`](@ref)) whose short-name properties map to the generated section structs, so
+`Foo.Request`/`Foo.Goal` read better than the `Foo_Request`/`Foo_Goal` structs. The ROS/wire type
+names stay unchanged. The `.Request`/`.Goal` resolution is the single shared `getproperty` method
+on `InterfaceMarker` (this only emits the tag struct). Splice the returned exprs *inside* the
+generated `<pkg>.<kind>` module — see `_inject_namespaces!`. A `msg` yields an empty vector.
 """
 function namespace_alias_decls(kind::AbstractString, name::AbstractString)
-    fulls = if kind == "srv"
-        [string(name, "_Request"), string(name, "_Response")]
-    elseif kind == "action"
-        vcat([string(name, "_Goal"), string(name, "_Result"), string(name, "_Feedback")],
-             String[string(m.name) for m in _action_protocol_messages(name)])
-    else
-        return Expr[]
-    end
-    # `Foo` is an empty tag struct (a *type*, so it works as the action handle and as
-    # a type parameter) with a `getproperty` that maps short names to the section
-    # structs; the `getfield` fallback keeps `Foo.name`/`Foo.parameters` etc. intact.
-    # Spliced beside the section structs in `<pkg>.<kind>`, after they're defined.
-    branches = ["s === :$(chopprefix(f, string(name, "_"))) && return $f" for f in fulls]
-    src = "begin\n" *
-          "struct $name end\n" *
-          "function Base.getproperty(::Type{$name}, s::Symbol)\n" *
-          join(branches, "\n") * "\n" *
-          "return getfield($name, s)\n" *
-          "end\n" *
-          "end"
-    return Expr[e for e in Meta.parse(src).args if e isa Expr]
+    (kind == "srv" || kind == "action") || return Expr[]
+    # `struct Foo <: InterfaceMarker end` — still a *type* (action handle / type parameter); the
+    # supertype routes `Foo.Request`/`Foo.Goal` through the one shared `getproperty` (no per-marker
+    # overload → no per-interface invalidation of `getproperty(::DataType,::Symbol)`). Spliced as a
+    # GlobalRef so `InterfaceMarker` resolves regardless of the generated module's imports.
+    return Expr[Expr(:struct, false,
+                     Expr(:(<:), Symbol(name), GlobalRef(@__MODULE__, :InterfaceMarker)),
+                     Expr(:block))]
 end
 
 """

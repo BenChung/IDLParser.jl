@@ -372,16 +372,27 @@ end
 # (typeof(serve), QueryableHandler, Entity))` bakes the loop + the node-logger scope + the
 # `serve`→`_serve_query` tree it calls, keeping the seven standard services' first schedule off
 # the bring-up critical path.
+# The serve loop body, a NAMED callable rather than a `_with_node_logger do …` closure, so the
+# `serve`→`_serve_query` serve tree is `precompile`able by name (an anonymous closure re-infers
+# the whole tree at the consumer task's first schedule — a dominant first-`run` cost on
+# service-bearing nodes). Mirrors `dispatch.jl`'s `_ConsumeLoopBody`.
+# `<: Function` so it passes the `with_logger(::Function, …)` gate `_with_node_logger` calls.
+struct _ServiceLoopBody{F, Q} <: Function
+    serve::F
+    qable::Q
+end
+@inline function (b::_ServiceLoopBody)()
+    while true
+        b.serve(take!(b.qable))
+    end
+end
+
 function _service_consume_loop(serve, qable, e::Entity)
     try
         # Node logger installed once per consumer task so a plain `@info` in a handler routes
         # to /rosout without a per-request `with_logger` scope. Serial handlers run inline under
         # it; Parallel ones are spawned from within this scope and inherit its logstate.
-        _with_node_logger(e.node) do
-            while true
-                serve(take!(qable))
-            end
-        end
+        _with_node_logger(_ServiceLoopBody(serve, qable), e.node)
     catch err
         # Closing the queryable disconnects its channel; the drain throws ShutdownException as
         # the normal teardown exit.
@@ -878,7 +889,7 @@ call resolves to a [`ServiceError`](@ref) rather than hanging; `timeout_ms == 0`
 arms no timer and waits until the reply arrives or the Context drains.
 
 Each call runs over a pooled, reusable request/reply primitive
-([`Zenoh.ReusableGet`](@ref)) declared on the client's `Querier`, so the per-call
+(`Zenoh.ReusableGet`) declared on the client's `Querier`, so the per-call
 transport apparatus is reused rather than rebuilt — only the request encode, the
 reply decode, and (for a non-default timeout) a token clone allocate.
 

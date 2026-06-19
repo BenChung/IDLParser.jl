@@ -37,6 +37,12 @@ mutable struct ActionClient{A, G, R, F}
     # dominant action-call allocation (~56 KB/goal of RIHS/keyexpr derivation). `nothing`
     # when the Goal/Result types lack registered wire descriptions (the action-TI fallback).
     const _service_tis::Any
+    # The three service-call keyexpr strings (send_goal/get_result/cancel_goal), built
+    # ONCE here. They are a pure function of the action FQN + the (cached) service
+    # TypeInfos, but `_service_key` rebuilt them per call — an `EndpointEntity` +
+    # `topic_keyexpr`/RIHS derivation, ~2.4 KB/goal. Cached, each `send`/`fetch`/`cancel`
+    # just wraps the stored string in a `Keyexpr`.
+    const _service_keys::NamedTuple{(:send_goal, :get_result, :cancel_goal), NTuple{3, String}}
     # Stable per-client gid + per-request seq for the rmw_zenoh request attachment.
     # A native queryable reads the request's (sequence_number, source_timestamp,
     # source_gid) to stamp its reply and hard-panics on an absent attachment, so the
@@ -44,10 +50,11 @@ mutable struct ActionClient{A, G, R, F}
     const _gid::NTuple{16, UInt8}
     @atomic _seq::Int64
     @atomic open::Bool
-    # Lazy routing-match probes for `send_goal` and `get_result`, declared on first
-    # `wait_for_action_server`/`action_server_matched`. `send`/`fetch` use one-shot
-    # gets and never read these.
-    @atomic _match::Union{Vector{_ClientWire}, Nothing}
+    # The three service-call wires (send_goal/get_result/cancel_goal): each a `Querier`
+    # on the service keyexpr plus a pooled `ReusableGet` transport. Declared lazily on
+    # first `send`/`fetch`/`cancel`/`wait_for_action_server`; `send`/`fetch`/`cancel`
+    # `call!` over the pool (the wires also serve as the routing-match probes).
+    @atomic _match::Union{NamedTuple{(:send_goal, :get_result, :cancel_goal), NTuple{3, _ClientWire}}, Nothing}
     const _match_lock::ReentrantLock
 end
 
@@ -59,7 +66,12 @@ function ActionClient(node::Node, name::AbstractString, ::Type{A};
     G = goal_type(support); R = result_type(support); F = feedback_type(support)
     fqn = resolve_name(node, name; kind=:service)
     gid = ROSZenoh.entity_gid(node.entity.z_id, next_entity_id!(node.context))
-    client = ActionClient{A, G, R, F}(node, fqn, support, qos, _action_service_tis(A, support),
+    stis = _action_service_tis(A, support)
+    _ti(kind) = stis === nothing ? type_info(A) : getfield(stis, kind)   # per-kind service TypeInfo
+    keys = (send_goal   = _service_key(node, qos, _send_goal_topic(fqn),   _ti(:send_goal)),
+            get_result  = _service_key(node, qos, _get_result_topic(fqn),  _ti(:get_result)),
+            cancel_goal = _service_key(node, qos, _cancel_goal_topic(fqn), _ti(:cancel_goal)))
+    client = ActionClient{A, G, R, F}(node, fqn, support, qos, stis, keys,
                                       gid, 0, true, nothing, ReentrantLock())
     _warmup!(_resolve_warmup(node, warmup, warmup_sync), () -> _warm_client(client))
     return client
@@ -77,36 +89,58 @@ function _warm_client(c::ActionClient{A, G, R, F}) where {A, G, R, F}
     nothing
 end
 
-# The rmw_zenoh per-request attachment for an action service `get`: a native peer
-# echoes it into the reply and hard-panics on its absence, so every `get` carries one.
+# The rmw_zenoh per-request attachment for an action service `get`, as the `Vector{UInt8}`
+# `call!` aliases zero-copy. A native peer echoes it into its reply and panics if absent, so
+# every get carries one; the per-request `seq` advances here.
 _request_attachment(client::ActionClient) =
-    encode_attachment((@atomic client._seq += 1), _now_ns(client.node), client._gid)
+    ROSZenoh.attachment_bytes((@atomic client._seq += 1), _now_ns(client.node), client._gid)
 
-# The SERVICE-level `TypeInfo` for a client call (`:send_goal`/`:get_result`/
-# `:cancel_goal`) — keying the `get` keyexpr on the service hash, never the action
-# type's own, is what routes against a native rmw_zenoh peer. The action-typed info
-# is the Julia-to-Julia path when the service hashes can't be synthesized.
-function _client_service_ti(client::ActionClient{A}, kind::Symbol) where {A}
-    tis = client._service_tis           # cached at construction (was recomputed per call)
-    tis === nothing ? type_info(A) : getfield(tis, kind)
+# Issue one action service request (`kind`) over its pooled `ReusableGet`, retrying the
+# discovery window while the route is unmatched (an unmatched get completes with no reply,
+# so `call!` returns `nothing` promptly — empty ≠ rejected). `bytes` is the request CDR,
+# aliased zero-copy by `call!`; the rmw_zenoh attachment (which a native peer echoes back
+# and panics if absent) rides each get as a fresh `Vector`. The reply, if any, is handed to
+# `decode(h)` BEFORE the pooled `rg` is released — the borrowed holder is invalid after the
+# next `call!`; `decode(nothing)` covers the no-reply case. Returns whatever `decode` returns.
+function _action_call(decode::F, client::ActionClient, kind::Symbol,
+                      bytes::Vector{UInt8}; retries::Int = 40) where {F}
+    ctx = client.node.context
+    w = getfield(_ensure_action_match!(client), kind)
+    rg = _acquire_rg!(w)
+    try
+        for _ in 1:retries                                    # ~retries × 50ms discovery backoffs
+            h = Zenoh.call!(rg; payload = bytes, attachment = _request_attachment(client))
+            h === nothing || return decode(h)                 # decode before the `finally` releases rg
+            is_shutdown(ctx) && break
+            sleep(0.05)
+        end
+        return decode(nothing)
+    finally
+        _release_rg!(w, rg)
+    end
 end
 
 Base.isopen(c::ActionClient) = @atomic c.open
 function Base.close(c::ActionClient)
     (@atomicswap c.open = false) || return nothing
-    ws = @atomicswap c._match = nothing             # reap any lazy match probes
-    ws === nothing || for w in ws; (try; close(w); catch; end); end
+    ws = @atomicswap c._match = nothing             # reap the lazy call/match wires
+    ws === nothing || for w in (ws.send_goal, ws.get_result, ws.cancel_goal)
+        (try; close(w); catch; end)                 # closes the pooled ReusableGets, then the Querier
+    end
     nothing
 end
 Base.show(io::IO, c::ActionClient{A}) where {A} =
     print(io, "ActionClient(", c.name, ", ", nameof(A),
           isopen(c) ? "" : ", closed", ")")
 
-# Lazily declare matching probes (Queriers on the keyexprs `send`/`fetch` query) on
-# first await of the server, reusing the shared `_ClientWire` machinery. Probe both
-# `send_goal` and `get_result`: `fetch`'s `get_result` is a one-shot get with a long
-# timeout, so awaiting its match spares `fetch` from blocking on an unmatched service
-# (`send` retries discovery itself). A client that never awaits declares no probes.
+# Per-kind `get` timeout baked into each call Querier (ms): `send`/`cancel` settle on a
+# prompt accept/ack; `get_result` blocks until the goal settles, so it gets the long bound.
+_action_call_timeout(kind::Symbol) = kind === :get_result ? _GET_RESULT_TIMEOUT_MS : 5000
+
+# Lazily declare the three call/match wires (Queriers on the send_goal/get_result/cancel_goal
+# keyexprs, each with a pooled `ReusableGet` transport) on first `send`/`fetch`/`cancel`/await.
+# The send_goal + get_result wires double as the routing-match probes. A client that never
+# touches its server declares none.
 function _ensure_action_match!(client::ActionClient)
     ws = @atomic client._match
     ws === nothing || return ws
@@ -114,15 +148,15 @@ function _ensure_action_match!(client::ActionClient)
         ws = @atomic client._match
         ws === nothing || return ws
         ctx = client.node.context
-        wires = _ClientWire[]
-        for (topic_of, kind) in ((_send_goal_topic, :send_goal),
-                                 (_get_result_topic, :get_result))
-            tk = _service_key(client, topic_of(client.name), _client_service_ti(client, kind))
-            w  = _ClientWire(Querier(ctx.session, Keyexpr(tk); target = :best_matching),
+        mk(kind) = begin
+            tk = getfield(client._service_keys, kind)        # cached at construction
+            w  = _ClientWire(Querier(ctx.session, Keyexpr(tk); target = :best_matching,
+                                     timeout_ms = _action_call_timeout(kind)),
                              nothing, ReentrantLock())
             _ensure_wire_listener!(w, ctx)
-            push!(wires, w)
+            w
         end
+        wires = (send_goal = mk(:send_goal), get_result = mk(:get_result), cancel_goal = mk(:cancel_goal))
         @atomic client._match = wires
         return wires
     end
@@ -142,7 +176,8 @@ never awaits its server declares none.
 """
 function action_server_matched(client::ActionClient)
     isopen(client) || return false
-    all(_wire_matched, _ensure_action_match!(client))
+    ws = _ensure_action_match!(client)
+    _wire_matched(ws.send_goal) && _wire_matched(ws.get_result)
 end
 
 """
@@ -218,30 +253,13 @@ function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     isactive(client.node) ||
         throw(NodeInactiveError("send on a client of an inactive node; probe isactive(node) first"))
     id = _new_goal_id()
-    ctx = client.node.context
-    tk = _service_key(client, _send_goal_topic(client.name), _client_service_ti(client, :send_goal))
-
     # The client mints the goal id (the correlation token reused on feedback /
-    # get_result / cancel) into `<A>_SendGoal_Request{goal_id, goal}`.
+    # get_result / cancel) into `<A>_SendGoal_Request{goal_id, goal}`. An accepted reply
+    # ⇒ :accepted; a not-ok reply or no reply within the discovery window ⇒ :rejected.
     req = _send_goal_request_type(A)(; goal_id = _to_uuid(id), goal = goal)
-    # The queryable can lag the liveliness token a peer discovers it by, so a `get` to
-    # a not-yet-matched route returns no reply — an empty result means undiscovered,
-    # not rejected. Retry until a reply lands (authoritative) or the window elapses
-    # (no server ⇒ rejected); a retried `get` re-fires only while the route is empty.
-    accepted = false
-    got_reply = false
-    for _ in 1:40                                          # up to ~2s of 50ms backoffs
-        for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req),
-                          attachment=_request_attachment(client), timeout_ms=5000)
-            got_reply = true
-            if Zenoh.is_ok(r)
-                resp = decode_owned(Zenoh.sample(r), _send_goal_response_type(A))
-                accepted = resp.accepted
-            end
-            break                   # a service has a single reply
-        end
-        (got_reply || is_shutdown(ctx)) && break
-        sleep(0.05)
+    accepted = _action_call(client, :send_goal, _encode_to_vector(req)) do h
+        h !== nothing && Zenoh.is_ok(h) &&
+            decode_owned(Zenoh.sample(h), _send_goal_response_type(A)).accepted
     end
     g = ClientGoal{A, G, R, F}(client, id, accepted ? :accepted : :rejected,
                                nothing, nothing, Threads.Condition(), false)
@@ -323,26 +341,13 @@ function _get_result_once(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     # Outbound gate (entry-only): no get_result query from a non-Active managed node.
     isactive(client.node) ||
         throw(NodeInactiveError("fetch on a client of an inactive node; probe isactive(node) first"))
-    ctx = client.node.context
-    tk = _service_key(client, _get_result_topic(client.name), _client_service_ti(client, :get_result))
     req = _get_result_request_type(A)(; goal_id = _to_uuid(g.id))
-    local got::Union{R, Nothing} = nothing
-    local result_state::Symbol = :aborted
-    got_reply = false
-    for _ in 1:40                                          # ~2s of 50ms backoffs to match
-        for r in Base.get(ctx.session, Keyexpr(tk), "";
-                          payload=encode(req), attachment=_request_attachment(client),
-                          timeout_ms=_GET_RESULT_TIMEOUT_MS)
-            got_reply = true
-            if Zenoh.is_ok(r)
-                resp = decode_owned(Zenoh.sample(r), _get_result_response_type(A))
-                result_state = _client_state_from_status(resp.status)
-                got = resp.result
-            end
-            break
-        end
-        (got_reply || is_shutdown(ctx)) && break
-        sleep(0.05)
+    # Once matched the server holds the reply until the goal settles (the wire's long
+    # `get_result` timeout); an unmatched route returns no reply, so retry discovery.
+    result_state, got = _action_call(client, :get_result, _encode_to_vector(req)) do h
+        (h !== nothing && Zenoh.is_ok(h)) || return (:aborted, nothing)
+        resp = decode_owned(Zenoh.sample(h), _get_result_response_type(A))
+        (_client_state_from_status(resp.status), resp.result)
     end
     got === nothing &&
         throw(ErrorException("fetch: no result for goal (server error, evicted \
@@ -408,16 +413,12 @@ function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     # Outbound gate (entry-only): no cancel_goal query from a non-Active managed node.
     isactive(client.node) ||
         throw(NodeInactiveError("cancel on a client of an inactive node; probe isactive(node) first"))
-    ctx = client.node.context
-    tk = _service_key(client, _cancel_goal_topic(client.name), _client_service_ti(client, :cancel_goal))
     # Request `action_msgs/CancelGoal_Request{goal_info{goal_id, stamp}}` targeting
-    # this goal (a zeroed goal_id would be the server's cancel-all sentinel).
+    # this goal (a zeroed goal_id would be the server's cancel-all sentinel). Best-effort,
+    # single-shot (`retries=1`): the reply is unused — we just need the ack to ride the wire.
     req = _CancelGoal_Request(; goal_info = _GoalInfo(; goal_id = _to_uuid(g.id),
                                                       stamp = to_msg(_Time, Dates.now(client.node))))
-    for r in Base.get(ctx.session, Keyexpr(tk), ""; payload=encode(req),
-                      attachment=_request_attachment(client), timeout_ms=5000)
-        break
-    end
+    _action_call((_) -> nothing, client, :cancel_goal, _encode_to_vector(req); retries = 1)
     _is_terminal_client_state(@atomic g._state) || @atomic g._state = :canceling
     nothing
 end
@@ -425,10 +426,13 @@ end
 # The Zenoh data-route keyexpr for a client-side service call: reproduce the key the
 # server's queryable declared via a transient `EndpointEntity` of the matching kind,
 # since the topic key is a pure function of topic + type + hash (not the client id).
-function _service_key(client::ActionClient, topic::AbstractString, ti::TypeInfo)
-    node = client.node
+# The service-call keyexpr string for one of the action's three services. Pure in
+# (node, qos, topic, ti); called once per client per kind at construction, the results
+# cached in `_service_keys` (see the struct). Takes `node`/`qos` rather than the client
+# so it can run before the client is built.
+function _service_key(node::Node, qos::QosProfile, topic::AbstractString, ti::TypeInfo)
     e = ROSZenoh.EndpointEntity(; id=0, node=node.entity, kind=Service,
-                                topic=String(topic), type_info=ti, qos=client.qos)
+                                topic=String(topic), type_info=ti, qos=qos)
     return topic_keyexpr(node.context.format, e)
 end
 

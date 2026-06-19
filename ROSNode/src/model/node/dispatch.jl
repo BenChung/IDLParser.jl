@@ -139,19 +139,36 @@ end
 # sample, and the view path borrows the worker's own live holder (zero-copy, valid
 # for the whole dispatch). The novelty gate is `ReentrantLock`-guarded. Decode runs
 # on the worker, so with N workers a slow handler in one keeps decoding in the others.
-function _consume_loop(e::Entity, ::Type{T}, handler, view::ViewMode, sub::S, gate) where {T, S<:Zenoh.AbstractSubscriberHandler}
+# The receive→dispatch loop body, a NAMED callable rather than a `_with_node_logger do …`
+# closure, so the whole chain (recv → predispatch → decode → handler) is `precompile`able by
+# name — an anonymous closure re-infers it at the consumer task's first schedule (a ~27 ms
+# first-message stall; see examples/startup/STARTUP-REPORT.md). Captures the loop's invariants;
+# `T` is the message type, the view is held as a concrete-typed field so `_dispatch_decoded`
+# stays specialised. Mirrors `service.jl`'s `_ServiceLoopBody`.
+# `<: Function` so it passes the `with_logger(::Function, …)` gate `_with_node_logger` calls.
+struct _ConsumeLoopBody{T, H, S<:Zenoh.AbstractSubscriberHandler, G, V<:ViewMode} <: Function
+    e::Entity
+    handler::H
+    sub::S
+    gate::G
+    holder::SampleHolder
+    view::V
+end
+@inline function (b::_ConsumeLoopBody{T})() where {T}
+    while (sample = recv!(b.sub, b.holder)) !== nothing
+        _note_lost(b.e, sample)
+        _predispatch(b.e, sample, b.gate) || continue
+        _dispatch_decoded(b.e, sample, T, b.handler, b.view)
+    end
+end
+
+function _consume_loop(e::Entity, ::Type{T}, handler::H, view::V, sub::S, gate::G) where {T, H, V<:ViewMode, S<:Zenoh.AbstractSubscriberHandler, G}
     holder = SampleHolder()
     try
         # Node logger installed once per consumer task and inherited by every handler
         # call and task it spawns; a per-message `with_logger` scope would allocate and
         # break the `Unchecked` zero-alloc tier.
-        _with_node_logger(e.node) do
-            while (sample = recv!(sub, holder)) !== nothing
-                _note_lost(e, sample)
-                _predispatch(e, sample, gate) || continue
-                _dispatch_decoded(e, sample, T, handler, view)
-            end
-        end
+        _with_node_logger(_ConsumeLoopBody{T, H, S, G, V}(e, handler, sub, gate, holder, view), e.node)
     catch err
         err isa ShutdownException && return
         isopen(e) &&

@@ -203,7 +203,7 @@ decode_owned(view::CDRView) = materialize(view)
     encode_attachment(seq, ts, gid::NTuple{16,UInt8}) -> ZBytes
 
 Serialize the per-message metadata triple into a `put`/`reply` attachment.
-Wraps [`ROSZenoh.encode_attachment`](@ref); `seq`/`ts` coerce to `Int64`, `gid`
+Wraps `ROSZenoh.encode_attachment`; `seq`/`ts` coerce to `Int64`, `gid`
 stays the fixed-width `NTuple{16,UInt8}` so the encoding is byte-exact against
 native rmw_zenoh peers — a `Vector` gid gets length-prefixed and fails their
 deserialize.
@@ -215,7 +215,7 @@ encode_attachment(seq::Integer, ts::Integer, gid::NTuple{16,UInt8}) =
     decode_attachment(sample) -> (seq::Int64, ts::Int64, gid::NTuple{16,UInt8})
 
 Read the metadata triple back from a received `Sample` (or `ZBytes`). The inverse
-of [`encode_attachment`](@ref); wraps [`ROSZenoh.decode_attachment`](@ref).
+of [`encode_attachment`](@ref); wraps `ROSZenoh.decode_attachment`.
 """
 decode_attachment(sample) = ROSZenoh.decode_attachment(sample)
 

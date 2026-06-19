@@ -848,5 +848,11 @@ end
 @setup_workload begin
     @compile_workload begin
         precompile(_rosout_publisher!, (Node,))
+        # The node-logger gate runs on the first log record of every consumer task's bring-up
+        # (each task installs the RosoutLogger via `_with_node_logger`); bake the level-resolution
+        # leaves so that first `@info`/`@error` doesn't JIT the longest-prefix level lookup.
+        precompile(_effective_level, (RosoutLogger,))
+        precompile(Logging.min_enabled_level, (RosoutLogger,))
+        precompile(Logging.shouldlog, (RosoutLogger, LogLevel, Module, Symbol, Symbol))
     end
 end

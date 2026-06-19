@@ -263,6 +263,11 @@ function _finalize_module!(mod::Module)
             if nt !== nothing
                 _anchor_reactions!(M)       # message handlers + decode/dispatch + service codec
                 _anchor_construction!(M)    # endpoint/materialise/param-server + publish path
+                # The accessor TYPE is baked above (the `entities(m::M)` method + marker ride this
+                # image). Materialise still calls `_entities_accessor_from_ports!(M, ports)` once —
+                # it finds the marker and no-ops, but the call itself JITs unless anchored. The two
+                # `PortsNT` sources are proven equal for derivable kinds, so `ports::nt`.
+                precompile(_entities_accessor_from_ports!, (Type{M}, nt))
             end
         catch err
             @debug "_finalize_module!: skipped a mixin bake" mod mixin = M exception = err
