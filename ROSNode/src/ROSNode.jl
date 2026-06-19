@@ -54,6 +54,7 @@ include("performance/intraprocess.jl")
 include("model/component/component.jl")
 include("model/component/run.jl")
 include("model/component/composition.jl")
+include("discovery/local_graph.jl")
 include("model/component/precompile.jl")
 
 end # module ROSNode

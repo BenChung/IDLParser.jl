@@ -81,12 +81,22 @@ its own queryable/querier into `entity.wire`.
 `type_info` may be `nothing` (a type-less endpoint). `qos` defaults
 to `default_qos()`.
 """
+# The entity id: a reserved one from the node's queue while materialising a composed
+# member's ports (Stage B — so the entity lands on the id its a-priori local-graph entry
+# used), else a fresh counter id (runtime/imperative endpoint).
+function _planned_or_next_id!(node::Node)
+    @lock node.lock begin
+        node._materialising && !isempty(node._id_queue) && return popfirst!(node._id_queue)
+    end
+    next_entity_id!(node.context)
+end
+
 function make_entity(node::Node, kind::EndpointKind, topic::AbstractString,
                      type_info::Union{TypeInfo, Nothing}=nothing;
                      qos::QosProfile=default_qos())
     isopen(node) || throw(ArgumentError("cannot create an entity on a closed node"))
     ctx = node.context
-    eid = next_entity_id!(ctx)
+    eid = _planned_or_next_id!(node)
     endpoint = EndpointEntity(; id=eid, node=node.entity, kind=kind,
                               topic=String(topic), type_info=type_info, qos=qos)
     lv_key = liveliness_keyexpr(ctx.format, endpoint)
@@ -94,14 +104,24 @@ function make_entity(node::Node, kind::EndpointKind, topic::AbstractString,
 
     ent = Entity(node, endpoint, lv_key, gid, nothing, nothing, nothing,
                  nothing, nothing, false, false, true)
-    # Declare liveliness first (peers discover us), then inject locally so our own
-    # graph queries are immediately authoritative.
+    # Declare liveliness first (peers discover us), then inject locally so our own graph
+    # queries are immediately authoritative — UNLESS this endpoint was populated into the
+    # local graph a-priori (Stage B): the reserved id makes its lv_key already present, so the
+    # per-declare inject (and its notify) is redundant and skipped. A runtime/imperative
+    # endpoint (counter id) is absent → inject as usual.
     ent._lv_token = LivelinessToken(ctx.session, Keyexpr(lv_key))
-    inject_endpoint!(ctx, lv_key, endpoint)
+    (@lock ctx.graph.lock haskey(ctx.graph.local_endpoints, lv_key)) ||
+        inject_endpoint!(ctx, lv_key, endpoint)
 
     @lock node.lock push!(node.entities, ent)
     return ent
 end
+
+# Materialise an entity directly from its descriptor — the shared-identity entry the
+# pattern `_make_*` use, so each endpoint's (kind, topic, type, qos) is derived ONCE in
+# its descriptor and consumed by both construction here and the a-priori graph enumeration.
+make_entity(node::Node, d::EndpointDesc) =
+    make_entity(node, d.kind, d.topic, d.type_info; qos = d.qos)
 
 Base.isopen(e::Entity) = @atomic e.open
 Base.show(io::IO, e::Entity) =

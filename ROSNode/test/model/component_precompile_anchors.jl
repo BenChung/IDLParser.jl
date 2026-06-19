@@ -27,7 +27,13 @@ _declared_kwargs(f) = reduce(union, (Base.kwarg_decl(m) for m in methods(f)); in
     specs = ROSNode._component_precompile_specs()
     @test !isempty(specs)
     for (f, ts) in specs
-        @test precompile(f, ts)
+        # Drift guard: the path must resolve to a real method. `precompile` returns `true` for a
+        # bakeable concrete sig; since `NodeKind`/`ComponentNode` became parametric (UnionAlls), the
+        # type-agnostic specs are abstract — `precompile` returns `false` (not bakeable as abstract;
+        # the per-node concrete specialisations are baked by `_anchor_node_plan!`/`_finalize_module!`),
+        # but the method still exists. So accept `precompile` OR `hasmethod` — a rename/arity change
+        # flips both to false and still fails here.
+        @test precompile(f, ts) || hasmethod(f, ts)
         kw = _kwanchor(f, ts)
         kw === nothing && continue
         declared = _declared_kwargs(kw.target_function)

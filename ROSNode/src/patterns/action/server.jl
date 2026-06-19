@@ -96,6 +96,29 @@ mutable struct ActionServer{A, G, R, F}
     @atomic open::Bool
 end
 
+# The five endpoints an action server expands to — three services + feedback/status
+# publishers. Each service keys its data keyexpr on its own SERVICE-level type + RIHS01
+# (`<pkg>/action/<A>_SendGoal`, `…_GetResult`, `action_msgs/srv/CancelGoal`), which routes
+# against a native peer; the action type's own hash routes only Julia-to-Julia, the path
+# taken when the service hashes can't be synthesized (Goal/Result lack registered TDs).
+# Feedback/status carry their own wire types (FeedbackMessage / GoalStatusArray). The ONE
+# source for an action's identity, shared by `_make_action_server` and the a-priori enumeration.
+function _action_descs(node, name::AbstractString, ::Type{A}; qos::QosProfile=default_qos()) where {A}
+    support = ActionTypeSupport(A)
+    fqn     = resolve_name(node, name; kind=:service)
+    stis    = _action_service_tis(A, support)
+    sg_ti = stis === nothing ? type_info(A) : stis.send_goal
+    cg_ti = stis === nothing ? type_info(A) : stis.cancel_goal
+    gr_ti = stis === nothing ? type_info(A) : stis.get_result
+    EndpointDesc[
+        EndpointDesc(Service,   _send_goal_topic(fqn),   sg_ti, qos),
+        EndpointDesc(Service,   _cancel_goal_topic(fqn), cg_ti, qos),
+        EndpointDesc(Service,   _get_result_topic(fqn),  gr_ti, qos),
+        EndpointDesc(Publisher, _feedback_topic(fqn), type_info_of(_feedback_message_type(A)), qos),
+        EndpointDesc(Publisher, _status_topic(fqn),   type_info_of(_GoalStatusArray),          qos),
+    ]
+end
+
 function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                              on_goal::Function = _default_on_goal,
                              on_cancel::Function = _default_on_cancel,
@@ -124,25 +147,14 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                              body or an `on_accepted=` callback"))
     end
 
-    # Five sub-endpoints. Each of the three services keys its data keyexpr on its own
-    # SERVICE-level type + RIHS01 (`<pkg>/action/<A>_SendGoal`, `…_GetResult`,
-    # `action_msgs/srv/CancelGoal`), which is what routes against a native peer; the
-    # action type's own hash routes only Julia-to-Julia and is the path taken when the
-    # service hashes can't be synthesized (Goal/Result not registered with their TDs).
-    stis = _action_service_tis(A, support)
-    sg_ti = stis === nothing ? type_info(A) : stis.send_goal
-    cg_ti = stis === nothing ? type_info(A) : stis.cancel_goal
-    gr_ti = stis === nothing ? type_info(A) : stis.get_result
-    send_goal_ent   = make_entity(node, Service,      _send_goal_topic(fqn),   sg_ti; qos=qos)
-    cancel_goal_ent = make_entity(node, Service,      _cancel_goal_topic(fqn), cg_ti; qos=qos)
-    get_result_ent  = make_entity(node, Service,      _get_result_topic(fqn),  gr_ti; qos=qos)
-    # Feedback/status carry their own wire types (FeedbackMessage / GoalStatusArray):
-    # the data keyexpr embeds type+hash, so a publisher must match what its subscriber
-    # declares.
-    feedback_ent    = make_entity(node, Publisher,    _feedback_topic(fqn),
-                                  type_info_of(_feedback_message_type(A)); qos=qos)
-    status_ent      = make_entity(node, Publisher,    _status_topic(fqn),
-                                  type_info_of(_GoalStatusArray); qos=qos)
+    # The five sub-endpoints' wire identities (see `_action_descs`), derived once and shared
+    # with the a-priori local-graph enumeration; materialise them in that fixed order.
+    descs = _action_descs(node, name, A; qos=qos)
+    send_goal_ent   = make_entity(node, descs[1])
+    cancel_goal_ent = make_entity(node, descs[2])
+    get_result_ent  = make_entity(node, descs[3])
+    feedback_ent    = make_entity(node, descs[4])
+    status_ent      = make_entity(node, descs[5])
 
     server = ActionServer{A, G, R, F}(node, fqn, support, on_goal, on_cancel, accepted,
                                       send_goal_ent, cancel_goal_ent, get_result_ent,

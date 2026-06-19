@@ -296,6 +296,17 @@ srv = Service(node, "add_two_ints", AddTwoInts_Request) do req
 end
 ```
 """
+# A service endpoint's wire identity. The keyexpr/liveliness key uses the SERVICE-level type
+# identity (`pkg/srv/Base` + the service RIHS01) to match rmw_zenoh peers — the request type's
+# own RIHS keys a distinct keyexpr that round-trips Julia-to-Julia but routes against no native
+# peer; it falls back to the request info for unregistered (unsynthesizable) types. The ONE
+# source for a service's identity, shared by construction below and the a-priori enumeration.
+function _service_desc(node, name::AbstractString, ::Type{Srv}; qos::QosProfile=default_qos()) where {Srv}
+    sti = something(service_type_info_of(request_type(Srv), response_type(Srv)),
+                    type_info_of(request_type(Srv)))
+    EndpointDesc(Service, resolve_name(node, name; kind=:service), sti, qos)
+end
+
 function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
                        qos::QosProfile=default_qos(), view::Bool=false,
                        concurrency::Concurrency=Serial(),
@@ -305,13 +316,7 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
                        warmup_sample=nothing) where {Srv}
     Req  = request_type(Srv)
     Resp = response_type(Srv)
-    sname = resolve_name(node, name; kind=:service)
-    # The keyexpr/liveliness key on the SERVICE-level type identity (`pkg/srv/Base` +
-    # the service RIHS01) to match rmw_zenoh peers; the request type's own RIHS keys a
-    # distinct keyexpr that round-trips Julia-to-Julia but routes against no native
-    # peer. Falls back to the request info only for unregistered (unsynthesizable) types.
-    sti = something(service_type_info_of(Req, Resp), type_info_of(Req))
-    ent = make_entity(node, Service, sname, sti; qos=qos)
+    ent = make_entity(node, _service_desc(node, name, Srv; qos=qos))
 
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
@@ -408,7 +413,16 @@ end
 # the decoded request, not the cell. A single scoped value (carrying the pair) rather
 # than two: one `with` binding instead of two halves the per-request dynamic-scope
 # allocation, and only the handler frame ever reads it.
-const _ACTIVE_SERVICE = Base.ScopedValues.ScopedValue{Any}(nothing)
+# The active service request's `(cell, wire)`, made visible to `respond!`/`detach!` within the
+# handler via TASK-LOCAL storage (not a `ScopedValue`). `respond!`/`detach!` read it only from
+# the handler's own frame/task, and the detached path carries an explicit `ServiceRequestHandle`
+# (`cell`+`wire`), so no cross-task propagation is needed — and a task-local set/restore avoids
+# the `ScopedValue` `with`'s per-request HAMT path-copy, whose cost grew with the consumer task's
+# ambient scope depth (the profiled service-server drift). `_run_handler!` runs on the same task
+# as the handler (Serial: inline on the consumer; Parallel: the whole `_serve_query` is `@spawn`ed),
+# so the slot is always set on the handler's own task.
+const _ACTIVE_SERVICE_KEY = :_ros_active_service
+@inline _active_service() = get(task_local_storage(), _ACTIVE_SERVICE_KEY, nothing)
 
 """
     respond!(req, status::SettlementStatus, payload) -> Bool
@@ -436,7 +450,7 @@ end
 ```
 """
 function respond!(@nospecialize(req), status::SettlementStatus, payload)
-    active = _ACTIVE_SERVICE[]
+    active = _active_service()
     active === nothing && throw(ArgumentError(
         "respond!(req, status, payload) called outside a Service handler \
          (an action goal settles via respond!(goal, …))"))
@@ -487,7 +501,7 @@ end
 ```
 """
 function detach!(@nospecialize(req))
-    active = _ACTIVE_SERVICE[]
+    active = _active_service()
     active === nothing && throw(ArgumentError(
         "detach!(req) called outside a Service handler"))
     cell = active[1]
@@ -600,9 +614,8 @@ end
 # the consumer task (`_spawn_service_consumer`).
 function _run_handler!(e::Entity, cell, ::Type{Resp}, handler, req) where {Resp}
     settle_handler!(cell,
-                    () -> Base.ScopedValues.with(_ACTIVE_SERVICE => (cell, e.wire)) do
-                        handler(req)
-                    end;
+                    () -> task_local_storage(() -> handler(req),
+                                             _ACTIVE_SERVICE_KEY, (cell, e.wire));
                     success_status = success,
                     default_result = () -> _zero_response(Resp),
                     log_id = e.endpoint.topic)

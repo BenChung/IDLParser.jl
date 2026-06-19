@@ -24,9 +24,14 @@ a `LifecycleNode` when managed) shared by the node's member mixins, the construc
 member instances by name, and the `LifecycleNode` handle (`lifecycle`) when managed.
 Returned by `run` / held by a [`Container`](@ref).
 """
-mutable struct ComponentNode
+# `Members` is the typed member container — a `NamedTuple{names, Tuple{concrete mixin types}}` for a
+# `@node` with a generated `_build_members` (the node-as-built form, grounded), or `Dict{Symbol,Any}`
+# for the dynamic fallback (mixin-as-node / un-finalized). `members[nm]` reads work for both
+# (`getindex` by Symbol); the typed form makes the dispatch concrete. `::ComponentNode` sites match
+# the UnionAll.
+mutable struct ComponentNode{Members}
     const node::Node
-    const members::Dict{Symbol, Any}
+    const members::Members
     const order::Vector{Symbol}     # member names in DI construction (toposort) order — drives
                                     # lifecycle fan-out + reverse-order teardown
     const wires::Dict{Symbol, Dict{Symbol, String}}  # member => (port => resolved wire name), remaps
@@ -148,10 +153,15 @@ NodeMember(name::Symbol, mixin::Type) = NodeMember(name, mixin, Pair{Symbol, Any
 A named collection of [`NodeMember`](@ref)s — the result of `@node N =
 […]`. `run(N)` / `add!(c, N)` instantiate it.
 """
-struct NodeKind
+# Parametric on the node's name (a `Symbol` type param) so each `@node` is a DISTINCT type
+# (`typeof(Rig) === NodeKind{:Rig}`) — the per-node identity the node-as-built machinery
+# (`_build_members`/`ComponentNode{…}`) dispatches on. The `name` field mirrors the param so the
+# many `k.name` reads are unchanged; every `::NodeKind` / `isa NodeKind` site matches the UnionAll.
+struct NodeKind{Name}
     name::Symbol
     members::Vector{NodeMember}
 end
+NodeKind(name::Symbol, members::Vector{NodeMember}) = NodeKind{name}(name, members)
 
 Base.show(io::IO, k::NodeKind) =
     print(io, "NodeKind(", k.name, ", ", [m.name => nameof(m.mixin) for m in k.members], ")")
@@ -255,6 +265,9 @@ function _finalize_module!(mod::Module)
             # mixin — which the `nt` gate below skips entirely (its action handle type isn't
             # statically derivable).
             _anchor_action_codecs!(M)
+            # Typed materialise body (Stage C): generated for every port-bearing mixin — including
+            # action-bearing ones, which the `nt` accessor gate below skips. Grounds materialise.
+            _gen_build_ports!(mod, M)                   # __ros_build_ports_<M>__ + _build_ports(node, m::M, …)
             nt = _entities_accessor_from_specs!(M)      # __ros_entities_<M>__ + entities(m::M)
             # Bake handlers + the construction path only once a typed accessor exists. A mixin
             # with a non-derivable port (action/client) keeps the generic `entities`, so it warms
@@ -269,6 +282,14 @@ function _finalize_module!(mod::Module)
                 # `PortsNT` sources are proven equal for derivable kinds, so `ports::nt`.
                 precompile(_entities_accessor_from_ports!, (Type{M}, nt))
             end
+            # Stage C: bake the generated typed materialise (`_gen_build_ports!` eval'd it above, so
+            # it's only visible in the latest world → `invokelatest`). AFTER the accessor, so a
+            # precompile hiccup can't skip the accessor (the bug the same-frame `precompile` had).
+            # pvalue is `Any` at the call site (`MixinRuntime.pserver::Any` → `current(…)::Any`),
+            # so anchor that — `pschema(M)` would bake a specialisation `_member_materialize!`
+            # never calls.
+            isconcretetype(M) &&
+                Base.invokelatest(precompile, _build_ports, (Node, M, Dict{Symbol, String}, Any))
         catch err
             @debug "_finalize_module!: skipped a mixin bake" mod mixin = M exception = err
         end
@@ -298,11 +319,41 @@ function _finalize_module!(mod::Module)
             K isa NodeKind || continue
             try
                 _anchor_node_plan!(K)
+                _gen_build_members!(mod, K)   # emit the node-as-built `_build_members(::Type{NodeKind{:N}}, node)`
             catch err
                 @debug "_finalize_module!: skipped a node-plan bake" mod node = K exception = err
             end
         end
     end
+    return nothing
+end
+
+# The node-as-built member constructor: `_build_members(::Type{NodeKind{:N}}, node)` returns the
+# member NamedTuple, generated once per `@node` as the toposort'd straight-line `construct` sequence
+# (deps threaded positionally from prior members). Its return type IS the node's typed `Members`.
+# Generic here; per-node methods are `Core.eval`'d at finalize (marker-cached, Revise-safe, like the
+# entities accessor). `__rt__`/pservers are NOT set here — the assembly does that after building the
+# node (the back-ref needs the `ComponentNode`); deps are injected as constructed objects only.
+function _build_members end
+
+function _gen_build_members!(mod::Module, K::NodeKind)
+    KT = typeof(K)                                # NodeKind{:N}
+    nm_sym = KT.parameters[1]
+    marker = Symbol("__ros_build_members_", nm_sym)
+    isdefined(mod, marker) && return nothing
+    order, bytype, edges = _members_plan(K)
+    loc = Dict(nm => Symbol("_m_", nm) for nm in order)
+    body = Expr(:block)
+    for nm in order
+        M = bytype[nm]
+        deps = Any[loc[d] for d in edges[nm]]
+        push!(body.args, :($(loc[nm]) = $(GlobalRef(@__MODULE__, :construct))($M, node, $(deps...))))
+    end
+    push!(body.args, :(return $(Expr(:tuple, (Expr(:(=), nm, loc[nm]) for nm in order)...))))
+    Core.eval(mod, quote
+        const $marker = true
+        $(GlobalRef(@__MODULE__, :_build_members))(::$(Type){$KT}, node::$(GlobalRef(@__MODULE__, :Node))) = $body
+    end)
     return nothing
 end
 
@@ -335,6 +386,28 @@ function _anchor_node_plan!(K::NodeKind)
         _anchor_action_codecs!(Tc)
         _anchor_reactions!(Tc)
         _anchor_construction!(Tc)
+        # The generated typed materialise on this parametric instantiation (eval'd → latest world).
+        # pvalue is `Any` at the call site (see `_member_materialize!`).
+        Base.invokelatest(precompile, _build_ports, (Node, Tc, Dict{Symbol, String}, Any))
+    end
+    # Stage A/C: anchor the generated typed assembly. `_build_members` is eval'd into this module
+    # (→ latest world) and keyed on `NodeKind{:N}` whose method this module owns, so it caches in
+    # the consumer image (verified: it drops out of first-`run` re-inference). NOT anchored: the
+    # `NodeKind{:N}`-keyed PLANNING frames (`_resolve_wires`/`_members_plan`/`_check_clobbers`/`_run`)
+    # — ROSNode methods on a ROSNode type → external MIs the consumer can't cache; they re-infer at
+    # first `run` regardless, and belong to a separate de-specialization / ROSNode-image effort.
+    Base.invokelatest(precompile, _build_members, (Type{typeof(K)}, Node))
+    # The Stage-B/C node-level fan-out keyed on the typed `ComponentNode{Members}` (Members carries
+    # the consumer's mixin types → consumer-cacheable). Anchor each directly — `_build_members`'s
+    # return type IS `Members`. (`_prime_local_graph!` + `_ordered_member_descs` were the largest
+    # cacheable-but-unanchored frames at first `run`.)
+    rts = Base.invokelatest(Base.return_types, _build_members, (Type{typeof(K)}, Node))
+    if length(rts) == 1 && isconcretetype(only(rts))
+        CN = ComponentNode{only(rts)}
+        Base.invokelatest(precompile, _prime_local_graph!,   (CN, Vector{Symbol}))
+        Base.invokelatest(precompile, _ordered_member_descs, (CN, Vector{Symbol}))
+        Base.invokelatest(precompile, _member_materialize!,  (CN, Symbol))
+        Base.invokelatest(precompile, _member_configure!,    (CN, Symbol))
     end
     return nothing
 end
@@ -499,6 +572,80 @@ _wire(p::PortSpec) = p.wire === nothing ? String(p.name) : p.wire
 # A port's wire name under a member's resolved remap map: the remapped name if
 # present, else the authored `_wire(p)`.
 _wire(p::PortSpec, wiremap::Dict{Symbol, String}) = get(wiremap, p.name, _wire(p))
+
+# ── Stage C: generated typed materialise (the node-as-built materialise body) ──────────
+# `_build_ports(node, m::Base, wiremap, pvalue)` is the typed, straight-line counterpart of
+# `_materialize_ports!`: generated once per port-bearing mixin BASE (marker-cached, Revise-safe,
+# like the entities accessor), with each port's kind/msgtype/reaction/`extra` BAKED at generation
+# time — so it has no `Vector{PortSpec}` walk, no Symbol-kind branch, no `Any`-field reads, and
+# returns a CONCRETE ports NamedTuple. The wire name (runtime remap) and a param-driven timer rate
+# stay runtime. Dispatch is on the member instance `m` (covering a parametric mixin's
+# instantiations), mirroring `entities(m::M)`. The dynamic `_materialize_ports!` remains the
+# fallback for an un-finalized mixin.
+function _build_ports end
+
+# Fallback for an un-finalized mixin (no generated typed method, e.g. a REPL mixin without
+# `@precompile_nodes`/`ros_init!`): the dynamic walk. Dispatching `_member_materialize!` on this
+# (vs a runtime `hasmethod` branch) keeps the compiler from inferring the dynamic path as the
+# untaken branch when a typed `_build_ports` exists.
+_build_ports(node::Node, m, wiremap, pvalue) =
+    _materialize_ports!(node, m, :_, mixin_spec(_base(typeof(m))).ports, pvalue, wiremap)
+
+# Runtime resolution of a `@every :param`-style timer rate from the member's parameter snapshot.
+function _timer_rate(pvalue, sym::Symbol)
+    sym in propertynames(pvalue) ||
+        error("@every: timer rate `:$(sym)` does not name a declared parameter")
+    hz = getproperty(pvalue, sym)
+    hz isa Real || error("@every: timer rate `:$(sym)` must be numeric (got `$(typeof(hz))`)")
+    return hz
+end
+
+function _gen_build_ports!(mod::Module, M::Type)
+    ports = mixin_spec(M).ports     # may be empty — a port-less mixin gets an empty typed materialise
+    marker = Symbol("__ros_build_ports_", nameof(M))
+    isdefined(mod, marker) && return nothing
+    R = @__MODULE__
+    body = Expr(:block)
+    pnames = Symbol[]; hlocs = Symbol[]; timers = Symbol[]
+    for p in ports
+        loc  = Symbol("_h_", p.name)
+        wire = :(get(wiremap, $(QuoteNode(p.name)), $(_wire(p))))     # runtime remap, authored default baked
+        if p.kind === :publisher
+            push!(body.args, :($loc = $(GlobalRef(R, :Publisher))(node, $wire, $(p.msgtype))))
+        elseif p.kind === :subscription
+            push!(body.args, :($loc = $(GlobalRef(R, :Subscription))(
+                $(GlobalRef(R, :_sub_cb))($(p.reaction), m), node, $wire, $(p.msgtype); warmup = :off)))
+        elseif p.kind === :service
+            push!(body.args, :($loc = $(GlobalRef(R, :Service))(
+                $(GlobalRef(R, :_sub_cb))($(p.reaction), m), node, $wire, $(p.msgtype); warmup = :off)))
+        elseif p.kind === :action
+            push!(body.args, :($loc = $(GlobalRef(R, :_make_action_server))(
+                node, $wire, $(typeof(p.reaction));
+                body = $(GlobalRef(R, :_component_action_adapter))(
+                    $(p.reaction), $(GlobalRef(R, :ActionTypeSupport))($(typeof(p.reaction))),
+                    $(p.extra.fb_pos), m))))
+        elseif p.kind === :timer
+            rate = p.extra.rate
+            hz = rate isa Symbol ? :($(GlobalRef(R, :_timer_rate))(pvalue, $(QuoteNode(rate)))) : rate
+            push!(body.args, :($loc = $(GlobalRef(R, :_paused_timer))(node,
+                $(GlobalRef(R, :Duration))(round(Int64, 1.0e9 / $hz)),
+                $(GlobalRef(R, :_timer_cb))($(p.reaction), m))))
+            push!(timers, loc)
+        else
+            continue
+        end
+        push!(pnames, p.name); push!(hlocs, loc)
+    end
+    nt = Expr(:tuple, Expr(:parameters, (Expr(:kw, pn, hl) for (pn, hl) in zip(pnames, hlocs))...))
+    push!(body.args, :(return ($nt, $(Expr(:ref, :Any, timers...)))))
+    Core.eval(mod, quote
+        const $marker = true
+        function $(GlobalRef(R, :_build_ports))(node::$(GlobalRef(R, :Node)), m::$M, wiremap, pvalue)
+            $body
+        end
+    end)
+    return nothing
+end
 
 # ── wire-topic remap resolution + clobber detection ──────────────────────────────
 
@@ -955,9 +1102,22 @@ end
 function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
     rt = getfield(m, :__rt__)::MixinRuntime
-    specs = mixin_spec(_base(typeof(m))).ports
-    ports, timers = _materialize_ports!(cnode.node, m, nm, specs, current(rt.pserver),
-                                        get(cnode.wires, nm, Dict{Symbol, String}()))
+    node = cnode.node
+    wiremap = get(cnode.wires, nm, Dict{Symbol, String}())
+    pvalue = current(rt.pserver)
+    # Stage B: only the declared port entities created here draw their reserved ids from the
+    # node's queue — gate `make_entity` on this window so a user `configure` hook (which runs
+    # between members) that creates an imperative endpoint can't steal a queued id.
+    node._materialising = true
+    ports, timers = try
+        # Stage C: a finalized mixin dispatches to its generated typed `_build_ports` (grounded
+        # materialise, concrete ports NamedTuple); an un-finalized one falls to the dynamic-walk
+        # method above. Dispatch (not a `hasmethod` branch) so the dynamic path isn't inferred as
+        # the untaken branch when a typed method exists.
+        _build_ports(node, m, wiremap, pvalue)
+    finally
+        node._materialising = false
+    end
     rt.ports = ports
     rt.timers = timers
     # type-stable `entities(m)::PortsNT` — the base goes in as BOTH the generated
@@ -1062,11 +1222,16 @@ end
 # `failure` token (the lifecycle driver maps it to `:failure`, staying Unconfigured).
 # A member throw propagates out (the lifecycle driver maps it to `:error`).
 function _members_configure!(cnode::ComponentNode, order::Vector{Symbol})
-    for (i, nm) in enumerate(order)
-        if _member_configure!(cnode, nm) === failure
-            foreach(j -> _member_cleanup!(cnode, order[j]), i:-1:1)
-            return failure
+    primed = _prime_local_graph!(cnode, order)        # one-shot a-priori local graph + reserved ids
+    try
+        for (i, nm) in enumerate(order)
+            if _member_configure!(cnode, nm) === failure
+                foreach(j -> _member_cleanup!(cnode, order[j]), i:-1:1)
+                return failure
+            end
         end
+    finally
+        _reconcile_local_graph!(cnode.node, primed)   # drop the queue + any aborted-member orphans
     end
     return nothing
 end
@@ -1120,8 +1285,9 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, @nospecializ
     # governs the node's logging from the start.
     log_level === nothing || set_logger_level!(node, log_level)
 
-    cnode = ComponentNode(node, Dict{Symbol, Any}(), order, wires, ln, nothing, true)
-    cnref[] = cnode
+    # `cnode`/`mbrs` are built INSIDE the try (the typed path needs the members before the node can
+    # be typed), so declare them here for the catch/return to see.
+    local cnode, mbrs
 
     # A failure mid-assembly (clobber/construct/DI/param-wiring/configure) must not leave
     # a half-built node — and its already-declared entities — orphaned on the (possibly
@@ -1132,16 +1298,34 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, @nospecializ
         # one wire name (without an explicit remap) is a hard error you fix by remapping.
         composed && _check_clobbers(K, node, wires, remapped)
 
-        # construct members in dependency order, injecting resolved siblings; attach
-        # each member's typed ParameterServer{P_M}. No materialise/configure here — that
-        # happens at the configure step (immediately for unmanaged, at the transition for managed).
-        for nm in order
-            M = bytype[nm]
-            deps = Any[cnode.members[d] for d in edges[nm]]
-            m = construct(M, node, deps...)
-            pserver = _build_pserver(node, pschema(M), _member_overrides(M, nm, overrides))
-            setfield!(m, :__rt__, MixinRuntime(cnode, nm, pserver, nothing, Any[]))
-            cnode.members[nm] = m
+        # Construct members in DI order; attach each member's typed ParameterServer{P_M}. No
+        # materialise/configure here — that's the configure step. A composed `@node` with a generated
+        # `_build_members` (the toposort'd straight-line constructor) builds a TYPED member NamedTuple
+        # → grounded assembly + a typed `ComponentNode{Members}`; otherwise (mixin-as-node, or no bake
+        # yet) the dynamic `Dict` path (unchanged behaviour). `cnref[]` is set before any managed
+        # transition runs (the callbacks reach the cnode through it).
+        if composed && hasmethod(_build_members, Tuple{Type{typeof(K)}, Node})
+            mbrs = _build_members(typeof(K), node)        # typed NamedTuple; __rt__ unset
+            cnode = ComponentNode{typeof(mbrs)}(node, mbrs, order, wires, ln, nothing, true)
+            cnref[] = cnode
+            for nm in order
+                m = mbrs[nm]
+                M = bytype[nm]
+                pserver = _build_pserver(node, pschema(M), _member_overrides(M, nm, overrides))
+                setfield!(m, :__rt__, MixinRuntime(cnode, nm, pserver, nothing, Any[]))
+            end
+        else
+            mbrs = Dict{Symbol, Any}()
+            cnode = ComponentNode{typeof(mbrs)}(node, mbrs, order, wires, ln, nothing, true)
+            cnref[] = cnode
+            for nm in order
+                M = bytype[nm]
+                deps = Any[mbrs[d] for d in edges[nm]]
+                m = construct(M, node, deps...)
+                pserver = _build_pserver(node, pschema(M), _member_overrides(M, nm, overrides))
+                setfield!(m, :__rt__, MixinRuntime(cnode, nm, pserver, nothing, Any[]))
+                mbrs[nm] = m
+            end
         end
 
         # node-level `ros2 param` surface: a mixin promoted to a node wires its
@@ -1176,7 +1360,12 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, @nospecializ
                 end
             end
         else
-            foreach(nm -> _member_configure!(cnode, nm), order)
+            primed = _prime_local_graph!(cnode, order)
+            try
+                foreach(nm -> _member_configure!(cnode, nm), order)
+            finally
+                _reconcile_local_graph!(cnode.node, primed)
+            end
             foreach(nm -> _member_activate!(cnode, nm), order)
         end
 

@@ -80,6 +80,29 @@ function _endpoint_info(e::EndpointEntity; is_local::Bool)
 end
 
 """
+    EndpointDesc(kind, topic, type_info, qos)
+
+The wire identity of one endpoint a node declares — `kind`, resolved `topic` FQN,
+`type_info`, and `qos` — known before its `Entity`/Zenoh route exists. The
+pre-materialisation half of an [`EndpointInfo`](@ref); the gid follows from the
+reserved id at construction. Each pattern derives its own (`_publisher_desc`,
+`_service_desc`, `_action_descs`, …) as the ONE source for that endpoint's identity;
+`make_entity(node, ::EndpointDesc)` turns one into a live entity, and
+[`node_endpoint_descs`](@ref) enumerates a node's whole set from the same functions —
+so materialisation and enumeration share a single derivation, not two kept in sync.
+"""
+struct EndpointDesc
+    kind::EndpointKind
+    topic::String
+    type_info::Union{TypeInfo, Nothing}
+    qos::QosProfile
+end
+
+# An already-materialised (or directly-injected) entity's identity as a descriptor —
+# for enumerating endpoints that bypass `make_entity`, e.g. the node-presence shell.
+_endpoint_desc(e::EndpointEntity) = EndpointDesc(e.kind, e.topic, e.type_info, e.qos)
+
+"""
     GraphIndex()
 
 The Context's discovery index: the observed `EndpointInfo` set keyed by
@@ -98,8 +121,14 @@ one.
 """
 mutable struct GraphIndex
     lock::ReentrantLock
-    # Keyed by liveliness token string, which uniquely identifies an endpoint.
+    # REMOTE endpoints, keyed by liveliness token string — discovered peers, mutated by the
+    # liveliness consumer as tokens arrive (genuine runtime data).
     endpoints::Dict{String, EndpointInfo}
+    # OUR OWN endpoints, same keying — held apart from the remote stream so a statically-known
+    # node's local graph is not built by per-declare mutation of the discovery dict (the Stage B
+    # seam). `endpoints_snapshot` unions the two; a remote echo of our own token (same key) is
+    # dropped in favour of the local entry.
+    local_endpoints::Dict{String, EndpointInfo}
     # Notified on every change; waiters re-check the graph predicate.
     changed::Threads.Condition
     # `on_graph_change` listeners, fired outside the lock since they may re-query the graph.
@@ -107,7 +136,7 @@ mutable struct GraphIndex
 end
 
 GraphIndex() = GraphIndex(ReentrantLock(), Dict{String, EndpointInfo}(),
-                          Threads.Condition(), Any[])
+                          Dict{String, EndpointInfo}(), Threads.Condition(), Any[])
 
 # ── type registry ──────────────────────────────────────────────────────────
 # Keyed by (name, RIHS01 hash) so evolved versions of a type coexist. RIHS01 is the
@@ -466,6 +495,17 @@ reading). Thread-safe: the increment-and-fetch is a single atomic operation.
 """
 next_entity_id!(ctx::Context) = (@atomic ctx._next_id += 1)
 
+"""
+    reserve_entity_ids!(ctx, n) -> Int
+
+Reserve a contiguous block of `n` entity ids from the same atomic counter and return
+the first. Lets a node compute its local discovery graph a-priori (the gid/liveliness
+key derive from the id) and then materialise the matching entities on those exact ids,
+so the pre-built graph and the declared tokens agree. `n == 0` is a no-op returning the
+next id without advancing.
+"""
+reserve_entity_ids!(ctx::Context, n::Integer) = (@atomic ctx._next_id += n) - n + 1
+
 # The Context fills the node-role for context-level clock reads, so a Context works
 # wherever the duck-typed `node.clocks` lookup expects a node.
 function clock(ctx::Context, src::ClockSource)
@@ -822,7 +862,7 @@ declares an endpoint; `remove_endpoint!` is the close-side inverse.
 """
 function inject_endpoint!(ctx::Context, key::AbstractString, e::EndpointEntity)
     info = _endpoint_info(e; is_local=true)
-    @lock ctx.graph.lock ctx.graph.endpoints[String(key)] = info
+    @lock ctx.graph.lock ctx.graph.local_endpoints[String(key)] = info
     _notify_graph_change!(ctx, EndpointInfo[info], EndpointInfo[])
     info
 end
@@ -834,7 +874,7 @@ Drop a locally-injected entity from the index (the close-side inverse of
 [`inject_endpoint!`](@ref)).
 """
 function remove_endpoint!(ctx::Context, key::AbstractString)
-    removed = @lock ctx.graph.lock pop!(ctx.graph.endpoints, String(key), nothing)
+    removed = @lock ctx.graph.lock pop!(ctx.graph.local_endpoints, String(key), nothing)
     removed === nothing || _notify_graph_change!(ctx, EndpointInfo[], EndpointInfo[removed])
     removed
 end
@@ -845,9 +885,38 @@ end
 An immutable snapshot of the index (copied out under the lock) — a
 consistent instant, not a live alias. The graph-query layer (`endpoints`,
 `topic_names_and_types`, …) filters over this.
+
+Unions our own (`local_endpoints`) with discovered remotes (`endpoints`); a remote
+echo of one of our own tokens (same liveliness key) is dropped in favour of the
+local entry, so an endpoint is never double-counted across the seam.
 """
-endpoints_snapshot(ctx::Context) =
-    @lock ctx.graph.lock collect(values(ctx.graph.endpoints))
+function endpoints_snapshot(ctx::Context)
+    @lock ctx.graph.lock begin
+        out = collect(values(ctx.graph.local_endpoints))
+        for (k, info) in ctx.graph.endpoints
+            haskey(ctx.graph.local_endpoints, k) || push!(out, info)
+        end
+        out
+    end
+end
+
+"""
+    _local_remote_split(ctx) -> (locals, remotes)
+
+The discovery index handed back as its two halves — our own endpoints and the discovered
+remotes — under one lock. The compat detectors only ever pair one side against the other,
+so they take the split directly off the seam rather than re-partitioning a unioned
+snapshot on every change. A remote echo of one of our own tokens (same key) is dropped from
+`remotes`, matching [`endpoints_snapshot`](@ref)'s dedup.
+"""
+function _local_remote_split(ctx::Context)
+    @lock ctx.graph.lock begin
+        locals  = collect(values(ctx.graph.local_endpoints))
+        remotes = EndpointInfo[v for (k, v) in ctx.graph.endpoints
+                               if !haskey(ctx.graph.local_endpoints, k)]
+        (locals, remotes)
+    end
+end
 
 """
     on_graph_change(f, node_or_ctx) -> f

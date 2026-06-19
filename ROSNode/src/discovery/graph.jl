@@ -365,7 +365,10 @@ function wait_for_graph_change(node_or_ctx; timeout::Union{Real, Nothing}=nothin
     _wait_on_graph(ctx, () -> _graph_keyset(ctx) != before; timeout=timeout)
 end
 
-_graph_keyset(ctx::Context) = @lock ctx.graph.lock Set(keys(ctx.graph.endpoints))
+# Both halves of the seam — local + remote keys — so a wait sees our own endpoints
+# appear/disappear, not just discovered ones.
+_graph_keyset(ctx::Context) =
+    @lock ctx.graph.lock union(Set(keys(ctx.graph.endpoints)), keys(ctx.graph.local_endpoints))
 
 # ── mismatch detection — views on the change stream ─────────────────────────
 # Both detectors are `on_graph_change` listeners: when an endpoint appears, they
@@ -459,9 +462,9 @@ end
 # + QoS. Checks always run as (local, remote) pairs so a pair added in one change
 # dedupes to one signature; local-vs-local and remote-vs-remote are skipped.
 function _run_detectors(ctx::Context, d::_Detectors, added::Vector{EndpointInfo})
-    snapshot = endpoints_snapshot(ctx)
-    locals = filter(e -> e.is_local, snapshot)
-    remotes = filter(e -> !e.is_local, snapshot)
+    # The local half is the static local graph; the remote half is the discovered stream.
+    # Take them straight off the seam rather than re-filtering a unioned snapshot per change.
+    locals, remotes = _local_remote_split(ctx)
     for e in added
         standing = e.is_local ? remotes : locals
         for other in standing
@@ -480,9 +483,7 @@ end
 # `_run_detectors` does, and deliver each pre-existing mismatch to `f` alone. The
 # shared `fired` edge-trigger set keeps a later change from double-firing.
 function _scan_for_listener!(ctx::Context, d::_Detectors, f::Function, kind::Symbol)
-    snapshot = endpoints_snapshot(ctx)
-    locals = filter(e -> e.is_local, snapshot)
-    remotes = filter(e -> !e.is_local, snapshot)
+    locals, remotes = _local_remote_split(ctx)
     for local_e in locals, remote in remotes
         local_e.topic == remote.topic || continue
         _complementary(local_e.kind, remote.kind) || continue

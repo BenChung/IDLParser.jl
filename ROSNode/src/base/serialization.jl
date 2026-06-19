@@ -55,6 +55,70 @@ function _encode_to_vector(msg)
     return buf
 end
 
+# ── ReusableEncoder: the shared allocation-free outbound encode core ──────────
+#
+# The one buffer-reuse engine behind every outbound message — publisher `put`, service
+# `reply`, and service/action request `call!`. Holds a growable CDR buffer + a reused
+# `CDRWriter` (preamble written once at construction) + a reused `CDRSizeCalculator` + a
+# reused 33-byte attachment buffer, guarded by `lock` for single-writer safety. The
+# patterns differ only in transport discipline *after* the encode: the move-consume
+# transports (`put`/`reply`, which `_move` the payload) copy the bytes into a held
+# `OwnedZBytes` via `Zenoh.copy_bytes!`; the borrow-alias transport (`call!`) passes the
+# reused `Vector`s straight in (it aliases them zero-copy for the call's duration).
+const _ENC_WRITER = typeof(CDRWriter(Vector{UInt8}(undef, 4), Val(CDR_LE)))
+const _ENC_DYN_INIT = 64   # initial growable-buffer capacity; grows to high-water on demand
+
+mutable struct ReusableEncoder
+    const lock::Base.ReentrantLock
+    const msgbuf::Vector{UInt8}
+    const writer::_ENC_WRITER
+    const sizecalc::CDRSizeCalculator
+    # `growable=false` (compact, `iscompact` fixed wire size): `msgbuf` is pre-sized exactly,
+    # a publish just re-seeks + writes — no size pass. `true` (dynamic, or a compact `T` whose
+    # default couldn't be sized): size with `sizecalc`, `resize!` `msgbuf` to fit, then write.
+    const growable::Bool
+    const attbuf::Vector{UInt8}
+end
+
+function ReusableEncoder(::Type{T}) where {T}
+    msgbuf = UInt8[]; growable = true
+    if iscompact(T)
+        try
+            msgbuf = Vector{UInt8}(undef, length(_encode_to_vector(_default_msg(T))))
+            growable = false
+        catch err
+            @debug "ReusableEncoder: compact fast path unavailable, using growable encode" type=T exception=err
+            msgbuf = Vector{UInt8}(undef, _ENC_DYN_INIT); growable = true
+        end
+    else
+        msgbuf = Vector{UInt8}(undef, _ENC_DYN_INIT)
+    end
+    return ReusableEncoder(Base.ReentrantLock(), msgbuf,
+                           CDRWriter(msgbuf, Val(CDR_LE)),   # emits the CDR_LE preamble into msgbuf[1:4]
+                           CDRSizeCalculator(), growable, Vector{UInt8}(undef, 33))
+end
+
+# Serialize `msg` into the reused buffer (its length set to the exact wire size `n`);
+# returns `n` (preamble + body). The exact length lets a borrow-alias caller pass `msgbuf`
+# straight to `call!`. Caller holds `enc.lock`.
+@inline function encode_into!(enc::ReusableEncoder, msg)
+    if enc.growable
+        c = enc.sizecalc
+        c.offset = 4                                   # reset the accumulator past the preamble
+        CDRSerialization.addValue!(c, msg)
+        n = position(c)
+        n == length(enc.msgbuf) || resize!(enc.msgbuf, n)
+    end
+    cw = enc.writer
+    seek(cw.buf, 4)                                    # preamble untouched
+    write(cw, msg)
+    return position(cw.buf)
+end
+
+# Fill the reused 33-byte attachment buffer with the rmw_zenoh `(seq, ts, gid)` metadata.
+@inline fill_attachment!(enc::ReusableEncoder, seq::Integer, ts::Integer, g::NTuple{16, UInt8}) =
+    (ROSZenoh._fill_attachment!(enc.attbuf, seq, ts, g); enc.attbuf)
+
 """
     as(x, ::Type{T}) -> T
 

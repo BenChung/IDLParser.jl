@@ -111,6 +111,9 @@ try
         # `_handle_type` exactness: the `@precompile_nodes` static `entities(m)::PortsNT`
         # derivation must equal the live materialise capture (publisher/sub/service/timer).
         _section("component_entities_static", "model/component_entities_static.jl")
+        # B1: the a-priori local-graph enumeration (`node_endpoint_descs`) reproduces the
+        # materialised is_local set, across every port kind + shell/get_type_description/params.
+        _section("local_graph_descs", "discovery/local_graph_descs.jl")
         # Warm/bake payoff: the function-barrier callback dispatches statically (S1a), client
         # warm anchors encode/call (S3), and a live node's handler is compiled after bring-up.
         _section("component_warm_compiled", "performance/component_warm_compiled.jl")

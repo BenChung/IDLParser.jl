@@ -23,29 +23,30 @@ The second type parameter pins the concrete Zenoh route (a plain or Advanced
 publisher, set by the QoS durability) so the `put` stays monomorphic; callers only
 spell `PublisherHandle{T}`.
 """
-# The concrete reused-encode-writer type — a `CDR_LE`, `Vector{UInt8}`-backed `CDRWriter`.
-# Independent of the message type `T` (the message rides through `write`), so one concrete
-# type covers every compact publisher; storing it concretely keeps `write` statically
-# dispatched on the hot path.
-const _PUB_WRITER = typeof(CDRWriter(Vector{UInt8}(undef, 4), Val(CDR_LE)))
-
 mutable struct PublisherHandle{T, R}
     const entity::Entity
     # Route type R pins the concrete Zenoh route (plain Publisher / AdvancedPublisher)
     # so put dispatches statically with no plain-vs-advanced branch on the hot path.
     const route::R
     @atomic seq::Int64           # per-endpoint attachment sequence_number
-    # Reused per-publish encode buffers, guarded by `buflock` for single-writer safety
-    # (ROS makes accidental concurrent publish on one handle easy; the lock is alloc-free
-    # uncontended). `attbuf` holds the fixed 33-byte attachment (every publisher reuses
-    # it). For a compact (`iscompact`) `T`, `writer` is a `CDRWriter` over the fixed-size
-    # `msgbuf` (preamble written once at construction) so a publish re-seeks + re-encodes
-    # in place; `nothing` for a dynamic `T`, which encodes a fresh buffer per call.
-    const buflock::Threads.SpinLock
-    const attbuf::Vector{UInt8}
-    const msgbuf::Vector{UInt8}
-    const writer::Union{Nothing, _PUB_WRITER}
+    # `enc` is the shared outbound encode core (reused buffers + `CDRWriter` + size calc +
+    # 33-byte attbuf, under its own lock — see `ReusableEncoder`). `att_zb`/`payload_zb` are
+    # held `OwnedZBytes` re-armed in place by `Zenoh.copy_bytes!` each send (no per-publish
+    # `ZBytes` alloc; carry no finalizer → `close` drops them). `put` runs under `enc.lock`
+    # since the boxes are shared state and `put` consumes (`_move`s) them; the `ReentrantLock`
+    # lets a contending publisher yield rather than busy-spin while a backpressured `put` blocks.
+    const enc::ReusableEncoder
+    const att_zb::Zenoh.OwnedZBytes
+    const payload_zb::Zenoh.OwnedZBytes
 end
+
+# The wire identity of a publisher/subscription endpoint — resolved topic + message type
+# info at the given QoS. The ONE source for this endpoint's identity, consumed by both
+# construction (`_make_*` below) and the a-priori local-graph enumeration.
+_publisher_desc(node, topic::AbstractString, ::Type{T}; qos::QosProfile=default_qos()) where {T} =
+    EndpointDesc(Publisher, resolve_name(node, topic), type_info_of(T), qos)
+_subscription_desc(node, topic::AbstractString, ::Type{T}; qos::QosProfile=default_qos()) where {T} =
+    EndpointDesc(Subscription, resolve_name(node, topic), type_info_of(T), qos)
 
 function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          qos::QosProfile=default_qos(),
@@ -53,26 +54,11 @@ function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          warmup::Union{Symbol, WarmupMode, Nothing}=nothing,
                          warmup_sync::Union{Bool, Nothing}=nothing,
                          warmup_sample=nothing) where {T}
-    name = resolve_name(node, topic)
-    ent = make_entity(node, Publisher, name, type_info_of(T); qos=qos)
+    ent = make_entity(node, _publisher_desc(node, topic, T; qos=qos))
     route = declare_publisher!(ent; congestion_control=congestion_control, priority=priority)
-    # A compact `T` has a fixed wire size, so reuse one buffer + `CDRWriter` across
-    # publishes (the constructor writes the preamble into `msgbuf[1:4]` once). If sizing
-    # fails (no default-constructible message), fall back to the dynamic fresh-encode path.
-    msgbuf = UInt8[]; writer = nothing
-    if iscompact(T)
-        try
-            msgbuf = Vector{UInt8}(undef, length(_encode_to_vector(_default_msg(T))))
-            writer = CDRWriter(msgbuf, Val(CDR_LE))
-        catch err
-            # A compact `T` that isn't default-constructible falls back to the dynamic
-            # fresh-encode path; log at debug so the silent perf downgrade is diagnosable.
-            @debug "publisher: compact fast path unavailable, using dynamic encode" type=T exception=err
-            msgbuf = UInt8[]; writer = nothing
-        end
-    end
-    pub = PublisherHandle{T, typeof(route)}(ent, route, 0, Threads.SpinLock(),
-                                            Vector{UInt8}(undef, 33), msgbuf, writer)
+    # The shared encode core + the two held copy-boxes (re-armed per send).
+    pub = PublisherHandle{T, typeof(route)}(ent, route, 0, ReusableEncoder(T),
+                                            Zenoh.reusable_copy_bytes(), Zenoh.reusable_copy_bytes())
     pol = _resolve_warmup(node, warmup, warmup_sync)
     _warmup!(pol, () -> _warm_publisher(pol, pub, warmup_sample))
     return pub
@@ -81,9 +67,10 @@ end
 """
     publish(pub::PublisherHandle{T}, msg::T) -> nothing
 
-Serialize and publish `msg` on `pub`'s topic. One exact-size `encode` pass
-produces the CDR payload, then the Zenoh `put` transmits by borrowing that heap
-buffer (zero-copy into transport). Returns `nothing`.
+Serialize and publish `msg` on `pub`'s topic. The CDR payload is encoded into the
+publisher's reused buffer (grown on demand for a variable-size `msg`) and copied
+into a held Zenoh payload box; the `put` then transmits it. At steady state this
+allocates nothing. Returns `nothing`.
 
 Each message carries the rmw_zenoh per-message attachment `(sequence_number,
 source_timestamp, source_gid)`: the sequence increments once per publisher
@@ -114,51 +101,38 @@ pub = Publisher(node, "/chatter", std_msgs.msg.String)
 publish(pub, std_msgs.msg.String(data = "hello"))
 ```
 """
-# Build this publish's (payload, attachment) `ZBytes` from the reused buffers, under
-# `buflock` (single-writer guard). Compact `T`: re-seek the reused `CDRWriter` past the
-# preamble, re-encode `msg` into `msgbuf`, and hand both buffers to Zenoh with
-# `copy=true` — Zenoh copies them into its own owned bytes synchronously, so the reused
-# buffers are free again at return (no per-call buffer alloc, no `preserve_handle` pin).
-# Dynamic `T`: a fresh borrowed `encode(msg)` as before; only the attachment reuses a buffer.
-@inline function _publish_buffers!(pub::PublisherHandle{T}, msg::T, seq::Int64, ts::Int64, e) where {T}
-    w = pub.writer
-    if w !== nothing
-        cw = w::_PUB_WRITER
-        @lock pub.buflock begin
-            seek(cw.buf, 4); write(cw, msg)                       # preamble untouched; body re-encoded
-            p = ZBytes(pub.msgbuf; copy = true)
-            ROSZenoh._fill_attachment!(pub.attbuf, seq, ts, gid(e))
-            (p, ZBytes(pub.attbuf; copy = true))
-        end
-    else
-        p = encode(msg)                                           # dynamic: fresh exact-size buffer (borrowed)
-        a = @lock pub.buflock begin
-            ROSZenoh._fill_attachment!(pub.attbuf, seq, ts, gid(e))
-            ZBytes(pub.attbuf; copy = true)
-        end
-        (p, a)
-    end
-end
-
 function publish(pub::PublisherHandle{T}, msg::T) where {T}
     e = pub.entity
     isopen(e) || return nothing
     isactive(e) || return nothing                   # lifecycle gate: inactive node drops the publish
 
     ts = nanoseconds(Dates.now(e.node, System()))   # System clock stamps wire timestamps
-    # Warm-up compiles the encode/attach path but skips the put and the seq commit:
+    # Warm-up compiles the encode/attach/arm/put path but skips the put and the seq commit:
     # the seq counter is wire state and the first real message must carry seq=1, the
-    # invariant a subscriber's gap detection relies on.
-    if _WARMUP[]
-        _publish_buffers!(pub, msg, (@atomic pub.seq) + 1, ts, e)
-        return nothing
+    # invariant a subscriber's gap detection relies on. It peeks the next seq, re-arms the
+    # held boxes (so `copy_bytes!` is compiled/precompile-cacheable), then re-gravestones
+    # them so the warmed state matches steady state (gravestone) — no box left filled-unsent.
+    warming = _WARMUP[]
+    seq = warming ? (@atomic pub.seq) + 1 : (@atomic pub.seq += 1)
+    # The intra-process short-circuit runs handler code, so keep it outside `buflock`; a real
+    # publish delivers locally before the put, as before. Warm-up does not deliver.
+    warming || deliver_local(pub, msg)
+    # Encode + arm the held copy-boxes and `put` — all under `enc.lock`, since the boxes
+    # are shared state and `put` consumes (`_move`s) them. `copy_bytes!` synchronously
+    # copies into Zenoh-owned storage (no per-call `ZBytes` alloc, no pin). The attachment
+    # (seq, source_timestamp, fixed 16-byte source_gid) is byte-exact and mandatory.
+    enc = pub.enc
+    @lock enc.lock begin
+        n = encode_into!(enc, msg)
+        Zenoh.copy_bytes!(pub.payload_zb, enc.msgbuf, n)
+        fill_attachment!(enc, seq, ts, gid(e))
+        Zenoh.copy_bytes!(pub.att_zb, enc.attbuf, 33)
+        if warming
+            close(pub.payload_zb); close(pub.att_zb)          # re-gravestone; reusable next send
+        else
+            put(pub.route, pub.payload_zb; attachment = pub.att_zb)   # statically dispatched on route type R
+        end
     end
-    # The attachment (sequence_number, source_timestamp, fixed 16-byte source_gid) is
-    # byte-exact and mandatory: a real ROS 2 peer unwraps it and panics if absent.
-    seq = (@atomic pub.seq += 1)
-    payload, attach = _publish_buffers!(pub, msg, seq, ts, e)
-    deliver_local(pub, msg)                           # intra-process short-circuit (no-op when disabled)
-    put(pub.route, payload; attachment=attach)        # statically dispatched on route type R
     return nothing
 end
 
@@ -167,7 +141,19 @@ publish(pub::PublisherHandle{T}, msg) where {T} =
     throw(ArgumentError("publish: expected a $(T), got a $(typeof(msg))"))
 
 Base.isopen(pub::PublisherHandle) = isopen(pub.entity)
-Base.close(pub::PublisherHandle) = close(pub.entity)
+# Close the entity first (trips `isopen` → new publishes bail at the gate), then take
+# `enc.lock` to wait out any in-flight publish before dropping the held copy-boxes. The
+# boxes carry no finalizer, so the holder must drop them; `close(::OwnedZBytes)` is
+# gravestone-idempotent, so dropping a post-put (already-moved) or warmup box — and a
+# second `close(pub)` from the node reaper — are all safe no-ops.
+function Base.close(pub::PublisherHandle)
+    close(pub.entity)
+    @lock pub.enc.lock begin
+        close(pub.payload_zb)
+        close(pub.att_zb)
+    end
+    return nothing
+end
 Base.show(io::IO, pub::PublisherHandle{T}) where {T} =
     print(io, "Publisher(", pub.entity.endpoint.topic, ", ", nameof(T),
           isopen(pub) ? "" : ", closed", ")")
@@ -209,8 +195,7 @@ function _make_subscription(handler, node::Node, topic::AbstractString, ::Type{T
                             warmup_sample=nothing) where {T}
     weak = _is_weak(_match_policy(match))
     view = _view_mode(view)
-    name = resolve_name(node, topic)
-    ent = make_entity(node, Subscription, name, type_info_of(T); qos=qos)
+    ent = make_entity(node, _subscription_desc(node, topic, T; qos=qos))
     # transient_local routes to an AdvancedSubscriber with latched history. The
     # transient_local re-latch dedup keys on payload content-hash, since cache replays
     # arrive as bare payloads with null attachment and timestamp; force_relatch bypasses

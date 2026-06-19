@@ -363,6 +363,27 @@ end
             close(s)
         catch
         end
+        # Bring-up bake (the "inert session"): `Context`/`Node`/`make_entity`/discovery are ROSNode
+        # ops on ROSNode/Zenoh types — consumer-AGNOSTIC (`make_entity` takes `Union{TypeInfo,
+        # Nothing}`, NOT the message type), so they ride ROSNode's OWN image and cover every node;
+        # a consumer's `@precompile_nodes` can't cache them (it caches only consumer-owned-type MIs).
+        # This dynamic bring-up resists frame-by-frame `precompile` (the LAUNCH lesson — it needs
+        # EXECUTION), so run a probe node on an inert no-connect session and let inference cache the
+        # path (Context ctor + `_register_*` + Node + `~/get_type_description` + `make_entity` per
+        # kind + the liveliness consumer). Synchronous `close` drain. Best-effort — a sandbox that
+        # can't open a session still builds. (The per-message-type `_make_publisher`/`_make_service`
+        # construction stays the consumer's `@precompile_nodes` job — those ARE consumer-typed.)
+        try
+            pctx = Context(; config = Config(; str =
+                "{mode:\"peer\",scouting:{multicast:{enabled:false}},timestamping:{enabled:true}}"))
+            pnode = Node(pctx, "_precompile_probe")
+            ti = type_info_of(Interfaces.builtin_interfaces.msg.Time)
+            for k in (Publisher, Subscription, Service)
+                make_entity(pnode, k, "rosnode/_probe", ti)
+            end
+            close(pctx)
+        catch
+        end
         # The composed-`@node` façade wiring is non-parametric — `CompositeParameterServer`
         # holds its members in a runtime field, not a type parameter — so its construction +
         # six-service wiring + `/parameter_events` aggregation is one specialisation shared by

@@ -126,6 +126,12 @@ mutable struct Node
     # Node-default `WarmupPolicy` for entities on this node; an entity ctor's own
     # `warmup`/`warmup_sync` kwargs override per-endpoint.
     const warmup::WarmupPolicy
+    # Stage B: entity ids reserved a-priori for the composed members' ports, consumed in
+    # enumeration order by `make_entity` while `_materialising` (the per-member materialise
+    # window), so the declared entities land on the ids the a-priori local graph used. Empty /
+    # false for a bare node and outside materialise — `make_entity` then draws from the counter.
+    const _id_queue::Vector{Int}
+    _materialising::Bool
     @atomic open::Bool
 end
 
@@ -147,7 +153,8 @@ function Node(ctx::Context, name::AbstractString;
     node = Node(ctx, nm, ns, fqn, ent, lv_key, nothing,
                 Any[], Dict{DataType, Any}(), ReentrantLock(),
                 Pair{String, String}[], nothing, nothing,
-                Dict{String, Int32}(), nothing, WarmupPolicy(warmup, warmup_sync), true)
+                Dict{String, Int32}(), nothing, WarmupPolicy(warmup, warmup_sync),
+                Int[], false, true)
 
     # Declare the node's liveliness token (peers discover the node), then inject
     # it into our own index so self-queries see it immediately.

@@ -365,6 +365,25 @@ function wire_parameter_services!(s::AbstractParameterServer)
     return s
 end
 
+# The fixed ROS 2 parameter-service set as (topic, request-type) pairs — the a-priori
+# enumeration of what `wire_parameter_services!` declares. The wiring above stays explicit and
+# statically typed (the startup-compile path); this list mirrors that fixed REP-defined set,
+# drift-guarded by `local_graph_descs.jl`. Each endpoint's IDENTITY is derived once, by the
+# shared `_service_desc`/`_publisher_desc`, not re-spelled here.
+const _PARAM_SERVICE_DECLS = (
+    ("~/describe_parameters",       _RCL_SRV.DescribeParameters_Request),
+    ("~/get_parameter_types",       _RCL_SRV.GetParameterTypes_Request),
+    ("~/get_parameters",            _RCL_SRV.GetParameters_Request),
+    ("~/list_parameters",           _RCL_SRV.ListParameters_Request),
+    ("~/set_parameters",            _RCL_SRV.SetParameters_Request),
+    ("~/set_parameters_atomically", _RCL_SRV.SetParametersAtomically_Request),
+)
+
+# The parameter server's endpoint descriptors: the six standard services + `/parameter_events`.
+_param_descs(node) =
+    push!(EndpointDesc[_service_desc(node, n, T) for (n, T) in _PARAM_SERVICE_DECLS],
+          _publisher_desc(node, "/parameter_events", _ParameterEvent))
+
 # `(callable, argtypes)` anchors for the six parameter services' construction + handler bodies over
 # a concrete server type `S`, plus the `/parameter_events` publisher. Emitter and drift guard
 # consume this one list. Baked once for `CompositeParameterServer` (every `@node`) and per-`P` for a
