@@ -7,7 +7,8 @@
 
 using CDRSerialization: CDRReader, CDRWriter, CDRSizeCalculator, read_view,
                         iscompact, materialize, CDRView, CDR_LE
-using Zenoh: ZBytes, Sample, AbstractSample, payload, as_memory
+using Zenoh: Zenoh, ZBytes, Sample, AbstractSample, payload, as_memory,
+             OwnedZBytes, reusable_copy_bytes, copy_bytes!
 import ROSZenoh
 # core.jl already re-exports `TypeInfo`; only `TypeHash` needs importing here.
 using ROSZenoh: TypeHash
@@ -118,6 +119,46 @@ end
 # Fill the reused 33-byte attachment buffer with the rmw_zenoh `(seq, ts, gid)` metadata.
 @inline fill_attachment!(enc::ReusableEncoder, seq::Integer, ts::Integer, g::NTuple{16, UInt8}) =
     (ROSZenoh._fill_attachment!(enc.attbuf, seq, ts, g); enc.attbuf)
+
+# ── MoveOutbound: the shared move-consume outbound path (publisher `put` + service `reply`) ──
+#
+# A `ReusableEncoder` plus the two held `OwnedZBytes` the move-consume transports re-arm and
+# `_move` each send (both `put` and `reply` consume their payload + attachment ZBytes). `arm!`
+# is the **common code path** the publisher and the service reply share: under `out.enc.lock`,
+# encode the message + attachment into the reused buffers and `copy_bytes!` them into the held
+# boxes, leaving `payload_zb`/`att_zb` ready to `_move` into the transport. The caller supplies
+# only the transport verb — `put(route, …)` vs `reply(query, …)` — and holds `out.enc.lock`
+# across it (the boxes are shared state the transport consumes; the lock also serializes
+# concurrent `Parallel` service replies, the analog of the publisher's single-writer guard).
+mutable struct MoveOutbound
+    const enc::ReusableEncoder
+    const payload_zb::OwnedZBytes
+    const att_zb::OwnedZBytes
+end
+MoveOutbound(::Type{T}) where {T} =
+    MoveOutbound(ReusableEncoder(T), reusable_copy_bytes(), reusable_copy_bytes())
+
+# Encode `msg` + the `(seq, ts, gid)` attachment into the held boxes (caller holds `out.enc.lock`).
+# After this the boxes hold the wire bytes, ready for the transport to `_move` (or `close` to
+# re-gravestone). `copy_bytes!` copies into Zenoh-owned storage in place — no per-send alloc.
+@inline function arm!(out::MoveOutbound, msg, seq::Integer, ts::Integer, g::NTuple{16, UInt8})
+    enc = out.enc
+    n = encode_into!(enc, msg)
+    copy_bytes!(out.payload_zb, enc.msgbuf, n)
+    fill_attachment!(enc, seq, ts, g)
+    copy_bytes!(out.att_zb, enc.attbuf, 33)
+    return nothing
+end
+
+# Drop the held boxes (gravestone) under the lock. Idempotent — `close(::OwnedZBytes)` is
+# gravestone-safe, so a post-send (already-moved) box and a second `close` are both no-ops.
+function Base.close(out::MoveOutbound)
+    @lock out.enc.lock begin
+        close(out.payload_zb)
+        close(out.att_zb)
+    end
+    return nothing
+end
 
 """
     as(x, ::Type{T}) -> T

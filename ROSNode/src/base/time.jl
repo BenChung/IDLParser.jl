@@ -462,11 +462,10 @@ Timer(node, period; clock::ClockSource=ROS()) =
 # land in later-included files — late-bound, fine at tick time.
 _timer_active(node) = node isa Node ? isactive(node) : true
 
-# One tick: the gate (live + Active) then the guarded user callback. Named (not the anonymous
-# `Base.Timer` `do`-block it used to be) so `precompile(_fire!, (Timer{C},))` bakes the gate +
-# dispatch site ahead of the first fire; the remaining `_ -> _fire!(t)` is a trivial forward. The
-# `t.f()` itself is a dynamic call (`f::Function`), so its concrete target compiles at first fire —
-# but that target is the warmed reaction, already anchored.
+# One tick: the gate (live + Active) then the guarded user callback. A named top-level function so
+# `precompile(_fire!, (Timer{C},))` bakes the gate + dispatch site ahead of the first fire; the
+# `_ -> _fire!(t)` handler is a trivial forward. `t.f()` is a dynamic call (`f::Function`), so its
+# concrete target compiles at first fire — but that target is the already-anchored warmed reaction.
 function _fire!(t::Timer)
     (@atomic t.open) || return nothing
     _timer_active(t.clk.node) || return nothing

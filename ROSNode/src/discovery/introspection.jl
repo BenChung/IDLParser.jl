@@ -151,8 +151,8 @@ of `(type_name, type_hash)` (rmw_zenoh dynamic type discovery). Blocks the calli
 on the reply exactly like [`call`](@ref) — it yields while the request is in flight —
 and returns the decoded `GetTypeDescription_Response`, whose `successful` flag
 distinguishes "the remote has this type" from "it doesn't". Raises
-[`ServiceError`](@ref) on an error reply, or when no reply arrives — a wait bounded by
-`timeout_ms` plus `call`'s small hard backstop.
+[`ServiceError`](@ref) on an error reply, or when no reply arrives within `timeout_ms`
+(the wait bound passed to `call`; `timeout_ms=0` waits unbounded).
 
 `client` is a [`ServiceClient`](@ref) built over the statically compiled
 `GetTypeDescription` service type and pointed at the remote's `~/get_type_description`.
@@ -844,10 +844,8 @@ end
 # `_ctx`, `registry`, `lookup_type`, `now`, and `to_msg` are defined elsewhere in
 # the module and in scope here.
 
-# The node logger lazily builds its `/rosout` publisher on the first log record, which fires
-# during a node's bring-up. Fixed `rcl_interfaces.msg.Log` route, so anchor the builder here
-# (it lives in this file, included after performance/warmup.jl) — the matching `encode(Log)`
-# bakes in warmup.jl's workload. Keeps the first-`run` /rosout init off the critical path.
+# Anchor the lazy /rosout publisher builder so the first-`run` /rosout init stays off the
+# critical path.
 @setup_workload begin
     @compile_workload begin
         precompile(_rosout_publisher!, (Node,))

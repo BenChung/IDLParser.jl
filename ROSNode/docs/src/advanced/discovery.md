@@ -30,7 +30,7 @@ It stores each discovered type description under `<project>/ros_typesupport/`, k
 
 The first sample of a new type pays codegen and JIT for the decode→handler chain, a latency spike mid-stream. Warm-up drives that cost off the hot path.
 
-`warmup = :precompile`, the node default, compiles the decode→handler chain. With `@ros_cache` recording the manifest, a repeat run pre-warms it at startup:
+`warmup = :precompile` compiles the decode→handler chain. The node default is `:off`, so opt in either on the node (`Node(...; warmup = :precompile)`) or per-subscription (as on line 66). With `@ros_cache` recording the manifest, a repeat run pre-warms it at startup:
 
 - **Run 1** discovers the type and warms it on first sight.
 - **Run 2+** warms at startup from the manifest, so the first sample arrives hot.

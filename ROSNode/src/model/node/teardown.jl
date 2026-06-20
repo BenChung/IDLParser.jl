@@ -16,7 +16,7 @@ function Base.close(e::Entity)
 
     # Data route first so the consumer task exits via FIFO disconnect rather than being
     # killed mid-dispatch: undeclaring the subscriber disconnects its channel and the
-    # consumer's recv loop ends cleanly. Then withdraw liveliness, then drop the index.
+    # consumer's recv loop ends cleanly.
     if e._route !== nothing
         try
             close(e._route)

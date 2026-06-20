@@ -33,15 +33,12 @@ mutable struct ActionClient{A, G, R, F}
     const support::ActionTypeSupport{A, G, R, F}
     const qos::QosProfile
     # The three SERVICE-level `TypeInfo`s (send_goal/get_result/cancel_goal), computed
-    # ONCE here — a pure function of `A`. Recomputing it per `send`/`get_result` was the
-    # dominant action-call allocation (~56 KB/goal of RIHS/keyexpr derivation). `nothing`
-    # when the Goal/Result types lack registered wire descriptions (the action-TI fallback).
+    # ONCE here — a pure function of `A`. `nothing` when the Goal/Result types lack
+    # registered wire descriptions (the action-TI fallback).
     const _service_tis::Any
     # The three service-call keyexpr strings (send_goal/get_result/cancel_goal), built
-    # ONCE here. They are a pure function of the action FQN + the (cached) service
-    # TypeInfos, but `_service_key` rebuilt them per call — an `EndpointEntity` +
-    # `topic_keyexpr`/RIHS derivation, ~2.4 KB/goal. Cached, each `send`/`fetch`/`cancel`
-    # just wraps the stored string in a `Keyexpr`.
+    # ONCE here — a pure function of the action FQN + the (cached) service TypeInfos.
+    # Each `send`/`fetch`/`cancel` wraps the stored string in a `Keyexpr`.
     const _service_keys::NamedTuple{(:send_goal, :get_result, :cancel_goal), NTuple{3, String}}
     # Stable per-client gid + per-request seq for the rmw_zenoh request attachment.
     # A native queryable reads the request's (sequence_number, source_timestamp,

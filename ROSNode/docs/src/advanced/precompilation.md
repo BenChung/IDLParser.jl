@@ -10,10 +10,10 @@ The first message on a topic, the first request to a service, or the first goal 
 
 | Tier | Runs at | Covers | How |
 |---|---|---|---|
-| Warm-up | endpoint construction | each endpoint's decode→handler chain, recompiled each process | automatic — node default `:precompile` |
+| Warm-up | endpoint construction | each endpoint's decode→handler chain, recompiled each process | opt-in per node via `warmup = :precompile`/`:execute`; node default `:off` |
 | Node bake | the consuming package's precompile | a component's typed accessors + reaction specializations, baked into its pkgimage | one line: [`@precompile_nodes`](@ref) |
 
-The two compose: warm-up applies to every node, and the bake additionally makes a precompiled component start from an already-compiled image, so even its first process is hot.
+The two compose: warm-up can be enabled on any node (opt-in, off by default), and the bake additionally makes a precompiled component start from an already-compiled image, so even its first process is hot.
 
 ## Warm-up
 
@@ -21,9 +21,9 @@ Every endpoint warms its own dispatch chain at construction under a [`WarmupPoli
 
 The mode chooses how deep warming reaches, cheapest first:
 
-- `:precompile` (the default) `precompile`-anchors the decode→handler chain: it caches the inference tree and codegens the type-specialized frame, side-effect-free and with no message instance.
+- `:precompile` `precompile`-anchors the decode→handler chain: it caches the inference tree and codegens the type-specialized frame, side-effect-free and with no message instance.
 - `:execute` additionally runs the handler once on a synthesized sample message, reaching full native depth. Outbound ROS operations (`publish`/`call`) null-route, and side effects marked with [`@effectful`](@ref) are skipped, so warming emits no real traffic and touches no external state.
-- `:off` skips warm-up.
+- `:off` (the node default) skips warm-up.
 
 The sync flag chooses when warming happens:
 
@@ -95,7 +95,6 @@ The bake reaches a mixin whose ports all have a statically derivable handle type
 WarmupPolicy
 WarmupMode
 Precompile
-Stub
 Execute
 NoWarmup
 @precompile_nodes

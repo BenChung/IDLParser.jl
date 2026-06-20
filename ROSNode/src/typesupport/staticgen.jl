@@ -16,7 +16,8 @@
 #     re-precompiles), and turn on runtime persistence (so this run's new discoveries
 #     are written for next time). Opt in to converge a deployment toward fast warm-up.
 #
-# `flush_type_cache` graduates the cache out to a folder (default `.msg`).
+# `flush_type_cache(to; format=:msg)` graduates the cache out to the folder `to`,
+# written in `format` (default `:msg`, a colcon-buildable package layout).
 
 import IDLParser
 using ROSMessages: ROSMessages, IL

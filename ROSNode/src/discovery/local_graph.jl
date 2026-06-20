@@ -1,11 +1,10 @@
 # The node's local discovery graph, computed a-priori from the static plan.
 #
 # Every wire endpoint a node declares for itself is a pure function of the node identity plus
-# its declared ports — not something we should have to recover by watching the node build.
+# its declared ports, computed a-priori from the static plan.
 # `node_endpoint_descs` enumerates that set using the SAME `_*_desc` functions each pattern
 # uses for its own `make_entity` (`_publisher_desc`/`_service_desc`/`_action_descs`/…): one
-# derivation per endpoint, shared between construction and enumeration, not a parallel copy
-# kept in lockstep by a test.
+# derivation per endpoint, shared between construction and enumeration.
 #
 # A declared port is not 1:1 with a wire endpoint: an action server expands to five, a
 # parameter server to seven, and the node itself contributes a presence shell +
@@ -121,8 +120,8 @@ function _reconcile_local_graph!(node::Node, primed::Vector{String})
     isempty(primed) && return nothing
     # `Set{String}` (not bare `Set`) + the `::Entity` assert keep this type-stable: `node.entities`
     # is `Vector{Any}`, so a bare `Set(gen)` infers an `Any`-eltype generator and falls to the
-    # dynamic `grow_to!`/`push_widen`/`rehash!` path (a large bring-up compile hotspot). The fixed
-    # element type + grounded `.lv_key` (a `String`) make every Set op monomorphic.
+    # dynamic widening path. The fixed element type + grounded `.lv_key` (a `String`) make every
+    # Set op monomorphic.
     live = Set{String}((e::Entity).lv_key for e in (@lock node.lock copy(node.entities)))
     orphans = EndpointInfo[]
     @lock node.context.graph.lock for k in primed

@@ -172,8 +172,9 @@ Transitions:
 
 ```
 ACCEPTED → EXECUTING → SUCCEEDED
-                     → CANCELING → CANCELED
-                     → ABORTED
+   │            ├→ CANCELING → CANCELED
+   │            └→ ABORTED
+   └──────────────→ CANCELING → CANCELED
 ```
 
 | State        | Wire value | Scope |

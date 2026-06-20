@@ -79,7 +79,7 @@ Base.show(io::IO, c::ComponentNode) =
 
 The node-level parameter aggregation: one entry per member, keyed by member name in
 declared order, each value the member's per-mixin snapshot (see
-[`parameters(m::Component)`](@ref)). So `parameters(node).camera` is member `camera`'s
+[`parameters(node, m)`](@ref)). So `parameters(node).camera` is member `camera`'s
 live snapshot, and the result is heterogeneous — for iterating a whole node, where
 `parameters(node, m)` is the type-stable per-mixin view. The flat `<member>.<field>` wire
 namespace these views live under is owned by [`CompositeParameterServer`](@ref).
@@ -350,7 +350,7 @@ end
 # member NamedTuple, generated once per `@node` as the toposort'd straight-line `construct` sequence
 # (deps threaded positionally from prior members). Its return type IS the node's typed `Members`.
 # Generic here; per-node methods are `Core.eval`'d at finalize (marker-cached, Revise-safe, like the
-# entities accessor). `__rt__`/pservers are NOT set here — the assembly does that after building the
+# entities accessor). pservers are NOT set here — the assembly does that after building the
 # node (the back-ref needs the `ComponentNode`); deps are injected as constructed objects only.
 function _build_members end
 
@@ -1025,8 +1025,8 @@ function _anchor_reactions!(::Type{CN}, ::Type{Mc}) where {CN, Mc}
                 # `Resp` (it depends on `Resp`, not the handler — so the abstract-`Function` handler
                 # the component service stores still bakes it). Plus the consumer task body on the
                 # concrete `_sub_cb` scheduler closure. Without this, the first request JITs the whole
-                # ~400 ms tree (the dominant first-`run` cost on a service-bearing mixin; see
-                # examples/startup/STARTUP-REPORT.md). The owned-query type is the FIFO queryable's.
+                # tree (the dominant first-`run` cost on a service-bearing mixin). The owned-query
+                # type is the FIFO queryable's.
                 Q = Zenoh.Query{Base.RefValue{Zenoh.LibZenohC.z_owned_query_t}}
                 precompile(_serve_query,            (Entity, Q, Type{Req}, Type{Resp}, Function, Bool))
                 precompile(_spawn_service_consumer, (Entity, Type{Req}, Type{Resp}, Function, Bool, Serial))

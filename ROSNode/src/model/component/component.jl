@@ -940,7 +940,7 @@ declare them. Each entry is one of two kinds:
 At assembly the node resolver maps each requirement to the
 single matching sibling (excluding `M` itself, so a mixin cannot satisfy its own
 requirement), forms a dependency edge, toposorts the members, and injects the resolved
-providers positionally into `construct(::Type{M}, node, deps…)` in `requires` order.
+providers positionally into `construct(::Type{M}, node, ::Val{Name}, deps…)` in `requires` order.
 
 Zero matches is an unsatisfied-dependency error; more than one is an ambiguity error
 (restructure so a single sibling satisfies it). Pin-pair disambiguation (an entry

@@ -425,10 +425,11 @@ end
 """
     registered_type(node_or_ctx, info::TypeInfo) -> Union{Type, Nothing}
 
-The concrete (generated) Julia type for `info`, realizing its codegen on first use.
-Returns `nothing` when the type fails to resolve or generate — the signal to deliver
-raw bytes until the type is ready. The decode/handler path reaches the returned type via
-`Base.invokelatest`, since codegen runs in a newer world age.
+For a message type, the concrete (generated) Julia type for `info`, realizing its codegen
+on first use. Returns `nothing` when the type fails to resolve or generate (the signal to
+deliver raw bytes), and for service/action entries, which have no single umbrella type —
+the service/action layer fetches their sections separately. The decode/handler path reaches
+the returned type via `Base.invokelatest`, since codegen runs in a newer world age.
 """
 function registered_type(ctxlike, info::TypeInfo)
     entry = resolve_type(ctxlike, info)

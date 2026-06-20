@@ -65,8 +65,8 @@ end
 # `argmin` over the fully-qualified type string, so the survivor is the globally smallest
 # FQN regardless of gather order. Warns once, naming the winner against a representative loser.
 function _reduce_candidates(sym::Symbol, cands::Vector{ResolveEntry})
-    keep = cands[1]                      # global argmin(string(type))
-    drop = cands[1]                      # global argmax — a deterministic representative loser
+    keep = cands[1]
+    drop = cands[1]
     for e in cands
         string(e.type) < string(keep.type) && (keep = e)
         string(e.type) > string(drop.type) && (drop = e)

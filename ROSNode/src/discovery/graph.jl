@@ -897,7 +897,9 @@ Feed one received sample to the message-lost detector for `sub`: decode
 Returns `nothing` when:
 
 - the message is in-order,
-- it is the very first message from a gid, or
+- it is the very first message from a gid,
+- the sample is a reorder, duplicate, or publisher-restart rebaseline (a
+  sequence number at or below the last seen for that gid), or
 - the sample carries no usable attachment.
 
 The subscription dispatch path calls this per sample, gated on

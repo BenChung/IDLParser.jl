@@ -40,7 +40,7 @@ mutable struct GoalHandle{A, G, R, F}
     const server::Any                    # back-ref to the ActionServer (duck-typed)
     const id::GoalId
     const request::G
-    const cell::ResultCell               # ResultCell{GoalHandle, R}; concrete elided
+    const cell::ResultCell               # ResultCell{Nothing, R}; handle param is Nothing to break the cell↔handle cycle
     const accepted_at::Int64             # acceptance stamp (wall ns)
     const lock::ReentrantLock
     @atomic status::GoalState

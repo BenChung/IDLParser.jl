@@ -243,7 +243,7 @@ const _Time                 = Interfaces.builtin_interfaces.msg.Time
 # ── value marshalling ───────────────────────────────────────────────────────────
 # A Julia parameter value ⇄ the `ParameterValue` tagged union. The `type` byte
 # selects the live arm; because the union is flat on the wire, every field is
-# present, so the other ten carry zeroed placeholders.
+# present, so the other eight carry zeroed placeholders.
 
 # A `ParameterValue` with `type=tag` and one arm filled; the rest are zero/empty.
 _param_value(tag::ParameterType; bool=false, int=Int64(0), dbl=0.0, str="",
@@ -319,12 +319,11 @@ the multi-schema [`CompositeParameterServer`](@ref) supply the six reflection
 handlers + `parameter_names`, so one wiring serves a plain node and a composed
 (member-prefixed) one alike.
 """
-# The six standard parameter services share one handler shape — a server `s` plus a request — so
-# they were anonymous `do`-blocks. Naming them (a callable struct keyed by an op marker) is what
-# lets `precompile` bake their construction + bodies BY NAME: the per-node param wiring is otherwise
-# the dominant un-bakeable launch cost, six gensym closures the bake can't reach. The server type is
-# a free parameter so the SAME anchors cover the `@node` path (one fixed `CompositeParameterServer`,
-# baked once in ROSNode's image) and the mixin-as-node `ParameterServer{P}` (per-package).
+# A named callable struct keyed by an op marker so `precompile` can bake each service's
+# construction and body by name; anonymous closures are unreachable to the bake, and per-node
+# param wiring is the dominant un-bakeable launch cost. The free server type lets the same
+# anchors cover both the `@node` `CompositeParameterServer` (baked once in ROSNode's image) and
+# the per-package `ParameterServer{P}`.
 struct _ParamSvcHandler{Op, S <: AbstractParameterServer}
     s::S
 end

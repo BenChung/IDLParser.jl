@@ -202,10 +202,10 @@ Two ports connect only when they resolve to the same name. A `@hears function fo
 
 A mixin whose state wraps an external resource — a device, a file, a connection — authors the setup and the matching release as lifecycle hooks. The five hooks are plain methods on the mixin type, each defaulting to a no-op:
 
-- `configure(m)` acquires resources into the mixin's state.
-- `activate(m)` / `deactivate(m)` mark the working edge. A managed node gates dispatch automatically (below), so most mixins leave both as no-ops.
-- `cleanup(m)` releases what `configure` acquired.
-- `on_error(m)` recovers after a hook throws on a managed transition.
+- `configure(node, m)` acquires resources into the mixin's state.
+- `activate(node, m)` / `deactivate(node, m)` mark the working edge. A managed node gates dispatch automatically (below), so most mixins leave both as no-ops.
+- `cleanup(node, m)` releases what `configure` acquired.
+- `on_error(node, m)` recovers after a hook throws on a managed transition.
 
 The framework brackets the hooks with its own bookkeeping: a member's entities materialise immediately before its `configure` runs, its timers (created paused) start at `activate`, and its entities close immediately after `cleanup`. The hooks cover only the state the framework can't see:
 

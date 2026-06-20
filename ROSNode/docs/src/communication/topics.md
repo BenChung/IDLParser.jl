@@ -47,7 +47,7 @@ The type-less `Subscription(node, "/chatter")` resolves each sample's concrete t
 
 The default `concurrency = Serial()` delivers messages in order on one task; pass `Parallel(n)` to fan out across threads, and see [Message Delivery](../advanced/delivery.md) for view modes and concurrency in depth. `spin` parks the main task to keep the process alive while the scheduler delivers each message on its own task, and `handle_signals = true` turns Ctrl-C into a graceful drain.
 
-`Publisher` and `Subscription` are singleton instances of distinct endpoint kinds; their constructors — documented under [`PublisherKind`](@ref ROSNode.PublisherKind) and [`SubscriptionKind`](@ref ROSNode.SubscriptionKind) — take the keyword surface `qos`, `congestion_control`, `priority`, `view`, `concurrency`, and `warmup`.
+`Publisher` and `Subscription` are singleton instances of distinct endpoint kinds. `Publisher` takes `qos`, `congestion_control`, `priority`, and the `warmup` family (`warmup`, `warmup_sync`, `warmup_sample`); `Subscription` takes `qos`, `view`, `concurrency`, `match`, and the same `warmup` family — documented under [`PublisherKind`](@ref ROSNode.PublisherKind) and [`SubscriptionKind`](@ref ROSNode.SubscriptionKind).
 
 To define your own message type directly in Julia, see [Authoring Interfaces in Julia](../advanced/authoring.md). Both halves are wire-compatible with ROS 2 nodes — see [Interoperating with ROS 2](../interop/ros2.md) to echo `/chatter` from a sourced ROS 2 environment, and [Getting Started](../getting-started.md) to start the router these examples point at.
 

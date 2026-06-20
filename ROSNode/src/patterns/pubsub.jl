@@ -29,15 +29,12 @@ mutable struct PublisherHandle{T, R}
     # so put dispatches statically with no plain-vs-advanced branch on the hot path.
     const route::R
     @atomic seq::Int64           # per-endpoint attachment sequence_number
-    # `enc` is the shared outbound encode core (reused buffers + `CDRWriter` + size calc +
-    # 33-byte attbuf, under its own lock — see `ReusableEncoder`). `att_zb`/`payload_zb` are
-    # held `OwnedZBytes` re-armed in place by `Zenoh.copy_bytes!` each send (no per-publish
-    # `ZBytes` alloc; carry no finalizer → `close` drops them). `put` runs under `enc.lock`
-    # since the boxes are shared state and `put` consumes (`_move`s) them; the `ReentrantLock`
-    # lets a contending publisher yield rather than busy-spin while a backpressured `put` blocks.
-    const enc::ReusableEncoder
-    const att_zb::Zenoh.OwnedZBytes
-    const payload_zb::Zenoh.OwnedZBytes
+    # `out` is the shared move-consume outbound path (`MoveOutbound`: a `ReusableEncoder` + the
+    # two held `OwnedZBytes` the `put` re-arms and `_move`s each send) — the same path the
+    # service reply uses. `put` runs under `out.enc.lock` since the boxes are shared state it
+    # consumes; the `ReentrantLock` lets a contending publisher yield rather than busy-spin
+    # while a backpressured `put` blocks.
+    const out::MoveOutbound
 end
 
 # The wire identity of a publisher/subscription endpoint — resolved topic + message type
@@ -56,9 +53,8 @@ function _make_publisher(node::Node, topic::AbstractString, ::Type{T};
                          warmup_sample=nothing) where {T}
     ent = make_entity(node, _publisher_desc(node, topic, T; qos=qos))
     route = declare_publisher!(ent; congestion_control=congestion_control, priority=priority)
-    # The shared encode core + the two held copy-boxes (re-armed per send).
-    pub = PublisherHandle{T, typeof(route)}(ent, route, 0, ReusableEncoder(T),
-                                            Zenoh.reusable_copy_bytes(), Zenoh.reusable_copy_bytes())
+    # The shared move-consume outbound path (encoder + the two held copy-boxes, re-armed per send).
+    pub = PublisherHandle{T, typeof(route)}(ent, route, 0, MoveOutbound(T))
     pol = _resolve_warmup(node, warmup, warmup_sync)
     _warmup!(pol, () -> _warm_publisher(pol, pub, warmup_sample))
     return pub
@@ -117,20 +113,16 @@ function publish(pub::PublisherHandle{T}, msg::T) where {T}
     # The intra-process short-circuit runs handler code, so keep it outside `buflock`; a real
     # publish delivers locally before the put, as before. Warm-up does not deliver.
     warming || deliver_local(pub, msg)
-    # Encode + arm the held copy-boxes and `put` — all under `enc.lock`, since the boxes
-    # are shared state and `put` consumes (`_move`s) them. `copy_bytes!` synchronously
-    # copies into Zenoh-owned storage (no per-call `ZBytes` alloc, no pin). The attachment
-    # (seq, source_timestamp, fixed 16-byte source_gid) is byte-exact and mandatory.
-    enc = pub.enc
-    @lock enc.lock begin
-        n = encode_into!(enc, msg)
-        Zenoh.copy_bytes!(pub.payload_zb, enc.msgbuf, n)
-        fill_attachment!(enc, seq, ts, gid(e))
-        Zenoh.copy_bytes!(pub.att_zb, enc.attbuf, 33)
+    # Arm the held copy-boxes (the shared `arm!` path) and `put` — under `out.enc.lock`, since
+    # the boxes are shared state `put` consumes (`_move`s). The attachment (seq, source_timestamp,
+    # fixed 16-byte source_gid) is byte-exact and mandatory.
+    out = pub.out
+    @lock out.enc.lock begin
+        arm!(out, msg, seq, ts, gid(e))
         if warming
-            close(pub.payload_zb); close(pub.att_zb)          # re-gravestone; reusable next send
+            close(out.payload_zb); close(out.att_zb)          # re-gravestone; reusable next send
         else
-            put(pub.route, pub.payload_zb; attachment = pub.att_zb)   # statically dispatched on route type R
+            put(pub.route, out.payload_zb; attachment = out.att_zb)   # statically dispatched on route type R
         end
     end
     return nothing
@@ -141,17 +133,13 @@ publish(pub::PublisherHandle{T}, msg) where {T} =
     throw(ArgumentError("publish: expected a $(T), got a $(typeof(msg))"))
 
 Base.isopen(pub::PublisherHandle) = isopen(pub.entity)
-# Close the entity first (trips `isopen` → new publishes bail at the gate), then take
-# `enc.lock` to wait out any in-flight publish before dropping the held copy-boxes. The
-# boxes carry no finalizer, so the holder must drop them; `close(::OwnedZBytes)` is
-# gravestone-idempotent, so dropping a post-put (already-moved) or warmup box — and a
-# second `close(pub)` from the node reaper — are all safe no-ops.
+# Close the entity first (trips `isopen` → new publishes bail at the gate), then drop the held
+# copy-boxes under `out.enc.lock` (waits out any in-flight publish). The boxes carry no
+# finalizer, so the holder must drop them; `close(::MoveOutbound)` is gravestone-idempotent, so
+# a post-put (already-moved) box and a second `close(pub)` from the node reaper are safe no-ops.
 function Base.close(pub::PublisherHandle)
     close(pub.entity)
-    @lock pub.enc.lock begin
-        close(pub.payload_zb)
-        close(pub.att_zb)
-    end
+    close(pub.out)
     return nothing
 end
 Base.show(io::IO, pub::PublisherHandle{T}) where {T} =
@@ -299,10 +287,10 @@ route and withdraws the token on its own.
 
 Keyword arguments shaping the route:
 
-- `qos` — the ROS 2 QoS profile.
-- `reliability` — maps onto the Zenoh publisher (`:reliable`/`:best_effort`).
-- `durability=:transient_local` — selects the route that latches history to
-  late-joining subscribers (an `AdvancedPublisher`).
+- `qos` — the ROS 2 QoS profile. Reliability and durability are fields of this
+  profile, e.g. `qos=QosProfile(reliability=:reliable, durability=:transient_local)`;
+  a `:transient_local` durability latches history to late-joining subscribers
+  (an `AdvancedPublisher`).
 - `congestion_control` — passes through to the Zenoh publisher.
 - `priority` — passes through to the Zenoh publisher.
 

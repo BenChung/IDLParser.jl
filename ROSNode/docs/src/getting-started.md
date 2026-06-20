@@ -4,7 +4,7 @@ ROSNode brings ROS 2 publish/subscribe, services, and actions to Julia over Zeno
 
 ## Adding ROSNode
 
-ROSNode is a member of this workspace. Activate its project to resolve the package and its dependencies:
+ROSNode is a member of this workspace. Import it once its project is active:
 
 ```julia
 using ROSNode

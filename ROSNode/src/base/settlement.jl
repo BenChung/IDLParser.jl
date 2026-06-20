@@ -28,14 +28,16 @@ goal.
 - Actions:  https://docs.ros.org/en/rolling/Concepts/Basic/About-Actions.html
 
 Filled exactly once: the first terminal write wins and runs `deliver`, and the
-status it was filled with is observable via [`outcome`](@ref). The four paths to
-that first write:
+status it was filled with is observable via [`outcome`](@ref). Three paths fill
+the cell (first wins):
 
 - explicit [`respond!`](@ref) — the authoritative write.
 - the handler's return value — fills only if still empty.
 - the fail-safe wrapper — fills only if still empty.
-- a second *explicit* terminal `respond!` — the one hard error; every other later
-  attempt is ignored ([`isfilled`](@ref) guards the return-value path).
+
+A second *explicit* terminal `respond!` after the cell is filled is the one hard
+error; every other later attempt is silently ignored ([`isfilled`](@ref) guards
+the return-value path).
 
 The lock makes concurrent settlement safe: a detached cleanup task can race the
 fail-safe wrapper, and only one wins.
@@ -162,7 +164,7 @@ end
     settle_handler!(cell, body; success_status, default_result, log_id=nothing)
 
 Run a user handler `body()` and guarantee `cell` is filled exactly once before
-the task is reaped. Collapses the three exits:
+the task is reaped. Collapses every handler exit into one settled cell:
 
 | Handler exit                         | Cell empty ⇒ filled with        | Log              |
 |--------------------------------------|---------------------------------|------------------|
@@ -170,7 +172,7 @@ the task is reaped. Collapses the three exits:
 | threw `Cancelled`                    | `canceled(default_result())`    | —                |
 | threw anything else                  | `aborted` `(default_result())`  | `@error` + trace |
 | returned/never responded, cell empty | `aborted` `(default_result())`  | `@error`         |
-| cell already full                    | — (ignored)                     | cleanup errors   |
+| cell already full                    | — (ignored)                     | —                |
 
 `success_status` is the per-layer success token ([`success`](@ref) for a service,
 [`succeeded`](@ref) for an action). `default_result` is a thunk producing the

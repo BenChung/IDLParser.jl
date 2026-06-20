@@ -1104,7 +1104,6 @@ end
 # overrunning task keeps running detached rather than being hard-killed mid-cleanup, so
 # the drain moves on. Exceptions from `f` are logged. Wall-clock primitives are spelled
 # `Base.` since a bare `Timer` would resolve to ROSNode's clock `Timer`.
-#
 function _run_bounded(f, ::Context, what::AbstractString, secs::Real)
     t = @async try
         f()

@@ -56,15 +56,16 @@ include("model/component/run.jl")
 include("model/component/composition.jl")
 include("discovery/local_graph.jl")
 include("model/component/precompile.jl")
+# Last: the package warm-up bake runs its `@compile_workload` at include time, so it must follow
+# every function it exercises (the inert-session bring-up close reaches `unregister_local_subscription!`
+# in intraprocess.jl, etc.). warmup.jl itself is early — lifecycle.jl needs its `WarmupMode`.
+include("performance/warmup_bake.jl")
 
-# Build + cache the canonical vendored-type index at precompile, HERE (after typesupport/staticgen
-# are included) rather than in `performance/warmup.jl` — that workload runs at its include point
-# (above), before `_package_iface_files`/the static-gen functions exist, so its probe's
-# `_register_canonical_types!` throws `UndefVarError` and `_CANONICAL_ENTRIES[]` never caches. With
-# everything defined here, the build succeeds and the cached index rides ROSNode's image, so the
-# first Context's `_register_canonical_types!` reuses it instead of re-parsing the vendored IDL at
-# bring-up (~80ms of PEG-parse inference off the first `run`). Best-effort — a sandbox without the
-# vendored sources still precompiles.
+# Built here, after the typesupport/staticgen includes, because the index build calls
+# `_package_iface_files` and the static-gen functions defined there. The cached canonical
+# index then rides ROSNode's image, sparing the first Context's `_register_canonical_types!`
+# a PEG-parse of the vendored IDL at bring-up. Best-effort — a sandbox without the vendored
+# sources still precompiles.
 PrecompileTools.@compile_workload begin
     try
         _canonical_entries()

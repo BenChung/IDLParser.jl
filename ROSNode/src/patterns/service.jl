@@ -114,6 +114,11 @@ end
 # the table empties. The table dies with the service in `close`, draining cells.
 mutable struct _ServiceWire
     const queryable::Queryable
+    # The shared move-consume reply path — the SAME `MoveOutbound` (encoder + held copy-boxes)
+    # the publisher uses for `put`; here it backs the success `reply`. `_service_deliver` re-arms
+    # it and `reply` `_move`s the boxes, under `out.enc.lock` (which serializes concurrent
+    # `Parallel` replies — the boxes are shared per-service state).
+    const out::MoveOutbound
     consumer::Union{Task, Nothing}
     @atomic seq::Int64           # per-service reply sequence_number (rmw_zenoh attachment)
     const detach_timeout::Float64
@@ -122,8 +127,8 @@ mutable struct _ServiceWire
     sweeper::Union{Base.Timer, Nothing}
 end
 
-_ServiceWire(queryable::Queryable, consumer, seq::Int64, detach_timeout::Real) =
-    _ServiceWire(queryable, consumer, seq, Float64(detach_timeout),
+_ServiceWire(queryable::Queryable, out::MoveOutbound, consumer, seq::Int64, detach_timeout::Real) =
+    _ServiceWire(queryable, out, consumer, seq, Float64(detach_timeout),
                  Dict{ResultCell, Float64}(), ReentrantLock(), nothing)
 
 # How often the sweeper scans for expired detached cells (seconds).
@@ -142,6 +147,7 @@ function Base.close(w::_ServiceWire)
             (try; timedwait(() -> istaskdone(t), 3.0; pollint=0.02); catch; end)
     end
     _drain_detached!(w)
+    close(w.out)        # drop the held reply copy-boxes (gravestone-idempotent, lock-guarded)
     nothing
 end
 
@@ -321,7 +327,7 @@ function _make_service(handler, node::Node, name::AbstractString, ::Type{Srv};
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
     qable = Queryable(ctx.session, Keyexpr(tk); channel=:fifo, complete=true)
-    wire = _ServiceWire(qable, nothing, Int64(0), detach_timeout)
+    wire = _ServiceWire(qable, MoveOutbound(Resp), nothing, Int64(0), detach_timeout)
     ent.wire = wire
     wire.consumer = _spawn_service_consumer(ent, Req, Resp, handler, view, concurrency)
 
@@ -362,10 +368,9 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
     qable = (e.wire::_ServiceWire).queryable
     serve = _service_scheduler(concurrency, e, Req, Resp, handler, view)
     # Sticky so Serial handlers run on the node's one cooperative thread. The loop body is a
-    # NAMED function (not an inline `Task() do … end`) so it can be `precompile`d by name —
-    # its `serve`→`_serve_query` serve tree is baked into ROSNode's image, and an anonymous
-    # task closure would re-infer that whole tree at first schedule (the startup-profile
-    # finding; see examples/startup/STARTUP-REPORT.md). Mirrors `dispatch.jl`'s `_consume_loop`.
+    # named function so `precompile(_service_consume_loop, …)` bakes the `serve`→`_serve_query`
+    # serve tree; an anonymous task closure would re-infer it at first schedule. Mirrors
+    # `dispatch.jl`'s `_consume_loop`.
     t = Task(() -> _service_consume_loop(serve, qable, e))
     t.sticky = true
     schedule(t)
@@ -373,14 +378,10 @@ function _spawn_service_consumer(e::Entity, ::Type{Req}, ::Type{Resp}, handler,
 end
 
 # One service consumer's serve loop: serve queries off `qable` until the queryable's channel
-# closes on drain. Named (not the `Task` do-block it replaced) so `precompile(_service_consume_loop,
-# (typeof(serve), QueryableHandler, Entity))` bakes the loop + the node-logger scope + the
-# `serve`→`_serve_query` tree it calls, keeping the seven standard services' first schedule off
-# the bring-up critical path.
-# The serve loop body, a NAMED callable rather than a `_with_node_logger do …` closure, so the
-# `serve`→`_serve_query` serve tree is `precompile`able by name (an anonymous closure re-infers
-# the whole tree at the consumer task's first schedule — a dominant first-`run` cost on
-# service-bearing nodes). Mirrors `dispatch.jl`'s `_ConsumeLoopBody`.
+# closes on drain. A named callable (not an anonymous task closure) so
+# `precompile(_service_consume_loop, (typeof(serve), QueryableHandler, Entity))` bakes the loop +
+# node-logger scope + the `serve`→`_serve_query` tree; an anonymous closure re-infers it at first
+# schedule. Mirrors `dispatch.jl`'s `_ConsumeLoopBody`.
 # `<: Function` so it passes the `with_logger(::Function, …)` gate `_with_node_logger` calls.
 struct _ServiceLoopBody{F, Q} <: Function
     serve::F
@@ -408,19 +409,10 @@ function _service_consume_loop(serve, qable, e::Entity)
     return nothing
 end
 
-# The active request's `(result cell, owning wire)`, bound by `_serve_query` over the
-# handler's extent so `respond!(req, …)`/`detach!(req)` reach them — the handler holds
-# the decoded request, not the cell. A single scoped value (carrying the pair) rather
-# than two: one `with` binding instead of two halves the per-request dynamic-scope
-# allocation, and only the handler frame ever reads it.
-# The active service request's `(cell, wire)`, made visible to `respond!`/`detach!` within the
-# handler via TASK-LOCAL storage (not a `ScopedValue`). `respond!`/`detach!` read it only from
-# the handler's own frame/task, and the detached path carries an explicit `ServiceRequestHandle`
-# (`cell`+`wire`), so no cross-task propagation is needed — and a task-local set/restore avoids
-# the `ScopedValue` `with`'s per-request HAMT path-copy, whose cost grew with the consumer task's
-# ambient scope depth (the profiled service-server drift). `_run_handler!` runs on the same task
-# as the handler (Serial: inline on the consumer; Parallel: the whole `_serve_query` is `@spawn`ed),
-# so the slot is always set on the handler's own task.
+# The active request `(cell, wire)` lives in task-local storage, read only from the handler's own
+# task (Serial: inline on the consumer; Parallel: the whole `_serve_query` is `@spawn`ed, so the
+# slot is always set on the handler's own task). The detached path carries an explicit
+# `ServiceRequestHandle` (`cell`+`wire`), so no cross-task propagation is needed.
 const _ACTIVE_SERVICE_KEY = :_ros_active_service
 @inline _active_service() = get(task_local_storage(), _ACTIVE_SERVICE_KEY, nothing)
 
@@ -436,8 +428,8 @@ domain's two statuses:
     [`ServiceError`](@ref);
   - `respond!(req, success, resp)` — replies `resp`.
 
-`req` is the handler's argument; the result cell is taken from the handler's
-dynamic scope (a `ScopedValue` bound for the handler's extent).
+`req` is the handler's argument; the result cell is taken from task-local
+storage, set for the handler's extent on the handler's own task.
 
 Returns `true`. Throws `ArgumentError` when called outside a service handler, or
 on an already-settled request (the double-settle error owned by [`respond!`](@ref)).
@@ -463,7 +455,8 @@ end
 A first-class handle to a detached service request, returned by [`detach!`](@ref).
 It carries the request's result cell (and its owning service) so a spawned task
 can settle the request via [`respond!`](@ref)`(handle, status, payload)` *without*
-the handler's `ScopedValue` — which is out of scope on the spawned task. It is the
+the handler's task-local active-request slot, which the spawned task does not
+inherit. It is the
 service analog of an action `GoalHandle`. Single-reply: the handle settles exactly
 once (services have no feedback stream).
 """
@@ -489,8 +482,8 @@ a forgotten `respond!` cannot hang the client. One-shot — `detach!` on an
 already-detached request returns the existing handle.
 
 `req` is the handler's argument; the cell and owning service are taken from the
-handler's dynamic scope. Throws `ArgumentError` when called outside a service
-handler.
+handler's task-local active-request slot. Throws `ArgumentError` when called
+outside a service handler.
 
 ```julia
 Service(node, "plan", Plan_Request; detach_timeout = 30.0) do req
@@ -635,10 +628,16 @@ end
 function _service_deliver(e::Entity, query::Query, ::Type{Resp}) where {Resp}
     function (status::SettlementStatus, payload)
         if status === success && payload isa Resp
-            bytes = encode(payload)
-            seq = (@atomic (e.wire::_ServiceWire).seq += 1)
+            w = e.wire::_ServiceWire
+            seq = (@atomic w.seq += 1)
             ts = nanoseconds(Dates.now(e.node, System()))   # reply-time wall ns
-            reply(query, bytes; attachment=encode_attachment(seq, ts, gid(e)))
+            # The same arm!+transport path as the publisher: re-arm the held boxes and let
+            # `reply` `_move` them, under `out.enc.lock` (shared per-service reply state).
+            out = w.out
+            @lock out.enc.lock begin
+                arm!(out, payload, seq, ts, gid(e))
+                reply(query, out.payload_zb; attachment=out.att_zb)
+            end
         else
             # Any non-success settlement error-replies; the client's `call` raises.
             reply_err(query, _err_message(status, payload))
