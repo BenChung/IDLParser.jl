@@ -119,7 +119,11 @@ end
 function _reconcile_local_graph!(node::Node, primed::Vector{String})
     @lock node.lock (node._materialising = false; empty!(node._id_queue))
     isempty(primed) && return nothing
-    live = Set(e.lv_key for e in (@lock node.lock copy(node.entities)))
+    # `Set{String}` (not bare `Set`) + the `::Entity` assert keep this type-stable: `node.entities`
+    # is `Vector{Any}`, so a bare `Set(gen)` infers an `Any`-eltype generator and falls to the
+    # dynamic `grow_to!`/`push_widen`/`rehash!` path (a large bring-up compile hotspot). The fixed
+    # element type + grounded `.lv_key` (a `String`) make every Set op monomorphic.
+    live = Set{String}((e::Entity).lv_key for e in (@lock node.lock copy(node.entities)))
     orphans = EndpointInfo[]
     @lock node.context.graph.lock for k in primed
         k in live && continue

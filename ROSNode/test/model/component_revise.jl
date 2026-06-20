@@ -24,8 +24,8 @@ module _ReviseMix
     end
     @param     RevWorker rate::Int64 = 10
     @publishes RevWorker out :: _T
-    @hears     function ingest(m::RevWorker, msg::_T) end
-    @every     :rate function beat(m::RevWorker) end
+    @hears     function ingest(node, m::RevWorker, msg::_T) end
+    @every     :rate function beat(node, m::RevWorker) end
 
     @mixin struct RevHelper end
     @publishes RevHelper aux :: _T
@@ -49,8 +49,8 @@ using ._ReviseMix: RevWorker, RevHelper
 
     # Revise re-evaluates the WHOLE top-level expression of an edited definition — for a
     # reaction, the method def AND the macro's port registration. Replay each.
-    Core.eval(M, :(@hears function ingest(m::RevWorker, msg::_T) m.n += 1 end))   # "edited body"
-    Core.eval(M, :(@every :rate function beat(m::RevWorker) end))
+    Core.eval(M, :(@hears function ingest(node, m::RevWorker, msg::_T) m.n += 1 end))   # "edited body"
+    Core.eval(M, :(@every :rate function beat(node, m::RevWorker) end))
     Core.eval(M, :(@publishes RevWorker out :: _T))
     Core.eval(M, :(@param RevWorker rate::Int64 = 10))
     Core.eval(M, :(@node RevRig = ["w" => RevWorker, "h" => RevHelper]))

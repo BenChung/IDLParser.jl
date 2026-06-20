@@ -513,7 +513,7 @@ mutable struct RosoutLogger <: AbstractLogger
     _pub::Any
     # Per-call-site-id `maxlog` emit counts (the logger enforces `maxlog`), mirroring
     # `ConsoleLogger`'s `message_limits`.
-    const _maxlog_counts::Dict{Any, Int}
+    const _maxlog_counts::Dict{Symbol, Int}   # keyed by the call-site id (a `Symbol`; see `_maxlog_exceeded!`)
     # Guards `_maxlog_counts`: the node's one logger is shared across `Parallel(n)`
     # handler threads, and concurrent `Dict` mutation can corrupt it.
     const _maxlog_lock::ReentrantLock
@@ -529,7 +529,7 @@ function RosoutLogger(node; name::AbstractString=_default_logger_name(node),
                       console::Bool=true,
                       min_level::LogLevel=Logging.BelowMinLevel)
     lg = RosoutLogger(node, String(name), parent, console, min_level, nothing,
-                      Dict{Any, Int}())
+                      Dict{Symbol, Int}())
     lg._pub = _rosout_publisher!(node)
     return lg
 end
@@ -630,10 +630,13 @@ end
 function _maxlog_exceeded!(lg::RosoutLogger, id, kwargs)
     maxlog = get(kwargs, :maxlog, nothing)
     maxlog === nothing && return false
+    # `id` is a `Symbol` from the logging macros, but a manual `_id=` can pass anything;
+    # normalize so the keys stay concrete (`Dict{Symbol,Int}`, not `Dict{Any,Int}`).
+    key = id isa Symbol ? id : Symbol(id)
     @lock lg._maxlog_lock begin
-        n = get(lg._maxlog_counts, id, 0)
+        n = get(lg._maxlog_counts, key, 0)
         n >= maxlog && return true
-        lg._maxlog_counts[id] = n + 1
+        lg._maxlog_counts[key] = n + 1
         return false
     end
 end

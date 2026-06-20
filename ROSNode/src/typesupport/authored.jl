@@ -375,7 +375,11 @@ function _emit_service(caller::Module, pkg::AbstractString, fname::Symbol, args,
 end
 
 # Parse `function Name(a::T, …)::Ret … end` → (Name, [(arg, Texpr)…], Ret-expr | nothing).
-function _parse_handler_sig(f::Expr)
+# `allow_untyped`: the component `@serves`/`@runs` pass a node-first signature whose leading
+# `node` arg is intentionally untyped (it dispatches on the mixin, not the node); accept it as
+# `::Any`. Authored types (`@ros_service`/`@ros_action`) keep the strict default, since every
+# arg there becomes a message field that needs a type.
+function _parse_handler_sig(f::Expr; allow_untyped::Bool=false)
     (f.head === :function || f.head === :(=)) ||
         error("@ros_service/@ros_action expects a `function …` definition")
     sig = f.args[1]; rettype = nothing
@@ -386,9 +390,13 @@ function _parse_handler_sig(f::Expr)
         error("@ros_service/@ros_action: could not parse the handler signature")
     args = Tuple{Symbol, Any}[]
     for a in sig.args[2:end]
-        (a isa Expr && a.head === :(::)) ||
+        if a isa Expr && a.head === :(::)
+            push!(args, (a.args[1]::Symbol, a.args[2]))
+        elseif a isa Symbol && allow_untyped
+            push!(args, (a, :Any))
+        else
             error("@ros_service/@ros_action: handler arg `$(a)` needs a type annotation")
-        push!(args, (a.args[1]::Symbol, a.args[2]))
+        end
     end
     return (sig.args[1]::Symbol, args, rettype)
 end

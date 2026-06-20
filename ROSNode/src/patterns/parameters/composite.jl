@@ -7,7 +7,7 @@
 # dot-separated as ROS2 nests parameters) and reusing the schema-independent service
 # core verbatim through the same six reflection handlers plus `parameter_names`.
 #
-# Each member keeps its own `ParameterServer{P_M}`, so `parameters(m)` stays
+# Each member keeps its own `ParameterServer{P_M}`, so `parameters(node, m)` stays
 # mixin-local and type-stable; the façade is only the node-level view. The prefix
 # tracks the construction path: a composed node gets the façade, while a single
 # mixin promoted to a node (`run(M)`) keeps the un-prefixed plain server.
@@ -27,7 +27,7 @@ order — the order `ros2 param list` reflects. Reached as `node.parameters` for
 a composed node.
 
 Each member keeps its own typed `ParameterServer{P_M}` (so a member's own
-`parameters(m)` stays type-stable); the façade is only the node-level aggregate.
+`parameters(node, m)` stays type-stable); the façade is only the node-level aggregate.
 It reuses the schema-independent service core by implementing the same six
 reflection handlers plus [`parameter_names`](@ref). It has no node-level dynamic
 tier — [`dynamic_parameters`](@ref) on it raises `ArgumentError`, directing you
@@ -53,7 +53,7 @@ CompositeParameterServer(node, members::Vector{Pair{Symbol, ParameterServer}}) =
 # than a `MethodError` from the `ParameterServer`-only form.
 dynamic_parameters(::CompositeParameterServer) =
     throw(ArgumentError("a composed @node has no node-level dynamic parameters; reach a member's server " *
-                        "(member schemas are typed — `parameters(m)`)"))
+                        "(member schemas are typed — `parameters(node, m)`)"))
 
 Base.show(io::IO, s::CompositeParameterServer) =
     print(io, "CompositeParameterServer(", length(s.members), " members: ",
@@ -187,7 +187,7 @@ function set_parameters_atomically(s::CompositeParameterServer, pairs)
     # member commit fires its forwarding listener; the member transactions and their
     # synchronous listeners run on *this* task, so collecting their batches into a
     # task-local buffer keyed by `_PARAM_COLLECTOR_KEY` captures exactly this set while a
-    # concurrent direct `parameters(m)` set on another task still publishes its own
+    # concurrent direct `parameters(node, m)` set on another task still publishes its own
     # event. `transaction` re-validates under the member's lock, so a concurrent set that
     # moved the base since phase 1 can still reject, mapped to the `(false, reason)`
     # `SetParametersResult` contract.
@@ -220,7 +220,7 @@ end
 # The façade owns the one `/parameter_events` publisher; member servers have none. A
 # forwarding listener on each member republishes that member's post-commit batch on
 # the node's publisher with prefixed names, so a change driven through the node-level
-# `~/set_parameters` and one made directly via `parameters(m)`/`@on_parameter` both
+# `~/set_parameters` and one made directly via `parameters(node, m)`/`@on_parameter` both
 # surface a node-level event. During a node-level atomic set on this task, the listener
 # collects its batch into the task-local buffer instead, so the whole set publishes as
 # one event.

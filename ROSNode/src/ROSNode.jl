@@ -57,4 +57,20 @@ include("model/component/composition.jl")
 include("discovery/local_graph.jl")
 include("model/component/precompile.jl")
 
+# Build + cache the canonical vendored-type index at precompile, HERE (after typesupport/staticgen
+# are included) rather than in `performance/warmup.jl` — that workload runs at its include point
+# (above), before `_package_iface_files`/the static-gen functions exist, so its probe's
+# `_register_canonical_types!` throws `UndefVarError` and `_CANONICAL_ENTRIES[]` never caches. With
+# everything defined here, the build succeeds and the cached index rides ROSNode's image, so the
+# first Context's `_register_canonical_types!` reuses it instead of re-parsing the vendored IDL at
+# bring-up (~80ms of PEG-parse inference off the first `run`). Best-effort — a sandbox without the
+# vendored sources still precompiles.
+PrecompileTools.@compile_workload begin
+    try
+        _canonical_entries()
+    catch err
+        @debug "precompile: canonical-entries build skipped" exception = err
+    end
+end
+
 end # module ROSNode

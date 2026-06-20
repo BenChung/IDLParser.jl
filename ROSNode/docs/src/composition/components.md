@@ -12,7 +12,7 @@ This page assembles a `Vehicle` node from two mixins. A `Sensor` publishes telem
     import ROSNode: configure, cleanup, construct, requires   # the generics you extend
     ```
 
-    Under a bare `using ROSNode`, a definition like `configure(m::MyMixin) = …` creates a **new local `configure`** that shadows ROSNode's. Your method is never called: the framework dispatches its own generic, runs the default no-op, and there is **no error or warning** — the node simply comes up without your setup. (Equivalently, qualify the name at the definition: `ROSNode.configure(m::MyMixin) = …`.)
+    Under a bare `using ROSNode`, a definition like `configure(node, m::MyMixin) = …` creates a **new local `configure`** that shadows ROSNode's. Your method is never called: the framework dispatches its own generic, runs the default no-op, and there is **no error or warning** — the node simply comes up without your setup. (Equivalently, qualify the name at the definition: `ROSNode.configure(node, m::MyMixin) = …`.)
 
     Members authored by the macros — `@hears`/`@serves`/`@every`/`@runs`/`@uses` reactions and `@param`/`@provides`/`@interface` — are macro-emitted and need no import.
 
@@ -47,26 +47,26 @@ end
 end
 ```
 
-A `@param` attaches a live parameter, read through `parameters(s)` and driveable from the [parameter](../communication/parameters.md) services. The `∈ 1..50` constraint reuses the parameter schema grammar:
+A `@param` attaches a live parameter, read through `parameters(node, s)` and driveable from the [parameter](../communication/parameters.md) services. The `∈ 1..50` constraint reuses the parameter schema grammar:
 
 ```julia
-@param Sensor rate::Int64 = 5 ∈ 1..50      # Hz — read live via parameters(s).rate
+@param Sensor rate::Int64 = 5 ∈ 1..50      # Hz — read live via parameters(node, s).rate
 ```
 
-A `@publishes` declares a publisher on the mixin. The `~/` prefix makes the topic node-private, so `~/telemetry` resolves against the node's name to `/vehicle/telemetry`. Drive the publisher through `entities(s)` — see [Topics](../communication/topics.md) for the publish surface:
+A `@publishes` declares a publisher on the mixin. The `~/` prefix makes the topic node-private, so `~/telemetry` resolves against the node's name to `/vehicle/telemetry`. Drive the publisher through `entities(node, s)` — see [Topics](../communication/topics.md) for the publish surface:
 
 ```julia
 @publishes Sensor telemetry :: Telemetry on "~/telemetry"   # node-private ⇒ /vehicle/telemetry
 ```
 
-`parameters(s)` and `entities(s)` are the two reflective accessors: `parameters(s)` returns the current, type-stable parameter snapshot, and `entities(s)` returns the materialised entity handles. Both are typed by the mixin type, so `parameters(s).rate` and `entities(s).telemetry` are ordinary typed field loads.
+Reactions and lifecycle hooks are **node-first**: they take `(node, m, …)`, where `m` is the mixin instance. The two reflective accessors take both — `parameters(node, s)` returns the current, type-stable parameter snapshot, and `entities(node, s)` returns the materialised entity handles. The mixin's path is a constant on its type, so `parameters(node, s).rate` and `entities(node, s).telemetry` are ordinary typed field loads off the node's carriers.
 
 A `@every` declares a timer. `:rate` binds its frequency to the `rate` parameter, in Hz. The timer fires only while the node is Active:
 
 ```julia
-@every :rate function tick(s::Sensor)
+@every :rate function tick(node, s::Sensor)
     s.level = max(0.0, s.level - 1.0)       # drain a little each tick
-    publish(entities(s).telemetry, Telemetry(battery = s.level, altitude = 12.0))
+    publish(entities(node, s).telemetry, Telemetry(battery = s.level, altitude = 12.0))
 end
 ```
 
@@ -75,9 +75,9 @@ end
 A `@serves` authors a service straight from a function signature. The arguments after the mixin are the request fields; the `@NamedTuple` return type is the response. The macro generates the `srv` type from that signature. See [Services](../communication/services.md) for the service model:
 
 ```julia
-@serves "~/safe_to_fly" function safe(g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
+@serves "~/safe_to_fly" function safe(node, g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
     b = battery(g.battery_src)              # reads the Sensor through the interface
-    (ok = b >= parameters(g).min_battery && target_altitude <= 100.0, battery = b)
+    (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
 end
 ```
 
@@ -103,22 +103,25 @@ battery(s::Sensor) = s.level                # satisfy the BatterySource contract
 `Guard` declares the need with `requires`, and receives the resolved provider in its `construct` method. The injected provider lands in a type-parameter field — its concrete type is fixed per composition (a real `Sensor` here, a mock in a test rig), so reactions read it type-stably:
 
 ```julia
-@mixin struct Guard{B}
+@mixin struct Guard{Name, B} <: Component{Name}
     battery_src::B                          # the injected sibling provider
 end
 requires(::Type{Guard}) = (BatterySource,)
-construct(::Type{Guard}, node, src) = Guard(battery_src = src)   # injected ⇒ Guard{Sensor}
+construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} =      # injected ⇒ Guard{name,Sensor}
+    Guard{Name, typeof(src)}(battery_src = src)
 @param Guard min_battery::Float64 = 20.0
 ```
 
-`construct` dispatches on the mixin being built — the bare base `Guard`, which covers every `Guard{B}`; reactions annotate the base the same way (`safe(g::Guard, …)`). The dependency is used through its interface method — `battery(g.battery_src)` in the service handler above. Omitting a zero-dep `construct` makes the dependency required: the mixin loads only composed in a `@node`. Providing one makes it optional — a zero-dep `construct(::Type{Guard}, node) = Guard(battery_src = …)` picks a default battery source (your own null-object stand-in that answers `battery`) so `run(Guard)` works standalone.
+A parametric mixin writes its own `Name` parameter and the `<: Component{Name}` clause in full (the macro injects them only for a plain, non-parametric struct like `Sensor`). `Name` is the member's path; `construct` threads it as a `Val{Name}` and returns the concrete instantiation.
+
+`construct` dispatches on the mixin being built — the bare base `Guard`, which covers every `Guard{Name, B}`; reactions annotate the base the same way (`safe(node, g::Guard, …)`). The dependency is used through its interface method — `battery(g.battery_src)` in the service handler above. Omitting a zero-dep `construct` makes the dependency required: the mixin loads only composed in a `@node`. Providing one makes it optional — a zero-dep `construct(::Type{Guard}, node, ::Val{Name}) where {Name} = Guard{Name, …}(battery_src = …)` picks a default battery source (your own null-object stand-in that answers `battery`) so `run(Guard)` works standalone.
 
 `requires` and `construct` are two of the ROSNode generics you extend, so they need the `import` (or a qualified `ROSNode.construct(…) = …`) from the warning at the top of the page — a bare `using`-shadowed definition is silently never called.
 
 `configure` is a lifecycle hook — a plain method run at startup; the lifecycle section below covers the full set:
 
 ```julia
-configure(s::Sensor) = @info "Sensor up" rate = parameters(s).rate
+configure(node, s::Sensor) = @info "Sensor up" rate = parameters(node, s).rate
 ```
 
 ## Assembling and running the node
@@ -214,10 +217,10 @@ import ROSNode: configure, cleanup
 end
 @param Recorder path::String = "flight.log"
 
-configure(r::Recorder) = r.io = open(parameters(r).path, "a")
-cleanup(r::Recorder)   = r.io === nothing || close(r.io)
+configure(node, r::Recorder) = r.io = open(parameters(node, r).path, "a")
+cleanup(node, r::Recorder)   = r.io === nothing || close(r.io)
 
-@hears "/vehicle/telemetry" function record(r::Recorder, msg::Telemetry)
+@hears "/vehicle/telemetry" function record(node, r::Recorder, msg::Telemetry)
     println(r.io, msg.battery)
 end
 ```

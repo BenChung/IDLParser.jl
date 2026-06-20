@@ -358,17 +358,31 @@ function _apply_ros_transport_config!(c::Config; localhost_only::Bool, peers::Ve
     c
 end
 
-function Context(; domain_id::Union{Integer, Nothing}=nothing,
-                   namespace::Union{AbstractString, Nothing}=nothing,
-                   enclave::Union{AbstractString, Nothing}=nothing,
-                   config::Union{Config, Nothing}=nothing,
-                   format::KeyExprFormat=RmwZenoh(),
-                   localhost_only::Bool=false,
-                   peers::AbstractVector{<:AbstractString}=String[],
-                   drain_timeout::Real=5.0,
-                   shm_clients=nothing,
-                   home::Union{Module, Nothing}=nothing,
-                   weak_types::Bool=false)
+Context(; domain_id::Union{Integer, Nothing}=nothing,
+          namespace::Union{AbstractString, Nothing}=nothing,
+          enclave::Union{AbstractString, Nothing}=nothing,
+          config::Union{Config, Nothing}=nothing,
+          format::KeyExprFormat=RmwZenoh(),
+          localhost_only::Bool=false,
+          peers::AbstractVector{<:AbstractString}=String[],
+          drain_timeout::Real=5.0,
+          shm_clients=nothing,
+          home::Union{Module, Nothing}=nothing,
+          weak_types::Bool=false) =
+    _open_context(domain_id, namespace, enclave, config, format, localhost_only,
+                  peers, drain_timeout, shm_clients, home, weak_types)
+
+# The Context build, behind a `@nospecialize` barrier. Its kwargs (config/domain_id/namespace/
+# peers/…) are user-controlled at an arbitrary `run`/`Context` call we have NO macro visibility
+# into, so specialising per-combination would either re-infer at every distinct call (~50ms) or
+# bake only the one combination the warm-up probe happened to use. Nospecialising every argument
+# makes this ONE MI regardless of the kwarg combination — baked once in ROSNode's own image (the
+# probe exercises it), reused by every caller. It runs once per node (cold) and returns a concrete
+# `Context`, so callers stay grounded; the few dynamic dispatches nospecialize leaves
+# (`open`/`convert`) are negligible on this path.
+function _open_context(domain_id, namespace, enclave, config, format, localhost_only,
+                       peers, drain_timeout, shm_clients, home, weak_types)
+    @nospecialize domain_id namespace enclave config format localhost_only peers drain_timeout shm_clients home weak_types
     dom = domain_id === nothing ? _env_domain_id() : Int(domain_id)
     ns  = _normalize_namespace(namespace === nothing ? _env_namespace() : String(namespace))
     enc = enclave === nothing ? _env_enclave() : String(enclave)

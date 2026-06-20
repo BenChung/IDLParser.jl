@@ -51,8 +51,8 @@ module _CompPorts
     @mixin struct LidP; end
     @publishes LidP image :: _T
     @mixin struct Fuse; end
-    @hears function left(m::Fuse, msg::_T) end
-    @hears function right(m::Fuse, msg::_T) end
+    @hears function left(node, m::Fuse, msg::_T) end
+    @hears function right(node, m::Fuse, msg::_T) end
 end
 using ._CompPorts
 
@@ -65,7 +65,7 @@ module _CompWiring
     @mixin struct Talk; end
     @publishes Talk foo :: _T on "~/foo"
     @mixin struct Listen; end
-    @hears function foo(m::Listen, msg::_T) end
+    @hears function foo(node, m::Listen, msg::_T) end
 end
 using ._CompWiring
 
@@ -105,8 +105,8 @@ using ._CompWiring
             # node-level member-namespaced view (§3.5/§4.4)
             @test parameters(rig).camera.fps == 60
             @test parameters(rig).lidar.range == 50.0
-            # mixin-local `parameters(m)` stays unprefixed
-            @test parameters(rig.members[:camera]).fps == 60
+            # mixin-local `parameters(node, m)` stays unprefixed
+            @test parameters(rig, rig.members[:camera]).fps == 60
         end
     end
 

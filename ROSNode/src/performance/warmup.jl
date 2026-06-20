@@ -374,8 +374,11 @@ end
         # can't open a session still builds. (The per-message-type `_make_publisher`/`_make_service`
         # construction stays the consumer's `@precompile_nodes` job — those ARE consumer-typed.)
         try
-            pctx = Context(; config = Config(; str =
-                "{mode:\"peer\",scouting:{multicast:{enabled:false}},timestamping:{enabled:true}}"))
+            # Open the probe Context the SAME way `run` does (`config=nothing` + `localhost_only`,
+            # peers a `Vector{String}`), so this execution bakes the EXACT runtime `Context` MI —
+            # incl. the default `Config()` + `_apply_ros_transport_config!` building that the
+            # config-given path skips. `localhost_only` keeps it inert (multicast scouting off).
+            pctx = Context(; peers = String[], localhost_only = true)
             pnode = Node(pctx, "_precompile_probe")
             ti = type_info_of(Interfaces.builtin_interfaces.msg.Time)
             for k in (Publisher, Subscription, Service)

@@ -16,16 +16,16 @@ end
 end
 @param Counter "tick rate" fps::Int64 = 30 ∈ 1..120
 @param Counter label::String = "hi"
-@every :fps function tick(m::Counter)
+@every :fps function tick(node, m::Counter)
     m.n += 1
 end
-@hears function ingest(m::Counter, msg::Ping)
+@hears function ingest(node, m::Counter, msg::Ping)
     m.n = Int(msg.seq)
 end
 # Publisher + service ports too, so the bake exercises `_anchor_construction!`'s publisher
 # send-path and service codec anchors (the subprocess check probes their MIs survive).
 @publishes Counter out :: Ping
-@serves "~/q" function q(m::Counter, x::Int64)::@NamedTuple{ok::Bool}
+@serves "~/q" function q(node, m::Counter, x::Int64)::@NamedTuple{ok::Bool}
     (ok = x > 0,)
 end
 
@@ -37,7 +37,7 @@ end
 # out of the entities-accessor bake — but `_anchor_action_codecs!` runs before that gate and
 # bakes its goal/result/feedback + wrapper codecs. Exercises the action-codec bake survival.
 @mixin struct Mover end
-@runs function move(m::Mover, n::Int64,
+@runs function move(node, m::Mover, n::Int64,
                     fb::FeedbackSink{@NamedTuple{k::Int64}})::@NamedTuple{done::Bool}
     (done = true,)
 end
@@ -64,7 +64,7 @@ module Byo
         v::Int = 7
     end
     @param Solo gain::Float64 = 2.0
-    @every 5 function beat(m::Solo)
+    @every 5 function beat(node, m::Solo)
         m.v += 1
     end
     @precompile_nodes      # bake under a BYO __init__ too (separate module roster)

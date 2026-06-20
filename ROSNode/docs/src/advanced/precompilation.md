@@ -62,7 +62,7 @@ using ROSNode
 
 @mixin struct Drive end
 @param Drive max_speed::Float64 = 2.0
-@hears function brake(d::Drive, msg::std_msgs.msg.Bool)
+@hears function brake(node, d::Drive, msg::std_msgs.msg.Bool)
     msg.data && stop!(d)
 end
 
@@ -74,7 +74,7 @@ end
 
 It bakes, into the consuming package's precompile image:
 
-- each mixin's typed `parameters(m)` and `entities(m)` accessors, and
+- each mixin's typed `parameters(node, m)` and `entities(node, m)` accessors, and
 - its reaction handlers, compiled against those accessors, together with the codec and dispatch frames they specialize.
 
 The bake reaches a mixin whose ports all have a statically derivable handle type. A mixin with an action server or client keeps the generic accessor and warms at first `run` instead, since its handle type materializes only then.
@@ -95,6 +95,7 @@ The bake reaches a mixin whose ports all have a statically derivable handle type
 WarmupPolicy
 WarmupMode
 Precompile
+Stub
 Execute
 NoWarmup
 @precompile_nodes

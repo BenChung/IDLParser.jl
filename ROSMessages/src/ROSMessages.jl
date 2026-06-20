@@ -53,6 +53,15 @@ struct _ReflectWL; a::Int32; v::SVector{3, Float64}; n::Vector{Int32}; end
         append!(decls, action_protocol_decls("A"; package="p"))
         resolved = ConstResolution.resolve_constants(decls)
         Generation.generate_code(resolved)
+        # ROSNode calls these IL entry points DIRECTLY (not via `parse_*`): `_parse_interface`,
+        # `_build_canonical_entries`, `_build_wellknown_entries`. `parse_*` inline `*_il`, so the
+        # workload's `parse_*` calls leave no reusable standalone CI for the direct path; bake
+        # each entry point's own native code. (The shared `_parse_section`/PEG combinator tree
+        # dispatches dynamically through IDLParser's packrat memo, so its native code isn't
+        # serializable here — the first direct parse of a session still pays that codegen once.)
+        precompile(Core.kwcall, (NamedTuple{(:name,), Tuple{String}}, typeof(message_il), String))
+        precompile(Core.kwcall, (NamedTuple{(:name,), Tuple{String}}, typeof(service_il), String))
+        precompile(Core.kwcall, (NamedTuple{(:name,), Tuple{String}}, typeof(action_il), String))
         # RIHS01 hash path.
         d = lower(message_il(msg; name="M"); package="")
         td = type_description_from_struct(d[end], "p/msg/M"; package="p", qualifier="msg")

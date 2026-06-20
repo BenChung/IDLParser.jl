@@ -29,9 +29,26 @@ Returned by `run` / held by a [`Container`](@ref).
 # for the dynamic fallback (mixin-as-node / un-finalized). `members[nm]` reads work for both
 # (`getindex` by Symbol); the typed form makes the dispatch concrete. `::ComponentNode` sites match
 # the UnionAll.
-mutable struct ComponentNode{Members}
+# A per-member materialised-ports cell: holds the member's typed ports NamedTuple once its
+# configure step materialises it, `nothing` before/after (so `entities` errors clearly pre-config
+# and cleanup can drop the handles). One cell per member lets configure/cleanup run independently;
+# the `Union{Nothing,P}` narrows to `P` after the `=== nothing` guard, so `entities` stays typed.
+mutable struct PortCell{P}
+    v::Union{Nothing, P}
+    PortCell{P}() where {P} = new{P}(nothing)
+end
+
+# The node owns the runtime, fully typed. A member (`Component{Name}`) holds no node reference;
+# `entities(node, m)`/`parameters(node, m)` read these carriers at the member named `_path(m)`,
+# so the node↔member relationship is acyclic (members never name the node).
+#   Members  — `@NamedTuple{a::Counter{:a}, …}` (typed) or `Dict{Symbol,Any}` (dynamic fallback)
+#   Ports    — `@NamedTuple{a::PortCell{PortsA}, …}` keyed by member name; cells filled at configure
+#   Pservers — `@NamedTuple{a::ParameterServer{Pa}, …}` keyed by member name; built at construct
+mutable struct ComponentNode{Members, Ports, Pservers}
     const node::Node
     const members::Members
+    const ports::Ports              # per-member PortCell, keyed by member name
+    const pservers::Pservers        # per-member ParameterServer, keyed by member name
     const order::Vector{Symbol}     # member names in DI construction (toposort) order — drives
                                     # lifecycle fan-out + reverse-order teardown
     const wires::Dict{Symbol, Dict{Symbol, String}}  # member => (port => resolved wire name), remaps
@@ -40,6 +57,18 @@ mutable struct ComponentNode{Members}
                                         # `close`; `nothing` when the caller supplied one
     @atomic open::Bool              # single-winner close latch (unmanaged path)
 end
+
+# ── accessors (methods of the `entities`/`parameters` generics declared in component.jl) ──
+# `_path(m)` is a constant lifted from the mixin's type parameter, so `getfield(carrier, _path(m))`
+# folds to the member's field — a typed load, no dispatch, no `Any`.
+function entities(node::ComponentNode, m::Component)
+    cell = getfield(node.ports, _path(m))
+    v = cell.v
+    v === nothing && error("entities($(nameof(typeof(m)))): member `$(_path(m))` not materialised yet (configure the node first)")
+    return v
+end
+
+parameters(node::ComponentNode, m::Component) = current(getfield(node.pservers, _path(m)))
 
 Base.show(io::IO, c::ComponentNode) =
     print(io, "ComponentNode(", c.node.fqn, c.lifecycle === nothing ? "" : ", managed",
@@ -52,12 +81,12 @@ The node-level parameter aggregation: one entry per member, keyed by member name
 declared order, each value the member's per-mixin snapshot (see
 [`parameters(m::Component)`](@ref)). So `parameters(node).camera` is member `camera`'s
 live snapshot, and the result is heterogeneous — for iterating a whole node, where
-`parameters(m)` is the type-stable per-mixin view. The flat `<member>.<field>` wire
+`parameters(node, m)` is the type-stable per-mixin view. The flat `<member>.<field>` wire
 namespace these views live under is owned by [`CompositeParameterServer`](@ref).
 """
-parameters(c::ComponentNode) = (; (nm => parameters(c.members[nm]) for nm in c.order)...)
+parameters(c::ComponentNode) = (; (nm => parameters(c, c.members[nm]) for nm in c.order)...)
 
-entities(c::ComponentNode) = (; (nm => entities(c.members[nm]) for nm in c.order)...)
+entities(c::ComponentNode) = (; (nm => entities(c, c.members[nm]) for nm in c.order)...)
 
 inner_node(c::ComponentNode) = c.node
 "The `LifecycleNode` driving a managed component node, or `nothing` (unmanaged)."
@@ -258,38 +287,15 @@ end
 # materialise path find the markers present and reuse the bakes rather than re-`Core.eval`ing.
 function _finalize_module!(mod::Module)
     isdefined(mod, :__mixin_bases__) || return nothing
+    # Per BASE: only the node-INDEPENDENT artifacts. The mixin's typed parameter schema, its
+    # generated `_build_ports` method, and its action codecs (keyed on the action type, not the
+    # node). The reaction handlers + construction/materialise path are node-first (they specialise
+    # on the concrete `ComponentNode`), so they bake per-`@node` in `_anchor_node_plan!` — not here.
     for M in getfield(mod, :__mixin_bases__)
         try
-            _ensure_schema!(M)                          # __ros_pschema_<M>__ + descriptors/pschema
-            # Action codecs first: accessor-independent, so they bake even for an action-bearing
-            # mixin — which the `nt` gate below skips entirely (its action handle type isn't
-            # statically derivable).
-            _anchor_action_codecs!(M)
-            # Typed materialise body (Stage C): generated for every port-bearing mixin — including
-            # action-bearing ones, which the `nt` accessor gate below skips. Grounds materialise.
-            _gen_build_ports!(mod, M)                   # __ros_build_ports_<M>__ + _build_ports(node, m::M, …)
-            nt = _entities_accessor_from_specs!(M)      # __ros_entities_<M>__ + entities(m::M)
-            # Bake handlers + the construction path only once a typed accessor exists. A mixin
-            # with a non-derivable port (action/client) keeps the generic `entities`, so it warms
-            # at first `run`; baking here would compile against the generic accessor and be
-            # invalidated when materialise emits the typed one.
-            if nt !== nothing
-                _anchor_reactions!(M)       # message handlers + decode/dispatch + service codec
-                _anchor_construction!(M)    # endpoint/materialise/param-server + publish path
-                # The accessor TYPE is baked above (the `entities(m::M)` method + marker ride this
-                # image). Materialise still calls `_entities_accessor_from_ports!(M, ports)` once —
-                # it finds the marker and no-ops, but the call itself JITs unless anchored. The two
-                # `PortsNT` sources are proven equal for derivable kinds, so `ports::nt`.
-                precompile(_entities_accessor_from_ports!, (Type{M}, nt))
-            end
-            # Stage C: bake the generated typed materialise (`_gen_build_ports!` eval'd it above, so
-            # it's only visible in the latest world → `invokelatest`). AFTER the accessor, so a
-            # precompile hiccup can't skip the accessor (the bug the same-frame `precompile` had).
-            # pvalue is `Any` at the call site (`MixinRuntime.pserver::Any` → `current(…)::Any`),
-            # so anchor that — `pschema(M)` would bake a specialisation `_member_materialize!`
-            # never calls.
-            isconcretetype(M) &&
-                Base.invokelatest(precompile, _build_ports, (Node, M, Dict{Symbol, String}, Any))
+            _ensure_schema!(M)            # __ros_pschema_<M>__ + descriptors/pschema
+            _anchor_action_codecs!(M)     # goal/result/feedback + wrapper codecs (node-independent)
+            _gen_build_ports!(mod, M)     # __ros_build_ports_<M>__ + _build_ports(cnode, m::M, …)
         catch err
             @debug "_finalize_module!: skipped a mixin bake" mod mixin = M exception = err
         end
@@ -317,9 +323,21 @@ function _finalize_module!(mod::Module)
     if isdefined(mod, :__node_kinds__)
         for (_, K) in getfield(mod, :__node_kinds__)
             K isa NodeKind || continue
+            # Functional bake FIRST + in its own guard: the node-as-built member constructor
+            # `_build_members(::Type{NodeKind{:N}}, node)` drives the typed runtime assembly path,
+            # so a throw in the (perf-only) node-plan bake below must never skip it.
             try
-                _anchor_node_plan!(K)
-                _gen_build_members!(mod, K)   # emit the node-as-built `_build_members(::Type{NodeKind{:N}}, node)`
+                _gen_build_members!(mod, K)
+                _gen_build_ports_carrier!(mod, K)
+                _gen_build_pservers!(mod, K)
+            catch err
+                @debug "_finalize_module!: skipped node-carrier gen" mod node = K exception = err
+            end
+            try
+                # `invokelatest`: `_anchor_node_plan!` reads `pschema`/`mixin_spec`/`_build_members`
+                # methods that `_ensure_schema!`/`_gen_build_members!` `Core.eval`'d earlier in THIS
+                # `_finalize_module!` frame — only visible in the latest world.
+                Base.invokelatest(_anchor_node_plan!, K)   # perf: precompile the assembly/fan-out/reaction path
             catch err
                 @debug "_finalize_module!: skipped a node-plan bake" mod node = K exception = err
             end
@@ -347,12 +365,63 @@ function _gen_build_members!(mod::Module, K::NodeKind)
     for nm in order
         M = bytype[nm]
         deps = Any[loc[d] for d in edges[nm]]
-        push!(body.args, :($(loc[nm]) = $(GlobalRef(@__MODULE__, :construct))($M, node, $(deps...))))
+        push!(body.args, :($(loc[nm]) = $(GlobalRef(@__MODULE__, :construct))(
+            $M, node, $(Val(nm)), $(deps...))))     # name threaded → `construct` builds `M{nm}`
     end
     push!(body.args, :(return $(Expr(:tuple, (Expr(:(=), nm, loc[nm]) for nm in order)...))))
     Core.eval(mod, quote
         const $marker = true
         $(GlobalRef(@__MODULE__, :_build_members))(::$(Type){$KT}, node::$(GlobalRef(@__MODULE__, :Node))) = $body
+    end)
+    return nothing
+end
+
+# The node's typed runtime carriers, generated per `@node` like `_build_members`: the empty
+# port cells (filled at configure) and the per-member parameter servers. The straight-line,
+# member-unrolled form makes each field's type concrete, so the returned NamedTuples — and thus
+# the `ComponentNode{Members, Ports, Pservers}` built from them — are fully typed and bake into
+# the consumer image. `_assemble` falls back to the equivalent dynamic generators (below) when a
+# node has no generated method (mixin-as-node, or not finalised). The per-member type expressions
+# (`_ports_nt_type`/`pschema`) are constant-folded at the spliced mixin type, exactly as the
+# dynamic forms compute them — so behaviour is identical, only the iteration is unrolled.
+function _build_ports_carrier end
+function _build_pservers end
+
+function _gen_build_ports_carrier!(mod::Module, K::NodeKind)
+    KT = typeof(K)
+    nm_sym = KT.parameters[1]
+    marker = Symbol("__ros_build_ports_carrier_", nm_sym)
+    isdefined(mod, marker) && return nothing
+    order, bytype, _ = _members_plan(K)
+    # Splice the cell's CONCRETE port-NamedTuple type as a literal (resolved now from `mixin_spec`,
+    # which `@mixin` defined before finalize): `PortCell{<concrete>}()` is then a static call the
+    # `_build_ports_carrier` anchor bakes — a runtime `_ports_nt_type(…)` wouldn't const-fold (the
+    # spec is a non-bits struct), leaving the constructor dynamic and unbaked.
+    cell(M) = :($(GlobalRef(@__MODULE__, :PortCell)){$(something(_ports_nt_type(mixin_spec(M).ports), Any))}())
+    fields = Expr(:tuple, (Expr(:(=), nm, cell(bytype[nm])) for nm in order)...)
+    Core.eval(mod, quote
+        const $marker = true
+        $(GlobalRef(@__MODULE__, :_build_ports_carrier))(::$(Type){$KT}, node::$(GlobalRef(@__MODULE__, :Node))) = $fields
+    end)
+    return nothing
+end
+
+function _gen_build_pservers!(mod::Module, K::NodeKind)
+    KT = typeof(K)
+    nm_sym = KT.parameters[1]
+    marker = Symbol("__ros_build_pservers_", nm_sym)
+    isdefined(mod, marker) && return nothing
+    order, bytype, _ = _members_plan(K)
+    srv(M, nm) = :($(GlobalRef(@__MODULE__, :_build_pserver))(node,
+        $(GlobalRef(@__MODULE__, :pschema))($M),
+        $(GlobalRef(@__MODULE__, :_member_overrides))($M, $(QuoteNode(nm)), overrides)))
+    fields = Expr(:tuple, (Expr(:(=), nm, srv(bytype[nm], nm)) for nm in order)...)
+    Core.eval(mod, quote
+        const $marker = true
+        # `overrides` is `@nospecialize`d (it is forwarded to the already-`@nospecialize`d
+        # `_member_overrides`), so a node bakes one carrier MI regardless of the caller's override set.
+        $(GlobalRef(@__MODULE__, :_build_pservers))(::$(Type){$KT}, node::$(GlobalRef(@__MODULE__, :Node)),
+            $(Expr(:macrocall, GlobalRef(Base, Symbol("@nospecialize")), LineNumberNode(@__LINE__, @__FILE__), :overrides))) = $fields
     end)
     return nothing
 end
@@ -370,44 +439,78 @@ end
 function _anchor_node_plan!(K::NodeKind)
     order, bytype, edges = _members_plan(K)   # bakes _resolve_di/_toposort for these member types
     _resolve_wires(K)                          # bakes wire-remap resolution for these ports
+    # Resolve each member's CONCRETE instantiation `Mc = M{name}` from `construct`'s return type,
+    # given its already-resolved deps (the name threaded as `Val{name}`).
     concrete = Dict{Symbol, Any}()
     for nm in order
         M = bytype[nm]
         deptypes = Any[concrete[d] for d in edges[nm]]
-        rts = Base.return_types(construct, (Type{M}, Node, deptypes...))
+        rts = Base.return_types(construct, (Type{M}, Node, Val{nm}, deptypes...))
         Tc = (length(rts) == 1 && isconcretetype(only(rts))) ? only(rts) : M
         concrete[nm] = Tc
-        # The base mixin is already anchored by the `__mixin_bases__` loop; only a parametric
-        # instantiation (`Tc` ≠ the declared base, e.g. `Guard{Sensor}`) needs anchoring here on
-        # its exact type. A `construct` that isn't type-stable leaves `Tc` non-concrete → skip
-        # (it falls back to the runtime member warm).
-        (Tc === M || !isconcretetype(Tc)) && continue
-        _ensure_schema!(_base(Tc))
-        _anchor_action_codecs!(Tc)
-        _anchor_reactions!(Tc)
-        _anchor_construction!(Tc)
-        # The generated typed materialise on this parametric instantiation (eval'd → latest world).
-        # pvalue is `Any` at the call site (see `_member_materialize!`).
-        Base.invokelatest(precompile, _build_ports, (Node, Tc, Dict{Symbol, String}, Any))
     end
-    # Stage A/C: anchor the generated typed assembly. `_build_members` is eval'd into this module
-    # (→ latest world) and keyed on `NodeKind{:N}` whose method this module owns, so it caches in
-    # the consumer image (verified: it drops out of first-`run` re-inference). NOT anchored: the
-    # `NodeKind{:N}`-keyed PLANNING frames (`_resolve_wires`/`_members_plan`/`_check_clobbers`/`_run`)
-    # — ROSNode methods on a ROSNode type → external MIs the consumer can't cache; they re-infer at
-    # first `run` regardless, and belong to a separate de-specialization / ROSNode-image effort.
-    Base.invokelatest(precompile, _build_members, (Type{typeof(K)}, Node))
-    # The Stage-B/C node-level fan-out keyed on the typed `ComponentNode{Members}` (Members carries
-    # the consumer's mixin types → consumer-cacheable). Anchor each directly — `_build_members`'s
-    # return type IS `Members`. (`_prime_local_graph!` + `_ordered_member_descs` were the largest
-    # cacheable-but-unanchored frames at first `run`.)
-    rts = Base.invokelatest(Base.return_types, _build_members, (Type{typeof(K)}, Node))
-    if length(rts) == 1 && isconcretetype(only(rts))
-        CN = ComponentNode{only(rts)}
-        Base.invokelatest(precompile, _prime_local_graph!,   (CN, Vector{Symbol}))
-        Base.invokelatest(precompile, _ordered_member_descs, (CN, Vector{Symbol}))
-        Base.invokelatest(precompile, _member_materialize!,  (CN, Symbol))
-        Base.invokelatest(precompile, _member_configure!,    (CN, Symbol))
+    # The generated member + carrier constructors (eval'd into this module → latest world), keyed on
+    # `NodeKind{:N}` whose method this module owns → caches in the consumer image. `_build_pservers`
+    # is `@nospecialize`d on overrides; the bake covers the no-override (empty NamedTuple) run.
+    Base.invokelatest(precompile, _build_members,       (Type{typeof(K)}, Node))
+    Base.invokelatest(precompile, _build_ports_carrier, (Type{typeof(K)}, Node))
+    Base.invokelatest(precompile, _build_pservers,      (Type{typeof(K)}, Node, NamedTuple{(), Tuple{}}))
+
+    # Derive the concrete node type `ComponentNode{Members, Ports, Pservers}` from the resolved
+    # members. Members/Ports/Pservers all carry the consumer's mixin + message types, so the
+    # node-level fan-out + per-member materialise/reaction frames keyed on it are CONSUMER-cacheable
+    # (unlike the `NodeKind{:N}`-keyed planning, which is external and re-infers regardless).
+    all(nm -> isconcretetype(concrete[nm]), order) || return nothing
+    Members  = NamedTuple{(order...,), Tuple{(concrete[nm] for nm in order)...}}
+    Ports    = NamedTuple{(order...,),
+                          Tuple{(PortCell{something(_ports_nt_type(mixin_spec(_base(concrete[nm])).ports), Any)}
+                                 for nm in order)...}}
+    Pservers = NamedTuple{(order...,),
+                          Tuple{(ParameterServer{pschema(_base(concrete[nm])) } for nm in order)...}}
+    CN = ComponentNode{Members, Ports, Pservers}
+
+    # The node constructor itself: `_assemble` is `@nospecialize(K)`, so it builds `CN` dynamically
+    # from the runtime carrier types — anchor the concrete constructor (unmanaged run: `lifecycle` and
+    # `owned_ctx` are `Nothing`) so that dynamic construction reuses cached code instead of re-inferring.
+    Base.invokelatest(precompile, CN,
+        (Node, Members, Ports, Pservers, Vector{Symbol}, Dict{Symbol, Dict{Symbol, String}}, Nothing, Nothing, Bool))
+    # The `CompositeParameterServer` member list `Pair{Symbol,ParameterServer}[nm => server …]` widens
+    # each concrete server to the abstract element type (a `convert`), built dynamically in `_assemble`
+    # over the runtime member names — anchor the per-schema `Pair` + `convert` so it reuses cached code.
+    for nm in order
+        P = pschema(_base(concrete[nm]))
+        Base.invokelatest(precompile, Pair, (Symbol, ParameterServer{P}))
+        Base.invokelatest(precompile, convert,
+            (Type{Pair{Symbol, ParameterServer}}, Pair{Symbol, ParameterServer{P}}))
+    end
+    # Field writes the assembly/materialise performs on the concrete node + cells: the owned Context
+    # onto the node (`cnode.owned_ctx = ctx`) and each member's built ports into its cell at configure
+    # (`cell.v = ports`). Both run in the `@nospecialize`d `_assemble`/materialise, so anchor them here.
+    Base.invokelatest(precompile, setproperty!, (CN, Symbol, Context))
+    for nm in order
+        PC = fieldtype(Ports, nm)                       # PortCell{<ports NT>}
+        Base.invokelatest(precompile, setproperty!, (PC, Symbol, PC.parameters[1]))
+    end
+
+    # Node-level fan-out + local-graph priming, keyed on the concrete node.
+    Base.invokelatest(precompile, _prime_local_graph!,   (CN, Vector{Symbol}))
+    Base.invokelatest(precompile, _ordered_member_descs, (CN, Vector{Symbol}))
+    prt = Base.invokelatest(Base.return_types, _prime_local_graph!, (CN, Vector{Symbol}))
+    length(prt) == 1 && Base.invokelatest(precompile, _reconcile_local_graph!, (Node, only(prt)))
+    for fn in (_member_materialize!, _member_configure!, _member_activate!,
+               _member_deactivate!, _member_cleanup!, _member_cancel_goals!)
+        Base.invokelatest(precompile, fn, (CN, Symbol))
+    end
+    Base.invokelatest(precompile, _members_on_error!, (CN, Vector{Symbol}))
+
+    # Per member, on the concrete node + instantiation: reaction handlers + decode/dispatch + the
+    # construction/materialise path (incl. the generated typed `_build_ports`). Action codecs are
+    # node-independent (keyed on the action type) and already baked per-base.
+    for nm in order
+        Mc = concrete[nm]
+        _ensure_schema!(_base(Mc))
+        Base.invokelatest(_anchor_reactions!,    CN, Mc)
+        Base.invokelatest(_anchor_construction!, CN, Mc)
     end
     return nothing
 end
@@ -418,7 +521,7 @@ end
 Bake this module's `@mixin`/`@node` declarations into its precompile image for a faster
 first `run`. Place it as the LAST top-level statement in a module that declares mixins/nodes
 (after every `@mixin`/`@param`/`@publishes`/… and reaction handler). It generates each
-mixin's typed `parameters(m)`/`entities(m)` accessors and precompiles its reaction handlers
+mixin's typed `parameters(node, m)`/`entities(node, m)` accessors and precompiles its reaction handlers
 — including the transitive codec/dispatch frames they specialise — into THIS package's image.
 
 Expands to a `PrecompileTools.@compile_workload` (referenced through ROSNode, so the
@@ -517,53 +620,54 @@ _default_name(::Type{M}) where {M} = _snake(String(nameof(M)))
 # through it, so the warm never reaches it. Routing through these `where {F}` helpers
 # specialises on the concrete reaction type, so the materialised callback is monomorphic and
 # precompilable, with the one dispatch paid once here at configure.
-_sub_cb(reaction::F, m) where {F} = msg -> reaction(m, msg)     # subscription + service: react(m, x)
-_timer_cb(reaction::F, m) where {F} = () -> reaction(m)         # @every timer: react(m)
+# Reaction-callback function barriers. `p.reaction` is stored `Any`, so a closure capturing it
+# directly would type it `Any` and dynamically dispatch every message/tick. Routing through these
+# `where {F}` helpers specialises on the concrete reaction type, so the materialised callback is
+# monomorphic. Node-first: the closure captures the `ComponentNode` and the member, calling the
+# handler `reaction(node, m, …)`.
+_sub_cb(reaction::F, node, m) where {F} = msg -> reaction(node, m, msg)   # subscription + service
+_timer_cb(reaction::F, node, m) where {F} = () -> reaction(node, m)       # @every timer
 
-# Create each declared port's runtime handle against the node-core. Returns the
-# handle NamedTuple (`entities(m)`) and the paused timers to start at activate.
-# `wiremap` is the member's resolved remap (port => wire name); a port not in it
-# uses its authored `_wire(p)`.
-function _materialize_ports!(node::Node, m, member::Symbol, specs::Vector{PortSpec}, pvalue,
+# Create each declared port's runtime handle against the node-core. Returns the handle
+# NamedTuple (the member's `entities`). Endpoints build against the core node (`cnode.node`);
+# reaction closures capture the `cnode` so the handler receives it as `node`. `wiremap` is the
+# member's resolved remap (port => wire name); a port not in it uses its authored `_wire(p)`.
+function _materialize_ports!(cnode::ComponentNode, m, specs::Vector{PortSpec}, pvalue,
                              wiremap::Dict{Symbol, String} = Dict{Symbol, String}())
+    node = cnode.node
     handles = Pair{Symbol, Any}[]
-    timers = Any[]
     for p in specs
         if p.kind === :publisher
             push!(handles, p.name => Publisher(node, _wire(p, wiremap), p.msgtype))
         elseif p.kind === :subscription
-            # `warmup = :off`: the endpoint's own warm would fire now, before the typed
-            # `entities(m::M)`/`parameters(m::M)` accessors are generated (at the end of
-            # `_member_materialize!`), compiling the handler against the generic accessors only
-            # to invalidate it. The member warms all its reactions once afterward, in
-            # `_warm_member_reactions!`.
-            sub = Subscription(_sub_cb(p.reaction, m), node, _wire(p, wiremap), p.msgtype; warmup = :off)
+            # `warmup = :off`: the endpoint's own warm is redundant — the member warms all its
+            # reactions once after materialise, in `_warm_member_reactions!`.
+            sub = Subscription(_sub_cb(p.reaction, cnode, m), node, _wire(p, wiremap), p.msgtype; warmup = :off)
             push!(handles, p.name => sub)
         elseif p.kind === :service
-            srv = Service(_sub_cb(p.reaction, m), node, _wire(p, wiremap), p.msgtype; warmup = :off)
+            srv = Service(_sub_cb(p.reaction, cnode, m), node, _wire(p, wiremap), p.msgtype; warmup = :off)
             push!(handles, p.name => srv)
         elseif p.kind === :action
             f = p.reaction
             support = ActionTypeSupport(typeof(f))
-            body = _component_action_adapter(f, support, p.extra.fb_pos, m)
+            body = _component_action_adapter(f, support, p.extra.fb_pos, cnode, m)
             push!(handles, p.name => _make_action_server(node, _wire(p, wiremap), typeof(f); body = body))
         elseif p.kind === :timer
             hz = p.extra.rate
             if hz isa Symbol
                 hz in fieldnames(typeof(pvalue)) || error(
-                    "@every: member `$(member)` timer `$(p.name)` rate `:$(hz)` does not name a declared parameter of $(_base(typeof(m)))")
+                    "@every: member `$(_path(m))` timer `$(p.name)` rate `:$(hz)` does not name a declared parameter of $(_base(typeof(m)))")
                 hz = getproperty(pvalue, hz)
                 hz isa Real || error(
-                    "@every: member `$(member)` timer `$(p.name)` rate parameter `:$(p.extra.rate)` must be numeric (got `$(typeof(hz))`)")
+                    "@every: member `$(_path(m))` timer `$(p.name)` rate parameter `:$(p.extra.rate)` must be numeric (got `$(typeof(hz))`)")
             end
-            t = _paused_timer(node, Duration(round(Int64, 1.0e9 / hz)), _timer_cb(p.reaction, m))
+            t = _paused_timer(node, Duration(round(Int64, 1.0e9 / hz)), _timer_cb(p.reaction, cnode, m))
             push!(handles, p.name => t)
-            push!(timers, t)
         else
             @warn "component: port kind :$(p.kind) not yet materialised" port = p.name type = typeof(m)
         end
     end
-    return (NamedTuple(handles), timers)
+    return NamedTuple(handles)
 end
 
 # A port's wire name: its explicit `on \"…\"` override, else the identifier.
@@ -573,23 +677,23 @@ _wire(p::PortSpec) = p.wire === nothing ? String(p.name) : p.wire
 # present, else the authored `_wire(p)`.
 _wire(p::PortSpec, wiremap::Dict{Symbol, String}) = get(wiremap, p.name, _wire(p))
 
-# ── Stage C: generated typed materialise (the node-as-built materialise body) ──────────
-# `_build_ports(node, m::Base, wiremap, pvalue)` is the typed, straight-line counterpart of
-# `_materialize_ports!`: generated once per port-bearing mixin BASE (marker-cached, Revise-safe,
-# like the entities accessor), with each port's kind/msgtype/reaction/`extra` BAKED at generation
-# time — so it has no `Vector{PortSpec}` walk, no Symbol-kind branch, no `Any`-field reads, and
-# returns a CONCRETE ports NamedTuple. The wire name (runtime remap) and a param-driven timer rate
-# stay runtime. Dispatch is on the member instance `m` (covering a parametric mixin's
-# instantiations), mirroring `entities(m::M)`. The dynamic `_materialize_ports!` remains the
-# fallback for an un-finalized mixin.
+# ── generated typed materialise (the node-as-built materialise body) ──────────
+# `_build_ports(cnode, m::Base, wiremap, pvalue)` is the typed, straight-line counterpart of
+# `_materialize_ports!`: generated once per port-bearing mixin BASE (marker-cached, Revise-safe),
+# with each port's kind/msgtype/reaction/`extra` BAKED at generation time — so it has no
+# `Vector{PortSpec}` walk, no Symbol-kind branch, no `Any`-field reads, and returns a CONCRETE
+# ports NamedTuple. The wire name (runtime remap) and a param-driven timer rate stay runtime.
+# Dispatch is on the member instance `m` (covering a parametric mixin's instantiations); endpoints
+# build against the core node (`cnode.node`) and reaction closures capture `cnode`. The dynamic
+# `_materialize_ports!` remains the fallback for an un-finalized mixin.
 function _build_ports end
 
 # Fallback for an un-finalized mixin (no generated typed method, e.g. a REPL mixin without
 # `@precompile_nodes`/`ros_init!`): the dynamic walk. Dispatching `_member_materialize!` on this
 # (vs a runtime `hasmethod` branch) keeps the compiler from inferring the dynamic path as the
 # untaken branch when a typed `_build_ports` exists.
-_build_ports(node::Node, m, wiremap, pvalue) =
-    _materialize_ports!(node, m, :_, mixin_spec(_base(typeof(m))).ports, pvalue, wiremap)
+_build_ports(cnode::ComponentNode, m, wiremap, pvalue) =
+    _materialize_ports!(cnode, m, mixin_spec(_base(typeof(m))).ports, pvalue, wiremap)
 
 # Runtime resolution of a `@every :param`-style timer rate from the member's parameter snapshot.
 function _timer_rate(pvalue, sym::Symbol)
@@ -606,7 +710,8 @@ function _gen_build_ports!(mod::Module, M::Type)
     isdefined(mod, marker) && return nothing
     R = @__MODULE__
     body = Expr(:block)
-    pnames = Symbol[]; hlocs = Symbol[]; timers = Symbol[]
+    push!(body.args, :(node = getfield(cnode, :node)))   # the core node, for endpoint construction
+    pnames = Symbol[]; hlocs = Symbol[]
     for p in ports
         loc  = Symbol("_h_", p.name)
         wire = :(get(wiremap, $(QuoteNode(p.name)), $(_wire(p))))     # runtime remap, authored default baked
@@ -614,33 +719,32 @@ function _gen_build_ports!(mod::Module, M::Type)
             push!(body.args, :($loc = $(GlobalRef(R, :Publisher))(node, $wire, $(p.msgtype))))
         elseif p.kind === :subscription
             push!(body.args, :($loc = $(GlobalRef(R, :Subscription))(
-                $(GlobalRef(R, :_sub_cb))($(p.reaction), m), node, $wire, $(p.msgtype); warmup = :off)))
+                $(GlobalRef(R, :_sub_cb))($(p.reaction), cnode, m), node, $wire, $(p.msgtype); warmup = :off)))
         elseif p.kind === :service
             push!(body.args, :($loc = $(GlobalRef(R, :Service))(
-                $(GlobalRef(R, :_sub_cb))($(p.reaction), m), node, $wire, $(p.msgtype); warmup = :off)))
+                $(GlobalRef(R, :_sub_cb))($(p.reaction), cnode, m), node, $wire, $(p.msgtype); warmup = :off)))
         elseif p.kind === :action
             push!(body.args, :($loc = $(GlobalRef(R, :_make_action_server))(
                 node, $wire, $(typeof(p.reaction));
                 body = $(GlobalRef(R, :_component_action_adapter))(
                     $(p.reaction), $(GlobalRef(R, :ActionTypeSupport))($(typeof(p.reaction))),
-                    $(p.extra.fb_pos), m))))
+                    $(p.extra.fb_pos), cnode, m))))
         elseif p.kind === :timer
             rate = p.extra.rate
             hz = rate isa Symbol ? :($(GlobalRef(R, :_timer_rate))(pvalue, $(QuoteNode(rate)))) : rate
             push!(body.args, :($loc = $(GlobalRef(R, :_paused_timer))(node,
                 $(GlobalRef(R, :Duration))(round(Int64, 1.0e9 / $hz)),
-                $(GlobalRef(R, :_timer_cb))($(p.reaction), m))))
-            push!(timers, loc)
+                $(GlobalRef(R, :_timer_cb))($(p.reaction), cnode, m))))
         else
             continue
         end
         push!(pnames, p.name); push!(hlocs, loc)
     end
     nt = Expr(:tuple, Expr(:parameters, (Expr(:kw, pn, hl) for (pn, hl) in zip(pnames, hlocs))...))
-    push!(body.args, :(return ($nt, $(Expr(:ref, :Any, timers...)))))
+    push!(body.args, :(return $nt))
     Core.eval(mod, quote
         const $marker = true
-        function $(GlobalRef(R, :_build_ports))(node::$(GlobalRef(R, :Node)), m::$M, wiremap, pvalue)
+        function $(GlobalRef(R, :_build_ports))(cnode::$(GlobalRef(R, :ComponentNode)), m::$M, wiremap, pvalue)
             $body
         end
     end)
@@ -655,7 +759,11 @@ end
 # `member => (port => wire-string)` for ALL ports, plus the set of explicitly-remapped
 # `(member, port)`. Errors on a remap of an unknown port, a ref to an unknown
 # member/port, or an unresolvable/cyclic ref chain.
-function _resolve_wires(k::NodeKind)
+# `@nospecialize(k)`: the wire plan is a pure function of `k.members` (data — `Vector{Symbol}`/
+# `Dict{Symbol,…}`, never node-kind-dependent types), so specialising per `NodeKind{:N}` only
+# spawns an external MI the consumer can't cache. Nospecialised, this is ONE MI baked in ROSNode's
+# own image (precompile.jl anchors it on the abstract `NodeKind`); every `@node` reuses it.
+function _resolve_wires(@nospecialize(k::NodeKind))
     wires    = Dict{Symbol, Dict{Symbol, String}}()
     portset  = Dict{Symbol, Set{Symbol}}()
     refs     = Dict{Tuple{Symbol, Symbol}, Tuple{Symbol, Symbol}}()  # (m,port) => (refm, refport)
@@ -713,7 +821,7 @@ _clobber_channel(kind::Symbol) =
 # Error on an unintended clobber: two members' same-channel output ports
 # resolving to one wire name, unless at least one was explicitly remapped (a deliberate
 # share). Resolves against the node namespace (so `~/x` vs `/ns/node/x` compare equal).
-function _check_clobbers(k::NodeKind, node::Node, wires, remapped)
+function _check_clobbers(@nospecialize(k::NodeKind), node::Node, wires, remapped)   # see `_resolve_wires` re: @nospecialize
     seen = Dict{Tuple{Symbol, String}, Tuple{Symbol, Symbol, Bool}}()
     for mem in k.members
         for p in mixin_spec(mem.mixin).ports
@@ -816,7 +924,7 @@ _members_plan(::Type{M}) where {M <: Component} =
     (Symbol[Symbol(_default_name(M))],
      Dict{Symbol, Type}(Symbol(_default_name(M)) => M),
      Dict{Symbol, Vector{Symbol}}(Symbol(_default_name(M)) => Symbol[]))
-function _members_plan(k::NodeKind)
+function _members_plan(@nospecialize(k::NodeKind))   # see `_resolve_wires` re: @nospecialize
     edges = _resolve_di(k.members)
     order = _toposort(k.members, edges)
     return (order, Dict{Symbol, Type}(m.name => m.mixin for m in k.members), edges)
@@ -863,22 +971,21 @@ function _check_runnable(M, what::AbstractString)
     error("$(what): $(M) is not a @mixin")
 end
 
-# Anchor a mixin's reaction handlers against type `M`, `precompile`-only and side-effect-free.
-# Specs come from `mixin_spec` keyed at `M`'s base, so the same routine serves both the
-# runtime warm (concrete `typeof(m)`, warming the actual instantiation incl. parametric) and
-# the module-end bake (base mixin, from `_finalize_module!`). Must run after the typed
-# accessors exist, so `parameters(m).x`/`entities(m).p` in a handler compile against the typed
-# forms rather than the generic ones — otherwise the bake is wasted and then invalidated.
-function _anchor_reactions!(::Type{M}) where {M}
-    for p in mixin_spec(_base(M)).ports
+# Anchor a node member's reaction handlers, `precompile`-only and side-effect-free. Keyed on the
+# CONCRETE node type `CN` (the reactions are node-first — `reaction(node, m, …)` — and the node is
+# the concrete `ComponentNode{Members,Ports,Pservers}`, so the handler + its materialised callback
+# specialise on it) and the member's concrete instantiation `Mc` (= `M{name}`). Specs come from
+# `mixin_spec` keyed at `Mc`'s base. Serves both the runtime warm (`_warm_member_reactions!`, the
+# live `cnode`/member types) and the per-`@node` bake (`_anchor_node_plan!`).
+function _anchor_reactions!(::Type{CN}, ::Type{Mc}) where {CN, Mc}
+    for p in mixin_spec(_base(Mc)).ports
         p.reaction === nothing && continue
         if p.kind === :subscription
-            precompile(p.reaction, (M, p.msgtype))
+            precompile(p.reaction, (CN, Mc, p.msgtype))
             # The consumer's decode→dispatch chain. A component subscription builds with
-            # `warmup = :off` (its own warm would fire before the typed accessors exist), so
-            # anchor that chain here through the materialised callback type — the `_sub_cb`
-            # closure the consumer actually invokes — in the default `Owned` view.
-            rts = Base.return_types(_sub_cb, (typeof(p.reaction), M))
+            # `warmup = :off`, so anchor that chain here through the materialised callback type —
+            # the `_sub_cb` closure the consumer actually invokes — in the default `Owned` view.
+            rts = Base.return_types(_sub_cb, (typeof(p.reaction), CN, Mc))
             if length(rts) == 1 && isconcretetype(only(rts))
                 H = only(rts)
                 T = p.msgtype
@@ -900,7 +1007,7 @@ function _anchor_reactions!(::Type{M}) where {M}
                 precompile(with_payload_memory, (_OwnedRun{T, H}, Zenoh.ZBytes{Ptr{Zenoh.LibZenohC.z_loaned_bytes_t}}))
             end
         elseif p.kind === :service
-            precompile(p.reaction, (M, p.msgtype))
+            precompile(p.reaction, (CN, Mc, p.msgtype))
             # The request decode + response encode the server runs around the handler. A
             # component service builds with `warmup = :off`, so its own `_warm_service` is
             # suppressed — this is the only place that codec is anchored (offline bake + the
@@ -923,7 +1030,7 @@ function _anchor_reactions!(::Type{M}) where {M}
                 Q = Zenoh.Query{Base.RefValue{Zenoh.LibZenohC.z_owned_query_t}}
                 precompile(_serve_query,            (Entity, Q, Type{Req}, Type{Resp}, Function, Bool))
                 precompile(_spawn_service_consumer, (Entity, Type{Req}, Type{Resp}, Function, Bool, Serial))
-                Hs = _cb_type(_sub_cb, p.reaction, M)   # the concrete `_sub_cb` handler closure
+                Hs = _cb_type(_sub_cb, p.reaction, CN, Mc)   # the concrete `_sub_cb` handler closure
                 if Hs !== nothing
                     Ss = Base.return_types(_service_scheduler, (Serial, Entity, Type{Req}, Type{Resp}, Hs, Bool))
                     if length(Ss) == 1 && isconcretetype(only(Ss))
@@ -933,17 +1040,17 @@ function _anchor_reactions!(::Type{M}) where {M}
             catch
             end
         elseif p.kind === :timer
-            precompile(p.reaction, (M,))
+            precompile(p.reaction, (CN, Mc))
         elseif p.kind === :action
             # The action adapter calls the user handler via an `Any[]` splat, which inference
             # can't follow, so the server's adapter-frame warm never anchors the handler `f`.
-            # Anchor it here with the exact signature the adapter calls:
-            # `f(m, goalfields…, FeedbackSink{FB})`, sink inserted at `fb_pos`. Guarded —
+            # Anchor it here with the exact signature the adapter calls (node-first):
+            # `f(node, m, goalfields…, FeedbackSink{FB})`, sink inserted at `fb_pos`. Guarded —
             # a malformed reconstruction must never break configure/precompile.
             try
                 f = p.reaction
                 support = ActionTypeSupport(typeof(f))
-                argtypes = Any[M]
+                argtypes = Any[CN, Mc]
                 for ft in fieldtypes(goal_type(support))
                     push!(argtypes, ft)
                 end
@@ -957,9 +1064,10 @@ function _anchor_reactions!(::Type{M}) where {M}
 end
 
 # The concrete materialised-callback closure type for a reaction — the `_sub_cb`/`_timer_cb`
-# the materialise path actually invokes — or `nothing` if it isn't a single concrete type.
-function _cb_type(cb, @nospecialize(reaction), ::Type{M}) where {M}
-    rts = Base.return_types(cb, (typeof(reaction), M))
+# the materialise path actually invokes (node-first: it captures the `ComponentNode` `CN` + the
+# member `Mc`) — or `nothing` if it isn't a single concrete type.
+function _cb_type(cb, @nospecialize(reaction), ::Type{CN}, ::Type{Mc}) where {CN, Mc}
+    rts = Base.return_types(cb, (typeof(reaction), CN, Mc))
     (length(rts) == 1 && isconcretetype(only(rts))) ? only(rts) : nothing
 end
 
@@ -980,9 +1088,10 @@ end
 # anchored on the concrete `_sub_cb`/`_timer_cb` closure types (the materialise path's
 # `p.reaction` is `Any`, so inference can't reach them on its own — the function-barrier reason
 # `_sub_cb` exists).
-function _construction_precompile_specs(::Type{M}) where {M}
+function _construction_precompile_specs(::Type{CN}, ::Type{Mc}) where {CN, Mc}
     specs = Tuple{Any, Any}[]
-    isconcretetype(M) || return specs
+    isconcretetype(Mc) || return specs
+    M = _base(Mc)
     P = pschema(M)
     # typed parameter server + the six standard parameter services (their fixed rcl_interfaces
     # codecs are baked into ROSNode's image by the warm-up workload).
@@ -992,22 +1101,31 @@ function _construction_precompile_specs(::Type{M}) where {M}
     # construction + handler bodies here (the `@node` path's `CompositeParameterServer` is baked
     # once in ROSNode's image). The named `_ParamSvcHandler` makes them precompilable by name.
     append!(specs, _parameter_service_specs(ParameterServer{P}))
-    for p in mixin_spec(_base(M)).ports
+    for p in mixin_spec(M).ports
         if p.kind === :publisher
-            # the send path the first publish JITs: the builder, then encode + the monomorphic
-            # publish over the plain `Zenoh.Publisher` route (a component publisher carries no
-            # per-port QoS, so the route type is always `Zenoh.Publisher` — see `_handle_type`).
+            # the a-priori local-graph descriptor (`_port_descs` → `_publisher_desc`, positional/
+            # default-qos): `PortSpec.msgtype` is abstractly typed, so `_prime_local_graph!` reaches
+            # this concrete form only via dynamic dispatch — anchor it on the known `p.msgtype`.
+            push!(specs, (_publisher_desc, (Node, String, Type{p.msgtype})))
+            # the send path the first publish JITs: the builder, the encode + reusable-encoder +
+            # CDR-write leaves, then the monomorphic publish over the plain `Zenoh.Publisher` route
+            # (a component publisher carries no per-port QoS — see `_handle_type`).
             push!(specs, (_make_publisher, (Node, String, Type{p.msgtype})))
             push!(specs, (encode, (p.msgtype,)))
+            push!(specs, (_encode_to_vector, (p.msgtype,)))
+            push!(specs, (ReusableEncoder, (Type{p.msgtype},)))
             push!(specs, (publish, (PublisherHandle{p.msgtype, Zenoh.Publisher}, p.msgtype)))
         elseif p.kind === :subscription || p.kind === :service
+            # the a-priori local-graph descriptor (positional/default-qos), reached only via
+            # dynamic dispatch from `_prime_local_graph!` (see the publisher branch).
+            push!(specs, (p.kind === :subscription ? _subscription_desc : _service_desc,
+                          (Node, String, Type{p.msgtype})))
             # The materialise path passes `p.reaction` (typed `Any` in the spec), so the
             # construction call there isn't inferable on its own — anchor the inner builder on the
-            # concrete `_sub_cb` closure type `H`. It's built with `warmup = :off` (a `Symbol`), so
-            # the heavy builder body specialises on that kwarg type; pin the matching `Core.kwcall`.
-            # (The `SubscriptionKind`/`ServiceKind` construction methods now dispatch by type, so
-            # the thin functor forward is inferable and needs no anchor of its own.)
-            H = _cb_type(_sub_cb, p.reaction, M)
+            # concrete `_sub_cb` closure type `H` (node-first: captures `CN` + `Mc`). It's built
+            # with `warmup = :off` (a `Symbol`), so the heavy builder body specialises on that
+            # kwarg type; pin the matching `Core.kwcall`.
+            H = _cb_type(_sub_cb, p.reaction, CN, Mc)
             H === nothing && continue
             inner = p.kind === :subscription ? _make_subscription : _make_service
             kw = NamedTuple{(:warmup,), Tuple{Symbol}}
@@ -1022,28 +1140,28 @@ function _construction_precompile_specs(::Type{M}) where {M}
                 end
             end
         elseif p.kind === :timer
-            H = _cb_type(_timer_cb, p.reaction, M)
+            H = _cb_type(_timer_cb, p.reaction, CN, Mc)
             H === nothing || push!(specs, (_paused_timer, (Node, Duration, H)))
         end
     end
-    # the materialise frame specialised on `M` + its schema, plus the member lifecycle hooks the
-    # fan-out invokes dynamically.
-    push!(specs, (_materialize_ports!, (Node, M, Symbol, Vector{PortSpec}, P, Dict{Symbol, String})))
+    # the grounded typed materialise on the concrete node + member (pvalue is the param snapshot
+    # `P` from `parameters(cnode, m)`), plus the member lifecycle hooks the fan-out invokes.
+    push!(specs, (_build_ports, (CN, Mc, Dict{Symbol, String}, P)))
     for h in (configure, activate, deactivate, cleanup, on_error)
-        push!(specs, (h, (M,)))
+        push!(specs, (h, (CN, Mc)))
     end
     return specs
 end
 
 # `precompile`-only, no session, no run. Guarded so a quirk in one mixin (a `pschema`/spec that
 # can't resolve) can't break the package's precompile.
-function _anchor_construction!(::Type{M}) where {M}
+function _anchor_construction!(::Type{CN}, ::Type{Mc}) where {CN, Mc}
     try
-        for (f, ts) in _construction_precompile_specs(M)
+        for (f, ts) in _construction_precompile_specs(CN, Mc)
             precompile(f, ts)
         end
     catch err
-        @debug "_anchor_construction!: skipped a construction bake" mixin = M exception = err
+        @debug "_anchor_construction!: skipped a construction bake" node = CN mixin = Mc exception = err
     end
     return nothing
 end
@@ -1089,43 +1207,35 @@ function _anchor_action_codecs!(::Type{M}) where {M}
     return nothing
 end
 
-# Runtime warm: anchor the member's handlers against its concrete `typeof(m)` once the typed
-# accessors exist. Honours `node.warmup` via `_warmup!` (off / inline-sync / background).
-# Subscriptions' own per-port warm is `:off`ed in `_materialize_ports!`; timers and services
-# have no other warm. The module-end bake (`@precompile_nodes`) does the same for the base
-# mixin ahead of time, so a baked node skips this work.
-function _warm_member_reactions!(node::Node, m)
-    _warmup!(node.warmup, () -> _anchor_reactions!(typeof(m)))
+# Runtime warm: anchor the member's handlers against the concrete node + member types once
+# materialised. Honours `node.warmup` via `_warmup!` (off / inline-sync / background).
+# Subscriptions' own per-port warm is `:off`ed in `_materialize_ports!`; timers and services have
+# no other warm. The per-`@node` bake (`@precompile_nodes` → `_anchor_node_plan!`) does the same
+# ahead of time, so a baked node skips this work.
+function _warm_member_reactions!(cnode::ComponentNode, m)
+    _warmup!(cnode.node.warmup, () -> _anchor_reactions!(typeof(cnode), typeof(m)))
     return nothing
 end
 
 function _member_materialize!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
-    rt = getfield(m, :__rt__)::MixinRuntime
     node = cnode.node
     wiremap = get(cnode.wires, nm, Dict{Symbol, String}())
-    pvalue = current(rt.pserver)
+    pvalue = parameters(cnode, m)               # the member's parameter snapshot (drives timer rates)
     # Stage B: only the declared port entities created here draw their reserved ids from the
     # node's queue — gate `make_entity` on this window so a user `configure` hook (which runs
     # between members) that creates an imperative endpoint can't steal a queued id.
     node._materialising = true
-    ports, timers = try
-        # Stage C: a finalized mixin dispatches to its generated typed `_build_ports` (grounded
-        # materialise, concrete ports NamedTuple); an un-finalized one falls to the dynamic-walk
-        # method above. Dispatch (not a `hasmethod` branch) so the dynamic path isn't inferred as
-        # the untaken branch when a typed method exists.
-        _build_ports(node, m, wiremap, pvalue)
+    ports = try
+        # A finalized mixin dispatches to its generated typed `_build_ports` (grounded materialise,
+        # concrete ports NamedTuple); an un-finalized one falls to the dynamic-walk method above.
+        _build_ports(cnode, m, wiremap, pvalue)
     finally
         node._materialising = false
     end
-    rt.ports = ports
-    rt.timers = timers
-    # type-stable `entities(m)::PortsNT` — the base goes in as BOTH the generated
-    # signature and the dedup key, so one method covers every instantiation (a concrete
-    # signature here would silently strand other instantiations on the untyped generic).
-    _entities_accessor_from_ports!(_base(typeof(m)), ports)
-    # Now that the typed accessors exist, anchor each reaction handler.
-    _warm_member_reactions!(cnode.node, m)
+    getfield(cnode.ports, nm).v = ports         # publish the handles into the node's typed cell
+    # Now that the member's handles exist, anchor each reaction handler.
+    _warm_member_reactions!(cnode, m)
     return nothing
 end
 
@@ -1133,17 +1243,18 @@ end
 # the hook's value (the `failure` token aborts + rolls back the fan-out below).
 function _member_configure!(cnode::ComponentNode, nm::Symbol)
     _member_materialize!(cnode, nm)
-    return configure(cnode.members[nm])
+    return configure(cnode, cnode.members[nm])
 end
 
 # activate: start the member's (paused) timers, then run its `activate` hook. Returns
-# the hook's value (the `failure` token aborts + rolls back the fan-out below).
+# the hook's value (the `failure` token aborts + rolls back the fan-out below). Timers live in
+# the member's materialised handles, so start every `Timer` among them.
 function _member_activate!(cnode::ComponentNode, nm::Symbol)
-    rt = getfield(cnode.members[nm], :__rt__)::MixinRuntime
-    for t in rt.timers
-        _start!(t)
+    m = cnode.members[nm]
+    for h in values(entities(cnode, m))
+        h isa Timer && _start!(h)
     end
-    return activate(cnode.members[nm])
+    return activate(cnode, m)
 end
 
 # Cancel-on-deactivate: cooperatively cancel every live goal on the member's action
@@ -1152,10 +1263,10 @@ end
 # valid (nav2 `terminate_all`). Guarded — a stuck server can't strand the fan-out.
 # A no-op for a member with no materialised ports (never configured / already cleaned).
 function _member_cancel_goals!(cnode::ComponentNode, nm::Symbol)
-    rt = getfield(cnode.members[nm], :__rt__)::MixinRuntime
-    rt.ports === nothing && return nothing
+    cell = getfield(cnode.ports, nm)
+    cell.v === nothing && return nothing
     budget = cnode.node.context.drain_timeout
-    for h in values(rt.ports)
+    for h in values(cell.v)
         h isa ActionServer || continue
         try
             cancel_all!(h; timeout = budget)
@@ -1171,7 +1282,7 @@ end
 # strand the rest's unwind (log-and-continue, like `_member_cleanup!`).
 function _member_deactivate!(cnode::ComponentNode, nm::Symbol)
     try
-        deactivate(cnode.members[nm])
+        deactivate(cnode, cnode.members[nm])
     catch err
         @error "component: deactivate threw" member = nm exception = (err, catch_backtrace())
     end
@@ -1184,18 +1295,17 @@ end
 # so cleanup runs exactly once per configure (idempotent across teardown triggers).
 function _member_cleanup!(cnode::ComponentNode, nm::Symbol)
     m = cnode.members[nm]
-    rt = getfield(m, :__rt__)::MixinRuntime
-    rt.ports === nothing && return nothing      # nothing acquired to release
+    cell = getfield(cnode.ports, nm)
+    cell.v === nothing && return nothing        # nothing acquired to release
     try
-        cleanup(m)
+        cleanup(cnode, m)
     catch err
         @error "component: cleanup threw" member = nm exception = (err, catch_backtrace())
     end
-    for h in values(rt.ports)
+    for h in values(cell.v)
         try; close(h); catch; end
     end
-    rt.ports = nothing
-    empty!(rt.timers)
+    cell.v = nothing
     return nothing
 end
 
@@ -1207,7 +1317,7 @@ function _members_on_error!(cnode::ComponentNode, order::Vector{Symbol})
     failed = false
     for nm in order
         try
-            on_error(cnode.members[nm])
+            on_error(cnode, cnode.members[nm])
         catch err
             failed = true
             @error "component: on_error threw" member = nm exception = (err, catch_backtrace())
@@ -1305,43 +1415,47 @@ function _assemble(ctx::Context, @nospecialize(K), name, namespace, @nospecializ
         # yet) the dynamic `Dict` path (unchanged behaviour). `cnref[]` is set before any managed
         # transition runs (the callbacks reach the cnode through it).
         if composed && hasmethod(_build_members, Tuple{Type{typeof(K)}, Node})
-            mbrs = _build_members(typeof(K), node)        # typed NamedTuple; __rt__ unset
-            cnode = ComponentNode{typeof(mbrs)}(node, mbrs, order, wires, ln, nothing, true)
-            cnref[] = cnode
-            for nm in order
-                m = mbrs[nm]
-                M = bytype[nm]
-                pserver = _build_pserver(node, pschema(M), _member_overrides(M, nm, overrides))
-                setfield!(m, :__rt__, MixinRuntime(cnode, nm, pserver, nothing, Any[]))
-            end
+            mbrs = _build_members(typeof(K), node)        # typed NamedTuple of `M{name}` instances
         else
             mbrs = Dict{Symbol, Any}()
-            cnode = ComponentNode{typeof(mbrs)}(node, mbrs, order, wires, ln, nothing, true)
-            cnref[] = cnode
             for nm in order
                 M = bytype[nm]
                 deps = Any[mbrs[d] for d in edges[nm]]
-                m = construct(M, node, deps...)
-                pserver = _build_pserver(node, pschema(M), _member_overrides(M, nm, overrides))
-                setfield!(m, :__rt__, MixinRuntime(cnode, nm, pserver, nothing, Any[]))
-                mbrs[nm] = m
+                mbrs[nm] = construct(M, node, Val(nm), deps...)   # builds `M{nm}` (name threaded)
             end
         end
+        # The node's typed runtime carriers, keyed by member name: per-member parameter servers
+        # (built now) and empty port cells (filled at the configure step). A member holds no
+        # reference back here, so `ComponentNode` stays acyclic. A finalized `@node` dispatches to
+        # its generated straight-line builders (typed carriers → fully-typed `ComponentNode`, baked);
+        # mixin-as-node / un-finalized falls to the equivalent dynamic generators.
+        KT = typeof(K)
+        pservers = composed && hasmethod(_build_pservers, Tuple{Type{KT}, Node, typeof(overrides)}) ?
+                   _build_pservers(KT, node, overrides) :
+                   (; (nm => _build_pserver(node, pschema(bytype[nm]), _member_overrides(bytype[nm], nm, overrides))
+                       for nm in order)...)
+        ports    = composed && hasmethod(_build_ports_carrier, Tuple{Type{KT}, Node}) ?
+                   _build_ports_carrier(KT, node) :
+                   (; (nm => PortCell{something(_ports_nt_type(mixin_spec(bytype[nm]).ports), Any)}()
+                       for nm in order)...)
+        cnode = ComponentNode{typeof(mbrs), typeof(ports), typeof(pservers)}(
+                    node, mbrs, ports, pservers, order, wires, ln, nothing, true)
+        cnref[] = cnode
 
         # node-level `ros2 param` surface: a mixin promoted to a node wires its
         # single server un-prefixed; a composed `@node` (even with one member) wires a
         # member-prefixed `CompositeParameterServer` over all members' servers, in declared
-        # order (the `ros2 param list` order). Either way each member's `parameters(m)`
+        # order (the `ros2 param list` order). Either way each member's `parameters(node, m)`
         # reads its own server, mixin-local.
         if composed
             members = Pair{Symbol, ParameterServer}[
-                nm => (getfield(cnode.members[nm], :__rt__)::MixinRuntime).pserver for nm in declared]
+                nm => getfield(cnode.pservers, nm) for nm in declared]
             facade = CompositeParameterServer(node, members)
             wire_parameter_services!(facade)
             _wire_composite_events!(facade)
             node.parameters = facade
         else
-            srv = (getfield(cnode.members[order[1]], :__rt__)::MixinRuntime).pserver
+            srv = getfield(cnode.pservers, order[1])
             node.parameters = srv
             wire_parameter_services!(srv)
         end
@@ -1438,7 +1552,11 @@ function Base.run(::Type{M}; name::AbstractString = _default_name(M),
                 log_level, warmup, warmup_sync, block)
 end
 
-function Base.run(k::NodeKind; name::AbstractString = String(k.name),
+# `@nospecialize(k::NodeKind)`: without it the kwarg body (`#run#…`) specialises on the concrete
+# `NodeKind{:N}`, so each `@node` re-infers the whole entry at first `run` (the biggest bring-up
+# frame). The body is node-kind-agnostic — it reads `k.members` (data) and forwards to the already
+# `@nospecialize`d `_run` — so one abstract-`NodeKind` body bakes into ROSNode's image for every node.
+function Base.run(@nospecialize(k::NodeKind); name::AbstractString = String(k.name),
                   namespace::Union{AbstractString, Nothing} = nothing,
                   overrides::NamedTuple = (;),
                   ctx::Union{Context, Nothing} = nothing,

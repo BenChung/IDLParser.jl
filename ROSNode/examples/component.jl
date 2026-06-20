@@ -51,10 +51,13 @@ module Drone
     @publishes Sensor telemetry :: Telemetry on "~/telemetry"   # node-private ⇒ /vehicle/telemetry
     battery(s::Sensor) = s.level                            # satisfy the BatterySource contract
     @provides  Sensor BatterySource
-    configure(s::Sensor) = @info "Sensor up" rate = parameters(s).rate
-    @every :rate function tick(s::Sensor)                   # fires at `rate` Hz, only while Active
+    # Reactions and lifecycle hooks are node-first: `(node, m, …)`. The accessors take both —
+    # `parameters(node, m)` / `entities(node, m)` — reading the node's typed carriers at the
+    # member's path (a constant on `m`'s type), so the body stays fully typed.
+    configure(node, s::Sensor) = @info "Sensor up" rate = parameters(node, s).rate
+    @every :rate function tick(node, s::Sensor)             # fires at `rate` Hz, only while Active
         s.level = max(0.0, s.level - 1.0)                   # drain a little each tick
-        publish(entities(s).telemetry, Telemetry(battery = s.level, altitude = 12.0))
+        publish(entities(node, s).telemetry, Telemetry(battery = s.level, altitude = 12.0))
     end
 
     # ── Guard: depends on a BatterySource; serves "safe to fly?" ───────────────────
@@ -62,18 +65,24 @@ module Drone
     # in a test rig), so it lands in a type parameter — reactions read it type-stably.
     struct NullBattery end                                  # null-object provider for standalone loads
     battery(::NullBattery) = 0.0
-    @mixin struct Guard{B}
+    # A parametric mixin writes its own `Name` param + the `<: Component{Name}` clause (the macro
+    # injects neither when the struct already has type params). `Name` is the member's path; `B` is
+    # the injected provider's concrete type.
+    @mixin struct Guard{Name, B} <: Component{Name}
         battery_src::B                                      # the injected sibling provider
     end
     requires(::Type{Guard}) = (BatterySource,)              # need a BatterySource …
-    construct(::Type{Guard}, node, src) = Guard(battery_src = src)        # … injected ⇒ Guard{Sensor}
-    construct(::Type{Guard}, node) = Guard(battery_src = NullBattery())   # standalone ⇒ Guard{NullBattery}
+    # `construct` threads the member name as `Val{Name}` and produces the concrete instantiation.
+    construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} =                # … injected ⇒ Guard{name,Sensor}
+        Guard{Name, typeof(src)}(battery_src = src)
+    construct(::Type{Guard}, node, ::Val{Name}) where {Name} =                     # standalone ⇒ Guard{name,NullBattery}
+        Guard{Name, NullBattery}(battery_src = NullBattery())
     @param Guard min_battery::Float64 = 20.0
-    # Inline-authoring `@serves`: the args after `g` are the request fields, the
-    # `@NamedTuple` return is the response — the macro generates the `srv` type.
-    @serves "~/safe_to_fly" function safe(g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
+    # Inline-authoring `@serves`: node-first, then the request fields after `g`; the `@NamedTuple`
+    # return is the response — the macro generates the `srv` type.
+    @serves "~/safe_to_fly" function safe(node, g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
         b = battery(g.battery_src)                          # reads the Sensor through the interface
-        (ok = b >= parameters(g).min_battery && target_altitude <= 100.0, battery = b)
+        (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
     end
 end
 using .Drone

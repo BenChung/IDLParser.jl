@@ -24,9 +24,9 @@ module _LGTypes
     @mixin struct Probe; end
     @param Probe rate::Int64 = 10
     @publishes Probe out :: _T
-    @hears function ingest(m::Probe, msg::_T) end
-    @serves "~/query" function query(m::Probe, x::Float64)::@NamedTuple{ok::Bool} end
-    @every :rate function beat(m::Probe) end
+    @hears function ingest(node, m::Probe, msg::_T) end
+    @serves "~/query" function query(node, m::Probe, x::Float64)::@NamedTuple{ok::Bool} end
+    @every :rate function beat(node, m::Probe) end
     @mixin struct Idle; end
 end
 # Reference qualified (not `using`): the suite shares one `Main`, and another test file

@@ -27,24 +27,49 @@ function _component_precompile_specs()
         (_member_activate!,    (ComponentNode, Symbol)),
         (_member_cleanup!,     (ComponentNode, Symbol)),
         (_members_on_error!,   (ComponentNode, Vector{Symbol})),
-        # run entry (both namespace variants × both log-level variants — the `ros2 component
-        # load --log-level` path passes a `LogLevel`, the bare run/load a `Nothing`) + teardown
-        # + node-level aggregate views
-        # positional tail: …, log_level, warmup (`Symbol`, default `:off`), warmup_sync (`Bool`), block
+        # run entry, over arg1 = the Context source × namespace variant × log-level variant.
+        # arg1 `Nothing` is the common path (`run(K; …)` opens+owns its own Context); `Context` is
+        # the caller-supplied one (`run(K; ctx=…)` / `load_node`). `K` is `@nospecialize`d in `_run`,
+        # so each anchor bakes the node-kind-agnostic MI. (`LogLevel` arg10 = `ros2 component load
+        # --log-level`; bare run = `Nothing`.) positional tail: …, log_level, warmup, warmup_sync, block
+        (_run, (Nothing, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
+        (_run, (Nothing, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
+        (_run, (Nothing, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
+        (_run, (Nothing, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
         (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
         (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
         (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
         (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
+        # the public `run(k::NodeKind; …)` entry. `k` is `@nospecialize`d, so its kwarg body is ONE
+        # node-kind-agnostic MI — bake it here (abstract `NodeKind`, not per-`@node`, so we don't
+        # re-overspecialize the very entry we just collapsed). The per-kwarg-combination `Core.kwcall`
+        # sorter still JITs, but it is the cheap arg-reorder shell; the body + `_run`/`_assemble` are baked.
+        (Base.run, (NodeKind,)),
         (Base.close, (ComponentNode,)),
         (parameters, (ComponentNode,)),
         (entities,   (ComponentNode,)),
+        # Entity creation is msgtype-INDEPENDENT (it takes a `TypeInfo`, not the message type), so its
+        # three concrete-kind forms bake ONCE here for every node. `make_entity(node, ::EndpointDesc)`
+        # dispatches dynamically on the descriptor's abstract `kind` field, so the per-kind kwcall
+        # target is not a static callee of the patterns' `_make_*` (anchored per-mixin) nor of the
+        # a-priori graph enumeration — anchor each kind plus the descriptor entry.
+        (make_entity, (Node, EndpointDesc)),
+        (Core.kwcall, (NamedTuple{(:qos,), Tuple{QosProfile}}, typeof(make_entity), Node, PublisherKind,    String, TypeInfo)),
+        (Core.kwcall, (NamedTuple{(:qos,), Tuple{QosProfile}}, typeof(make_entity), Node, SubscriptionKind, String, TypeInfo)),
+        (Core.kwcall, (NamedTuple{(:qos,), Tuple{QosProfile}}, typeof(make_entity), Node, ServiceKind,      String, TypeInfo)),
+        # the default `~/get_type_description` service descriptor (fixed request type), enumerated for
+        # every node's a-priori local graph (`_base_node_descs`).
+        (_service_desc, (Node, String, Type{GetTypeDescription_Request})),
+        # node-assembly field writes on fixed (msgtype-independent) types: the node's parameter facade
+        # and an endpoint's consumer task, both built dynamically during `_assemble`/materialise.
+        (setproperty!, (Node, Symbol, CompositeParameterServer)),
+        (setproperty!, (Entity, Symbol, Task)),
         # node-kind registry
         (node_kind,           (String,)),
         (node_kinds,          ()),
         (register_node_kind!, (String, NodeKind)),
-        # DI zero-dep fallback + the module load hook
-        (_zero_dep_construct, (DataType,)),
-        (_zero_dep_construct, (UnionAll,)),
+        # the module load hook (the name-threaded `construct` default is parametric on the member
+        # name, so it is left to compile on first use rather than anchored generically here)
         (ros_init!,           (Module,)),
         # kwarg entry points via `Core.kwcall` (the real entry, not the positional method).
         # `_assemble` in both log-level variants; `load_node` with its actual keywords
@@ -70,5 +95,12 @@ end
 @compile_workload begin
     for (f, ts) in _component_precompile_specs()
         precompile(f, ts)
+    end
+    # Bring-up's first `maxlog=`-bearing log (the no-`home` hint) drives the *global*
+    # `ConsoleLogger`'s `message_limits::Dict{Any,Int}` accounting — a Base path we can't
+    # narrow but can bake by exercising it once here (captures the real MIs, incl. the
+    # closure `get!` form, more robustly than naming Base internals). Routed to `devnull`.
+    Base.CoreLogging.with_logger(Base.CoreLogging.ConsoleLogger(devnull)) do
+        @info "ROSNode precompile: warm maxlog path" maxlog = 1
     end
 end
