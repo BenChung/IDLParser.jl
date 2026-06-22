@@ -67,7 +67,7 @@ Start with [Getting Started](getting-started.md): start a router, open a context
 
 **Composition**
 
-- [Components](composition/components.md) — author a node as a collection of mixins, and compose nodes into a process.
+- [Components](composition/components.md) — author a node as a collection of components, and compose nodes into a process.
 
 **Interop**
 

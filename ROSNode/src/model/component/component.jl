@@ -1,6 +1,6 @@
-# Components — a node is a collection of components. A component is a state-only mutable struct
-# `S{Name} <: Component{Name}`; `member_schema(S) = component(S, …)` ties it to its ports
-# (`publishes`/`uses` HAS ports, `hears`/`serves`/`runs`/`every` DOES reactions) and DI evidence;
+# Components — a node is a collection of components. A component's `mutable struct S{Name} <: Component{Name}`
+# holds its private state; `member_schema(S) = component(S, Params, …)` ties it to its public parameters,
+# its ports (`publishes`/`uses` HAS ports, `hears`/`serves`/`runs`/`every` DOES reactions) and DI evidence;
 # lifecycle hooks are plain methods dispatched on the component. `node("a" => A, …)` assembles
 # members into a `NodeSchema` and `run` instantiates it.
 
@@ -8,8 +8,8 @@
     abstract type Component{Name} end
 
 Supertype of every component type. A component is a cohesive chunk
-of a node — its own mutable state, the ports its [`member_schema`](@ref) declares, and the lifecycle
-hooks dispatched on it; a node is a collection of components sharing one node-core.
+of a node — its private state and public parameters, the ports its [`member_schema`](@ref) declares,
+and the lifecycle hooks dispatched on it; a node is a collection of components sharing one node-core.
 
 `Name` is the component's relative path within its node — its member name, lifted to a type
 parameter so resolution against the node's typed runtime collapses through dispatch

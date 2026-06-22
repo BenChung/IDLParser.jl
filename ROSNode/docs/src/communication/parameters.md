@@ -113,7 +113,7 @@ The hook runs on every set, server-side and through a client transaction, mirror
 
 The `rcl_interfaces` parameter types are vendored, so a parameter example is self-contained: it needs only a router and a stock Julia environment. See [Getting Started](../getting-started.md) for the router. A live `server` is also driveable by `ros2 param get`/`set` against a matching router; see [Interoperating with ROS 2](../interop/ros2.md).
 
-A parameter also attaches to a component: `@param` declares a live, `ros2 param`-driveable parameter on a mixin. See [Components](../composition/components.md).
+A parameter also attaches to a component: `@param` declares one of a component's **public** parameters — its live, `ros2 param`-driveable data, separate from the private state its struct holds. See [Components](../composition/components.md).
 
 ## See also
 

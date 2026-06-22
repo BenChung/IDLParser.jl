@@ -41,7 +41,14 @@ module Drone
 end
 ```
 
-A component's state is a `mutable struct` parameterised by its member-path `Name` and subtyping `Component{Name}`. The struct holds only private state; the entities ride the schema, not the struct. A zero-argument ctor `S{Name}()` builds it with no dependencies — the default the framework calls when nothing is injected:
+A component splits its data into two independent stores, and each datum goes to the one matching who may read it:
+
+- **Private state** — the fields of the component's `mutable struct`. Internal to the component; touched only by its own reactions and hooks.
+- **Public parameters** — a separate `@parameters` struct. Read live and retuned from outside through the [parameter](../communication/parameters.md) services (`ros2 param get`/`set`).
+
+The two are independent, so a component carries whatever mix it needs — both, one, or neither. The `Sensor` carries both: a private `level` and a public `rate`.
+
+The state struct is parameterised by its member-path `Name` and subtypes `Component{Name}`; the entities ride the schema, not the struct. A zero-argument ctor `S{Name}()` builds it with no dependencies — the default the framework calls when nothing is injected:
 
 ```julia
 mutable struct Sensor{Name} <: Component{Name}
@@ -50,13 +57,15 @@ end
 Sensor{Name}() where {Name} = Sensor{Name}(100.0)
 ```
 
-A `@parameters` struct declares the component's live parameters, read through `parameters(node, s)` and driveable from the [parameter](../communication/parameters.md) services. The `∈ 1..50` constraint reuses the parameter schema grammar:
+The `@parameters` struct holds the public side, read through `parameters(node, s)`. The `∈ 1..50` constraint reuses the parameter schema grammar:
 
 ```julia
 @parameters struct SensorParams
-    rate::Int64 = 5 ∈ 1..50                 # Hz — read live via parameters(node, s).rate
+    rate::Int64 = 5 ∈ 1..50                 # Hz — public: read live, retunable via `ros2 param`
 end
 ```
+
+`component(State, Params, …)` (below) binds both stores onto the component; `component(State, …)` with the `Params` argument dropped is a component with private state and no public parameters.
 
 Reactions and lifecycle hooks are **node-first**: they take `(node, m, …)`, where `m` is the component instance. The two reflective accessors take both — `parameters(node, s)` returns the current, type-stable parameter snapshot, and `entities(node, s)` returns the materialised entity handles. The member's path is a constant on its type, so `parameters(node, s).rate` and `entities(node, s).telemetry` are ordinary typed field loads off the node's carriers.
 
@@ -73,16 +82,17 @@ end
 
 ## The schema — `member_schema` and the value combinators
 
-`member_schema(::Type{S})` is the trait carrying the component's schema. It is defined on the **bare base** `S` (never a `S{Name}` instantiation), and `component(State, Params, ports…)` ties the state and parameter types to the authored ports:
+[`member_schema`](@ref)`(::Type{S})` is the trait carrying the component's schema. It is defined on the **bare base** `S` (never a `S{Name}` instantiation), and [`component`](@ref)`(State, Params, ports…)` ties the state and parameter types to the authored ports. Each value combinator builds one port from a `name` plus its specifics; the full signatures and options live in [Schema combinators](@ref):
 
-- `publishes(:name, T; on)` — a publisher port carrying message type `T`.
-- `hears(:name, T, handler; on)` — a subscription dispatching `handler` per message.
-- `serves(:name, ReqType, handler; on)` — a service over a request type.
-- `every(:name, rate, handler)` — a timer; `rate` is a frequency in Hz or a parameter `Symbol` to bind it live.
-- `runs(:name, Action, exec; on)` — an action server over a pre-authored action type.
-- [`uses(:name, marker; on)`](@ref uses) — a persistent service/action **client** port.
+- [`publishes`](@ref)`(:telemetry, Telemetry; on)` — a publisher carrying a message type.
+- [`hears`](@ref)`(:odom, Odometry, on_odom; on)` — a subscription running a handler per message.
+- [`serves`](@ref)`(:safe, SafeReq, safe; on)` — a service-server answering a request.
+- [`runs`](@ref)`(:dock, Dock, dock!; on)` — an action-server running each accepted goal.
+- [`every`](@ref)`(:tick, :rate, tick)` — a timer firing a reaction (a frequency in Hz, or a parameter to bind it live).
+- [`uses`](@ref)`(:cmd, CmdReq; on)` — a persistent service/action **client** port.
+- [`remap`](@ref)`(Sensor, :telemetry => "…")` — wire overrides on a member, applied at `node(…)`.
 
-A port's `on` clause sets its wire name; with none, the wire defaults to the port/reaction name. The `~/` prefix makes a topic node-private, so `~/telemetry` resolves against the node's name to `/vehicle/telemetry`. `every(:tick, :rate, tick)` binds the timer's frequency to the `rate` parameter:
+`every(:tick, :rate, tick)` binds the timer's frequency to the `rate` parameter:
 
 ```julia
 member_schema(::Type{Sensor}) = component(Sensor, SensorParams,
@@ -92,6 +102,56 @@ member_schema(::Type{Sensor}) = component(Sensor, SensorParams,
 ```
 
 The `provides = (BatterySource,)` keyword is the dependency-injection evidence covered below.
+
+### Port names and wires
+
+A combinator's first argument, `name`, is the port's **identity** — its key in `entities(node, m)`, and (for the reaction combinators) the handler's name. The **wire name** it resolves to follows a short chain:
+
+1. the default wire is the port `name`;
+2. an `on = "wire"` clause overrides that default;
+3. a `node` [`remap`](@ref) overrides it again;
+4. the result resolves against the node's namespace to a ROS name — see [Inspecting the resolved wiring](@ref).
+
+Timers are the exception: they carry no wire.
+
+### Inspecting a schema
+
+A schema is a plain value — build one and look at it before running anything. A `member_schema`, and a `node(…)` schema, print their structure and the authored wire names:
+
+```@example schema
+using ROSNode
+import ROSNode: member_schema
+const Time = ROSNode.Interfaces.builtin_interfaces.msg.Time
+
+mutable struct Beacon{Name} <: Component{Name}
+    seq::Int                                       # private state
+end
+Beacon{Name}() where {Name} = Beacon{Name}(0)
+
+pulse(node, b::Beacon) = nothing                   # timer reaction
+on_clock(node, b::Beacon, msg::Time) = nothing     # subscription handler
+
+member_schema(::Type{Beacon}) = component(Beacon,
+    publishes(:beat, Time; on = "~/beat"),         # private wire ~/beat
+    hears(:clock, Time, on_clock; on = "/clock"),  # absolute wire /clock
+    every(:pulse, 2.0, pulse))                     # timer, no wire
+
+member_schema(Beacon)
+```
+
+Composing it into a node shows the resolved DI order and each member's ports:
+
+```@example schema
+rig = node("beacon" => Beacon; name = "Rig")
+```
+
+[`describe_wiring`](@ref) goes one step further: on a *built* node it appends the fully-qualified ROS name each wire resolves to (here `~/beat` private → `/rig/beat`, `/clock` absolute → `/clock`):
+
+```@example schema
+cn = run(rig; name = "rig", localhost_only = true, block = false)
+describe_wiring(cn)
+close(cn)
+```
 
 ## Inline-authored entities
 
@@ -150,8 +210,8 @@ The `requires = (BatterySource,)` plus `ctor = make_guard` in `Guard`'s `member_
 
 The block uses inline directives:
 
-- `field = default` — a struct field with the default the zero-arg ctor uses.
-- `@param x::T = d ∈ lo..hi` — a parameter; the macro collects these into an emitted `@parameters struct`.
+- `field = default` — a **private** state field (a plain `mutable struct` field), with the default the zero-arg ctor uses.
+- `@param x::T = d ∈ lo..hi` — a **public** parameter; the macro collects these into an emitted `@parameters struct`. Mix the two freely: a block carries any number of each.
 - `@provides Iface` — interface(s) the component provides.
 - `@publishes out::T on "~/wire"` — a publisher port (the wire clause **trails** the declaration).
 - `@hears function h(node, m, msg::T) … end` — a subscription port plus its handler (inline-only).
@@ -217,41 +277,15 @@ The ground station is a plain node subscribing to `/vehicle/telemetry`. The vehi
 
 ## Inspecting the resolved wiring
 
-A port's **wire name** defaults to the name you wrote:
-
-- `hears`, `serves`, `every`, `runs` — the reaction's name.
-- `publishes`, `uses` — the declared port name.
-
-An `on "topic"` clause or a [`node`](@ref) `remap` overrides that default. The wire name then resolves against the node's namespace to the topic on the wire — a relative `foo` on node `/vehicle` lands on `/foo`:
-
-```
-hears(:foo, …)   →   wire name  foo   →   topic  /foo
-```
-
-`describe_wiring` prints each member's ports and the fully-qualified ROS name each resolves to — the quick way to confirm two ports share a name before chasing a silent non-delivery:
-
-```julia
-describe_wiring(vehicle)
-```
-
-```
-wiring of /vehicle — 2 member(s)
-  sensor :: Sensor
-    telemetry         pub   ~/telemetry            → /vehicle/telemetry
-    tick              timer
-  guard :: Guard
-    safe              srv   ~/safe_to_fly          → /vehicle/safe_to_fly
-```
-
-The middle column is each port's authored wire name (after any `remap`), the arrow its resolved name. A name resolves against the node by the [standard ROS rules](https://design.ros2.org/articles/topic_and_service_names.html):
+The last step of the chain in [Port names and wires](@ref) resolves a wire name against the node's namespace, by the [standard ROS rules](https://design.ros2.org/articles/topic_and_service_names.html):
 
 - a relative name (`foo`) resolves under the node's namespace — `/foo`;
 - a private name (`~/foo`) resolves under the node's own name — `/vehicle/foo`;
 - an absolute name (`/foo`) stands as written.
 
-The resolved name is what the entity uses on the wire as a Zenoh key expression; see [Addressing & Key Expressions](../foundations/addressing.md) for the keyexpr it becomes.
+[`describe_wiring`](@ref) on a built node prints each port's authored wire name and the resolved name beside it — the [Inspecting a schema](@ref) demo runs it live. It is the quick way to confirm two ports share a name before chasing a silent non-delivery. The resolved name is what the entity uses on the wire as a Zenoh key expression; see [Addressing & Key Expressions](../foundations/addressing.md).
 
-Two ports connect only when they resolve to the same name. A `hears(:foo, …)` (relative `foo`) and a `publishes(:p, …; on = "~/foo")` (private) therefore land on different topics — `describe_wiring` shows the split as `→ /foo` against `→ /vehicle/foo`. A `node` call also errors if two same-channel outputs collide on one name unless one was explicitly remapped — `remap(Sensor, :telemetry => "…")` resolves the clash.
+Two ports connect only when they resolve to the same name. A `hears(:foo, …)` (relative `foo`) and a `publishes(:p, …; on = "~/foo")` (private) therefore land on different topics — `/foo` against `/vehicle/foo`. A `node` call errors if two same-channel outputs collide on one name unless one was explicitly remapped; [`remap`](@ref) resolves the clash.
 
 ## Lifecycle
 
@@ -284,10 +318,22 @@ Component
 member_schema
 ```
 
+### Schema combinators
+
+```@docs
+component
+publishes
+hears
+serves
+runs
+every
+uses
+remap
+```
+
 ### Ports and entities
 
 ```@docs
-uses
 @service
 @action
 entities

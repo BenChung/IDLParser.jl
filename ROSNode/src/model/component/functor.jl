@@ -23,14 +23,43 @@ descname(::Type{<:PortDesc{Name}}) where {Name} = Name
 
 # ── combinators: plain Symbol names (the ctor materialises the type param; no surface Val) ────────
 _norm_wire(on) = on === nothing ? nothing : String(on)
+"""
+    publishes(name::Symbol, T; on=nothing) -> Pub
+
+A publisher port carrying message type `T`, sent with `publish(entities(node, m).name, msg)`. `name`
+keys the handle in `entities(node, m)`; `on` sets its wire name (the port `name` by default).
+"""
 publishes(name::Symbol, ::Type{T}; on = nothing) where {T} = Pub{name, T}(_norm_wire(on))
+
+"""
+    hears(name::Symbol, T, handler; on=nothing) -> Sub
+
+A subscription on message type `T` that runs `handler(node, m, msg::T)` per message. `on` sets the wire
+it subscribes to (the reaction `name` by default).
+"""
 hears(name::Symbol, ::Type{T}, handler; on = nothing) where {T} = Sub{name, T, typeof(handler)}(handler, _norm_wire(on))
 # single service-request marker, but request/response are RESOLVED EAGERLY here (normal world) into
 # the descriptor type params. The @generated carrier builder must NOT call response_type from a
 # generator world: a user-AUTHORED service's _Response binding postdates ROSNode's definition world
 # and would be invisible there (imported/vendored types live in ROSNode's world and masked this).
+"""
+    serves(name::Symbol, ReqType, handler; on=nothing) -> Srv
+    serves(name::Symbol, handler; on=nothing) -> Srv          # a bare @service handler
+    serves(name::Symbol, existing::Srv; on=nothing) -> Srv    # rebind under another name/wire
+
+A service-server port answering `handler(node, m, req)` over request type `ReqType`. `on` sets the
+service wire (the port `name` by default). Author the request/response types inline with
+[`@service`](@ref) (then `serves` takes the bare handler), or pass a pre-authored `ReqType` here. See
+[Services](../communication/services.md).
+"""
 serves(name::Symbol, ::Type{Req}, handler; on = nothing) where {Req} =
     Srv{name, request_type(Req), response_type(Req), typeof(handler)}(handler, _norm_wire(on))
+"""
+    every(name::Symbol, rate, handler) -> Tmr
+
+A timer firing `handler(node, m)` at `rate` — a frequency in Hz (a `Real`), or a parameter `Symbol` to
+bind the period live to that parameter. A timer carries no wire, and fires only while the node is `Active`.
+"""
 every(name::Symbol, rate::Union{Real, Symbol}, handler) =
     Tmr{name, typeof(handler)}(handler, rate isa Symbol ? rate : Float64(rate))
 # action server over a PRE-authored @ros_action type — `action` is the authored marker (its type is
@@ -41,6 +70,14 @@ every(name::Symbol, rate::Union{Real, Symbol}, handler) =
 # user-authored action's `ActionTypeSupport(typeof(marker))` specialization (the Srv world-age trap).
 _action_server_type(::Type{A}) where {A} =
     (s = ActionTypeSupport(A); ActionServer{A, goal_type(s), result_type(s), feedback_type(s)})
+"""
+    runs(name::Symbol, Action, exec; on=nothing) -> Act
+    runs(name::Symbol, existing::Act; on=nothing) -> Act      # rebind under another name/wire
+
+An action-server port running `exec(node, m, goal)` per accepted goal, over a pre-authored `@ros_action`
+type `Action`. `on` sets the action wire (the port `name` by default). Author the action inline with
+[`@action`](@ref), or pass a pre-authored `Action` here. See [Actions](../communication/actions.md).
+"""
 runs(name::Symbol, action, exec; on = nothing) =
     (AT = typeof(action); Act{name, AT, typeof(exec), _action_server_type(AT)}(exec, _norm_wire(on)))
 
@@ -103,6 +140,13 @@ port_descs(d::Use, node, w) = EndpointDesc[]    # clients prime lazily — no a-
 
 # a node() member with explicit wire remaps — remap(SchemaOrType, port => "wire" | (member, port), …)
 struct _Remap; schema::Any; remaps::Vector{Pair{Symbol, Any}}; end
+"""
+    remap(component, port => "wire" | (member, port), …)
+
+Wrap a `node(…)` member with explicit wire overrides for one or more of its ports. `port => "wire"`
+retargets that port's wire name; `port => (member, port)` ties it to another member's port (a
+cross-member wire). Use it to resolve a name clash or to connect two members onto one topic.
+"""
 remap(s, rs::Vararg{Pair}) = _Remap(s, Pair{Symbol, Any}[Symbol(r.first) => r.second for r in rs])
 _unwrap(x::_Remap) = (x.schema, x.remaps)
 _unwrap(x) = (x, Pair{Symbol, Any}[])
@@ -158,6 +202,15 @@ function _evidence(t::Tuple)
 end
 
 # Ports are PortDesc values OR bare @service/@action handlers (converted via _to_port, functor_authoring.jl).
+"""
+    component(State, [Params,] ports…; provides=(), requires=(), ctor=nothing) -> MemberSchema
+
+Tie a component's `State` type and an optional `Params` ([`@parameters`](@ref)) type to its ports — the
+`publishes`/`hears`/`serves`/`runs`/`every`/`uses` descriptors, plus bare [`@service`](@ref)/[`@action`](@ref)
+handlers. The result is the component's [`member_schema`](@ref). Drop `Params` for a component with no
+public parameters. `provides`/`requires` declare the component's dependency-injection evidence and `ctor`
+its injected constructor (see [Parametric Components](parametric.md)).
+"""
 component(::Type{S}, ports...; kw...) where {S} = _component(S, EmptyParams, map(_to_port, ports); kw...)
 component(::Type{S}, ::Type{P}, ports...; kw...) where {S, P} = _component(S, P, map(_to_port, ports); kw...)
 function _component(::Type{S}, ::Type{P}, ports::Tuple;
@@ -1024,3 +1077,53 @@ _desc_kind(::Use{N, false}) where {N} = :service_client
 _desc_kind(::Use{N, true})  where {N} = :action_client
 _functor_describe_ports(ms::MemberSchema) =
     Tuple{Symbol, Symbol, String}[(_dname(d), _desc_kind(d), _port_wire(d)) for d in ms.ports]
+
+# ── pretty-printers: a schema VALUE prints its structure + authored wire names. Resolving those wire
+#    names to fully-qualified ROS topics needs a node, so that stays `describe_wiring`'s job on a built
+#    ComponentNode. ─────────────────────────────────────────────────────────────────────────────────
+const _NO_REMAP = Dict{Symbol, String}()
+
+# the "(params P, provides …, requires …)" annotation, omitting whichever parts are empty
+function _schema_anno(ms::MemberSchema)
+    T = typeof(ms); parts = String[]
+    P = paramtype(T); P === EmptyParams || push!(parts, "params $(nameof(P))")
+    pv = provides_of(T); isempty(pv) || push!(parts, "provides $(join((nameof(x) for x in pv), ", "))")
+    rq = requires_of(T); isempty(rq) || push!(parts, "requires $(join((nameof(x) for x in rq), ", "))")
+    isempty(parts) ? "" : " (" * join(parts, ", ") * ")"
+end
+
+# one indented "name  kind  wire" line per port (the wire is the post-remap name from `wmap`, else the
+# descriptor default); timers carry no wire.
+function _port_lines(ms::MemberSchema, indent::AbstractString, wmap)
+    rows = _functor_describe_ports(ms)
+    isempty(rows) && return [indent * "(no ports)"]
+    map(rows) do (pname, pkind, dwire)
+        kindstr = _port_kindstr(pkind)
+        pkind === :timer ? indent * rpad(string(pname), 14) * kindstr :
+                           indent * rpad(string(pname), 14) * rpad(kindstr, 7) * get(wmap, pname, dwire)
+    end
+end
+
+# a lone descriptor, compact: `pub :telemetry → ~/telemetry`
+Base.show(io::IO, d::PortDesc) = print(io, _port_kindstr(_desc_kind(d)), " :", _dname(d),
+    _desc_kind(d) === :timer ? "" : " → " * _port_wire(d))
+
+function Base.show(io::IO, ::MIME"text/plain", ms::MemberSchema)
+    lines = ["MemberSchema $(nameof(statetype(typeof(ms))))" * _schema_anno(ms)]
+    append!(lines, _port_lines(ms, "  ", _NO_REMAP))
+    print(io, join(lines, "\n"))
+end
+Base.show(io::IO, ms::MemberSchema) = print(io, "MemberSchema(", nameof(statetype(typeof(ms))), ")")
+
+function Base.show(io::IO, ::MIME"text/plain", ns::NodeSchema)
+    nm = ns.name === nothing ? "(anonymous)" : "\"$(ns.name)\""
+    lines = ["NodeSchema $nm — $(length(ns.order)) member(s), DI order: $(join(ns.order, " → "))"]
+    for mem in ns.order
+        ms = getfield(ns.members, mem)
+        push!(lines, "  $mem :: $(nameof(statetype(typeof(ms))))" * _schema_anno(ms))
+        append!(lines, _port_lines(ms, "    ", get(ns.wires, mem, _NO_REMAP)))
+    end
+    print(io, join(lines, "\n"))
+end
+Base.show(io::IO, ns::NodeSchema) =
+    print(io, "NodeSchema(", ns.name === nothing ? "anonymous" : repr(String(ns.name)), ", ", length(ns.order), " members)")
