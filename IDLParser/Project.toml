@@ -11,7 +11,7 @@ PEG = "12d937ae-5f68-53be-93c9-3a6f997a20a8"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]
-CDRSerialization = "0.1.2"
+CDRSerialization = "0.2.0"
 Moshi = "0.3.5"
 OrderedCollections = "1.8.0"
 PEG = "1.0.4"
