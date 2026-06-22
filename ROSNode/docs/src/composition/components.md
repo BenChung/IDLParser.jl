@@ -2,9 +2,19 @@
 
 A component is a node authored as a collection of cohesive chunks — each a typed struct of private state, the entities authored onto it, and its own lifecycle. Where the other pages wire a node imperatively (open a context, create a `Node`, attach a publisher here, a service there), a component assembles the node from these chunks and runs it.
 
-The assembly is a **schema value**. The value combinators `publishes`/`every`/`serves`/`hears`/`runs`/`uses` author the entities; `component(State, Params, ports…; provides=/requires=/ctor=)` ties them to a state type through the `member_schema` trait; and `node("name" => State, …)` composes the members — resolving dependency injection once — into one runnable `NodeSchema`. `run(schema)` brings the node up.
+Components can be built in two ways:
 
-This page assembles a `Vehicle` node from two components. A `Sensor` publishes telemetry on a timer and provides a battery reading; a `Guard` requires that reading and serves a "safe to fly?" query. `node` composes them; `run` brings the node up. The full example lives in `examples/component.jl`, and `examples/component_macro.jl` authors the same node with the [`@component`](@ref) macro.
+- [The @component macro](@ref) with **[`@component`](@ref)** — one `mutable struct` block declares the state, parameters, ports, reactions, and lifecycle hooks together.
+- [The member schema](@ref) with **[`component`](@ref) and the value combinators** — write the pieces separately: `publishes`/`hears`/`serves`/`runs`/`every`/`uses` author the entities, and `component(State, Params, ports…)` binds them to a state type through the `member_schema` trait. This is the primitive `@component` expands to; reach for it directly for dynamic or programmatic assembly.
+
+Either way, `node("name" => State, …)` composes the components with dependency injection into one runnable `NodeSchema` and `run(schema)` brings the node up.
+
+This page builds a `Vehicle` node from two explicit combinator-built components, then recapping it as one [`@component`](@ref) block. The `Vehicle` is built from two parts:
+
+* A `Sensor` that publishes telemetry on a timer and provides a battery reading, and
+* a `Guard` which enforces a sensed minimum battery level and that serves a "safe to fly?" query. 
+
+The full functorized example lives in `examples/component.jl` with `examples/component_macro.jl` being the `@component`-based dual.
 
 !!! warning "`import` the framework generics — a bare `using` silently shadows them"
     The lifecycle hooks (`configure`, `activate`, `deactivate`, `cleanup`, `on_error`) and the `member_schema` trait are **ROSNode functions you add methods to**. Bring them in with `import`, not plain `using`:
@@ -57,7 +67,7 @@ end
 Sensor{Name}() where {Name} = Sensor{Name}(100.0)
 ```
 
-The `@parameters` struct holds the public side, read through `parameters(node, s)`. The `∈ 1..50` constraint reuses the parameter schema grammar:
+The `@parameters` struct holds the public side, read through `parameters(node, s)`. The `∈ 1..50` constraint reuses the [parameter schema grammar](../communication/parameters.md):
 
 ```julia
 @parameters struct SensorParams
@@ -80,7 +90,7 @@ function tick(node, s::Sensor)              # fires at `rate` Hz, only while Act
 end
 ```
 
-## The schema — `member_schema` and the value combinators
+## The member schema
 
 [`member_schema`](@ref)`(::Type{S})` is the trait carrying the component's schema. It is defined on the **bare base** `S` (never a `S{Name}` instantiation), and [`component`](@ref)`(State, Params, ports…)` ties the state and parameter types to the authored ports. Each value combinator builds one port from a `name` plus its specifics; the full signatures and options live in [Schema combinators](@ref):
 
@@ -90,7 +100,7 @@ end
 - [`runs`](@ref)`(:dock, Dock, dock!; on)` — an action-server running each accepted goal.
 - [`every`](@ref)`(:tick, :rate, tick)` — a timer firing a reaction (a frequency in Hz, or a parameter to bind it live).
 - [`uses`](@ref)`(:cmd, CmdReq; on)` — a persistent service/action **client** port.
-- [`remap`](@ref)`(Sensor, :telemetry => "…")` — wire overrides on a member, applied at `node(…)`.
+- [`remap`](@ref)`(Sensor, :telemetry => "…")` — override the names a member's ports resolve to, at `node(…)`.
 
 `every(:tick, :rate, tick)` binds the timer's frequency to the `rate` parameter:
 
@@ -103,20 +113,20 @@ member_schema(::Type{Sensor}) = component(Sensor, SensorParams,
 
 The `provides = (BatterySource,)` keyword is the dependency-injection evidence covered below.
 
-### Port names and wires
+### Port names and topics
 
-A combinator's first argument, `name`, is the port's **identity** — its key in `entities(node, m)`, and (for the reaction combinators) the handler's name. The **wire name** it resolves to follows a short chain:
+A combinator's first argument, `name`, is the port's **identity** — its key in `entities(node, m)`, and (for the reaction combinators) the handler's name. That same `name` is also, by default, the **topic** the port uses (its service or action name, for `serves`/`runs`/`uses`). It resolves through a short chain:
 
-1. the default wire is the port `name`;
-2. an `on = "wire"` clause overrides that default;
+1. the default is the port's own `name`, taken as a relative name;
+2. an `on = "/some/name"` clause overrides that default;
 3. a `node` [`remap`](@ref) overrides it again;
-4. the result resolves against the node's namespace to a ROS name — see [Inspecting the resolved wiring](@ref).
+4. the chosen name resolves against the node's namespace to its fully-qualified form — see [Inspecting the resolved wiring](@ref).
 
-Timers are the exception: they carry no wire.
+Timers are the exception: they address no topic and fire locally.
 
 ### Inspecting a schema
 
-A schema is a plain value — build one and look at it before running anything. A `member_schema`, and a `node(…)` schema, print their structure and the authored wire names:
+A schema is a plain value — build one and look at it before running anything. A `member_schema`, and a `node(…)` schema, print their structure and each port's authored name:
 
 ```@example schema
 using ROSNode
@@ -132,9 +142,9 @@ pulse(node, b::Beacon) = nothing                   # timer reaction
 on_clock(node, b::Beacon, msg::Time) = nothing     # subscription handler
 
 member_schema(::Type{Beacon}) = component(Beacon,
-    publishes(:beat, Time; on = "~/beat"),         # private wire ~/beat
-    hears(:clock, Time, on_clock; on = "/clock"),  # absolute wire /clock
-    every(:pulse, 2.0, pulse))                     # timer, no wire
+    publishes(:beat, Time; on = "~/beat"),         # private topic ~/beat
+    hears(:clock, Time, on_clock; on = "/clock"),  # absolute topic /clock
+    every(:pulse, 2.0, pulse))                     # timer (no topic)
 
 member_schema(Beacon)
 ```
@@ -145,7 +155,7 @@ Composing it into a node shows the resolved DI order and each member's ports:
 rig = node("beacon" => Beacon; name = "Rig")
 ```
 
-[`describe_wiring`](@ref) goes one step further: on a *built* node it appends the fully-qualified ROS name each wire resolves to (here `~/beat` private → `/rig/beat`, `/clock` absolute → `/clock`):
+[`describe_wiring`](@ref) goes one step further: on a *built* node it appends the fully-qualified ROS name each port resolves to (here `~/beat` private → `/rig/beat`, `/clock` absolute → `/clock`):
 
 ```@example schema
 cn = run(rig; name = "rig", localhost_only = true, block = false)
@@ -153,9 +163,14 @@ describe_wiring(cn)
 close(cn)
 ```
 
-## Inline-authored entities
+## Services and actions
 
-A bare `serves`/`hears` wires a **pre-authored** request or message type to a handler. [`@service`](@ref) instead authors the ROS service **type** and the handler in one place: the arguments after `(node, m)` are the request fields, and the `@NamedTuple` return type is the response. The macro generates `f_Request`/`f_Response` from that signature and registers them. See [Services](../communication/services.md) for the service model:
+Services and actions are the **imperative** ports: a request earns a response, a goal runs to a result. Each needs a typed request/response (or goal/result/feedback) contract, and you create one two ways:
+
+- **Author it inline** — [`@service`](@ref) / [`@action`](@ref) define the contract *and* the handler in one place. The arguments after `(node, m)` are the request (or goal) fields; the `@NamedTuple` return is the response (or result).
+- **Wire a pre-authored type** — `serves(:name, ReqType, handler)` / `runs(:name, Action, exec)` bind a handler to a service or action type you already have, imported from another package or authored elsewhere.
+
+Inline authoring keeps the whole port in one definition:
 
 ```julia
 @service "~/safe_to_fly" function safe(node, g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
@@ -164,14 +179,14 @@ A bare `serves`/`hears` wires a **pre-authored** request or message type to a ha
 end
 ```
 
-The leading string `"~/safe_to_fly"` names the service wire; the handler keeps the function name `safe`. The `safe` marker drops straight into `component(…)` as a port — `component` converts a bare `@service`/`@action` handler into its descriptor automatically:
+The leading `"~/safe_to_fly"` sets the service name; the handler keeps its function name `safe`, which drops straight into `component(…)` as a port:
 
 ```julia
 member_schema(::Type{Guard}) = component(Guard, GuardParams, safe;
     requires = (BatterySource,), ctor = make_guard)
 ```
 
-[`@action`](@ref) authors an action server the same way, deriving the Goal/Result/Feedback types from the signature and a `FeedbackSink` parameter. Drop down a tier with `serves(:other, safe; on)` to reuse the same handler under another name, or `serves(:n, safe_Request, h; on)` to wire a different handler to the authored type.
+[`@action`](@ref) authors an action server the same way, with a feedback stream alongside the goal and result. Both macros generate and register the wire types for you, and either handler rebinds under another name — the [`@service`](@ref)/[`@action`](@ref) docstrings cover those forms, and [Services](../communication/services.md) / [Actions](../communication/actions.md) the request/response and goal/result/feedback models.
 
 ## Dependency injection between components
 
@@ -190,7 +205,12 @@ battery(s::Sensor) = s.level                # satisfy the BatterySource contract
 # … provides = (BatterySource,) in Sensor's component(…) above
 ```
 
-Provision is Holy-trait evidence — a `provides=` listing (equivalently a [`@provides`](@ref) / [`provides`](@ref) declaration), resolved against need rather than by subtyping. A consumer declares the matching need in `requires=` and receives the resolved provider through its constructor. `Guard` holds that provider in a type parameter so reads of it are type-stable, and supplies a constructor that places its own member name:
+Provision is **Holy-trait evidence**: a component declares the interfaces it provides, resolved against a consumer's `requires` rather than by subtyping. Declare it two ways:
+
+- **on the `component(…)` call** — the `provides = (BatterySource,)` keyword;
+- **on the type** — a [`@provides`](@ref) declaration (`@provides Sensor BatterySource`), sugar for a [`provides`](@ref)`(::Type{Sensor})` method.
+
+The keyword takes precedence; the method is the fallback, used when the keyword is omitted. A consumer declares its matching need with `requires=` (or, the same two ways, a [`requires`](@ref)`(::Type{M})` method) and receives the resolved provider through its constructor. `Guard` holds that provider in a type parameter so reads of it are type-stable, and supplies a constructor that places its own member name:
 
 ```julia
 mutable struct Guard{Name, B} <: Component{Name}
@@ -204,7 +224,7 @@ make_guard(node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
 
 The `requires = (BatterySource,)` plus `ctor = make_guard` in `Guard`'s `member_schema` above wire the need to the constructor. The single dependency arrives as `src`, fixing the member's type to `Guard{:guard, Sensor{:sensor}}`; the handler reads it through the interface — `battery(g.battery_src)` in the `safe` service. [Parametric Components](parametric.md) covers the constructor contract in full, injecting a mock provider in tests, and running a dependent component standalone.
 
-## The `@component` macro — the same component in one block
+## The @component macro
 
 [`@component`](@ref) is the concise authoring tier: it emits the whole value API — the struct, the zero-arg ctor, the `@parameters` struct, the reaction/hook methods, and `member_schema` — from one `mutable struct` block. A struct-body edit re-runs the whole block and re-keys everything together (Revise-friendlier than the separate definitions). It is sugar over `component`/`node`; the raw combinators remain the primitive, and the two coexist in one `node`.
 
@@ -213,13 +233,13 @@ The block uses inline directives:
 - `field = default` — a **private** state field (a plain `mutable struct` field), with the default the zero-arg ctor uses.
 - `@param x::T = d ∈ lo..hi` — a **public** parameter; the macro collects these into an emitted `@parameters struct`. Mix the two freely: a block carries any number of each.
 - `@provides Iface` — interface(s) the component provides.
-- `@publishes out::T on "~/wire"` — a publisher port (the wire clause **trails** the declaration).
+- `@publishes out::T on "~/topic"` — a publisher port (the `on` clause **trails** the declaration).
 - `@hears function h(node, m, msg::T) … end` — a subscription port plus its handler (inline-only).
 - `@every :rate function tick(node, m) … end` — a timer port plus its handler (`rate` = Hz or a parameter `Symbol`; inline-only).
 - `@service "~/s" function f(node, m, x::X)::@NamedTuple{…} … end` — inline service authoring.
 - `configure(node, m) = …` — lifecycle hooks live in the block too.
 
-A bare `m` argument is annotated `m::Sensor` for you, so reaction bodies stay fully typed. The handler directives `@hears`/`@service`/`@action` take a **leading** `"wire"` string, while `@publishes` takes the **trailing** `on "wire"` form — the split follows the name source.
+A bare `m` argument is annotated `m::Sensor` for you, so reaction bodies stay fully typed. The handler directives `@hears`/`@service`/`@action` take a **leading** name string, while `@publishes` takes the **trailing** `on "…"` form — the split follows the name source.
 
 ```julia
 @component mutable struct Sensor{Name} <: Component{Name}
@@ -277,13 +297,13 @@ The ground station is a plain node subscribing to `/vehicle/telemetry`. The vehi
 
 ## Inspecting the resolved wiring
 
-The last step of the chain in [Port names and wires](@ref) resolves a wire name against the node's namespace, by the [standard ROS rules](https://design.ros2.org/articles/topic_and_service_names.html):
+The last step of the chain in [Port names and topics](@ref) resolves a port's name against the node's namespace, by the [standard ROS rules](https://design.ros2.org/articles/topic_and_service_names.html):
 
 - a relative name (`foo`) resolves under the node's namespace — `/foo`;
 - a private name (`~/foo`) resolves under the node's own name — `/vehicle/foo`;
 - an absolute name (`/foo`) stands as written.
 
-[`describe_wiring`](@ref) on a built node prints each port's authored wire name and the resolved name beside it — the [Inspecting a schema](@ref) demo runs it live. It is the quick way to confirm two ports share a name before chasing a silent non-delivery. The resolved name is what the entity uses on the wire as a Zenoh key expression; see [Addressing & Key Expressions](../foundations/addressing.md).
+[`describe_wiring`](@ref) on a built node prints each port's authored name and the resolved name beside it — the [Inspecting a schema](@ref) demo runs it live. It is the quick way to confirm two ports share a name before chasing a silent non-delivery. The resolved name is what the entity uses as a Zenoh key expression; see [Addressing & Key Expressions](../foundations/addressing.md).
 
 Two ports connect only when they resolve to the same name. A `hears(:foo, …)` (relative `foo`) and a `publishes(:p, …; on = "~/foo")` (private) therefore land on different topics — `/foo` against `/vehicle/foo`. A `node` call errors if two same-channel outputs collide on one name unless one was explicitly remapped; [`remap`](@ref) resolves the clash.
 

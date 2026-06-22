@@ -4,9 +4,11 @@ A node kind runs at two scales, and its code is identical at both. Deploy-time w
 
 ## Two scales
 
-A node kind runs **standalone** — `run(Vehicle; name = "vehicle")` gives it its own process with its own session, discovery, and registry.
+Nodes can be run **standalone** or in a **container**. Both support sessions, discovery, and registry, but differ in namespacing. 
 
-Several nodes share one process through a **container**. Each [`add!`](@ref) instantiates a node on the container's single Context, so the nodes share one session, discovery, and registry, plus a direct in-process delivery path between them:
+**Standalone** nodes can be ran directly — `run(Vehicle; name = "vehicle")`; a standalone node will directly expose its entities under the given name.
+
+Several nodes can share one process through a **container**. Each [`add!`](@ref) instantiates a node on the container's single Context, so the nodes share one session, discovery, and registry, plus a direct in-process delivery path between them:
 
 ```julia
 container("fleet") do c

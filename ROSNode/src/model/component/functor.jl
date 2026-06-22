@@ -27,14 +27,14 @@ _norm_wire(on) = on === nothing ? nothing : String(on)
     publishes(name::Symbol, T; on=nothing) -> Pub
 
 A publisher port carrying message type `T`, sent with `publish(entities(node, m).name, msg)`. `name`
-keys the handle in `entities(node, m)`; `on` sets its wire name (the port `name` by default).
+keys the handle in `entities(node, m)`; `on` sets its topic (the port `name` by default).
 """
 publishes(name::Symbol, ::Type{T}; on = nothing) where {T} = Pub{name, T}(_norm_wire(on))
 
 """
     hears(name::Symbol, T, handler; on=nothing) -> Sub
 
-A subscription on message type `T` that runs `handler(node, m, msg::T)` per message. `on` sets the wire
+A subscription on message type `T` that runs `handler(node, m, msg::T)` per message. `on` sets the topic
 it subscribes to (the reaction `name` by default).
 """
 hears(name::Symbol, ::Type{T}, handler; on = nothing) where {T} = Sub{name, T, typeof(handler)}(handler, _norm_wire(on))
@@ -45,10 +45,10 @@ hears(name::Symbol, ::Type{T}, handler; on = nothing) where {T} = Sub{name, T, t
 """
     serves(name::Symbol, ReqType, handler; on=nothing) -> Srv
     serves(name::Symbol, handler; on=nothing) -> Srv          # a bare @service handler
-    serves(name::Symbol, existing::Srv; on=nothing) -> Srv    # rebind under another name/wire
+    serves(name::Symbol, existing::Srv; on=nothing) -> Srv    # rebind under another name
 
 A service-server port answering `handler(node, m, req)` over request type `ReqType`. `on` sets the
-service wire (the port `name` by default). Author the request/response types inline with
+service name (the port `name` by default). Author the request/response types inline with
 [`@service`](@ref) (then `serves` takes the bare handler), or pass a pre-authored `ReqType` here. See
 [Services](../communication/services.md).
 """
@@ -58,7 +58,7 @@ serves(name::Symbol, ::Type{Req}, handler; on = nothing) where {Req} =
     every(name::Symbol, rate, handler) -> Tmr
 
 A timer firing `handler(node, m)` at `rate` — a frequency in Hz (a `Real`), or a parameter `Symbol` to
-bind the period live to that parameter. A timer carries no wire, and fires only while the node is `Active`.
+bind the period live to that parameter. A timer addresses no topic, and fires only while the node is `Active`.
 """
 every(name::Symbol, rate::Union{Real, Symbol}, handler) =
     Tmr{name, typeof(handler)}(handler, rate isa Symbol ? rate : Float64(rate))
@@ -72,10 +72,10 @@ _action_server_type(::Type{A}) where {A} =
     (s = ActionTypeSupport(A); ActionServer{A, goal_type(s), result_type(s), feedback_type(s)})
 """
     runs(name::Symbol, Action, exec; on=nothing) -> Act
-    runs(name::Symbol, existing::Act; on=nothing) -> Act      # rebind under another name/wire
+    runs(name::Symbol, existing::Act; on=nothing) -> Act      # rebind under another name
 
 An action-server port running `exec(node, m, goal)` per accepted goal, over a pre-authored `@ros_action`
-type `Action`. `on` sets the action wire (the port `name` by default). Author the action inline with
+type `Action`. `on` sets the action name (the port `name` by default). Author the action inline with
 [`@action`](@ref), or pass a pre-authored `Action` here. See [Actions](../communication/actions.md).
 """
 runs(name::Symbol, action, exec; on = nothing) =
@@ -100,7 +100,7 @@ struct Use{Name, IsAct, M, H} <: PortDesc{Name}; marker::M; wire::Union{String, 
 Declare a persistent service/action CLIENT port. `marker` is a service request type (or `@ros_service`
 marker) → a `ServiceClient`, or an `@ros_action`/authored action marker → an `ActionClient`. The client
 is materialised at configure into `entities(node, m).name` and held for the node's life (reuse it for
-`call`/`send`), mirroring rclcpp's `create_client`. `on` sets the wire (else the port name).
+`call`/`send`), mirroring rclcpp's `create_client`. `on` sets the service/action name (else the port `name`).
 """
 function uses(name::Symbol, marker; on = nothing)
     MT = marker isa Type ? marker : typeof(marker)
@@ -141,11 +141,11 @@ port_descs(d::Use, node, w) = EndpointDesc[]    # clients prime lazily — no a-
 # a node() member with explicit wire remaps — remap(SchemaOrType, port => "wire" | (member, port), …)
 struct _Remap; schema::Any; remaps::Vector{Pair{Symbol, Any}}; end
 """
-    remap(component, port => "wire" | (member, port), …)
+    remap(component, port => "name" | (member, port), …)
 
-Wrap a `node(…)` member with explicit wire overrides for one or more of its ports. `port => "wire"`
-retargets that port's wire name; `port => (member, port)` ties it to another member's port (a
-cross-member wire). Use it to resolve a name clash or to connect two members onto one topic.
+Wrap a `node(…)` member with explicit name overrides for one or more of its ports. `port => "name"`
+retargets that port's topic (or service/action name); `port => (member, port)` ties it to another
+member's port. Use it to resolve a name clash or to connect two members onto one topic.
 """
 remap(s, rs::Vararg{Pair}) = _Remap(s, Pair{Symbol, Any}[Symbol(r.first) => r.second for r in rs])
 _unwrap(x::_Remap) = (x.schema, x.remaps)
