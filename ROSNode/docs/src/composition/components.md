@@ -1,6 +1,6 @@
 # Components
 
-A component is a node authored as a collection of cohesive chunks — each a typed struct of private state, the entities authored onto it, and its own lifecycle. Where the other pages wire a node imperatively (open a context, create a `Node`, attach a publisher here, a service there), a component assembles the node from these chunks and runs it.
+A component is a node authored as a collection of cohesive chunks — each a typed struct of private state, the entities authored onto it, and its own lifecycle. A component assembles the node from these chunks and runs it, where the other pages wire a node imperatively — open a context, create a `Node`, attach a publisher here, a service there.
 
 Components can be built in two ways:
 
@@ -13,8 +13,6 @@ This page builds a `Vehicle` node from two explicit combinator-built components,
 
 * A `Sensor` that publishes telemetry on a timer and provides a battery reading, and
 * a `Guard` which enforces a sensed minimum battery level and that serves a "safe to fly?" query. 
-
-The full functorized example lives in `examples/component.jl` with `examples/component_macro.jl` being the `@component`-based dual.
 
 !!! warning "`import` the framework generics — a bare `using` silently shadows them"
     The lifecycle hooks (`configure`, `activate`, `deactivate`, `cleanup`, `on_error`) and the `member_schema` trait are **ROSNode functions you add methods to**. Bring them in with `import`, not plain `using`:
@@ -62,7 +60,7 @@ The state struct is parameterised by its member-path `Name` and subtypes `Compon
 
 ```julia
 mutable struct Sensor{Name} <: Component{Name}
-    level::Float64                          # private state (simulated battery %)
+    level::Float64                          # simulated battery %
 end
 Sensor{Name}() where {Name} = Sensor{Name}(100.0)
 ```
@@ -85,7 +83,7 @@ Reactions and lifecycle hooks are **node-first**: they take `(node, m, …)`, wh
 configure(node, s::Sensor) = @info "Sensor up" rate = parameters(node, s).rate
 
 function tick(node, s::Sensor)              # fires at `rate` Hz, only while Active
-    s.level = max(0.0, s.level - 1.0)       # drain a little each tick
+    s.level = max(0.0, s.level - 1.0)
     publish(entities(node, s).telemetry, Telemetry(battery = s.level, altitude = 12.0))
 end
 ```
@@ -138,13 +136,13 @@ mutable struct Beacon{Name} <: Component{Name}
 end
 Beacon{Name}() where {Name} = Beacon{Name}(0)
 
-pulse(node, b::Beacon) = nothing                   # timer reaction
-on_clock(node, b::Beacon, msg::Time) = nothing     # subscription handler
+pulse(node, b::Beacon) = nothing
+on_clock(node, b::Beacon, msg::Time) = nothing
 
 member_schema(::Type{Beacon}) = component(Beacon,
-    publishes(:beat, Time; on = "~/beat"),         # private topic ~/beat
-    hears(:clock, Time, on_clock; on = "/clock"),  # absolute topic /clock
-    every(:pulse, 2.0, pulse))                     # timer (no topic)
+    publishes(:beat, Time; on = "~/beat"),         # private
+    hears(:clock, Time, on_clock; on = "/clock"),  # absolute
+    every(:pulse, 2.0, pulse))                     # timer: no topic
 
 member_schema(Beacon)
 ```
@@ -243,12 +241,12 @@ A bare `m` argument is annotated `m::Sensor` for you, so reaction bodies stay fu
 
 ```julia
 @component mutable struct Sensor{Name} <: Component{Name}
-    level::Float64 = 100.0                              # private state (simulated battery %)
+    level::Float64 = 100.0                              # simulated battery %
     @param rate::Int64 = 5 ∈ 1..50                      # Hz — read live; driveable by `ros2 param`
     @provides BatterySource                             # satisfies the BatterySource contract
     @publishes telemetry::Telemetry on "~/telemetry"    # node-private ⇒ /vehicle/telemetry
     @every :rate function tick(node, m)                 # fires at the live `rate` Hz, only while Active
-        m.level = max(0.0, m.level - 1.0)               # drain a little each tick
+        m.level = max(0.0, m.level - 1.0)
         publish(entities(node, m).telemetry, Telemetry(battery = m.level, altitude = 12.0))
     end
     configure(node, m) = @info "Sensor up" rate = parameters(node, m).rate
@@ -267,9 +265,13 @@ battery(s::Sensor) = s.level
 const Vehicle = node("sensor" => Drone.Sensor, "guard" => Drone.Guard; name = "Vehicle")
 ```
 
-`Guard` requires `BatterySource` and `Sensor` provides it, so the framework toposorts the members by dependency and injects the `Sensor` into the `Guard`. A dependency configures before its dependent and tears down after. `name = "Vehicle"` registers the kind in the process-global registry, so a container can load it by name (see [Containers & Dynamic Composition](containers.md)); the resolved member order and dependency edges are frozen into the returned `NodeSchema`'s type, so construction is type-stable.
+`Guard` requires `BatterySource` and `Sensor` provides it, so the framework toposorts the members by dependency and injects the `Sensor` into the `Guard`. A dependency configures before its dependent and tears down after. `name = "Vehicle"` registers the kind in the process-global registry, so a container can load it by name (see [Containers & Dynamic Composition](containers.md)). The resolved member order and dependency edges are frozen into the returned `NodeSchema`'s type, so construction is type-stable.
 
-`run` brings the node up. `block = false` returns so you can drive the node from the calling code; passing `ctx` runs it on an existing context, and dropping `ctx` runs it standalone in its own process. `overrides` sets each member's parameters by their local names:
+`run` brings the node up. Its options:
+
+- `block = false` — returns immediately so the caller can drive the node.
+- `ctx = ctx` — runs the node on an existing context; omit `ctx` to run it standalone in its own process.
+- `overrides = (…,)` — sets each member's parameters by their local names.
 
 ```julia
 @context() do ctx
@@ -309,7 +311,7 @@ Two ports connect only when they resolve to the same name. A `hears(:foo, …)` 
 
 ## Lifecycle
 
-Every component has a lifecycle: the `configure`/`activate`/`deactivate`/`cleanup`/`on_error` hooks, run **unmanaged** (brought straight up at `run`) or **managed** (driven through the `lifecycle_msgs` control surface, with the `isactive` gate holding dispatch until `Active`). A component that wraps an external resource authors its setup in `configure` and the matching release in `cleanup`. [Component Lifecycle](lifecycle.md) is the full treatment: the hook set, the managed state machine, the dispatch gate, and failure/recovery.
+Every component has a lifecycle: setup in `configure`, the matching release in `cleanup`, and `activate`/`deactivate`/`on_error` for the rest. A component runs unmanaged or managed. [Component Lifecycle](lifecycle.md) is the full treatment: the hook set, the managed state machine, the dispatch gate, and failure/recovery.
 
 ## Composition at two scales
 

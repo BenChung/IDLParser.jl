@@ -89,7 +89,12 @@ A hook signals failure two ways:
 <div class="rosnode-statechart" data-machine="recovery"></div>
 ```
 
-`on_error` runs across the members in dependency order. The node recovers to `Unconfigured` when every member returns cleanly; a throwing `on_error` (logged, with the remaining members still run) drops it to `Finalized`. Error processing then runs the guarded member-cleanup fan-out — each member's `cleanup` plus its port close — so recovery to `Unconfigured` is a true reset: a later `configure!` reacquires from scratch, with no stale entities still dispatching and no double-acquire. An unmanaged node has no error-processing state — `run` / `add!` tears the partial node down (every member that reached `configure` cleans up against its partial state, entities close) and the throw propagates.
+`on_error` runs across the members in dependency order, then:
+
+- every member returns cleanly → the node recovers to `Unconfigured`;
+- an `on_error` throws → the node drops to `Finalized` (the throw is logged and the remaining members still run).
+
+Error processing then runs the guarded member-cleanup fan-out — each member's `cleanup` plus its port close — so recovery to `Unconfigured` is a true reset: a later `configure!` reacquires from scratch, with no stale entities still dispatching and no double-acquire. An unmanaged node has no error-processing state — `run` / `add!` tears the partial node down (every member that reached `configure` cleans up against its partial state, entities close) and the throw propagates.
 
 ## Ordering and idempotent cleanup
 

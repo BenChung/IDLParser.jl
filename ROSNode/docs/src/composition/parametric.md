@@ -1,6 +1,6 @@
 # Parametric Components
 
-A component carries its member path as the type parameter `Name`. A **parametric** component adds further type parameters — most often to hold an injected dependency in a field whose type is fixed per composition, so reactions read it through a typed field load rather than a dynamic dispatch.
+A component carries its member path as the type parameter `Name`. A **parametric** component adds further type parameters — most often to hold an injected dependency in a field whose type is fixed per composition, so reactions read it through a direct, type-stable field load.
 
 [Components](components.md) injects a `Sensor` into a `Guard` through the `BatterySource` interface. This page is the contract behind that injection: how the constructor places `Name` and the resolved dependencies, how the same component takes a real provider in production and a mock in a test, and how to run a dependent component on its own.
 
@@ -36,7 +36,7 @@ construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} = Guard{Name, type
 member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,))
 ```
 
-A `requires` backed by neither a `ctor` nor a matching `construct` method is rejected at authoring time, since the default zero-dependency constructor has no slot for the injected provider. A non-parametric component (every parameter past `Name` defaulted) needs none of this — its default `M{Name}()` is the zero-dependency constructor.
+A `requires` backed by neither a `ctor` nor a matching `construct` method is rejected at authoring time, since the default zero-dependency constructor has no slot for the injected provider. A component whose every parameter past `Name` is defaulted already has its constructor — the default `M{Name}()` — and supplies none of the above.
 
 An injected provider arrives **constructed but not yet configured**: the framework configures providers ahead of their consumers (see [Component Lifecycle](lifecycle.md)). Store it from the constructor, then read it through its interface from `configure` onward.
 
@@ -65,8 +65,8 @@ battery(::NullBattery) = 100.0                          # always "full": the sta
 mutable struct SoloGuard{Name} <: Component{Name}
     battery_src::NullBattery
 end
-SoloGuard{Name}() where {Name} = SoloGuard{Name}(NullBattery())   # zero-dependency constructor
-member_schema(::Type{SoloGuard}) = component(SoloGuard, GuardParams, safe)   # no `requires`
+SoloGuard{Name}() where {Name} = SoloGuard{Name}(NullBattery())
+member_schema(::Type{SoloGuard}) = component(SoloGuard, GuardParams, safe)
 
 run(SoloGuard; name = "guard")                          # un-prefixed params: ros2 param get /guard min_battery
 ```
