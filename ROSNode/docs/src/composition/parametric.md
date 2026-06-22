@@ -36,7 +36,7 @@ construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} = Guard{Name, type
 member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,))
 ```
 
-A `requires` backed by neither a `ctor` nor a matching `construct` method is rejected at authoring time, since the default zero-dependency constructor has no slot for the injected provider. A component whose every parameter past `Name` is defaulted already has its constructor — the default `M{Name}()` — and supplies none of the above.
+`component` rejects a `requires` backed by neither a `ctor` nor a matching `construct` method at authoring time: the default zero-dependency constructor has no slot for the injected provider. A component whose every parameter past `Name` is defaulted already has its constructor — the default `M{Name}()` — and supplies none of the above.
 
 An injected provider arrives **constructed but not yet configured**: the framework configures providers ahead of their consumers (see [Component Lifecycle](lifecycle.md)). Store it from the constructor, then read it through its interface from `configure` onward.
 

@@ -1,6 +1,6 @@
 # Components
 
-A component is a node authored as a collection of cohesive chunks — each a typed struct of private state, the entities authored onto it, and its own lifecycle. A component assembles the node from these chunks and runs it, where the other pages wire a node imperatively — open a context, create a `Node`, attach a publisher here, a service there.
+A component is a node authored as a collection of cohesive chunks — each a typed struct of private state, the entities authored onto it, and its own lifecycle. A component assembles the node from these chunks and runs it, where the other pages wire a node imperatively — a context, a `Node`, and each endpoint attached by hand.
 
 Components can be built in two ways:
 
@@ -56,7 +56,7 @@ A component splits its data into two independent stores, and each datum goes to 
 
 The two are independent, so a component carries whatever mix it needs — both, one, or neither. The `Sensor` carries both: a private `level` and a public `rate`.
 
-The state struct is parameterised by its member-path `Name` and subtypes `Component{Name}`; the entities ride the schema, not the struct. A zero-argument ctor `S{Name}()` builds it with no dependencies — the default the framework calls when nothing is injected:
+The state struct is parameterised by its member-path `Name` and subtypes `Component{Name}`; the entities ride the schema, not the struct. A zero-argument ctor `S{Name}()` builds it with no dependencies — the default the framework calls for a component with no `requires`:
 
 ```julia
 mutable struct Sensor{Name} <: Component{Name}
@@ -69,7 +69,7 @@ The `@parameters` struct holds the public side, read through `parameters(node, s
 
 ```julia
 @parameters struct SensorParams
-    rate::Int64 = 5 ∈ 1..50                 # Hz — public: read live, retunable via `ros2 param`
+    rate::Int64 = 5 ∈ 1..50                 # Hz — retunable via `ros2 param`
 end
 ```
 

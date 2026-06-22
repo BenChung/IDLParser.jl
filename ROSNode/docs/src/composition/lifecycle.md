@@ -53,7 +53,7 @@ deactivate!(ln)     # → Inactive: members deactivate in reverse order, gating 
 cleanup!(ln)        # → Unconfigured: each cleanup runs, entities close — a configure! starts fresh
 ```
 
-These calls and a `ros2 lifecycle` orchestrator drive one machine over `~/change_state`. Each transition runs the members' hooks under the [settlement three-way](../communication/services.md), so it lands its target, declines back to its origin, or diverts into error processing. Click a transition to step through it:
+These calls and a `ros2 lifecycle` orchestrator drive one machine over `~/change_state`. Each transition runs the members' hooks under the [settlement three-way](../communication/services.md). Click a transition to step through it:
 
 ```@raw html
 <div class="rosnode-statechart" data-machine="lifecycle"></div>
@@ -71,7 +71,12 @@ A managed node holds each port shut at dispatch until it reaches `Active`:
 | Action server | goal, cancel, and result requests get an error reply; feedback and status publications drop |
 | Action client (`send`/`fetch`/`cancel`) | the call raises `NodeInactiveError` — probe `isactive(node)` first |
 
-The gate is why most components leave `activate`/`deactivate` as no-ops: those hooks carry only work beyond the gating — pre-rolling a device, flushing a buffer. `deactivate` goes one step further and cooperatively cancels any goals still in flight: each executing body sees the cancel signal and settles `CANCELED`, and a body that ignores it runs detached after a bounded wait, so a node bounced to `Inactive` stops working against state the orchestrator may have invalidated. The control surface, the parameter services, and `~/get_type_description` stay live throughout, so an orchestrator drives transitions and tunes parameters on an inactive node.
+The gate is why most components leave `activate`/`deactivate` as no-ops: those hooks carry only work beyond the gating — pre-rolling a device, flushing a buffer. `deactivate` goes one step further: it cooperatively cancels any goals still in flight, so a node bounced to `Inactive` stops working against state the orchestrator may have invalidated. Each executing body sees the cancel signal:
+
+- a body that honors it settles `CANCELED`;
+- a body that ignores it runs detached, after a bounded wait.
+
+The control surface, the parameter services, and `~/get_type_description` stay live throughout, so an orchestrator drives transitions and tunes parameters on an inactive node.
 
 Two ports sit outside the gate:
 
