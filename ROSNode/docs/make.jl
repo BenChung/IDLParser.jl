@@ -36,6 +36,9 @@ makedocs(;
         ],
         "Composition" => [
             "Components" => "composition/components.md",
+            "Parametric Components" => "composition/parametric.md",
+            "Component Lifecycle" => "composition/lifecycle.md",
+            "Containers & Dynamic Composition" => "composition/containers.md",
         ],
         "Interoperating with ROS 2" => "interop/ros2.md",
     ],

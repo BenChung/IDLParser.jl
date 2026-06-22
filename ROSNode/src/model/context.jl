@@ -986,6 +986,19 @@ end
 on_shutdown(f::Function, node) = on_shutdown(f, _ctx(node))
 
 """
+    deregister_on_shutdown!(ctx, f) -> nothing
+
+Remove a hook registered with [`on_shutdown`](@ref), matched by identity. Lets a node on a borrowed,
+long-lived Context (one loaded onto a composition container) drop its teardown hook when it closes, so
+the Context carries hooks only for its live nodes. Idempotent — a no-op when `f` is not registered.
+"""
+function deregister_on_shutdown!(ctx::Context, f)
+    @lock ctx._state_lock filter!(h -> h !== f, ctx._on_shutdown)
+    nothing
+end
+deregister_on_shutdown!(node, f) = deregister_on_shutdown!(_ctx(node), f)
+
+"""
     register_resource!(ctx, handle) -> handle
 
 Track a `close`-able handle (node, endpoint, timer) so the drain undeclares it
@@ -995,6 +1008,18 @@ list in reverse so dependents close before their dependencies.
 function register_resource!(ctx::Context, handle)
     @lock ctx._state_lock push!(ctx._resources, handle)
     handle
+end
+
+"""
+    deregister_resource!(ctx, handle) -> nothing
+
+Drop a handle tracked with `register_resource!`, matched by identity. Lets a closed node on a borrowed,
+long-lived Context (one unloaded from a composition container) release itself, so the Context's drain list
+holds only live resources. Idempotent — a no-op when `handle` is not tracked.
+"""
+function deregister_resource!(ctx::Context, handle)
+    @lock ctx._state_lock filter!(h -> h !== handle, ctx._resources)
+    nothing
 end
 
 """

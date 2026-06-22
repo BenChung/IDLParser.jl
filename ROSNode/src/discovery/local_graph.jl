@@ -16,26 +16,6 @@
 
 export local_graph, describe_graph
 
-# One declared port's wire endpoints under its resolved wire name `w`. `:timer` is not an
-# endpoint (empty); `:action` expands to five; every other kind is one. Each delegates to the
-# pattern's own descriptor — the shared identity source — so this never re-derives identity.
-function _port_descs(node, p::PortSpec, w::AbstractString)
-    if p.kind === :publisher
-        return EndpointDesc[_publisher_desc(node, w, p.msgtype)]
-    elseif p.kind === :subscription
-        return EndpointDesc[_subscription_desc(node, w, p.msgtype)]
-    elseif p.kind === :service
-        return EndpointDesc[_service_desc(node, w, p.msgtype)]
-    elseif p.kind === :action
-        return _action_descs(node, w, action_type(ActionTypeSupport(typeof(p.reaction))))
-    elseif p.kind === :timer
-        return EndpointDesc[]
-    else
-        @warn "node_endpoint_descs: port kind :$(p.kind) not enumerated" port = p.name
-        return EndpointDesc[]
-    end
-end
-
 # The endpoints every node declares for itself, independent of any composition: the presence
 # shell (derived from the SAME `_node_endpoint` the Node injects), `~/get_type_description`
 # (served by default, via the shared `_service_desc`), and — when the node carries a parameter
@@ -71,12 +51,12 @@ node_endpoint_descs(cn::ComponentNode) =
 # queue relies on: members in `order`, each member's ports in spec order, an action expanded
 # to its five in `_action_descs` order. Shared by `node_endpoint_descs(cn)` and the priming.
 function _ordered_member_descs(cn::ComponentNode, order::Vector{Symbol} = cn.order)
+    ms = cn.member_schemas                                            # the frozen per-member MemberSchema NT
     descs = EndpointDesc[]
     for nm in order
-        m  = cn.members[nm]
         wm = get(cn.wires, nm, Dict{Symbol, String}())
-        for p in mixin_spec(_base(typeof(m))).ports
-            append!(descs, _port_descs(cn.node, p, get(wm, p.name, _wire(p))))
+        for d in getfield(ms, nm).ports                              # the node's FROZEN descriptors
+            append!(descs, port_descs(d, cn.node, _wirename(d, wm)))  # (handles inline component(…) + rebound/remapped)
         end
     end
     descs
@@ -121,8 +101,9 @@ function _reconcile_local_graph!(node::Node, primed::Vector{String})
     # `Set{String}` (not bare `Set`) + the `::Entity` assert keep this type-stable: `node.entities`
     # is `Vector{Any}`, so a bare `Set(gen)` infers an `Any`-eltype generator and falls to the
     # dynamic widening path. The fixed element type + grounded `.lv_key` (a `String`) make every
-    # Set op monomorphic.
-    live = Set{String}((e::Entity).lv_key for e in (@lock node.lock copy(node.entities)))
+    # Set op monomorphic. Only OPEN entities count as backing — a primed key whose entity was closed
+    # (e.g. a partially-built member cleaned up on an aborted configure) is an orphan to drop.
+    live = Set{String}((e::Entity).lv_key for e in (@lock node.lock copy(node.entities)) if isopen(e))
     orphans = EndpointInfo[]
     @lock node.context.graph.lock for k in primed
         k in live && continue
@@ -141,7 +122,7 @@ end
 
 The endpoints this node declares for itself — its own `is_local` slice of the discovery
 graph (publishers, subscriptions, services, the node-presence shell, parameter services, …),
-each with its gid. The live counterpart of [`node_endpoint_descs`](@ref): a composed `@node`'s
+each with its gid. The live counterpart of [`node_endpoint_descs`](@ref): a composed node's
 members' ports are populated a-priori (the local graph is a static function of the plan),
 while imperative/dynamic endpoints appear as they are created. Reads the local half of the
 index directly, so it never includes a discovered remote.

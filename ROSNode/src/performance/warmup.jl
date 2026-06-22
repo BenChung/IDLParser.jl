@@ -22,7 +22,7 @@
 # constructor until the first message is guaranteed compiled.
 
 using PrecompileTools: @setup_workload, @compile_workload
-import PrecompileTools          # name needed for `@precompile_nodes`' GlobalRef to its `@compile_workload`
+import PrecompileTools          # name needed for the `precompile_node` bake's `PrecompileTools.@compile_workload`
 # Fixed primitive arrays (`float[3]`) generate as `SVector`; the default-message
 # builder detects them. Named explicitly because the module-wide `using` lands in a
 # file included after this one.
@@ -37,7 +37,11 @@ using StaticArrays: StaticArray
 # foreground inference of construction even when warm-up is off (the default). Nospecializing
 # makes the `warm()` call dynamic, so the thunk is inferred/compiled only if it actually runs
 # (on the background task, off the foreground), and not at all when the mode is `NoWarmup`.
-function _warmup!(policy::WarmupPolicy, @nospecialize(warm))
+# `@noinline` is load-bearing: this body is tiny and would otherwise inline into the endpoint
+# constructor, defeating the `@nospecialize` (the inlined site sees the concrete thunk type and,
+# unable to fold the runtime `policy.mode isa NoWarmup`, infers `warm()` → the whole `_warm_*`
+# chain — ~250ms of construction-time codegen for a node that disabled warm-up).
+@noinline function _warmup!(policy::WarmupPolicy, @nospecialize(warm))
     policy.mode isa NoWarmup && return nothing
     if policy.sync
         warm()

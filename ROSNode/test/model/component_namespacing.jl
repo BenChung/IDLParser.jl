@@ -1,10 +1,10 @@
-# Component layer §4.4/§7 — node-level parameter namespacing across a multi-mixin
-# `@node`, and dynamic `LoadNode`/`ros2 component` composition. LIVE: nodes run on a
+# Functor node API §4.4/§7 — node-level parameter namespacing across a multi-member
+# `node(…)`, and dynamic `LoadNode`/`ros2 component` composition. LIVE: nodes run on a
 # real Zenoh session (the suite's private router, `ROS_TEST_EP`) with `block=false`,
 # driven in-process. Proves: a composed node exposes one member-prefixed (`<member>.
-# <field>`) `ros2 param` surface; a single-member `@node` is still prefixed while a
-# mixin promoted to a node is not (§4.3); and a container hosts working
-# `~/_container/{load_node,unload_node,list_nodes}` services + the programmatic API.
+# <field>`) `ros2 param` surface; a single-member `node()` is still prefixed (§4.3);
+# and a container hosts working `~/_container/{load_node,unload_node,list_nodes}`
+# services + the programmatic API.
 #
 # Always run Zenoh tests under a hard force-kill: `timeout -k 5 120 julia …`.
 
@@ -13,9 +13,11 @@ using ROSNode: Context, Node, Subscription, ServiceClient, call, wait_for_servic
                CompositeParameterServer, ParameterServer,
                parameters, entities, get_parameters, set_parameters_atomically,
                describe_parameters, parameter_names, node_kind, node_kinds,
-               load_node, unload_node, list_nodes, container, add!
+               load_node, unload_node, list_nodes, container, add!,
+               node, component, publishes, hears, remap, member_schema, describe_wiring
 using Test
 
+const RNX = ROSNode
 const _EP = isdefined(Main, :ROS_TEST_EP) ? Main.ROS_TEST_EP :
             get(ENV, "ROS_TEST_EP", "tcp/localhost:7447")
 _cctx(f::Function) = Context(f; peers = [_EP], localhost_only = true)
@@ -24,61 +26,80 @@ const _RMSG = ROSNode.Interfaces.rcl_interfaces.msg
 const _RSRV = ROSNode.Interfaces.rcl_interfaces.srv
 const _CSRV = ROSNode.Interfaces.composition_interfaces.srv
 
-# Two param-bearing mixins (a shared `fps` field, to exercise prefixed disambiguation)
-# in a submodule, so their kinds register and schemas generate.
+# Two param-bearing members (a shared `fps` field, to exercise prefixed disambiguation),
+# defined in a submodule so their kinds register and schemas resolve at load.
 module _CompTypes
     using ROSNode
-    @mixin struct Cam; x::Int = 0; end
-    @param Cam fps::Int64 = 30 ∈ 1..120
-    @param Cam gain::Float64 = 1.0
+    import ROSNode: member_schema
 
-    @mixin struct Lid; y::Int = 0; end
-    @param Lid fps::Int64 = 10
-    @param Lid range::Float64 = 50.0
+    @parameters struct CamParams
+        fps::Int64    = 30 ∈ 1..120
+        gain::Float64 = 1.0
+    end
+    mutable struct Cam{Name} <: Component{Name}; x::Int; end
+    Cam{Name}() where {Name} = Cam{Name}(0)
+    member_schema(::Type{Cam}) = component(Cam, CamParams)
+
+    @parameters struct LidParams
+        fps::Int64     = 10
+        range::Float64 = 50.0
+    end
+    mutable struct Lid{Name} <: Component{Name}; y::Int; end
+    Lid{Name}() where {Name} = Lid{Name}(0)
+    member_schema(::Type{Lid}) = component(Lid, LidParams)
 end
 using ._CompTypes
 
-@node Rig = ["camera" => _CompTypes.Cam, "lidar" => _CompTypes.Lid]
-@node Box = ["camera" => _CompTypes.Cam]
+const Rig = node("camera" => _CompTypes.Cam, "lidar" => _CompTypes.Lid; name = "Rig")
+const Box = node("camera" => _CompTypes.Cam; name = "Box")
 
-# Port-bearing mixins for the §4.4 wire-topic remap + clobber tests (a vendored msg
+# Port-bearing members for the §4.4 wire-topic remap + clobber tests (a vendored msg
 # type fills the ports — content is irrelevant, only the wire names matter here).
 module _CompPorts
     using ROSNode
+    import ROSNode: member_schema
     const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
-    @mixin struct CamP; end
-    @publishes CamP image :: _T
-    @mixin struct LidP; end
-    @publishes LidP image :: _T
-    @mixin struct Fuse; end
-    @hears function left(node, m::Fuse, msg::_T) end
-    @hears function right(node, m::Fuse, msg::_T) end
+
+    mutable struct CamP{Name} <: Component{Name} end
+    member_schema(::Type{CamP}) = component(CamP, publishes(:image, _T))
+
+    mutable struct LidP{Name} <: Component{Name} end
+    member_schema(::Type{LidP}) = component(LidP, publishes(:image, _T))
+
+    _noop(node, m, msg) = nothing
+    mutable struct Fuse{Name} <: Component{Name} end
+    member_schema(::Type{Fuse}) =
+        component(Fuse, hears(:left, _T, _noop), hears(:right, _T, _noop))
 end
 using ._CompPorts
 
-# A publisher on a private `~/foo` and a `@hears foo` (relative) — the name-resolution
-# trap: `~/foo` resolves under the node FQN, bare `foo` under the namespace, so they
-# land on different topics. `describe_wiring` must make that split visible.
+# A publisher on a private `~/foo` and a `hears(:foo, …)` (relative) — the name-resolution
+# trap: `~/foo` resolves under the node FQN, bare `foo` under the namespace, so they land
+# on different topics. `describe_wiring` must make that split visible.
 module _CompWiring
     using ROSNode
+    import ROSNode: member_schema
     const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
-    @mixin struct Talk; end
-    @publishes Talk foo :: _T on "~/foo"
-    @mixin struct Listen; end
-    @hears function foo(node, m::Listen, msg::_T) end
+
+    mutable struct Talk{Name} <: Component{Name} end
+    member_schema(::Type{Talk}) = component(Talk, publishes(:foo, _T; on = "~/foo"))
+
+    _hearfoo(node, m, msg) = nothing
+    mutable struct Listen{Name} <: Component{Name} end
+    member_schema(::Type{Listen}) = component(Listen, hears(:foo, _T, _hearfoo))
 end
 using ._CompWiring
 
-@node Mismatch = ["talk" => _CompWiring.Talk, "listen" => _CompWiring.Listen]
+const Mismatch = node("talk" => _CompWiring.Talk, "listen" => _CompWiring.Listen; name = "Mismatch")
 
-@node TwoCam  = ["front" => _CompPorts.CamP{image => "front/image"},      # isolate the two outputs
-                 "rear"  => _CompPorts.CamP{image => "rear/image"}]
-@node Fused   = ["front" => _CompPorts.CamP{image => "front/image"},      # cross-member wiring:
-                 "fuse"  => _CompPorts.Fuse{left => front.image}]         #   fuse.left ⇐ front.image
-@node Collide = ["a" => _CompPorts.CamP, "b" => _CompPorts.LidP]          # both publish "image" ⇒ clobber
-@node Shared  = ["a" => _CompPorts.CamP, "b" => _CompPorts.LidP{image => "a/image"}]  # remap ⇒ no clobber
+const TwoCam  = node("front" => remap(_CompPorts.CamP, :image => "front/image"),   # isolate the two outputs
+                     "rear"  => remap(_CompPorts.CamP, :image => "rear/image"); name = "TwoCam")
+const Fused   = node("front" => remap(_CompPorts.CamP, :image => "front/image"),   # cross-member wiring:
+                     "fuse"  => remap(_CompPorts.Fuse, :left => (:front, :image)); name = "Fused")  # fuse.left ⇐ front.image
+const Collide = node("a" => _CompPorts.CamP, "b" => _CompPorts.LidP; name = "Collide")          # both publish "image" ⇒ clobber
+const Shared  = node("a" => _CompPorts.CamP, "b" => remap(_CompPorts.LidP, :image => "a/image"); name = "Shared")  # remap ⇒ no clobber
 
-@testset "component namespacing + composition (Zenoh session)" begin
+@testset "functor namespacing + composition (Zenoh session)" begin
 
     @testset "multi-member node-level parameter namespacing (§4.4)" begin
         _cctx() do ctx
@@ -105,32 +126,35 @@ using ._CompWiring
             # node-level member-namespaced view (§3.5/§4.4)
             @test parameters(rig).camera.fps == 60
             @test parameters(rig).lidar.range == 50.0
-            # mixin-local `parameters(node, m)` stays unprefixed
+            # member-local `parameters(node, m)` stays unprefixed
             @test parameters(rig, rig.members[:camera]).fps == 60
         end
     end
 
     @testset "prefixing tracks the construction path (§4.3)" begin
         _cctx() do ctx
-            # composed @node, single member ⇒ STILL prefixed
+            # composed node(), single member ⇒ STILL prefixed
             box = run(Box; ctx = ctx, name = "box", block = false)
             @test box.node.parameters isa CompositeParameterServer
             @test sort(string.(parameter_names(box.node.parameters))) ==
                   ["camera.fps", "camera.gain"]
-            # mixin promoted to a node ⇒ un-prefixed, mixin-local names
+            # bare-type promote `run(Cam)` ⇒ UN-prefixed flat ParameterServer (the @mixin `run(Mixin)`
+            # surface): a node that *is* one component exposes the component's own field names, not a
+            # member-prefixed composite. `flat=true` is the default for the type-level promote.
             cam = run(_CompTypes.Cam; ctx = ctx, name = "cam", block = false)
             @test cam.node.parameters isa ParameterServer
+            @test !(cam.node.parameters isa CompositeParameterServer)
             @test sort(string.(parameter_names(cam.node.parameters))) == ["fps", "gain"]
         end
     end
 
-    @testset "overrides: mixin-local applies to all; prefixed targets one (§4.3)" begin
+    @testset "overrides: member-local applies to all; prefixed targets one (§4.3)" begin
         _cctx() do ctx
             rig = run(Rig; ctx = ctx, name = "rig_ov", block = false,
                       overrides = (fps = 25, var"camera.fps" = 77))
             ps = rig.node.parameters
             @test get_parameters(ps, ["camera.fps"]) == [77]   # prefixed wins for camera
-            @test get_parameters(ps, ["lidar.fps"]) == [25]    # mixin-local hits lidar
+            @test get_parameters(ps, ["lidar.fps"]) == [25]    # member-local hits lidar
         end
     end
 
@@ -154,10 +178,10 @@ using ._CompWiring
     end
 
     @testset "kind registry (§7)" begin
+        # node(…; name=…) registers by default — the schema VALUE is the registered kind
         @test node_kind("Rig") === Rig
-        @test node_kind("Cam") === _CompTypes.Cam
         @test node_kind("nonesuch") === nothing
-        @test all(in(node_kinds()), ("Rig", "Box", "Cam", "Lid"))
+        @test all(in(node_kinds()), ("Rig", "Box"))
         # tolerate a namespaced plugin spelling by last segment
         @test ROSNode.resolve_node_kind("", "my_pkg::Rig") === Rig
     end
@@ -170,9 +194,9 @@ using ._CompWiring
             (cn1, uid1) = load_node(c, "", "Rig"; name = "lr")
             @test uid1 == 1
             @test endswith(String(cn1.node.fqn), "lr")
-            (cn2, uid2) = load_node(c, "", "Cam"; name = "lc", parameters = (fps = 5,))
+            (cn2, uid2) = load_node(c, "", "Box"; name = "lb", parameters = (var"camera.fps" = 5,))
             @test uid2 == 2
-            @test get_parameters(cn2.node.parameters, ["fps"]) == [5]
+            @test get_parameters(cn2.node.parameters, ["camera.fps"]) == [5]
             l = list_nodes(c)
             @test length(l) == 2 && first.(l) == [UInt64(1), UInt64(2)]
             @test unload_node(c, uid1)
@@ -222,21 +246,19 @@ using ._CompWiring
     end
 
     @testset "wire-topic remap + clobber (§4.4)" begin
-        # own-port string remap
-        w, remapped = ROSNode._resolve_wires(TwoCam)
-        @test w[:front][:image] == "front/image"
-        @test w[:rear][:image]  == "rear/image"
-        @test (:front, :image) in remapped
+        # node() resolves every member port's wire at schema-build; the resolved map +
+        # explicitly-remapped set are frozen on the schema (the functor _resolve_wires).
+        @test TwoCam.wires[:front][:image] == "front/image"
+        @test TwoCam.wires[:rear][:image]  == "rear/image"
+        @test (:front, :image) in TwoCam.remapped
         # cross-member ref resolves to the target's (remapped) wire
-        wf, _ = ROSNode._resolve_wires(Fused)
-        @test wf[:fuse][:left]   == "front/image"
-        @test wf[:front][:image] == "front/image"
-        # a remap naming a port the mixin doesn't declare is an error
-        @test_throws ErrorException ROSNode._resolve_wires(
-            ROSNode.NodeKind(:Bad, [ROSNode.NodeMember(:a, _CompPorts.CamP, Pair{Symbol, Any}[:nope => "x"])]))
+        @test Fused.wires[:fuse][:left]   == "front/image"
+        @test Fused.wires[:front][:image] == "front/image"
+        # a remap naming a port the member doesn't declare is an error at node()
+        @test_throws ErrorException node("a" => remap(_CompPorts.CamP, :nope => "x"))
 
         _cctx() do ctx
-            # two publishers on one resolved name, no remap ⇒ hard clobber error at assembly
+            # two publishers on one resolved name, no remap ⇒ hard clobber error at run() assembly
             @test_throws ErrorException run(Collide; ctx = ctx, name = "collide", block = false)
             # remapping one side resolves the clobber
             @test run(Shared; ctx = ctx, name = "shared", block = false) isa ROSNode.ComponentNode

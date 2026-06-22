@@ -470,7 +470,7 @@ Sealed abstract supertype selecting how an entity's dispatch chain is warmed —
 `mode` of a [`WarmupPolicy`](@ref), on a depth-versus-cost curve:
 
   - [`NoWarmup`](@ref) (`:off`) — no warm-up; the node default (warming is baked offline
-    by [`@precompile_nodes`](@ref) instead of run at construction).
+    by [`precompile_node`](@ref) instead of run at construction).
   - [`Precompile`](@ref) (`:precompile`) — a side-effect-free `precompile`-anchor of the
     dispatch chain.
   - [`Execute`](@ref) (`:execute`) — additionally run the handler once on a sample

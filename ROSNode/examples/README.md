@@ -22,15 +22,20 @@ imports interfaces by name (`@ros_import`); the second authors them in Julia (`@
 | `authored_service.jl`    | Service server + client       | `@ros_service function` → `example_interfaces/srv/AddTwoInts`   |
 | `authored_action.jl`     | Action server + client        | `@ros_action function` → `action_tutorials_interfaces/action/Fibonacci` |
 
-**Components** — author a whole *node* as a collection of mixins (see `DESIGN-COMPONENTS.md`):
+**Components** — author a whole *node* as a `node(…)` schema of member components (the functor
+API; see `PLAN-NODE-PLAN.md`, and `DESIGN-COMPONENTS.md` for the underlying concepts):
 
-| File           | Pattern                            | Shows                                                                                   |
-| -------------- | ---------------------------------- | --------------------------------------------------------------------------------------- |
-| `component.jl` | Node as a collection of `@mixin`s  | `@param` / `@publishes` / `@every` / inline `@serves`, DI via `@interface`/`@provides`/`requires`/`construct`, `@node` + `run` |
+| File           | Pattern                              | Shows                                                                                   |
+| -------------- | ------------------------------------ | --------------------------------------------------------------------------------------- |
+| `component.jl` | Node as a `node(…)` schema of components | `publishes`/`every` + inline `@service` authoring, `component`/`member_schema`, DI via `@interface`/`provides`/`requires`/`ctor`, `node(…; name=…)` + `run` + `container`/`load_node` |
+| `component_macro.jl` | The same node, authored with `@component` | `@component mutable struct … end` emitting the value API in one block (`@param`/`@provides`/`@publishes`/`@every`/`configure`); coexists with the raw API for the DI-consumer `Guard` |
 
-`component.jl` is self-contained (it authors its own types and runs the node plus a
-client in one process), so it needs no router — point `@context` at one only to reach
-other hosts.
+`component.jl` / `component_macro.jl` are self-contained (they author their own types and
+run the node plus a client in one process), so they need no router — point `@context` at
+one only to reach other hosts. The two are the same node: `component.jl` authors every
+component the long way; `component_macro.jl` shows the concise `@component` tier (provider
+`Sensor`) alongside the raw API (DI-consumer `Guard`, whose `@requires` form is a planned
+`@component` extension).
 
 ## Running
 

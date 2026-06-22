@@ -56,11 +56,11 @@ Construction performs these steps:
 `warmup` and `warmup_sync` set the node-default `WarmupPolicy` that pre-JITs the
 encode/decode dispatch chain for entities created on the node. **Default `:off`**: the
 deployment path is to bake the dispatch chain into the package image at precompile with
-[`@precompile_nodes`](@ref), which is paid once offline and — unlike the runtime warm — does
+[`precompile_node`](@ref), which is paid once offline and — unlike the runtime warm — does
 not spawn background compilation that contends with the node's own bring-up. Opt into a
 runtime warm (`:precompile`/`:execute`) for an un-precompiled node (REPL/script), a parametric
-mixin whose concrete instantiation `@precompile_nodes` can't bake, or a dynamic subscription's
-manifest replay.
+component whose concrete instantiation [`precompile_node`](@ref) can't bake, or a dynamic
+subscription's manifest replay.
 
 | Keyword | Accepted values | Effect |
 |---|---|---|

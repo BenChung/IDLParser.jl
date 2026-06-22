@@ -55,6 +55,9 @@ include("model/component/component.jl")
 include("model/component/run.jl")
 include("model/component/composition.jl")
 include("discovery/local_graph.jl")
+include("model/component/functor.jl")
+include("model/component/functor_authoring.jl")
+include("model/component/component_macro.jl")
 include("model/component/precompile.jl")
 # Last: the package warm-up bake runs its `@compile_workload` at include time, so it must follow
 # every function it exercises (the inert-session bring-up close reaches `unregister_local_subscription!`

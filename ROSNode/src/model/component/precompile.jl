@@ -1,50 +1,23 @@
-# Type-agnostic scaffolding precompile anchors. The non-endpoint component control flow —
-# assembly planning, the lifecycle fan-out, the run/teardown entry, the node-kind registry,
-# DI, and the load hook — is parameterised on `Entity`/`NodeKind`/`ComponentNode`/`Symbol`/
-# `Dict`, not on any user mixin type, so baking each specialisation once helps every node.
+# Type-agnostic scaffolding precompile anchors. The non-component-specific control flow — the
+# per-member lifecycle teardown fan-out, the teardown entry, the node-kind registry, entity
+# creation, and the load hook — is parameterised on `Entity`/`ComponentNode`/`NodeSchema`/`Symbol`/
+# `Dict`, not on any user component type, so baking each specialisation once helps every node.
 # These are bare `precompile` anchors (compile without running). `_component_precompile_specs`
 # is the single source for both the `@compile_workload` (which bakes them into ROSNode's
 # pkgimage) and the drift-guard test (which asserts each still resolves to a real method).
 #
-# Type-specific per-`(M, T)` handler/dispatch/codec leaves belong to the consumer: they are
-# warmed at node bring-up (`_warm_member_reactions!`) or baked into the user's own package by
-# `@precompile_nodes`.
+# Component-specific per-`(M, T)` handler/dispatch/codec leaves belong to the consumer: a node's
+# full first-`run` path is baked by `precompile_node(schema)` (the functor bake below, and the
+# consumer's own `@compile_workload precompile_node(...)`).
 
-# (callable, argtypes) pairs. The `Core.kwcall` entries target the *keyword* method of
-# `_assemble`/`load_node` — the real entry point (reached via `invokelatest` / the container
-# service) — not the positional method, which would read green while the kw path stays unbaked.
+# (callable, argtypes) pairs. The `Core.kwcall` entry targets the *keyword* method of `load_node`
+# — the real entry point (reached via the container service) — not the positional method, which
+# would read green while the kw path stays unbaked.
 function _component_precompile_specs()
     specs = Tuple{Any, Tuple}[
-        # assembly planning (the composed-`NodeKind` path)
-        (_members_plan,   (NodeKind,)),
-        (_resolve_di,     (Vector{NodeMember},)),
-        (_toposort,       (Vector{NodeMember}, Dict{Symbol, Vector{Symbol}})),
-        (_resolve_wires,  (NodeKind,)),
-        (_check_clobbers, (NodeKind, Node, Dict{Symbol, Dict{Symbol, String}}, Set{Tuple{Symbol, Symbol}})),
         # lifecycle fan-out (stops at the `Any` member dispatch — the user-code boundary)
-        (_member_materialize!, (ComponentNode, Symbol)),
-        (_member_configure!,   (ComponentNode, Symbol)),
-        (_member_activate!,    (ComponentNode, Symbol)),
-        (_member_cleanup!,     (ComponentNode, Symbol)),
-        (_members_on_error!,   (ComponentNode, Vector{Symbol})),
-        # run entry, over arg1 = the Context source × namespace variant × log-level variant.
-        # arg1 `Nothing` is the common path (`run(K; …)` opens+owns its own Context); `Context` is
-        # the caller-supplied one (`run(K; ctx=…)` / `load_node`). `K` is `@nospecialize`d in `_run`,
-        # so each anchor bakes the node-kind-agnostic MI. (`LogLevel` arg10 = `ros2 component load
-        # --log-level`; bare run = `Nothing`.) positional tail: …, log_level, warmup, warmup_sync, block
-        (_run, (Nothing, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
-        (_run, (Nothing, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
-        (_run, (Nothing, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
-        (_run, (Nothing, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
-        (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
-        (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, Nothing,  Symbol, Bool, Bool)),
-        (_run, (Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
-        (_run, (Context, NodeKind, String, String,  NamedTuple{(), Tuple{}}, Vector{String}, Bool, Bool, Bool, LogLevel, Symbol, Bool, Bool)),
-        # the public `run(k::NodeKind; …)` entry. `k` is `@nospecialize`d, so its kwarg body is ONE
-        # node-kind-agnostic MI — bake it here (abstract `NodeKind`, not per-`@node`, so we don't
-        # re-overspecialize the very entry we just collapsed). The per-kwarg-combination `Core.kwcall`
-        # sorter still JITs, but it is the cheap arg-reorder shell; the body + `_run`/`_assemble` are baked.
-        (Base.run, (NodeKind,)),
+        (_member_cleanup!,   (ComponentNode, Symbol)),
+        (_members_on_error!, (ComponentNode, Vector{Symbol})),
         (Base.close, (ComponentNode,)),
         (parameters, (ComponentNode,)),
         (entities,   (ComponentNode,)),
@@ -67,17 +40,11 @@ function _component_precompile_specs()
         # node-kind registry
         (node_kind,           (String,)),
         (node_kinds,          ()),
-        (register_node_kind!, (String, NodeKind)),
-        # the module load hook (the name-threaded `construct` default is parametric on the member
-        # name, so it is left to compile on first use rather than anchored generically here)
+        (register_node_kind!, (String, NodeSchema)),
+        # the module load hook
         (ros_init!,           (Module,)),
-        # kwarg entry points via `Core.kwcall` (the real entry, not the positional method).
-        # `_assemble` in both log-level variants; `load_node` with its actual keywords
-        # (`name`/`namespace`/`parameters`) — its `#load_node#` body delegates to `run`.
-        (Core.kwcall, (NamedTuple{(:managed, :autostart, :log_level, :warmup, :warmup_sync), Tuple{Bool, Bool, Nothing, Symbol, Bool}},
-                       typeof(_assemble), Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}})),
-        (Core.kwcall, (NamedTuple{(:managed, :autostart, :log_level, :warmup, :warmup_sync), Tuple{Bool, Bool, LogLevel, Symbol, Bool}},
-                       typeof(_assemble), Context, NodeKind, String, Nothing, NamedTuple{(), Tuple{}})),
+        # `load_node`'s kwarg entry (the real entry via the container service); its `#load_node#`
+        # body delegates to `run` (functor `run(::Type{M})` / `run(::NodeSchema)`).
         (Core.kwcall, (NamedTuple{(:name, :namespace, :parameters), Tuple{String, String, NamedTuple{(), Tuple{}}}},
                        typeof(load_node), Container, String, String)),
     ]
@@ -92,10 +59,34 @@ function _component_precompile_specs()
     return specs
 end
 
+# ── functor-node bake ───────────────────────────────────────────────────────────
+# The functor `run(::NodeSchema)` specializes per concrete schema type (no `@nospecialize` collapse),
+# but every GENERIC callee it pulls in — `node`/DI/wire resolution, the `@generated` carrier builders,
+# `construct_port` per port kind, the lifecycle fan-out, a-priori priming, and (via `precompile_schema`)
+# the spawned-task codec anchors — is shared with every consumer schema. We bake them once here through
+# a representative two-member node (pub + timer; sub + service) over vendored message/service types.
+# The per-consumer schema's own `run`/builder specialization is the consumer's `@compile_workload` job.
+const _PcTime   = Interfaces.builtin_interfaces.msg.Time
+const _PcGPReq  = Interfaces.rcl_interfaces.srv.GetParameters_Request
+const _PcGPResp = Interfaces.rcl_interfaces.srv.GetParameters_Response
+
+mutable struct _PcSource{Name} <: Component{Name} end
+_pc_tick(node, m::_PcSource) = nothing
+member_schema(::Type{_PcSource}) = component(_PcSource, publishes(:p, _PcTime), every(:t, 10, _pc_tick))
+
+mutable struct _PcSink{Name} <: Component{Name} end
+_pc_hear(node, m::_PcSink, msg) = nothing
+_pc_serve(node, m::_PcSink, req) = _default_msg(_PcGPResp)
+member_schema(::Type{_PcSink}) = component(_PcSink, hears(:p, _PcTime, _pc_hear), serves(:s, _PcGPReq, _pc_serve))
+
 @compile_workload begin
     for (f, ts) in _component_precompile_specs()
         precompile(f, ts)
     end
+    # Build a representative schema (compiles node()/component/_to_port/DI/wire for the String=>Type
+    # member form), then bake its full first-`run` path (run specialization + lifecycle fan-out on the
+    # concrete ComponentNode + spawned consume/serve/dispatch bodies) — the same call a consumer makes.
+    precompile_node(node("src" => _PcSource, "snk" => _PcSink; register = false))
     # Bring-up's first `maxlog=`-bearing log (the no-`home` hint) drives the *global*
     # `ConsoleLogger`'s `message_limits::Dict{Any,Int}` accounting — a Base path we can't
     # narrow but can bake by exercising it once here (captures the real MIs, incl. the

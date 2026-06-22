@@ -1,7 +1,7 @@
 # Dynamic composition — `ros2 component` parity. Two halves:
 #
 #   • a process-global **node-kind registry by name** (the `rclcpp_components_register_nodes`
-#     analog): `@node`/`@mixin` register their kind, so a name can be instantiated later;
+#     analog): `node(…; name=…)`/`@register_nodes` register a kind, so a name can be instantiated later;
 #   • a container's **`~/_container/{load_node,unload_node,list_nodes}` services** over the
 #     vendored `composition_interfaces` types, so `ros2 component load/unload/list` and the
 #     `ComposableNodeContainer` / `LoadComposableNodes` launch actions drive a running
@@ -11,11 +11,10 @@
 export register_node_kind!, node_kind, node_kinds, load_node, unload_node, list_nodes
 
 # ── the node-kind registry (rclcpp_components_register_nodes analog) ─────────────
-# Process-global name → kind. A string → kind map can't dispatch, so unlike the per-mixin
-# spec store this stays a runtime registry rather than module-local. `@mixin`/`@node`
-# register a kind via the dual path: immediately in the REPL/script case, and through
-# `ros_init!` (the load hook) for a precompiled package, where a top-level mutation of this
-# dict would not survive precompile.
+# Process-global name → kind. A string → kind map can't dispatch, so this stays a runtime
+# registry rather than module-local. `node(…; name=…)`/`@register_nodes` register a kind via
+# the dual path: immediately in the REPL/script case, and through `ros_init!` (the load hook)
+# for a precompiled package, where a top-level mutation of this dict would not survive precompile.
 
 const _NODE_KINDS = Dict{String, Any}()
 const _NODE_KINDS_LOCK = ReentrantLock()
@@ -29,9 +28,9 @@ instantiable by name, so a container's [`load_node`](@ref) (and the
 `~/_container/load_node` service behind `ros2 component load`) can build it from a load
 request.
 
-`K` is a `NodeKind` (from `@node N = […]`) or a `@mixin` type used directly as
-a node. `@node`/`@mixin` register a kind via the dual path that survives precompilation:
-immediately at module-body evaluation in the REPL/script/`Main` case, and through the
+`K` is a `NodeSchema` (from `node(…)`) or a component `Type` used directly as
+a node. `node(…; name=…)`/`@register_nodes` register a kind via the dual path that survives
+precompilation: immediately at module-body evaluation in the REPL/script/`Main` case, and through the
 module's load hook ([`ros_init!`](@ref)) for a precompiled package. The call is
 thread-safe (guarded by the registry lock), and a repeated `name` is last-writer-wins.
 """
@@ -41,9 +40,9 @@ function register_node_kind!(name::AbstractString, @nospecialize(K))
 end
 
 """
-    node_kind(name::AbstractString) -> Union{NodeKind, Type, Nothing}
+    node_kind(name::AbstractString) -> Union{NodeSchema, Type, Nothing}
 
-The node kind registered under `name` — the `NodeKind` or `@mixin` type passed
+The node kind registered under `name` — the `NodeSchema` or component `Type` passed
 to [`register_node_kind!`](@ref) — or `nothing` when no kind carries that name.
 Thread-safe (guarded by the registry lock).
 
@@ -84,7 +83,6 @@ function resolve_node_kind(package_name::AbstractString, plugin_name::AbstractSt
 end
 
 # The default node name for a kind when a load request leaves `node_name` empty.
-_kind_default_name(k::NodeKind) = String(k.name)
 _kind_default_name(::Type{M}) where {M} = _default_name(M)
 
 # ── container loaded-set bookkeeping ─────────────────────────────────────────────
@@ -101,8 +99,8 @@ function _track_loaded!(c::Container, cn::ComponentNode)
 end
 
 # Wire `Parameter[]` from a load request into a `run` `overrides` NamedTuple. Names
-# may be mixin-local (`fps`) or member-prefixed (`camera.fps`) — `_member_overrides`
-# (run.jl) accepts both.
+# may be un-prefixed (`fps`) or member-prefixed (`camera.fps`) — `_filter_overrides`
+# (functor.jl) accepts both.
 function _overrides_from_wire(params)
     isempty(params) && return (;)
     return (; (Symbol(p.name) => _from_param_value(p.value) for p in params)...)
@@ -128,18 +126,18 @@ Resolution matches `plugin_name` against the process-global registry in order:
 
 Each keyword defaults from the kind and Context; pass either to override:
 
-- `name` — the kind's name (the `@node` name, or the mixin type's snake-cased name);
+- `name` — the kind's name (the `node(…; name=…)` name, or the component type's snake-cased name);
 - `namespace` — the Context's namespace.
 
 `parameters` is a `run` `overrides` NamedTuple, taking two key forms:
 
 | Key form        | Scope                                                        | Example          |
 |:----------------|:-------------------------------------------------------------|:-----------------|
-| mixin-local     | every member that declares it                                | `fps`            |
-| member-prefixed | one member, winning over the mixin-local form                | `var"camera.fps"` |
+| un-prefixed     | every member that declares it                                | `fps`            |
+| member-prefixed | one member, winning over the un-prefixed form               | `var"camera.fps"` |
 
-The prefix is the member's name within the node — a `@node` member's declared name, or
-the snake-cased mixin type for a mixin loaded directly as a node — independent of the
+The prefix is the member's name within the node — a `node(…)` member's declared name, or
+the snake-cased component type for a component loaded directly as a node — independent of the
 node instance `name`.
 
 The node is built by `run(K; ctx = c.ctx, block = false, …)` on the container's shared
@@ -165,14 +163,15 @@ end
 """
 function load_node(c::Container, package_name::AbstractString, plugin_name::AbstractString;
                    name::AbstractString = "", namespace::AbstractString = "",
-                   parameters::NamedTuple = (;))
+                   parameters::NamedTuple = (;), overrides::NamedTuple = (;))
     K = resolve_node_kind(package_name, plugin_name)
     K === nothing &&
         throw(ArgumentError("load_node: no component `$(plugin_name)` registered" *
                             (isempty(package_name) ? "" : " (package `$(package_name)`)")))
     nm = isempty(name) ? _kind_default_name(K) : name
     ns = isempty(namespace) ? nothing : namespace
-    cn = run(K; ctx = c.ctx, block = false, name = nm, namespace = ns, overrides = parameters)
+    ov = isempty(overrides) ? parameters : overrides   # `overrides=` (run/add!/container name) aliases `parameters=`
+    cn = run(K; ctx = c.ctx, block = false, name = nm, namespace = ns, overrides = ov)
     return (cn, _track_loaded!(c, cn))
 end
 
@@ -270,7 +269,7 @@ function _wire_container_services!(c::Container)
         if !isempty(req.remap_rules)
             return _COMP_SRV.LoadNode_Response(; success = false,
                 error_message = "remap_rules not supported (remap wiring is a follow-up); " *
-                    "load without remaps or remap at the @node member (`Mixin{port => target}`)",
+                    "load without remaps or remap at the node member (`remap(M, port => target)`)",
                 full_node_name = "", unique_id = UInt64(0))
         end
         local cn = nothing

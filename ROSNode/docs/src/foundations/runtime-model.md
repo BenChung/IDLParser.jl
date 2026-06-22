@@ -108,6 +108,7 @@ describe_graph
 node_endpoint_descs
 resolve_name
 on_shutdown
+deregister_on_shutdown!
 request_shutdown
 is_shutdown
 next_entity_id!

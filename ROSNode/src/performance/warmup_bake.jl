@@ -27,8 +27,8 @@
         # The six standard parameter services + /parameter_events ride every node that
         # calls `wire_parameter_services!`, and their request/response codecs are over
         # fixed `rcl_interfaces` types — so bake that shared codec layer once here rather
-        # than re-JITing it at the first node with parameters. The per-mixin `ParameterServer{P_M}`
-        # service *construction* is schema-specific and stays `@precompile_nodes`' job.
+        # than re-JITing it at the first node with parameters. The per-member `ParameterServer{P_M}`
+        # service *construction* is schema-specific and stays `precompile_node`'s job.
         let RCL = Interfaces.rcl_interfaces.srv
             for (ReqT, RespT) in ((RCL.DescribeParameters_Request,        RCL.DescribeParameters_Response),
                                   (RCL.GetParameterTypes_Request,         RCL.GetParameterTypes_Response),
@@ -149,13 +149,13 @@
         # Bring-up bake (the "inert session"): `Context`/`Node`/`make_entity`/discovery are ROSNode
         # ops on ROSNode/Zenoh types — consumer-AGNOSTIC (`make_entity` takes `Union{TypeInfo,
         # Nothing}`, NOT the message type), so they ride ROSNode's OWN image and cover every node;
-        # a consumer's `@precompile_nodes` can't cache them (it caches only consumer-owned-type MIs).
+        # a consumer's `precompile_node` can't cache them (it caches only consumer-owned-type MIs).
         # This dynamic bring-up resists frame-by-frame `precompile` (the LAUNCH lesson — it needs
         # EXECUTION), so run a probe node on an inert no-connect session and let inference cache the
         # path (Context ctor + `_register_*` + Node + `~/get_type_description` + `make_entity` per
         # kind + the liveliness consumer). Synchronous `close` drain. Best-effort — a sandbox that
         # can't open a session still builds. (The per-message-type `_make_publisher`/`_make_service`
-        # construction stays the consumer's `@precompile_nodes` job — those ARE consumer-typed.)
+        # construction stays the consumer's `precompile_node` job — those ARE consumer-typed.)
         try
             # Open the probe Context the SAME way `run` does (`config=nothing` + `localhost_only`,
             # peers a `Vector{String}`), so this execution bakes the EXACT runtime `Context` MI —
@@ -170,11 +170,11 @@
             close(pctx)
         catch
         end
-        # The composed-`@node` façade wiring is non-parametric — `CompositeParameterServer`
+        # The composed-node façade wiring is non-parametric — `CompositeParameterServer`
         # holds its members in a runtime field, not a type parameter — so its construction +
         # six-service wiring + `/parameter_events` aggregation is one specialisation shared by
         # every composed node. Bake it here rather than re-JITing the whole wiring at the first
-        # composed node's `run` (the per-mixin `ParameterServer{P}` form stays per-schema).
+        # composed node's `run` (the per-member `ParameterServer{P}` form stays per-schema).
         precompile(CompositeParameterServer, (Node, Vector{Pair{Symbol, ParameterServer}}))
         precompile(wire_parameter_services!, (CompositeParameterServer,))
         precompile(_wire_composite_events!,  (CompositeParameterServer,))

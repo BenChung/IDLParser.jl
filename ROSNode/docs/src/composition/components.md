@@ -1,24 +1,26 @@
 # Components
 
-A component is a node authored as a collection of `@mixin`s — each a cohesive chunk of private state, the entities authored onto it, and its own lifecycle. Where the other pages wire a node imperatively (open a context, create a `Node`, attach a publisher here, a service there), a component assembles the node from these chunks and runs it.
+A component is a node authored as a collection of cohesive chunks — each a typed struct of private state, the entities authored onto it, and its own lifecycle. Where the other pages wire a node imperatively (open a context, create a `Node`, attach a publisher here, a service there), a component assembles the node from these chunks and runs it.
 
-This page assembles a `Vehicle` node from two mixins. A `Sensor` publishes telemetry on a timer and provides a battery reading; a `Guard` requires that reading and serves a "safe to fly?" query. `@node` composes them; `run` brings the node up. The full example lives in `examples/component.jl`.
+The assembly is a **schema value**. The value combinators `publishes`/`every`/`serves`/`hears`/`runs`/`uses` author the entities; `component(State, Params, ports…; provides=/requires=/ctor=)` ties them to a state type through the `member_schema` trait; and `node("name" => State, …)` composes the members — resolving dependency injection once — into one runnable `NodeSchema`. `run(schema)` brings the node up.
+
+This page assembles a `Vehicle` node from two components. A `Sensor` publishes telemetry on a timer and provides a battery reading; a `Guard` requires that reading and serves a "safe to fly?" query. `node` composes them; `run` brings the node up. The full example lives in `examples/component.jl`, and `examples/component_macro.jl` authors the same node with the [`@component`](@ref) macro.
 
 !!! warning "`import` the framework generics — a bare `using` silently shadows them"
-    The lifecycle hooks (`configure`, `activate`, `deactivate`, `cleanup`, `on_error`) and the assembly generics (`construct`, `requires`) are **ROSNode functions you add methods to**. Bring them in with `import`, not plain `using`:
+    The lifecycle hooks (`configure`, `activate`, `deactivate`, `cleanup`, `on_error`) and the `member_schema` trait are **ROSNode functions you add methods to**. Bring them in with `import`, not plain `using`:
 
     ```julia
     using ROSNode
-    import ROSNode: configure, cleanup, construct, requires   # the generics you extend
+    import ROSNode: configure, cleanup, member_schema   # the generics you extend
     ```
 
-    Under a bare `using ROSNode`, a definition like `configure(node, m::MyMixin) = …` creates a **new local `configure`** that shadows ROSNode's. Your method is never called: the framework dispatches its own generic, runs the default no-op, and there is **no error or warning** — the node simply comes up without your setup. (Equivalently, qualify the name at the definition: `ROSNode.configure(node, m::MyMixin) = …`.)
+    Under a bare `using ROSNode`, a definition like `configure(node, m::Sensor) = …` creates a **new local `configure`** that shadows ROSNode's. Your method is never called: the framework dispatches its own generic, runs the default no-op, and there is **no error or warning** — the node simply comes up without your setup. (Equivalently, qualify the name at the definition: `ROSNode.configure(node, m::Sensor) = …`.)
 
-    Members authored by the macros — `@hears`/`@serves`/`@every`/`@runs`/`@uses` reactions and `@param`/`@provides`/`@interface` — are macro-emitted and need no import.
+    Reaction handlers (`tick`, `safe`) are fresh functions, so they need no import. The [`@component`](@ref) macro emits its `member_schema` and lifecycle methods as `ROSNode.…` for you, so a component authored entirely with the macro needs no import either.
 
-## The mixin — state plus the entities authored onto it
+## The component — state plus the entities authored onto it
 
-The mixins and their authored types live in a module that names the ROS package the inline-authored service belongs to; the message type is authored in its own package module. `run` and the ground-station client see them through `Drone.*` and `Msgs.Telemetry`:
+The components and their authored types live in a module that names the ROS package the inline-authored service belongs to; the message type is authored in its own package module. `run` and the ground-station client see them through `Drone.*` and `Msgs.Telemetry`:
 
 ```julia
 module Msgs
@@ -34,107 +36,160 @@ module Drone
     using ROSNode
     using ..Msgs: Telemetry
     @ros_package "drone"            # names the inline-authored service type below
-    import ROSNode: configure, requires, construct   # the generics this module extends
-    # ── mixins authored below ──
+    import ROSNode: configure, member_schema   # the generics this module extends
+    # ── components authored below ──
 end
 ```
 
-`@mixin` declares one chunk. The struct holds private state; entities attach to the mixin type itself, keeping the struct state-only:
+A component's state is a `mutable struct` parameterised by its member-path `Name` and subtyping `Component{Name}`. The struct holds only private state; the entities ride the schema, not the struct. A zero-argument ctor `S{Name}()` builds it with no dependencies — the default the framework calls when nothing is injected:
 
 ```julia
-@mixin struct Sensor
-    level::Float64 = 100.0          # private state (simulated battery %)
+mutable struct Sensor{Name} <: Component{Name}
+    level::Float64                          # private state (simulated battery %)
+end
+Sensor{Name}() where {Name} = Sensor{Name}(100.0)
+```
+
+A `@parameters` struct declares the component's live parameters, read through `parameters(node, s)` and driveable from the [parameter](../communication/parameters.md) services. The `∈ 1..50` constraint reuses the parameter schema grammar:
+
+```julia
+@parameters struct SensorParams
+    rate::Int64 = 5 ∈ 1..50                 # Hz — read live via parameters(node, s).rate
 end
 ```
 
-A `@param` attaches a live parameter, read through `parameters(node, s)` and driveable from the [parameter](../communication/parameters.md) services. The `∈ 1..50` constraint reuses the parameter schema grammar:
+Reactions and lifecycle hooks are **node-first**: they take `(node, m, …)`, where `m` is the component instance. The two reflective accessors take both — `parameters(node, s)` returns the current, type-stable parameter snapshot, and `entities(node, s)` returns the materialised entity handles. The member's path is a constant on its type, so `parameters(node, s).rate` and `entities(node, s).telemetry` are ordinary typed field loads off the node's carriers.
+
+`configure` is a lifecycle hook — a plain method run at startup; the [Component Lifecycle](lifecycle.md) page covers the full set. A reaction handler is an ordinary function dispatched on the component base:
 
 ```julia
-@param Sensor rate::Int64 = 5 ∈ 1..50      # Hz — read live via parameters(node, s).rate
-```
+configure(node, s::Sensor) = @info "Sensor up" rate = parameters(node, s).rate
 
-A `@publishes` declares a publisher on the mixin. The `~/` prefix makes the topic node-private, so `~/telemetry` resolves against the node's name to `/vehicle/telemetry`. Drive the publisher through `entities(node, s)` — see [Topics](../communication/topics.md) for the publish surface:
-
-```julia
-@publishes Sensor telemetry :: Telemetry on "~/telemetry"   # node-private ⇒ /vehicle/telemetry
-```
-
-Reactions and lifecycle hooks are **node-first**: they take `(node, m, …)`, where `m` is the mixin instance. The two reflective accessors take both — `parameters(node, s)` returns the current, type-stable parameter snapshot, and `entities(node, s)` returns the materialised entity handles. The mixin's path is a constant on its type, so `parameters(node, s).rate` and `entities(node, s).telemetry` are ordinary typed field loads off the node's carriers.
-
-A `@every` declares a timer. `:rate` binds its frequency to the `rate` parameter, in Hz. The timer fires only while the node is Active:
-
-```julia
-@every :rate function tick(node, s::Sensor)
+function tick(node, s::Sensor)              # fires at `rate` Hz, only while Active
     s.level = max(0.0, s.level - 1.0)       # drain a little each tick
     publish(entities(node, s).telemetry, Telemetry(battery = s.level, altitude = 12.0))
 end
 ```
 
-## Inline-authored entities
+## The schema — `member_schema` and the value combinators
 
-A `@serves` authors a service straight from a function signature. The arguments after the mixin are the request fields; the `@NamedTuple` return type is the response. The macro generates the `srv` type from that signature. See [Services](../communication/services.md) for the service model:
+`member_schema(::Type{S})` is the trait carrying the component's schema. It is defined on the **bare base** `S` (never a `S{Name}` instantiation), and `component(State, Params, ports…)` ties the state and parameter types to the authored ports:
+
+- `publishes(:name, T; on)` — a publisher port carrying message type `T`.
+- `hears(:name, T, handler; on)` — a subscription dispatching `handler` per message.
+- `serves(:name, ReqType, handler; on)` — a service over a request type.
+- `every(:name, rate, handler)` — a timer; `rate` is a frequency in Hz or a parameter `Symbol` to bind it live.
+- `runs(:name, Action, exec; on)` — an action server over a pre-authored action type.
+- [`uses(:name, marker; on)`](@ref uses) — a persistent service/action **client** port.
+
+A port's `on` clause sets its wire name; with none, the wire defaults to the port/reaction name. The `~/` prefix makes a topic node-private, so `~/telemetry` resolves against the node's name to `/vehicle/telemetry`. `every(:tick, :rate, tick)` binds the timer's frequency to the `rate` parameter:
 
 ```julia
-@serves "~/safe_to_fly" function safe(node, g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
+member_schema(::Type{Sensor}) = component(Sensor, SensorParams,
+    publishes(:telemetry, Telemetry; on = "~/telemetry"),   # node-private ⇒ /vehicle/telemetry
+    every(:tick, :rate, tick);
+    provides = (BatterySource,))
+```
+
+The `provides = (BatterySource,)` keyword is the dependency-injection evidence covered below.
+
+## Inline-authored entities
+
+A bare `serves`/`hears` wires a **pre-authored** request or message type to a handler. [`@service`](@ref) instead authors the ROS service **type** and the handler in one place: the arguments after `(node, m)` are the request fields, and the `@NamedTuple` return type is the response. The macro generates `f_Request`/`f_Response` from that signature and registers them. See [Services](../communication/services.md) for the service model:
+
+```julia
+@service "~/safe_to_fly" function safe(node, g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
     b = battery(g.battery_src)              # reads the Sensor through the interface
     (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
 end
 ```
 
-The leading string `"~/safe_to_fly"` names the service; the handler keeps the function name `safe`.
+The leading string `"~/safe_to_fly"` names the service wire; the handler keeps the function name `safe`. The `safe` marker drops straight into `component(…)` as a port — `component` converts a bare `@service`/`@action` handler into its descriptor automatically:
 
-## Dependency injection between mixins
+```julia
+member_schema(::Type{Guard}) = component(Guard, GuardParams, safe;
+    requires = (BatterySource,), ctor = make_guard)
+```
+
+[`@action`](@ref) authors an action server the same way, deriving the Goal/Result/Feedback types from the signature and a `FeedbackSink` parameter. Drop down a tier with `serves(:other, safe; on)` to reuse the same handler under another name, or `serves(:n, safe_Request, h; on)` to wire a different handler to the authored type.
+
+## Dependency injection between components
 
 `Guard` needs a battery reading that a sibling owns. It asks for that capability by interface, and the framework injects a sibling that provides it.
 
-An `@interface` names a capability — the generic functions a provider must define:
+An [`@interface`](@ref) names a capability — the generic functions a provider must define:
 
 ```julia
 @interface BatterySource  battery(_)::Float64
 ```
 
-`Sensor` provides it by backing the contract method and declaring the evidence with `@provides`:
+`Sensor` provides it by backing the contract method and listing the interface in its `provides=`:
 
 ```julia
 battery(s::Sensor) = s.level                # satisfy the BatterySource contract
-@provides Sensor BatterySource
+# … provides = (BatterySource,) in Sensor's component(…) above
 ```
 
-`Guard` declares the need with `requires`, and receives the resolved provider in its `construct` method. The injected provider lands in a type-parameter field — its concrete type is fixed per composition (a real `Sensor` here, a mock in a test rig), so reactions read it type-stably:
+Provision is Holy-trait evidence — a `provides=` listing (equivalently a [`@provides`](@ref) / [`provides`](@ref) declaration), resolved against need rather than by subtyping. A consumer declares the matching need in `requires=` and receives the resolved provider through its constructor. `Guard` holds that provider in a type parameter so reads of it are type-stable, and supplies a constructor that places its own member name:
 
 ```julia
-@mixin struct Guard{Name, B} <: Component{Name}
+mutable struct Guard{Name, B} <: Component{Name}
     battery_src::B                          # the injected sibling provider
 end
-requires(::Type{Guard}) = (BatterySource,)
-construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} =      # injected ⇒ Guard{name,Sensor}
-    Guard{Name, typeof(src)}(battery_src = src)
-@param Guard min_battery::Float64 = 20.0
+@parameters struct GuardParams
+    min_battery::Float64 = 20.0
+end
+make_guard(node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
 ```
 
-A parametric mixin writes its own `Name` parameter and the `<: Component{Name}` clause in full (the macro injects them only for a plain, non-parametric struct like `Sensor`). `Name` is the member's path; `construct` threads it as a `Val{Name}` and returns the concrete instantiation.
+The `requires = (BatterySource,)` plus `ctor = make_guard` in `Guard`'s `member_schema` above wire the need to the constructor. The single dependency arrives as `src`, fixing the member's type to `Guard{:guard, Sensor{:sensor}}`; the handler reads it through the interface — `battery(g.battery_src)` in the `safe` service. [Parametric Components](parametric.md) covers the constructor contract in full, injecting a mock provider in tests, and running a dependent component standalone.
 
-`construct` dispatches on the mixin being built — the bare base `Guard`, which covers every `Guard{Name, B}`; reactions annotate the base the same way (`safe(node, g::Guard, …)`). The dependency is used through its interface method — `battery(g.battery_src)` in the service handler above. Omitting a zero-dep `construct` makes the dependency required: the mixin loads only composed in a `@node`. Providing one makes it optional — a zero-dep `construct(::Type{Guard}, node, ::Val{Name}) where {Name} = Guard{Name, …}(battery_src = …)` picks a default battery source (your own null-object stand-in that answers `battery`) so `run(Guard)` works standalone.
+## The `@component` macro — the same component in one block
 
-`requires` and `construct` are two of the ROSNode generics you extend, so they need the `import` (or a qualified `ROSNode.construct(…) = …`) from the warning at the top of the page — a bare `using`-shadowed definition is silently never called.
+[`@component`](@ref) is the concise authoring tier: it emits the whole value API — the struct, the zero-arg ctor, the `@parameters` struct, the reaction/hook methods, and `member_schema` — from one `mutable struct` block. A struct-body edit re-runs the whole block and re-keys everything together (Revise-friendlier than the separate definitions). It is sugar over `component`/`node`; the raw combinators remain the primitive, and the two coexist in one `node`.
 
-`configure` is a lifecycle hook — a plain method run at startup; the lifecycle section below covers the full set:
+The block uses inline directives:
+
+- `field = default` — a struct field with the default the zero-arg ctor uses.
+- `@param x::T = d ∈ lo..hi` — a parameter; the macro collects these into an emitted `@parameters struct`.
+- `@provides Iface` — interface(s) the component provides.
+- `@publishes out::T on "~/wire"` — a publisher port (the wire clause **trails** the declaration).
+- `@hears function h(node, m, msg::T) … end` — a subscription port plus its handler (inline-only).
+- `@every :rate function tick(node, m) … end` — a timer port plus its handler (`rate` = Hz or a parameter `Symbol`; inline-only).
+- `@service "~/s" function f(node, m, x::X)::@NamedTuple{…} … end` — inline service authoring.
+- `configure(node, m) = …` — lifecycle hooks live in the block too.
+
+A bare `m` argument is annotated `m::Sensor` for you, so reaction bodies stay fully typed. The handler directives `@hears`/`@service`/`@action` take a **leading** `"wire"` string, while `@publishes` takes the **trailing** `on "wire"` form — the split follows the name source.
 
 ```julia
-configure(node, s::Sensor) = @info "Sensor up" rate = parameters(node, s).rate
+@component mutable struct Sensor{Name} <: Component{Name}
+    level::Float64 = 100.0                              # private state (simulated battery %)
+    @param rate::Int64 = 5 ∈ 1..50                      # Hz — read live; driveable by `ros2 param`
+    @provides BatterySource                             # satisfies the BatterySource contract
+    @publishes telemetry::Telemetry on "~/telemetry"    # node-private ⇒ /vehicle/telemetry
+    @every :rate function tick(node, m)                 # fires at the live `rate` Hz, only while Active
+        m.level = max(0.0, m.level - 1.0)               # drain a little each tick
+        publish(entities(node, m).telemetry, Telemetry(battery = m.level, altitude = 12.0))
+    end
+    configure(node, m) = @info "Sensor up" rate = parameters(node, m).rate
+end
+# A non-node-first interface impl lives OUTSIDE the block (a struct edit would orphan it):
+battery(s::Sensor) = s.level
 ```
+
+`@component` v1 covers the DI-free common case plus `@provides`. A DI **consumer** (`@requires` + an injected ctor, see [Parametric Components](parametric.md)) or a client port stays on the raw `component(M, …; requires=(I,), ctor=f)` / `uses(:n, marker)` API — `@requires`/`@uses` in the block error clearly, pointing at the raw form. The two compose seamlessly in the same `node`: the `Sensor` above and a raw-API `Guard` assemble into one node unchanged.
 
 ## Assembling and running the node
 
-`@node` assembles the node from a list of members. Each `"name" => Mixin` pair gives the mixin a namespace within the node:
+[`node`](@ref) assembles the node kind from a list of members. Each `"name" => State` pair gives the component a namespace within the node, and DI is resolved once, here:
 
 ```julia
-@node Vehicle = ["sensor" => Drone.Sensor, "guard" => Drone.Guard]
+const Vehicle = node("sensor" => Drone.Sensor, "guard" => Drone.Guard; name = "Vehicle")
 ```
 
-`Guard` requires `BatterySource` and `Sensor` provides it, so the framework toposorts the members by dependency and injects the `Sensor` into the `Guard`. A dependency configures before its dependent and tears down after.
+`Guard` requires `BatterySource` and `Sensor` provides it, so the framework toposorts the members by dependency and injects the `Sensor` into the `Guard`. A dependency configures before its dependent and tears down after. `name = "Vehicle"` registers the kind in the process-global registry, so a container can load it by name (see [Containers & Dynamic Composition](containers.md)); the resolved member order and dependency edges are frozen into the returned `NodeSchema`'s type, so construction is type-stable.
 
-`run` brings the node up. `block = false` returns so you can drive the node from the calling code; passing `ctx` runs it on an existing context, and dropping `ctx` runs it standalone in its own process. `overrides` sets each mixin's parameters by their local names:
+`run` brings the node up. `block = false` returns so you can drive the node from the calling code; passing `ctx` runs it on an existing context, and dropping `ctx` runs it standalone in its own process. `overrides` sets each member's parameters by their local names:
 
 ```julia
 @context() do ctx
@@ -158,19 +213,19 @@ configure(node, s::Sensor) = @info "Sensor up" rate = parameters(node, s).rate
 end
 ```
 
-The ground station is a plain node subscribing to `/vehicle/telemetry`. The vehicle publishes telemetry at 5 Hz, and the guard answers the `~/safe_to_fly` query its `@serves` authored.
+The ground station is a plain node subscribing to `/vehicle/telemetry`. The vehicle publishes telemetry at 5 Hz, and the guard answers the `~/safe_to_fly` query its `@service` authored.
 
 ## Inspecting the resolved wiring
 
-A port's **wire name** defaults to the identifier you wrote:
+A port's **wire name** defaults to the name you wrote:
 
-- `@hears`, `@serves`, `@every`, `@runs` — the reaction's name.
-- `@publishes`, `@uses` — the declared port name.
+- `hears`, `serves`, `every`, `runs` — the reaction's name.
+- `publishes`, `uses` — the declared port name.
 
-An `on "topic"` clause or a [`@node`](@ref) remap overrides that default. The wire name then resolves against the node's namespace to the topic on the wire — a relative `foo` on node `/vehicle` lands on `/foo`:
+An `on "topic"` clause or a [`node`](@ref) `remap` overrides that default. The wire name then resolves against the node's namespace to the topic on the wire — a relative `foo` on node `/vehicle` lands on `/foo`:
 
 ```
-@hears function foo   →   wire name  foo   →   topic  /foo
+hears(:foo, …)   →   wire name  foo   →   topic  /foo
 ```
 
 `describe_wiring` prints each member's ports and the fully-qualified ROS name each resolves to — the quick way to confirm two ports share a name before chasing a silent non-delivery:
@@ -188,7 +243,7 @@ wiring of /vehicle — 2 member(s)
     safe              srv   ~/safe_to_fly          → /vehicle/safe_to_fly
 ```
 
-The middle column is each port's authored wire name (after any [`@node`](@ref) remap), the arrow its resolved name. A name resolves against the node by the [standard ROS rules](https://design.ros2.org/articles/topic_and_service_names.html):
+The middle column is each port's authored wire name (after any `remap`), the arrow its resolved name. A name resolves against the node by the [standard ROS rules](https://design.ros2.org/articles/topic_and_service_names.html):
 
 - a relative name (`foo`) resolves under the node's namespace — `/foo`;
 - a private name (`~/foo`) resolves under the node's own name — `/vehicle/foo`;
@@ -196,107 +251,23 @@ The middle column is each port's authored wire name (after any [`@node`](@ref) r
 
 The resolved name is what the entity uses on the wire as a Zenoh key expression; see [Addressing & Key Expressions](../foundations/addressing.md) for the keyexpr it becomes.
 
-Two ports connect only when they resolve to the same name. A `@hears function foo` (relative `foo`) and a `@publishes … on "~/foo"` (private) therefore land on different topics — `describe_wiring` shows the split as `→ /foo` against `→ /vehicle/foo`.
+Two ports connect only when they resolve to the same name. A `hears(:foo, …)` (relative `foo`) and a `publishes(:p, …; on = "~/foo")` (private) therefore land on different topics — `describe_wiring` shows the split as `→ /foo` against `→ /vehicle/foo`. A `node` call also errors if two same-channel outputs collide on one name unless one was explicitly remapped — `remap(Sensor, :telemetry => "…")` resolves the clash.
 
-## Lifecycle — acquiring and releasing state
+## Lifecycle
 
-A mixin whose state wraps an external resource — a device, a file, a connection — authors the setup and the matching release as lifecycle hooks. The five hooks are plain methods on the mixin type, each defaulting to a no-op:
+Every component has a lifecycle: the `configure`/`activate`/`deactivate`/`cleanup`/`on_error` hooks, run **unmanaged** (brought straight up at `run`) or **managed** (driven through the `lifecycle_msgs` control surface, with the `isactive` gate holding dispatch until `Active`). A component that wraps an external resource authors its setup in `configure` and the matching release in `cleanup`. [Component Lifecycle](lifecycle.md) is the full treatment: the hook set, the managed state machine, the dispatch gate, and failure/recovery.
 
-- `configure(node, m)` acquires resources into the mixin's state.
-- `activate(node, m)` / `deactivate(node, m)` mark the working edge. A managed node gates dispatch automatically (below), so most mixins leave both as no-ops.
-- `cleanup(node, m)` releases what `configure` acquired.
-- `on_error(node, m)` recovers after a hook throws on a managed transition.
+## Composition at two scales
 
-The framework brackets the hooks with its own bookkeeping: a member's entities materialise immediately before its `configure` runs, its timers (created paused) start at `activate`, and its entities close immediately after `cleanup`. The hooks cover only the state the framework can't see:
-
-```julia
-import ROSNode: configure, cleanup
-
-@mixin struct Recorder
-    io::Any = nothing                       # configure opens it, cleanup closes it
-end
-@param Recorder path::String = "flight.log"
-
-configure(node, r::Recorder) = r.io = open(parameters(node, r).path, "a")
-cleanup(node, r::Recorder)   = r.io === nothing || close(r.io)
-
-@hears "/vehicle/telemetry" function record(node, r::Recorder, msg::Telemetry)
-    println(r.io, msg.battery)
-end
-```
-
-A managed node's dispatch gate (below) holds `record` until `Active`: `configure` has already opened `r.io` when the first message lands. An unmanaged node delivers from the moment the subscription materialises, and a message can reach `record` before `configure` assigns `r.io`. Guard the field in the handler, or run the node managed, when that window matters.
-
-Every node shares this vocabulary; `managed` chooses who drives it:
-
-- **Unmanaged (default).** `run` / `add!` brings the node straight up: construction runs every member's `configure`, then every member's `activate`. `cleanup` runs at teardown — an explicit `close(node)`, a container's `unload_node` (containers are the second scale of composition, below), or the Context drain when the node's Context closes.
-- **Managed (`managed = true`).** The node declares the lifecycle control surface (the five `lifecycle_msgs` services plus the `~/transition_event` topic) and starts `Unconfigured`. The hooks run at the real transitions — `autostart = true` runs `configure!` then `activate!` during construction — and an external orchestrator (`ros2 lifecycle set …`) or in-process calls drive them:
-
-```julia
-vehicle = run(Vehicle; ctx = ctx, name = "vehicle", managed = true, block = false)
-ln = ROSNode.lifecycle(vehicle)
-configure!(ln)      # → Inactive: entities materialise, each member's configure runs
-activate!(ln)       # → Active: timers start, dispatch gating lifts
-deactivate!(ln)     # → Inactive: members deactivate in reverse order, gating drops back
-cleanup!(ln)        # → Unconfigured: each cleanup runs, entities close — a configure! starts fresh
-```
-
-Those calls drive one state machine — the same one a `ros2 lifecycle` orchestrator drives over `~/change_state`. Each transition runs the members' hooks under the [settlement three-way](../communication/services.md), so it can land its target, decline back to its origin, or divert into error processing. Step through it:
-
-```@raw html
-<div class="rosnode-statechart" data-machine="lifecycle"></div>
-```
-
-While a managed node is in any state other than `Active`, the framework gates each port at dispatch:
-
-| Port | Gating while not `Active` |
-|------|---------------------------|
-| Publisher | the publish drops |
-| Subscription, timer | the reaction doesn't fire |
-| Service | the request gets an error reply |
-| Action server | goal, cancel, and result requests get an error reply; feedback and status publications drop |
-| Action client (`send`/`fetch`/`cancel`) | the call raises `NodeInactiveError` — probe `isactive(node)` first |
-
-The service client is the exception: `call` issues regardless of the node's state and blocks to its own timeout, so guard it on `isactive(node)` yourself when that matters. `deactivate` goes one step further and cooperatively cancels any goals still in flight — each executing body sees the cancel signal and settles `CANCELED`, and a body that ignores it is left running detached after a bounded wait — so a node bounced to `Inactive` does not keep working against state the orchestrator may have invalidated. The control surface stays live throughout, as do the parameter services and `~/get_type_description` — an orchestrator drives transitions and tunes parameters on an inactive node. `activate`/`deactivate` therefore carry only work beyond that automatic gating — pre-rolling a device, flushing a buffer.
-
-In a multi-mixin node the hooks fan out in dependency order: `configure`, `activate`, and `on_error` run providers first, `deactivate` and `cleanup` in reverse. In `Vehicle`, the `Sensor` configures before the `Guard` it was injected into, and cleans up after it.
-
-A hook signals failure two ways. Returning the lifecycle `failure` token rolls the transition back to its pre-transition state: the fan-out stops at the failing member, the members that already ran the forward hook unwind in reverse dependency order (a failed `activate!` deactivates them and lands `Inactive`; a failed `configure!` cleans them up, closes their ports, and lands `Unconfigured`), and the transition reports `:failure` — error processing is not entered. Throwing instead diverts to error processing. On a managed node a throw enters it:
-
-```@raw html
-<div class="rosnode-statechart" data-machine="recovery"></div>
-```
-
-Across a node's members, `on_error` runs in dependency order; the node recovers to `Unconfigured` only when every member returns cleanly, and a throwing `on_error` (logged, with the remaining members still run) drops it to `Finalized`. After the `on_error` fan-out, error processing runs the guarded member-cleanup fan-out — each member's `cleanup` hook plus its port close — so recovery to `Unconfigured` is a true reset rather than a latch over leftover state: a later `configure!` reacquires from scratch with no stale entities still dispatching and no double-acquire. An *unmanaged* node has no error processing: `run` / `add!` tears the partial node down — every member that reached `configure` cleans up against its partial state, entities close, and nothing is left on the Context — then the throw propagates.
-
-`cleanup` runs at most once per `configure`. Teardown has several triggers — explicit `close`, `unload_node`, the shutdown transition, the Context drain — and a node can see more than one; the member's materialised entities are the guard, so the first trigger runs `cleanup` and later ones are no-ops. The framework logs a throwing `cleanup` and teardown continues: the member's entities still close and the remaining members still clean up. After `cleanup` the entities drop; the managed `cleanup!` transition runs the same guarded step, so a re-`configure!` rematerialises them.
-
-## Two scales of composition
-
-A `@node` runs standalone — `run(Vehicle; name = "vehicle")` gives it its own process with its own session, discovery, and registry.
-
-Several nodes share one process through a `container`. Each `add!` instantiates a node on the container's single context, so the nodes share one session, discovery, and registry, plus a direct in-process delivery path between them:
-
-```julia
-container("fleet") do c
-    add!(c, Vehicle;       name = "vehicle")
-    add!(c, GroundStation; name = "ground")     # another @node
-end
-```
-
-The same `Vehicle` runs either way — standalone or composed. Deploy-time wiring picks the scale, leaving the node's code unchanged.
-
-## Other reactions and ports
-
-The example uses `@publishes`, `@serves`, and `@every`. The mixin surface has three more verified members, each mirroring its primitive layer:
-
-- `@hears` declares a subscription reaction — a handler dispatched on the mixin for each message on a topic.
-- `@uses` records a client-port spec naming a [service](../communication/services.md) or action client the mixin depends on. Port materialisation builds no handle for it yet, so construct the client directly against the node-core — `ServiceClient(node, name, T)` or `ActionClient(node, name, A)` — and drive it from the mixin's reactions.
-- `@runs` inline-authors an action server from a function signature, the way `@serves` authors a service.
+`run(Vehicle; name = "vehicle")` gives the node its own process, with its own session, discovery, and registry. A `container` instead runs several nodes in one process — sharing one session, discovery, and a direct in-process delivery path between them — and loads a registered kind by name (`load_node`, the `ros2 component load` path). The same schema runs either way; deploy-time wiring picks the scale. [Containers & Dynamic Composition](containers.md) covers containers, by-name loading, and inspecting a composed node.
 
 ## See also
 
-- [Parameters](../communication/parameters.md) — the live parameter model `@param` builds on.
+- [Parametric Components](parametric.md) — type parameters beyond `Name`, the dependency-injection constructor contract, mocks, and standalone runs.
+- [Component Lifecycle](lifecycle.md) — the hook set, managed nodes, and the dispatch gate.
+- [Containers & Dynamic Composition](containers.md) — running several nodes in one process and loading a kind by name.
+- [Parameters](../communication/parameters.md) — the live parameter model `@parameters` builds on.
+- [Precompilation & Warm-up](../advanced/precompilation.md) — baking a component's first-`run` path with `precompile_node`.
 - [Interoperating with ROS 2](../interop/ros2.md) — driving a component's parameters, topics, and services from `ros2` tooling.
 
 ## API reference
@@ -305,55 +276,38 @@ The example uses `@publishes`, `@serves`, and `@every`. The mixin surface has th
 CurrentModule = ROSNode
 ```
 
-### Mixins and ports
+### Authoring a component
 
 ```@docs
 Component
-@mixin
-@param
-@publishes
-@uses
-@every
-@hears
-@serves
-@runs
-@interface
-@provides
-provides
-requires
-construct
+@component
+member_schema
+```
+
+### Ports and entities
+
+```@docs
+uses
+@service
+@action
 entities
 parameters
 ```
 
-### Lifecycle hooks
+### Interfaces and dependency injection
 
 ```@docs
-configure
-activate
-deactivate
-cleanup
-on_error
+@interface
+@provides
+provides
+requires
 ```
 
-### Assembling and running
+The dependency-injection constructor ([`construct`](@ref)) is documented under [Parametric Components](parametric.md); the lifecycle hooks under [Component Lifecycle](lifecycle.md); containers, the node-kind registry, and schema introspection under [Containers & Dynamic Composition](containers.md).
+
+### Assembling a node
 
 ```@docs
-@node
+node
 describe_wiring
-Container
-container
-add!
-ros_init!
-```
-
-### Node-kind registry
-
-```@docs
-register_node_kind!
-node_kind
-node_kinds
-load_node
-unload_node
-list_nodes
 ```

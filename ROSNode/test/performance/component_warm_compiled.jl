@@ -1,17 +1,18 @@
-# Payoff checks for the warm-up / module-end-bake work (PLAN-WARMUP-REGISTRATION S1a/S3/S6):
+# Payoff checks for the warm-up / precompile-anchor work (PLAN-NODE-PLAN.md precompile_schema):
 # prove the machinery actually puts the handler path in the method cache, not just that it runs.
 #   1. S1a — the function-barrier'd component callback dispatches the reaction STATICALLY
 #      (`code_typed`, pure-unit, with an Any-capture negative control proving the detector bites).
 #   2. S3  — a `ServiceClient` built under `:precompile,sync` has its `encode`/`call` path cached.
-#   3. Startup — after a real component node bring-up, its reaction handler `(M, msgtype)` is
-#      compiled (the warm reaches the user handler).
+#   3. Startup — after a real functor node bring-up, the `precompile_schema` reaction anchor
+#      compiles the user handler `(CN, Mc, msgtype)` (the warm reaches the user handler).
 # The deterministic BAKE payoff — handlers compiled at LOAD of a precompiled package, race-free —
 # is asserted in `component_precompile.jl`; this file covers the live runtime tiers.
 #
 # Always run Zenoh tests under a hard force-kill: `timeout -k 5 120 julia …`.
 
 using ROSNode
-using ROSNode: Context, Node, ServiceClient, ActionClient, ActionServer, call, mixin_spec, _sub_cb
+using ROSNode: Context, Node, ServiceClient, ActionClient, ActionServer, call,
+               member_schema, node, hears, _sub_cb, _base, _cb_type, _anchor_functor_sub!
 using Test
 
 const _EP = isdefined(Main, :ROS_TEST_EP) ? Main.ROS_TEST_EP :
@@ -51,14 +52,22 @@ module _WarmAct
     @ros_import from="../fixtures/byo" "robot_msgs/action/Process"
 end
 
-# Distinct mixins per testset so one testset's inference can't pre-satisfy another's cache check.
+# Distinct functor members per testset so one testset's inference can't pre-satisfy another's cache
+# check. Node-first handlers; `member_schema(M) = component(M, hears(:p, T, h))` carries the sub.
 module _WarmTypes
     using ROSNode
+    using ROSNode: component, hears
+    import ROSNode: member_schema          # EXTENDED below (must import, not `using`, to add methods)
     const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
-    @mixin struct Sink; got::Int = 0; end           # S1a subject
-    @hears function absorb(node, m::Sink, msg::_T); m.got += 1; nothing; end
-    @mixin struct Spin; got::Int = 0; end           # startup subject (untouched until run)
-    @hears function gulp(node, m::Spin, msg::_T); m.got += 1; nothing; end
+    mutable struct Sink{Name} <: ROSNode.Component{Name}; got::Int; end    # S1a subject
+    Sink{Name}() where {Name} = Sink{Name}(0)
+    absorb(node, m::Sink, msg::_T) = (m.got += 1; nothing)
+    member_schema(::Type{Sink}) = component(Sink, hears(:in, _T, absorb))
+
+    mutable struct Spin{Name} <: ROSNode.Component{Name}; got::Int; end    # startup subject
+    Spin{Name}() where {Name} = Spin{Name}(0)
+    gulp(node, m::Spin, msg::_T) = (m.got += 1; nothing)
+    member_schema(::Type{Spin}) = component(Spin, hears(:in, _T, gulp))
 end
 using ._WarmTypes: Sink, Spin
 
@@ -66,15 +75,18 @@ using ._WarmTypes: Sink, Spin
 
     @testset "S1a — component callback dispatches the reaction statically" begin
         m = Sink{:s}()
-        p = only(port for port in mixin_spec(Sink).ports if port.kind === :subscription)
+        d = only(p for p in member_schema(Sink).ports if p isa ROSNode.Sub)
         T = _WarmTypes._T
-        # production callback via the `where {F}` barrier → reaction lifted to a concrete type
-        # parameter, captured concretely → the `reaction(node, m, msg)` call is statically
-        # dispatched (node-first; `nothing` stands in for the node — the handler ignores it).
-        @test !_wc_ssa_any(_wc_ci(_sub_cb(p.reaction, nothing, m), (T,)))
-        # faithful pre-barrier control: read the reaction straight off `PortSpec.reaction::Any`
-        # (what the barrier replaces) → the call is dynamic. Proves the detector actually bites.
-        prebarrier = let pp = p, mm = m; msg -> pp.reaction(nothing, mm, msg); end
+        # production callback via the `where {F}` barrier → the handler (carried CONCRETELY on the
+        # `Sub{Name,T,F}` descriptor as `.handler`) is lifted to a concrete type parameter and
+        # captured concretely → the `reaction(node, m, msg)` call is statically dispatched
+        # (node-first; `nothing` stands in for the node — the handler ignores it).
+        @test !_wc_ssa_any(_wc_ci(_sub_cb(d.handler, nothing, m), (T,)))
+        # faithful pre-barrier control: erase the handler's type through an `Any` slot (what
+        # `_sub_cb`'s `where {F}` barrier recovers — the old `PortSpec.reaction::Any` field) → the
+        # call is dynamic. Proves the detector actually bites.
+        anyh = Any[d.handler]
+        prebarrier = let h = anyh, mm = m; msg -> h[1](nothing, mm, msg); end
         @test _wc_ssa_any(_wc_ci(prebarrier, (T,)))
     end
 
@@ -89,20 +101,29 @@ using ._WarmTypes: Sink, Spin
         end
     end
 
-    @testset "startup — component reaction path compiled after bring-up (Zenoh session)" begin
+    @testset "startup — functor reaction path compiled by precompile_schema (Zenoh session)" begin
         _wcctx() do ctx
-            n = run(Spin; ctx = ctx, name = "warmspin", warmup = :precompile, block = false)
+            schema = node("spin" => Spin)
+            n = run(schema; ctx = ctx, name = "warmspin", block = false)
             m = only(values(n.members))
-            # bring-up under `warmup = :precompile` completes without error; `mixin_spec` keys on
-            # the base (the member type is now `Spin{:spin}`, an instantiation).
-            @test mixin_spec(ROSNode._base(typeof(m))) !== nothing
-            # DEFERRED (runtime-on-node precompile re-tuning, DESIGN-RUNTIME-ON-NODE.md §8): the
-            # reaction handler + decode→dispatch warm goes through `_anchor_reactions!`, whose specs
-            # still carry pre-rework (non node-first) signatures, so the cache-survival assert below
-            # is parked until that anchor is re-tuned:
-            #   H = only(return_types(_sub_cb, (typeof(reaction), typeof(n), M)))
-            #   @test timedwait(5) do; _wc_cached(reaction, (typeof(n), M, msgtype)) && _wc_cached(_dispatch_decoded, …); end === :ok
-            @test_skip "reaction warm cache-survival — re-tune _anchor_reactions! for the node-first convention (deferred)"
+            # bring-up completes without error; `member_schema` keys on the base (the member type is
+            # now `Spin{:spin}`, an instantiation — `_base` recovers the wrapper).
+            @test member_schema(_base(typeof(m))) !== nothing
+
+            # The functor anchor IS node-first (`_anchor_functor_sub!`, functor.jl), so the deferred
+            # mixin cache-survival assert is now LIVE: derive the concrete (CN, Mc, T) + the `_sub_cb`
+            # closure `H`, run the per-(T,H) anchor, and confirm the user handler + the decode→dispatch
+            # leaves survive in the method cache.
+            CN = typeof(n); Mc = typeof(m)
+            d  = only(p for p in member_schema(_base(Mc)).ports if p isa ROSNode.Sub)
+            T  = typeof(d).parameters[2]      # Sub{Name, T, F} → the message type
+            reaction = d.handler
+            _anchor_functor_sub!(CN, Mc, T, reaction)
+            @test _wc_cached(reaction, (CN, Mc, T))                   # the user handler, node-first
+            H = _cb_type(_sub_cb, reaction, CN, Mc)
+            @test H !== nothing                                       # the materialised callback is one concrete type
+            @test _wc_cached(ROSNode.decode_owned, (Memory{UInt8}, Type{T}))
+            @test _wc_cached(ROSNode._dispatch_decoded, (ROSNode.Entity, ROSNode.SampleHolder, Type{T}, H, ROSNode.Owned))
         end
     end
 
