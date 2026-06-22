@@ -93,6 +93,10 @@ mutable struct ActionServer{A, G, R, F}
     # Per-endpoint attachment sequence_numbers, one per published topic.
     @atomic feedback_seq::Int64
     @atomic status_seq::Int64
+    # One shared move-consume outbound for all five transport sites (feedback/status `put`
+    # with attachment via `arm!`; the three attachment-less `reply`s via `arm_payload!`),
+    # serialized by its lock. Growable, so one encoder spans every reply/topic message type.
+    const out::MoveOutbound
     @atomic open::Bool
 end
 
@@ -160,7 +164,7 @@ function _make_action_server(node::Node, name::AbstractString, ::Type{A};
                                       send_goal_ent, cancel_goal_ent, get_result_ent,
                                       feedback_ent, status_ent,
                                       Dict{GoalId, GoalHandle{A, G, R, F}}(),
-                                      ReentrantLock(), ReentrantLock(), 0, 0, true)
+                                      ReentrantLock(), ReentrantLock(), 0, 0, MoveOutbound(), true)
 
     _wire_action_server!(server)
 
@@ -243,6 +247,7 @@ function Base.close(server::ActionServer)
             @error "close(ActionServer): closing sub-endpoint failed" exception=(err, catch_backtrace())
         end
     end
+    close(server.out)        # drop the shared move-consume copy-boxes (gravestone-idempotent)
     nothing
 end
 
@@ -616,8 +621,11 @@ function _publish_feedback(server::ActionServer{A, G, R, F}, id::GoalId, fb::F) 
     route === nothing && return nothing
     msg = _feedback_message_type(A)(; goal_id = _to_uuid(id), feedback = fb)
     seq = (@atomic server.feedback_seq += 1)
-    attach = encode_attachment(seq, _now_ns(server.node), gid(e))
-    put(route::ZPublisher, encode(msg); attachment=attach)
+    out = server.out
+    @lock out.enc.lock begin                       # shared move-consume path (the publisher's twin)
+        arm!(out, msg, seq, _now_ns(server.node), gid(e))
+        put(route::ZPublisher, out.payload_zb; attachment = out.att_zb)
+    end
     nothing
 end
 
@@ -638,8 +646,11 @@ function _publish_status(server::ActionServer)
         for g in values(server.goals) if !(@atomic g.fetched)]
     msg = _GoalStatusArray(; status_list = statuses)
     seq = (@atomic server.status_seq += 1)
-    attach = encode_attachment(seq, _now_ns(server.node), gid(e))
-    put(route::ZPublisher, encode(msg); attachment=attach)
+    out = server.out
+    @lock out.enc.lock begin                       # shared move-consume path
+        arm!(out, msg, seq, _now_ns(server.node), gid(e))
+        put(route::ZPublisher, out.payload_zb; attachment = out.att_zb)
+    end
     nothing
 end
 
@@ -688,7 +699,11 @@ end
 function _reply_send_goal(server::ActionServer{A, G, R, F}, q::Query, accepted::Bool) where {A, G, R, F}
     resp = _send_goal_response_type(A)(; accepted = accepted,
                                        stamp = to_msg(_Time, Dates.now(server.node)))
-    reply(q, encode(resp))
+    out = server.out
+    @lock out.enc.lock begin                       # payload-only move-consume (reply carries no attachment)
+        arm_payload!(out, resp)
+        reply(q, out.payload_zb)
+    end
     nothing
 end
 
@@ -700,7 +715,11 @@ function _reply_cancel(server::ActionServer, q::Query, accepted::AbstractVector)
     canceling = _GoalInfo[_GoalInfo(; goal_id = _to_uuid(g.id), stamp = stamp) for g in accepted]
     resp = _CancelGoal_Response(; return_code = Int8(isempty(accepted) ? 1 : 0),
                                 goals_canceling = canceling)
-    reply(q, encode(resp))
+    out = server.out
+    @lock out.enc.lock begin                       # payload-only move-consume
+        arm_payload!(out, resp)
+        reply(q, out.payload_zb)
+    end
     nothing
 end
 
@@ -718,7 +737,11 @@ function _reply_result(server::ActionServer{A, G, R, F}, q::Query, g::GoalHandle
         reply_err(q, string("action result unavailable (status ", _goal_status_byte(st), ")"))
     else
         resp = _get_result_response_type(A)(; status = _goal_status_byte(st), result = result)
-        reply(q, encode(resp))
+        out = server.out
+        @lock out.enc.lock begin                   # payload-only move-consume
+            arm_payload!(out, resp)
+            reply(q, out.payload_zb)
+        end
     end
     @atomic g.fetched = true
     nothing

@@ -100,20 +100,25 @@ _request_attachment(client::ActionClient) =
 # `decode(h)` BEFORE the pooled `rg` is released — the borrowed holder is invalid after the
 # next `call!`; `decode(nothing)` covers the no-reply case. Returns whatever `decode` returns.
 function _action_call(decode::F, client::ActionClient, kind::Symbol,
-                      bytes::Vector{UInt8}; retries::Int = 40) where {F}
+                      req::Req; retries::Int = 40) where {F, Req}
     ctx = client.node.context
     w = getfield(_ensure_action_match!(client), kind)
-    rg = _acquire_rg!(w)
+    slot = _acquire_rg!(w)                                    # shared `_ClientWire` pool
     try
+        enc = slot.enc::ReusableEncoder      # action wires carry one (reqtype set per kind)
+        encode_into!(enc, req)
+        # One seq per logical request (was rebuilt per retry); `call!` aliases the slot's
+        # reused request + attachment buffers each retry — no per-call alloc.
+        fill_attachment!(enc, (@atomic client._seq += 1), _now_ns(client.node), client._gid)
         for _ in 1:retries                                    # ~retries × 50ms discovery backoffs
-            h = Zenoh.call!(rg; payload = bytes, attachment = _request_attachment(client))
-            h === nothing || return decode(h)                 # decode before the `finally` releases rg
+            h = Zenoh.call!(slot.rg; payload = enc.msgbuf, attachment = enc.attbuf)
+            h === nothing || return decode(h)                 # decode before the `finally` releases the slot
             is_shutdown(ctx) && break
             sleep(0.05)
         end
         return decode(nothing)
     finally
-        _release_rg!(w, rg)
+        _release_rg!(w, slot)
     end
 end
 
@@ -138,22 +143,26 @@ _action_call_timeout(kind::Symbol) = kind === :get_result ? _GET_RESULT_TIMEOUT_
 # keyexprs, each with a pooled `ReusableGet` transport) on first `send`/`fetch`/`cancel`/await.
 # The send_goal + get_result wires double as the routing-match probes. A client that never
 # touches its server declares none.
-function _ensure_action_match!(client::ActionClient)
+function _ensure_action_match!(client::ActionClient{A}) where {A}
     ws = @atomic client._match
     ws === nothing || return ws
     @lock client._match_lock begin
         ws = @atomic client._match
         ws === nothing || return ws
         ctx = client.node.context
-        mk(kind) = begin
+        # `reqtype` per kind ⇒ each wire's pooled gets carry a borrow encoder for that
+        # request type, so `_action_call` encodes into the slot's reused buffers.
+        mk(kind, reqtype) = begin
             tk = getfield(client._service_keys, kind)        # cached at construction
             w  = _ClientWire(Querier(ctx.session, Keyexpr(tk); target = :best_matching,
                                      timeout_ms = _action_call_timeout(kind)),
-                             nothing, ReentrantLock())
+                             nothing, ReentrantLock(); reqtype = reqtype)
             _ensure_wire_listener!(w, ctx)
             w
         end
-        wires = (send_goal = mk(:send_goal), get_result = mk(:get_result), cancel_goal = mk(:cancel_goal))
+        wires = (send_goal   = mk(:send_goal,   _send_goal_request_type(A)),
+                 get_result  = mk(:get_result,  _get_result_request_type(A)),
+                 cancel_goal = mk(:cancel_goal, _CancelGoal_Request))
         @atomic client._match = wires
         return wires
     end
@@ -254,7 +263,7 @@ function send(client::ActionClient{A, G, R, F}, goal::G) where {A, G, R, F}
     # get_result / cancel) into `<A>_SendGoal_Request{goal_id, goal}`. An accepted reply
     # ⇒ :accepted; a not-ok reply or no reply within the discovery window ⇒ :rejected.
     req = _send_goal_request_type(A)(; goal_id = _to_uuid(id), goal = goal)
-    accepted = _action_call(client, :send_goal, _encode_to_vector(req)) do h
+    accepted = _action_call(client, :send_goal, req) do h
         h !== nothing && Zenoh.is_ok(h) &&
             decode_owned(Zenoh.sample(h), _send_goal_response_type(A)).accepted
     end
@@ -341,7 +350,7 @@ function _get_result_once(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     req = _get_result_request_type(A)(; goal_id = _to_uuid(g.id))
     # Once matched the server holds the reply until the goal settles (the wire's long
     # `get_result` timeout); an unmatched route returns no reply, so retry discovery.
-    result_state, got = _action_call(client, :get_result, _encode_to_vector(req)) do h
+    result_state, got = _action_call(client, :get_result, req) do h
         (h !== nothing && Zenoh.is_ok(h)) || return (:aborted, nothing)
         resp = decode_owned(Zenoh.sample(h), _get_result_response_type(A))
         (_client_state_from_status(resp.status), resp.result)
@@ -415,7 +424,7 @@ function cancel(g::ClientGoal{A, G, R, F}) where {A, G, R, F}
     # single-shot (`retries=1`): the reply is unused — we just need the ack to ride the wire.
     req = _CancelGoal_Request(; goal_info = _GoalInfo(; goal_id = _to_uuid(g.id),
                                                       stamp = to_msg(_Time, Dates.now(client.node))))
-    _action_call((_) -> nothing, client, :cancel_goal, _encode_to_vector(req); retries = 1)
+    _action_call((_) -> nothing, client, :cancel_goal, req; retries = 1)
     _is_terminal_client_state(@atomic g._state) || @atomic g._state = :canceling
     nothing
 end

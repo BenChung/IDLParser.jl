@@ -1074,6 +1074,12 @@ function _drain!(ctx::Context)
             if ctx._lv_sub !== nothing
                 try
                     close(ctx._lv_sub)
+                    # `close` defers the buffered sub's teardown to a `@spawn`'d finalizer; during
+                    # precompilation (the warm-up bake's inert session) no scheduler runs it, leaving
+                    # the sub's AsyncCondition open — a "waiting for IO to finish" precompile hang. Drive
+                    # it synchronously there (matches the raw-session warm's explicit teardown).
+                    ccall(:jl_generating_output, Cint, ()) == 0 ||
+                        Zenoh._teardown_buffered_sub!(ctx._lv_sub)
                 catch err
                     @error "drain: closing discovery subscriber failed" exception=(err, catch_backtrace())
                 end

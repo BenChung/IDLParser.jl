@@ -48,11 +48,14 @@ settlement ownership has transferred to a spawned task. `respond!`/`fill!`/
 `_settle!`/`wait_settled` stay detach-agnostic; only the at-return backstop reads it.
 """
 mutable struct ResultCell{H, R}
-    const handle::H
+    # Settable (not `const`) so a pooled cell can be re-pointed at a new request on
+    # reuse (see [`reset!`](@ref) / [`ResultCellPool`](@ref)); written only while the
+    # cell is quiescent.
+    handle::H
     # deliver(status::SettlementStatus, payload) — hands the settled value to the
     # wire (reply-ok / query-error / result cache). Runs once, under the lock,
     # holding the first terminal write. Provided by the owning Service/Action.
-    const deliver
+    deliver
     const lock::ReentrantLock
     # Settlement signal, built on `lock`. A waiter (the action `get_result` request
     # task) parks here and is woken the instant the cell fills, instead of
@@ -70,6 +73,50 @@ function ResultCell{H, R}(handle::H, deliver) where {H, R}
     lk = ReentrantLock()
     return ResultCell{H, R}(handle, deliver, lk, Threads.Condition(lk), false, nothing, false)
 end
+
+# Re-point a quiescent (settled, unreferenced, no parked waiter) cell at a new
+# request and clear its terminal state, reusing the `lock`/`cond` so the
+# per-request struct + `ReentrantLock` + `Threads.Condition` (~270 B) aren't
+# reallocated. The writes are unsynchronized — sound only because the pool's
+# release points hand back only quiescent cells (see [`ResultCellPool`](@ref)).
+function reset!(cell::ResultCell{H, R}, handle::H, deliver) where {H, R}
+    cell.handle = handle
+    cell.deliver = deliver
+    cell.status = nothing
+    @atomic cell.filled = false
+    @atomic cell.detached = false
+    return cell
+end
+
+"""
+    ResultCellPool{H, R}
+
+Free-list of quiescent [`ResultCell`](@ref)s. [`acquire!`](@ref) reuses a freed
+cell (re-pointed via [`reset!`](@ref)) or allocates one on a miss; [`release!`](@ref)
+returns a cell. Reuse skips the per-request struct + `ReentrantLock` +
+`Threads.Condition` allocation, the bulk of a service request's settlement cost.
+
+Sound only where released cells are quiescent — settled, unreferenced, and with no
+task parked on the cell's `cond`. Services qualify: a service cell has no
+[`wait_settled`](@ref) waiter and is released only after its handler settled and
+replied (the non-detached path). Action result cells do **not** — they are the
+15-minute result cache and stay live — so the action layer doesn't pool. The free
+list is bounded by peak concurrent (non-detached) requests; detached cells escape
+to the detach registry and are never returned.
+"""
+mutable struct ResultCellPool{H, R}
+    const free::Vector{ResultCell{H, R}}
+    const lock::ReentrantLock
+end
+ResultCellPool{H, R}() where {H, R} = ResultCellPool{H, R}(ResultCell{H, R}[], ReentrantLock())
+
+function acquire!(pool::ResultCellPool{H, R}, handle::H, deliver) where {H, R}
+    cell = @lock pool.lock (isempty(pool.free) ? nothing : pop!(pool.free))
+    return cell === nothing ? ResultCell{H, R}(handle, deliver) : reset!(cell, handle, deliver)
+end
+
+release!(pool::ResultCellPool{H, R}, cell::ResultCell{H, R}) where {H, R} =
+    (@lock pool.lock push!(pool.free, cell); nothing)
 
 """
     isfilled(cell::ResultCell) -> Bool

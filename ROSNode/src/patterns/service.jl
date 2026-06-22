@@ -344,22 +344,29 @@ end
 # serves on spawned threads bounded to `n` in flight by a semaphore; `Parallel(Inf)`
 # is unbounded. A full finite pool blocks the consumer, buffering queries in the
 # queryable FIFO (a busy error-reply on saturation is a pending refinement).
+# Each scheduler owns one typed `ResultCellPool` captured in its query callback (the
+# callback outlives individual queries), so the per-request cell + lock + condition are
+# recycled instead of reallocated. The pool's own lock makes the `Parallel` concurrent
+# acquire/release safe.
 _service_scheduler(::Serial, e, ::Type{Req}, ::Type{Resp}, h, v) where {Req, Resp} =
-    query -> _serve_query(e, query, Req, Resp, h, v)
+    let pool = ResultCellPool{Query, Resp}()
+        query -> _serve_query(e, query, Req, Resp, h, v, pool)
+    end
 function _service_scheduler(c::Parallel, e, ::Type{Req}, ::Type{Resp}, h, v) where {Req, Resp}
+    pool = ResultCellPool{Query, Resp}()
     if isfinite(c.n)
         sem = Base.Semaphore(Int(c.n))
         return function (query)
             Base.acquire(sem)
             Threads.@spawn try
-                _serve_query(e, query, Req, Resp, h, v)
+                _serve_query(e, query, Req, Resp, h, v, pool)
             finally
                 Base.release(sem)
             end
             nothing
         end
     else
-        return query -> (Threads.@spawn _serve_query(e, query, Req, Resp, h, v); nothing)
+        return query -> (Threads.@spawn _serve_query(e, query, Req, Resp, h, v, pool); nothing)
     end
 end
 
@@ -541,12 +548,12 @@ _is_infra_service(topic::AbstractString) =
 # once, in the `finally` after any reply, to send the rmw_zenoh final-ack the client's
 # `get` waits on.
 function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
-                      handler, view::Bool) where {Req, Resp}
+                      handler, view::Bool, pool::ResultCellPool{Query, Resp}) where {Req, Resp}
     cell = nothing                          # hoisted so the `finally` can read its detach state
     try
         p = payload(query)
         p === nothing && throw(ArgumentError("service request carried no payload"))
-        cell = ResultCell{Query, Resp}(query, _service_deliver(e, query, Resp))
+        cell = acquire!(pool, query, _service_deliver(e, query, Resp))
         # The `isactive` dispatch gate: an inactive managed node's application services
         # error-reply here rather than run the handler; infra services are exempt. The
         # owned query's final-ack still rides the `finally` below.
@@ -578,6 +585,10 @@ function _serve_query(e::Entity, query::Query, ::Type{Req}, ::Type{Resp},
             catch
             end
         end
+        # Recycle the cell unless it detached — a detached cell escaped to the detach
+        # registry, which drops (and GCs) it on settle/sweep. A non-detached cell is
+        # settled and unreferenced here, so the pool can safely re-point it.
+        cell isa ResultCell && !(@atomic cell.detached) && release!(pool, cell)
     end
     nothing
 end
@@ -687,20 +698,32 @@ entity(s::ServiceHandle) = s.entity
 # [`wait_for_service`](@ref) (where this Querier is also the `call` transport, in
 # `entity.wire`) and [`wait_for_action_server`](@ref) (a send_goal matching probe).
 # `lock` guards the lazy listener declare.
+# One pooled borrow-path sender: a single-in-flight `ReusableGet` plus, for wires that reuse
+# a request encoder (the service client), a `ReusableEncoder` whose `msgbuf`/`attbuf` `call!`
+# aliases zero-copy. `enc === nothing` for wires that pre-encode their own bytes (the action
+# client's call wires). Held exclusively while acquired, so it needs no lock of its own.
+struct _PooledGet
+    rg::ReusableGet
+    enc::Union{Nothing, ReusableEncoder}
+end
+
 mutable struct _ClientWire
     const querier::Querier
     listener::Union{MatchingListener, Nothing}
     const lock::ReentrantLock
-    # Free-list of reusable request/reply gets over `querier`, the `call` transport.
+    # Request type for the borrow encoder bundled with each pooled get; `nothing` ⇒ the
+    # caller supplies pre-encoded bytes (action client). Only consulted on a pool miss.
+    const reqtype::Union{DataType, Nothing}
+    # Free-list of reusable request/reply senders over `querier`, the `call` transport.
     # A `ReusableGet` is single-in-flight, so `call` acquires one per in-flight call and
     # releases it after; idle ones are pooled (capped) for reuse. Guarded by `lock`.
-    const pool::Vector{ReusableGet}
+    const pool::Vector{_PooledGet}
     closing::Bool                # set in close(); release then closes rather than pools
 end
-# 3-arg form keeps existing call sites (incl. the action client's match-probe wires,
-# which never call — their pool stays empty).
-_ClientWire(querier::Querier, listener, lock::ReentrantLock) =
-    _ClientWire(querier, listener, lock, ReusableGet[], false)
+# Keeps existing call sites (incl. the action client's match-probe wires, which pre-encode);
+# `reqtype` opts a wire into the bundled borrow encoder (the service client passes its `Req`).
+_ClientWire(querier::Querier, listener, lock::ReentrantLock; reqtype::Union{DataType, Nothing}=nothing) =
+    _ClientWire(querier, listener, lock, reqtype, _PooledGet[], false)
 
 # Cap on idle pooled gets; bursts beyond this close on release rather than accumulate.
 const _RG_POOL_CAP = 8
@@ -708,17 +731,21 @@ const _RG_POOL_CAP = 8
 # Acquire a reusable get for one `call` (pop a pooled one or declare a fresh one over the
 # wire's querier), and release it back (pool it, or close it if the pool is full/closing).
 function _acquire_rg!(w::_ClientWire)
-    @lock w.lock (isempty(w.pool) ? ReusableGet(w.querier; capacity = 1) : pop!(w.pool))
+    @lock w.lock begin
+        isempty(w.pool) || return pop!(w.pool)
+        enc = w.reqtype === nothing ? nothing : ReusableEncoder(w.reqtype)
+        return _PooledGet(ReusableGet(w.querier; capacity = 1), enc)
+    end
 end
-function _release_rg!(w::_ClientWire, rg::ReusableGet)
+function _release_rg!(w::_ClientWire, slot::_PooledGet)
     doclose = @lock w.lock begin
         if w.closing || length(w.pool) >= _RG_POOL_CAP
             true
         else
-            push!(w.pool, rg); false
+            push!(w.pool, slot); false
         end
     end
-    doclose && (try; close(rg); catch; end)
+    doclose && (try; close(slot.rg); catch; end)
     nothing
 end
 
@@ -746,7 +773,7 @@ function Base.close(w::_ClientWire)
         w.listener === nothing || (try; close(w.listener); catch; end)
         w.listener = nothing
         w.closing = true                         # in-flight gets close on release
-        for rg in w.pool; (try; close(rg); catch; end); end
+        for slot in w.pool; (try; close(slot.rg); catch; end); end
         empty!(w.pool)
     end
     try; close(w.querier); catch; end            # after the gets — they borrow it
@@ -804,7 +831,7 @@ function ServiceClient(node::Node, name::AbstractString, ::Type{Srv};
     ctx = ent.node.context
     tk = topic_keyexpr(ctx.format, ent.endpoint)
     querier = Querier(ctx.session, Keyexpr(tk); target=:all_complete, timeout_ms=0)
-    ent.wire = _ClientWire(querier, nothing, ReentrantLock())
+    ent.wire = _ClientWire(querier, nothing, ReentrantLock(); reqtype=Req)   # reqtype ⇒ bundled borrow encoder
     client = ServiceClient{Req, Resp}(ent, 0)
     # Warm the call codec like the server endpoints. Inherits `node.warmup`, so a
     # `ParameterClient`'s lazily-built internal `ServiceClient`s warm here too.
@@ -920,35 +947,37 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
     isopen(client) ||
         throw(ArgumentError("call on a closed ServiceClient"))
     e = client.entity
-
-    # The request CDR bytes and the attachment, as `Vector{UInt8}`s `call!` aliases
-    # zero-copy (kept alive — captured by `run`, `GC.@preserve`d inside `call!` — until
-    # it returns).
-    bytes = _encode_to_vector(req)
-    # During :execute warm-up the encode above runs but there is no server, so return a
-    # default `Resp` (the caller's continuation still compiles) without issuing the query.
+    # During :execute warm-up there is no server, so bake the borrow encode on a transient
+    # encoder (compiling `encode_into!`/`fill_attachment!`) and return a default `Resp`
+    # without acquiring a get or issuing the query (the caller's continuation still compiles).
     if _WARMUP[]
+        enc = ReusableEncoder(Req)
+        encode_into!(enc, req)
+        fill_attachment!(enc, (@atomic client.seq) + 1,
+                         nanoseconds(Dates.now(e.node, System())), gid(e))
         return async ? Threads.@spawn(_default_msg(Resp)) : _default_msg(Resp)
     end
     w = e.wire::_ClientWire
     seq = (@atomic client.seq += 1)
     ts = nanoseconds(Dates.now(e.node, System()))      # request-time wall ns
-    attach = ROSZenoh.attachment_bytes(seq, ts, gid(e))
 
-    # One pooled `ReusableGet` per in-flight call (single-in-flight), released after. The
-    # pooled apparatus is reused across calls — no per-call `Channel`/drain task/reply
-    # `Ref`. Per-call timeout rides a `CancellationToken` armed by a `Base.Timer` only
-    # when `timeout_ms > 0`; the querier is `timeout_ms=0`, so the token is the sole
-    # bound. `call!` returns `nothing` on cancel / no reply (→ `ServiceError`); a wedged
-    # get is bounded by the firing token, so no spawned backstop is needed.
-    rg = _acquire_rg!(w)
+    # One pooled get + its bundled borrow encoder per in-flight call (single-in-flight),
+    # released after. The request CDR bytes and the 33-byte attachment go into the slot's
+    # reused buffers (`encode_into!`/`fill_attachment!`), which `call!` aliases zero-copy —
+    # no per-call `Vector`/`ZBytes` alloc; the slot keeps them alive until `call!` returns.
+    # Per-call timeout rides a `CancellationToken` armed by a `Base.Timer` only when
+    # `timeout_ms > 0` (the querier is `timeout_ms=0`, so the token is the sole bound).
+    slot = _acquire_rg!(w)
     run = function ()
+        enc = slot.enc::ReusableEncoder      # service wires always carry one (reqtype=Req)
         tok = timeout_ms > 0 ? CancellationToken() : nothing
         # `Base.Timer` qualified — ROSNode's own ROS `Timer` shadows the name here.
         timer = tok === nothing ? nothing :
                 Base.Timer(_ -> (try; Zenoh.cancel(tok); catch; end), timeout_ms / 1000)
         try
-            h = Zenoh.call!(rg; payload=bytes, attachment=attach, cancellation=tok)
+            encode_into!(enc, req)
+            fill_attachment!(enc, seq, ts, gid(e))
+            h = Zenoh.call!(slot.rg; payload=enc.msgbuf, attachment=enc.attbuf, cancellation=tok)
             return _resolve_holder(h, Resp, e.endpoint.topic)   # decodes (copies out) before reuse
         finally
             # Stop the timer so it can't fire post-return. The token drops via its finalizer.
@@ -956,16 +985,16 @@ function call(client::ServiceClient{Req, Resp}, req::Req;
         end
     end
 
-    # The spawned closure keeps `bytes`/`attach`/`rg` alive across the call; release on
+    # The spawned closure keeps the slot (its buffers) alive across the call; release on
     # completion (whichever path). Async surfaces a failure through `fetch` as a
     # `TaskFailedException`; the sync path returns/raises directly.
     if async
-        return Threads.@spawn (try; run(); finally; _release_rg!(w, rg); end)
+        return Threads.@spawn (try; run(); finally; _release_rg!(w, slot); end)
     end
     try
         return run()
     finally
-        _release_rg!(w, rg)
+        _release_rg!(w, slot)
     end
 end
 

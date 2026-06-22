@@ -99,6 +99,15 @@ function ReusableEncoder(::Type{T}) where {T}
                            CDRSizeCalculator(), growable, Vector{UInt8}(undef, 33))
 end
 
+# Type-agnostic growable encoder, for a caller that encodes MULTIPLE message types through one
+# instance (e.g. an action server's three reply types). Always takes the size-pass path, so it
+# fits any message; the buffer grows to the high-water mark across them.
+function ReusableEncoder()
+    msgbuf = Vector{UInt8}(undef, _ENC_DYN_INIT)
+    return ReusableEncoder(Base.ReentrantLock(), msgbuf, CDRWriter(msgbuf, Val(CDR_LE)),
+                           CDRSizeCalculator(), true, Vector{UInt8}(undef, 33))
+end
+
 # Serialize `msg` into the reused buffer (its length set to the exact wire size `n`);
 # returns `n` (preamble + body). The exact length lets a borrow-alias caller pass `msgbuf`
 # straight to `call!`. Caller holds `enc.lock`.
@@ -137,6 +146,9 @@ mutable struct MoveOutbound
 end
 MoveOutbound(::Type{T}) where {T} =
     MoveOutbound(ReusableEncoder(T), reusable_copy_bytes(), reusable_copy_bytes())
+# Growable, type-agnostic — for a payload-only mover that sends several message types (the
+# action replies, which carry no attachment, so `att_zb` stays an unused gravestone).
+MoveOutbound() = MoveOutbound(ReusableEncoder(), reusable_copy_bytes(), reusable_copy_bytes())
 
 # Encode `msg` + the `(seq, ts, gid)` attachment into the held boxes (caller holds `out.enc.lock`).
 # After this the boxes hold the wire bytes, ready for the transport to `_move` (or `close` to
@@ -147,6 +159,15 @@ MoveOutbound(::Type{T}) where {T} =
     copy_bytes!(out.payload_zb, enc.msgbuf, n)
     fill_attachment!(enc, seq, ts, g)
     copy_bytes!(out.att_zb, enc.attbuf, 33)
+    return nothing
+end
+
+# Payload-only arm (caller holds `out.enc.lock`): encode `msg` into the held `payload_zb` for a
+# transport that takes no attachment (the action server's `reply(q, payload)`). `att_zb` is left
+# untouched (gravestone). The caller then `_move`s `out.payload_zb` into the transport.
+@inline function arm_payload!(out::MoveOutbound, msg)
+    n = encode_into!(out.enc, msg)
+    copy_bytes!(out.payload_zb, out.enc.msgbuf, n)
     return nothing
 end
 
