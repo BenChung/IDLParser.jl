@@ -14,7 +14,7 @@ The `ros2` CLI reaches ROSNode entities the same way it reaches any node, once t
 2. Start its router so both sides have a meeting point: `ros2 run rmw_zenoh_cpp rmw_zenohd`.
 3. Match `ROS_DOMAIN_ID` on both sides (default `0`).
 
-A domain or RMW mismatch produces silence — no traffic and no diagnostic — because `domain_id` leads every keyexpr, so mismatched domains never meet (see [Addressing & Key Expressions](../foundations/addressing.md)).
+A domain or RMW mismatch produces silence — no traffic, no diagnostic — because `domain_id` leads every keyexpr, so each side's traffic stays confined to its own domain (see [Addressing & Key Expressions](../foundations/addressing.md)).
 
 Topics — echo what a `Publisher` sends, or feed a `Subscription` ([Topics](../communication/topics.md)):
 
@@ -51,7 +51,11 @@ ros2 lifecycle get /vehicle
 
 ## Where imported types come from
 
-`@ros_import` statically generates an interface by name from ROSNode's vendored tree or, inside a sourced ROS 2 environment, from `AMENT_PREFIX_PATH`. The `from=` argument adds local source roots that are searched first, so your own packages resolve ahead of — and can shadow — the vendored and ament trees:
+`@ros_import` statically generates an interface by name, resolving sources in precedence order:
+
+1. Local source roots passed via `from=` — searched first, so your own packages resolve ahead of (and can shadow) the rest.
+2. ROSNode's vendored tree.
+3. `AMENT_PREFIX_PATH`, when run inside a sourced ROS 2 environment.
 
 ```julia
 @ros_import "std_msgs/msg/String" from="interfaces"

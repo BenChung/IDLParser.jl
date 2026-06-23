@@ -1,6 +1,6 @@
 # Runtime Type Discovery
 
-A type-less `Subscription` resolves each sample's message type at runtime, so a single subscriber handles a stream whose definition it learns over the wire. This powers generic tooling — recorders, bridges, introspection — over types the tool never imported.
+A `Subscription` created without a type argument — a dynamic subscription — resolves each sample's message type at runtime, so a single subscriber handles a stream whose definition it learns over the wire. This powers generic tooling — recorders, bridges, introspection — over types the tool never imported.
 
 ## Resolving a type off the wire
 
@@ -12,7 +12,13 @@ sub = Subscription(node, "/chatter") do msg
 end
 ```
 
-`msg` is the real decoded struct with type-stable field access, so `msg.data` is fast and concrete. The framework resolves the wire type in order: the home table, then the type registry, then the project cache, then ament, then a wire `GetTypeDescription` query to the publisher.
+`msg` is the real decoded struct with type-stable field access, so `msg.data` is fast and concrete. The framework resolves the wire type in this order, taking the first that hits:
+
+1. the home table (the calling module's imported structs)
+2. the type registry
+3. the project cache
+4. ament
+5. a wire `GetTypeDescription` query to the publisher
 
 The home table is the entry point. `@context` binds the calling module as the Context's resolution home (see [The Runtime Model](../foundations/runtime-model.md)), and a wire type resolves against that module's imported structs first. A module that has imported `Reading` lands *its* `Reading` deterministically; the later stages cover types the home has never seen.
 
@@ -24,13 +30,19 @@ The home table is the entry point. `@context` binds the calling module as the Co
 @ros_cache
 ```
 
-It stores each discovered type description under `<project>/ros_typesupport/`, keyed by RIHS01, records a per-node warm-up manifest under `ros_typesupport/manifests/`, and bakes wire-discovered types into static ones at precompile. Discovery works without it; `@ros_cache` is what makes a discovery stick, so the next run starts from the cached definition.
+It persists discoveries project-locally so the next run starts from the cached definition:
+
+- stores each discovered type description under `<project>/ros_typesupport/`, keyed by RIHS01
+- records a per-node warm-up manifest under `ros_typesupport/manifests/`
+- bakes wire-discovered types into static ones at precompile
+
+Discovery works without it; `@ros_cache` is what makes a discovery stick.
 
 ## Warm-up
 
 The first sample of a new type pays codegen and JIT for the decode→handler chain, a latency spike mid-stream. Warm-up drives that cost off the hot path.
 
-`warmup = :precompile` compiles the decode→handler chain. The node default is `:off`, so opt in either on the node (`Node(...; warmup = :precompile)`) or per-subscription (as on line 66). With `@ros_cache` recording the manifest, a repeat run pre-warms it at startup:
+`warmup = :precompile` compiles the decode→handler chain. The node default is `:off`, so opt in either on the node (`Node(...; warmup = :precompile)`) or per-subscription (see the recorder example below, where the `Subscription` is created with `warmup = :precompile`). With `@ros_cache` recording the manifest, a repeat run pre-warms it at startup:
 
 - **Run 1** discovers the type and warms it on first sight.
 - **Run 2+** warms at startup from the manifest, so the first sample arrives hot.
@@ -43,7 +55,11 @@ The first sample of a new type pays codegen and JIT for the decode→handler cha
 
 ## A recorder
 
-A generic recorder buffers readings off `/readings` without importing the type. The publisher half stands in for some other node on the graph, publishing `sensor_demo/msg/Reading`; split it into a second process (or a real ROS 2 node) and the subscriber discovers the type over the wire with the same code. This example ships runnable as `examples/warming.jl`. Run it from the ROSNode project so `--project=.` activates the ROSNode environment; the `from = "interfaces"` root resolves against the script's directory, `examples/interfaces/`. Start a router first so both processes meet:
+A generic recorder buffers readings off `/readings` without importing the type. The publisher half stands in for some other node on the graph, publishing `sensor_demo/msg/Reading`; split it into a second process (or a real ROS 2 node) and the subscriber discovers the type over the wire with the same code. This example ships runnable as `examples/warming.jl`. Before running:
+
+- run it from the ROSNode project so `--project=.` activates the ROSNode environment
+- the `from = "interfaces"` root resolves against the script's directory, `examples/interfaces/`
+- start a router first so both processes meet:
 
 ```sh
 zenohd -l tcp/localhost:7447 &
@@ -60,8 +76,6 @@ using ROSNode
 @context(peers = ["tcp/localhost:7447"]) do ctx
     node = Node(ctx, "recorder")
 
-    # type-less: resolves each sample's type at runtime; `warmup = :precompile`
-    # warms the decode→handler chain so a repeat run pre-warms it at startup
     buffer = Any[]
     sub = Subscription(node, "/readings"; warmup = :precompile) do msg
         @effectful push!(buffer, (msg.sensor_id, msg.value))
@@ -84,7 +98,7 @@ With `@ros_import` present, Run 1 resolves `Reading` from the home table and war
 
 ## Graduating to a static type
 
-Once a topic's type is known, the framework logs a one-time hint naming the discovered type and the static spelling to graduate to:
+Once the framework resolves a topic's type, it logs a one-time hint naming the discovered type and the static spelling to graduate to:
 
 ```julia
 sub = Subscription(node, "/readings", Reading) do msg

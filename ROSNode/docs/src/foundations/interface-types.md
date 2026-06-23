@@ -19,17 +19,14 @@ The binding follows the interface kind:
 - An **action** binds the bare namespace, which serves as the action handle and exposes `.Goal`, `.Result`, and `.Feedback`.
 
 ```julia
-# message: bare leaf type
 pub = Publisher(node, "/chatter", std_msgs.msg.String)
 
-# service: reference by .Request
 srv = Service(node, "/add_two_ints", AddTwoInts.Request) do req
     AddTwoInts.Response(sum = req.a + req.b)
 end
 
-# action: bare namespace is the handle; sections by short name
 server = ActionServer(node, "/fibonacci", Fibonacci) do goal
-    seq = Int32[0, 1]   # elides the per-step extension loop
+    seq = Int32[0, 1]
     feedback!(goal, Fibonacci.Feedback(partial_sequence = seq))
     Fibonacci.Result(sequence = seq)
 end
@@ -43,14 +40,18 @@ One `@ros_import` call handles several interfaces, with these knobs:
 Drop `from=` to resolve a name from the vendored tree and the local ROS 2 environment:
 
 ```julia
-@ros_import "std_msgs/msg/String"   # from a locally installed ROS 2 distro
+@ros_import "std_msgs/msg/String"
 ```
 
 ROSNode searches three sources for each name, in order:
 
 1. the `from=` source roots, when given;
 2. ROSNode's vendored interface tree;
-3. the local ROS 2 install, scanned in turn: roots registered with [`add_search_path!`](@ref) (highest precedence), then `AMENT_PREFIX_PATH` (a sourced workspace), then `CMAKE_PREFIX_PATH`, then the `/opt/ros/<distro>` system installs (`rolling`, `jazzy`, `kilted`, `lyrical`, `humble`).
+3. the local ROS 2 install, scanned in precedence order:
+   1. roots registered with [`add_search_path!`](@ref);
+   2. `AMENT_PREFIX_PATH` (a sourced workspace);
+   3. `CMAKE_PREFIX_PATH`;
+   4. the `/opt/ros/<distro>` system installs (`rolling`, `jazzy`, `kilted`, `lyrical`, `humble`).
 
 Because `from=` roots come first, a local package can supply a new type or override a vendored or environment one.
 

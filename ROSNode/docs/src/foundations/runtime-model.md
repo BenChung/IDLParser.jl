@@ -26,11 +26,14 @@ The `from="interfaces"` argument tells `@ros_import` where to find the `std_msgs
 
 ## Contexts
 
-A `Context` owns the Zenoh session, discovery, and shutdown. The `@context do ctx … end` form drains in-flight work and closes the session on exit, and binds the calling module as the type-resolution home so wire types resolve against that module's imported structs.
+A `Context` owns the Zenoh session, discovery, and shutdown. The `@context do ctx … end` form, on exit:
+
+- drains in-flight work,
+- closes the Zenoh session,
+- and binds the calling module as the type-resolution home, so wire types resolve against that module's imported structs.
 
 ```julia
 @context(peers = ["tcp/localhost:7447"]) do ctx
-    # everything lives here
 end
 ```
 
@@ -64,7 +67,7 @@ ROSNode mirrors `rmw_zenoh`, whose discovery is router-based. The `peers` keywor
 end
 ```
 
-Omit `peers` (and set `localhost_only` / `domain_id` as needed) to use environment discovery:
+Environment discovery is the default: without `peers`, ROSNode scouts via multicast, and the `localhost_only` / `domain_id` knobs shape its reach:
 
 | Knob | Effect | Default |
 |------|--------|---------|

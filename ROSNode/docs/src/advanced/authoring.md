@@ -13,7 +13,7 @@ module Msgs
     using ROSNode
     @ros_package "demo_msgs"
     @ros_message struct Header;  stamp::Float64; frame::String;          end
-    @ros_message struct Chatter; header::Header; data::String; seq::Int32; end   # nested authored ref
+    @ros_message struct Chatter; header::Header; data::String; seq::Int32; end
 end
 ```
 
@@ -39,7 +39,7 @@ The annotate form `@ros_message "pkg/msg/Name" T` keeps your Julia name `T` and 
 module Msgs
     using ROSNode
     Base.@kwdef struct Chatter; data::String; end
-    @ros_message "std_msgs/msg/String" Chatter      # Julia `Chatter` ⇔ ROS std_msgs/msg/String
+    @ros_message "std_msgs/msg/String" Chatter
 end
 ```
 
@@ -66,8 +66,8 @@ srv = Service(node, "/add_two_ints", Srv.AddTwoInts)
 
 client = ServiceClient(node, "/add_two_ints", Srv.AddTwoInts)
 if wait_for_service(client; timeout = 5)
-    resp = call(client; a = Int64(2), b = Int64(40))   # request fields as kwargs
-    @info "response" sum = resp.sum                     # → 42
+    resp = call(client; a = Int64(2), b = Int64(40))
+    @info "response" sum = resp.sum
 end
 ```
 
@@ -88,7 +88,7 @@ module Act
         seq = Int32[0, 1]
         for _ in 1:order
             push!(seq, seq[end] + seq[end-1])
-            fb((partial_sequence = copy(seq),))   # publish feedback + cancellation yield point
+            fb((partial_sequence = copy(seq),))
         end
         (sequence = seq,)
     end
@@ -102,12 +102,12 @@ server = ActionServer(node, "/fibonacci", Act.Fibonacci)
 
 client = ActionClient(node, "/fibonacci", Act.Fibonacci)
 if wait_for_action_server(client; timeout = 5)
-    gh = send(client; order = Int32(8))       # goal fields as kwargs; blocks until the server accepts or rejects
-    for fb in feedback(gh)                     # empty stream if the goal was rejected
+    gh = send(client; order = Int32(8))       # blocks until the server accepts or rejects
+    for fb in feedback(gh)                     # yields each Feedback message; empty if the goal was rejected
         @info "feedback" fb.partial_sequence
     end
     if state(gh) != :rejected
-        result = fetch(gh)                    # settled — result is a NamedTuple (fetch raises on a rejected goal)
+        result = fetch(gh)                    # raises on a rejected goal
         @info "result" result.sequence
     end
 end

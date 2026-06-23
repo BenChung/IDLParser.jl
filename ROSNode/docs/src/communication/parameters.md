@@ -24,11 +24,22 @@ The annotations on each field shape how peers may drive it:
 - `∈ (a, b, c)` constrains a field to that choice set.
 - `|> readonly` blocks runtime sets; startup overrides still apply.
 
-Legal field types are the ROS 2 parameter value set: the scalars `Bool`, `Int64`, `Float64`, `String`, and `Symbol` (string-with-choices sugar), plus the array types `Vector{Bool}`, `Vector{Int64}`, `Vector{Float64}`, `Vector{String}`, and `Vector{UInt8}` (the byte array). The macro generates an immutable struct, so reads stay type-stable.
+Legal field types are the ROS 2 parameter value set:
+
+- Scalars: `Bool`, `Int64`, `Float64`, `String`, `Symbol` (string-with-choices sugar)
+- Arrays: `Vector{Bool}`, `Vector{Int64}`, `Vector{Float64}`, `Vector{String}`, `Vector{UInt8}` (the byte array)
+
+The macro generates an immutable struct, so reads stay type-stable.
 
 ## The server
 
-`Node(ctx, name, Schema)` attaches a typed parameter server at `node.parameters` and wires the six standard `rcl_interfaces` parameter services plus `/parameter_events`. The node is driveable by any ROS 2 parameter client. `overrides` overlays startup values (CLI, launch, or YAML) onto the schema defaults:
+`Node(ctx, name, Schema)` attaches a typed parameter server at `node.parameters` and:
+
+- wires the six standard `rcl_interfaces` parameter services
+- wires `/parameter_events`
+- makes the node driveable by any ROS 2 parameter client
+
+`overrides` overlays startup values onto the schema defaults; sources are CLI, launch, or YAML:
 
 ```julia
 node = Node(ctx, "client_demo_server", DemoParams; overrides = (max_speed = 50,))
@@ -86,7 +97,7 @@ end
 `set_parameter!` sets a single field. An out-of-range value raises `ParameterRejection`, the same exception a local server set raises, so the failure contract is uniform across local and remote:
 
 ```julia
-set_parameter!(client, :max_speed, 999)   # out of [0, 100] → raises ParameterRejection
+set_parameter!(client, :max_speed, 999)
 ```
 
 `on_parameter_event` watches the remote's changes, firing the do-block on each batch the server publishes to `/parameter_events`:

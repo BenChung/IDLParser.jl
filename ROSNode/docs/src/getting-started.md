@@ -43,9 +43,10 @@ julia --project=ROSNode ROSNode/examples/publisher.jl     # in one terminal
 julia --project=ROSNode ROSNode/examples/subscriber.jl    # in another
 ```
 
-The publisher emits a `published` `@info` record once a second, carrying `msg.data = "hello world N"`; the subscriber emits a matching `heard` record for each one as it arrives, carrying `msg.data` and its `String` type.
+- Publisher: emits a `published` `@info` record once a second, carrying `msg.data = "hello world N"`.
+- Subscriber: emits a matching `heard` record for each one as it arrives, carrying `msg.data` and its `String` type.
 
-Examples that bundle both halves (`service.jl`, `action.jl`, `parameters.jl`) take a role argument to split across two processes — the `ROLE` env var or the first CLI arg, defaulting to `both`:
+Examples that bundle both halves (`service.jl`, `action.jl`, `parameters.jl`) take a role argument to split across two processes. Set the role with the `ROLE` env var or the first CLI arg; it defaults to `both`:
 
 ```sh
 julia --project=ROSNode ROSNode/examples/service.jl server    # serve only (Ctrl-C to stop)

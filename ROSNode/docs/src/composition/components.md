@@ -9,7 +9,7 @@ Components can be built in two ways:
 
 Either way, `node("name" => State, …)` composes the components with dependency injection into one runnable `NodeSchema` and `run(schema)` brings the node up.
 
-This page builds a `Vehicle` node from two explicit combinator-built components, then recapping it as one [`@component`](@ref) block. The `Vehicle` is built from two parts:
+This page builds a `Vehicle` node from two explicit combinator-built components, then recaps it as one [`@component`](@ref) block. The `Vehicle` is built from two parts:
 
 * A `Sensor` that publishes telemetry on a timer and provides a battery reading, and
 * a `Guard` which enforces a sensed minimum battery level and that serves a "safe to fly?" query. 
@@ -43,9 +43,8 @@ end
 module Drone
     using ROSNode
     using ..Msgs: Telemetry
-    @ros_package "drone"            # names the inline-authored service type below
-    import ROSNode: configure, member_schema   # the generics this module extends
-    # ── components authored below ──
+    @ros_package "drone"
+    import ROSNode: configure, member_schema
 end
 ```
 
@@ -60,7 +59,7 @@ The state struct is parameterised by its member-path `Name` and subtypes `Compon
 
 ```julia
 mutable struct Sensor{Name} <: Component{Name}
-    level::Float64                          # simulated battery %
+    level::Float64                          # simulated
 end
 Sensor{Name}() where {Name} = Sensor{Name}(100.0)
 ```
@@ -69,7 +68,7 @@ The `@parameters` struct holds the public side, read through `parameters(node, s
 
 ```julia
 @parameters struct SensorParams
-    rate::Int64 = 5 ∈ 1..50                 # Hz — retunable via `ros2 param`
+    rate::Int64 = 5 ∈ 1..50                 # Hz
 end
 ```
 
@@ -132,7 +131,7 @@ import ROSNode: member_schema
 const Time = ROSNode.Interfaces.builtin_interfaces.msg.Time
 
 mutable struct Beacon{Name} <: Component{Name}
-    seq::Int                                       # private state
+    seq::Int
 end
 Beacon{Name}() where {Name} = Beacon{Name}(0)
 
@@ -142,7 +141,7 @@ on_clock(node, b::Beacon, msg::Time) = nothing
 member_schema(::Type{Beacon}) = component(Beacon,
     publishes(:beat, Time; on = "~/beat"),         # private
     hears(:clock, Time, on_clock; on = "/clock"),  # absolute
-    every(:pulse, 2.0, pulse))                     # timer: no topic
+    every(:pulse, 2.0, pulse))
 
 member_schema(Beacon)
 ```
@@ -172,7 +171,7 @@ Inline authoring keeps the whole port in one definition:
 
 ```julia
 @service "~/safe_to_fly" function safe(node, g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
-    b = battery(g.battery_src)              # reads the Sensor through the interface
+    b = battery(g.battery_src)
     (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
 end
 ```
@@ -199,8 +198,7 @@ An [`@interface`](@ref) names a capability — the generic functions a provider 
 `Sensor` provides it by backing the contract method and listing the interface in its `provides=`:
 
 ```julia
-battery(s::Sensor) = s.level                # satisfy the BatterySource contract
-# … provides = (BatterySource,) in Sensor's component(…) above
+battery(s::Sensor) = s.level
 ```
 
 Provision is **Holy-trait evidence**: a component declares the interfaces it provides, resolved against a consumer's `requires` rather than by subtyping. Declare it two ways:
@@ -242,9 +240,9 @@ A bare `m` argument is annotated `m::Sensor` for you, so reaction bodies stay fu
 ```julia
 @component mutable struct Sensor{Name} <: Component{Name}
     level::Float64 = 100.0                              # simulated battery %
-    @param rate::Int64 = 5 ∈ 1..50                      # Hz — read live; driveable by `ros2 param`
-    @provides BatterySource                             # satisfies the BatterySource contract
-    @publishes telemetry::Telemetry on "~/telemetry"    # node-private ⇒ /vehicle/telemetry
+    @param rate::Int64 = 5 ∈ 1..50                      # Hz
+    @provides BatterySource
+    @publishes telemetry::Telemetry on "~/telemetry"
     @every :rate function tick(node, m)                 # fires at the live `rate` Hz, only while Active
         m.level = max(0.0, m.level - 1.0)
         publish(entities(node, m).telemetry, Telemetry(battery = m.level, altitude = 12.0))
@@ -259,13 +257,18 @@ battery(s::Sensor) = s.level
 
 ## Assembling and running the node
 
-[`node`](@ref) assembles the node kind from a list of members. Each `"name" => State` pair gives the component a namespace within the node, and DI is resolved once, here:
+[`node`](@ref) assembles the node kind from a list of members. Each `"name" => State` pair gives the component a namespace within the node, and the framework resolves DI once, here:
 
 ```julia
 const Vehicle = node("sensor" => Drone.Sensor, "guard" => Drone.Guard; name = "Vehicle")
 ```
 
-`Guard` requires `BatterySource` and `Sensor` provides it, so the framework toposorts the members by dependency and injects the `Sensor` into the `Guard`. A dependency configures before its dependent and tears down after. `name = "Vehicle"` registers the kind in the process-global registry, so a container can load it by name (see [Containers & Dynamic Composition](containers.md)). The resolved member order and dependency edges are frozen into the returned `NodeSchema`'s type, so construction is type-stable.
+`Guard` requires `BatterySource` and `Sensor` provides it, so the `node` call:
+
+- toposorts the members by dependency and injects the `Sensor` into the `Guard`;
+- orders lifecycle so a dependency configures before its dependent and tears down after;
+- registers the kind under `name = "Vehicle"` in the process-global registry, so a container can load it by name (see [Containers & Dynamic Composition](containers.md));
+- freezes the member order and dependency edges into the returned `NodeSchema`'s type, so construction is type-stable.
 
 `run` brings the node up. Its options:
 
@@ -282,7 +285,7 @@ const Vehicle = node("sensor" => Drone.Sensor, "guard" => Drone.Guard; name = "V
 
     vehicle = run(Vehicle; ctx = ctx, name = "vehicle",
                   overrides = (rate = 5, min_battery = 90.0), block = false)
-    sleep(1.2)                              # telemetry streams in at 5 Hz
+    sleep(1.2)                              # let a few telemetry messages arrive before the query
 
     SafeReq = Drone.drone.srv.safe_Request
     guard = ServiceClient(ground, "/vehicle/safe_to_fly", SafeReq)
@@ -307,7 +310,10 @@ The last step of the chain in [Port names and topics](@ref) resolves a port's na
 
 [`describe_wiring`](@ref) on a built node prints each port's authored name and the resolved name beside it — the [Inspecting a schema](@ref) demo runs it live. It is the quick way to confirm two ports share a name before chasing a silent non-delivery. The resolved name is what the entity uses as a Zenoh key expression; see [Addressing & Key Expressions](../foundations/addressing.md).
 
-Two ports connect only when they resolve to the same name. A `hears(:foo, …)` (relative `foo`) and a `publishes(:p, …; on = "~/foo")` (private) therefore land on different topics — `/foo` against `/vehicle/foo`. A `node` call errors if two same-channel outputs collide on one name unless one was explicitly remapped; [`remap`](@ref) resolves the clash.
+Two ports connect only when they resolve to the same name:
+
+- **Mismatched names silently miss.** A `hears(:foo, …)` (relative `foo` → `/foo`) and a `publishes(:p, …; on = "~/foo")` (private → `/vehicle/foo`) land on different topics, so they never connect.
+- **Colliding names error.** A `node` call errors when two same-channel outputs resolve to one name, unless one was explicitly remapped — [`remap`](@ref) resolves the clash.
 
 ## Lifecycle
 

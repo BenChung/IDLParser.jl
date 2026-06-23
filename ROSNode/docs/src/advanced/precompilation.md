@@ -4,7 +4,7 @@
 CurrentModule = ROSNode
 ```
 
-The first message on a topic, the first request to a service, or the first goal to an action compiles the whole type-specialized chain — decode, your handler, and everything the handler calls. That one-time JIT cost lands as a startup spike, or as a stall on the first live message. Two mechanisms move it off the hot path: **warm-up** compiles the chain at endpoint construction, and the **node bake** folds a component's first-`run` path into its package's precompiled image.
+The first message on a topic, the first request to a service, or the first goal to an action compiles the whole type-specialized chain — decode, your handler, and everything the handler calls. That one-time JIT cost lands as a startup spike, or as a stall on the first live message. Two mechanisms compile that chain ahead of the first live message: **warm-up** compiles it at endpoint construction, and the **node bake** folds a component's first-`run` path into its package's precompiled image.
 
 ## Two tiers
 
@@ -33,9 +33,8 @@ The sync flag chooses when warming happens:
 Set the policy as the node default that every endpoint inherits, or override it per endpoint:
 
 ```julia
-node = Node(ctx, "vehicle"; warmup = :precompile, warmup_sync = true)   # node default
+node = Node(ctx, "vehicle"; warmup = :precompile, warmup_sync = true)
 
-# per-endpoint override; :execute runs the handler once on a fabricated Twist
 Subscription(node, "/cmd_vel", geometry_msgs.msg.Twist;
              warmup = :execute, warmup_sync = true) do msg
     drive(msg)
@@ -78,7 +77,7 @@ const Rig = node("drive" => Drive; name = "Rig")
 # under precompilation, so a precompiled package must re-register from __init__.
 __init__() = register_node_kind!("Rig", Rig)
 
-@compile_workload precompile_node(Rig)   # bake Rig's first-run path into Vehicle's image
+@compile_workload precompile_node(Rig)
 end
 ```
 
@@ -88,7 +87,7 @@ end
 - each port's codec (encode/decode), wire resolution, and per-handle close;
 - the spawned consume/serve/dispatch bodies — the subscription receive loop, the service request→handler→response serve tree, and the intra-process delivery leg — keyed on the member's concrete type and each reaction's handler.
 
-Prefer the **value** form `precompile_node(Rig)` over the type form `precompile_node(typeof(Rig))`: the value form anchors reaction bodies from the node's frozen handlers, so inline `component(…)` members and rebound/remapped handlers bake correctly. The type form is best-effort — with no handler values it falls back to a guarded `member_schema(base)` lookup and skips an inline `component(…)` member rather than aborting the precompile.
+Prefer the **value** form `precompile_node(Rig)` over the type form `precompile_node(typeof(Rig))`: the value form anchors reaction bodies from the node's frozen handlers, so inline `component(…)` members and rebound/remapped handlers bake correctly. The type form is best-effort: with no handler values it (1) falls back to a guarded `member_schema(base)` lookup, and (2) skips an inline `component(…)` member instead of aborting the precompile.
 
 The bake reaches a member whose ports have statically derivable handle types. Action ports are anchored too, but an action whose handle materialises only at `run` keeps the generic accessor and warms at first `run` instead.
 

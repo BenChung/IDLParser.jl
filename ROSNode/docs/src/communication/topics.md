@@ -6,7 +6,13 @@ This page builds a talker that publishes a `std_msgs/String` on `/chatter` and a
 
 ## Imported interfaces
 
-`@ros_import` bakes a standard interface by name and lands it at `std_msgs.msg.String` in the calling module. The `from="interfaces"` root names where the macro reads the `.msg` source: these examples run from the repository's `examples/` directory, where `interfaces/std_msgs/msg/String.msg` ships, so run them from there or point `from=` at your own interface tree (a sourced ROS 2 environment also resolves `std_msgs` without `from=`). The talker opens a context, creates a node, and publishes a fresh `String` each second:
+`@ros_import` bakes a standard interface by name and lands it at `std_msgs.msg.String` in the calling module. The `from=` root names where the macro reads the `.msg` source. Resolve `std_msgs` one of three ways:
+
+- run from the repository's `examples/` directory, where `interfaces/std_msgs/msg/String.msg` ships (`from="interfaces"`);
+- point `from=` at your own interface tree;
+- source a ROS 2 environment, which resolves `std_msgs` without `from=`.
+
+The talker opens a context, creates a node, and publishes a fresh `String` each second:
 
 ```julia
 using ROSNode
@@ -45,9 +51,11 @@ end
 
 The type-less `Subscription(node, "/chatter")` resolves each sample's concrete type at runtime against the home module's imports, which `@context` binds from the calling module. This single `@ros_import "std_msgs/msg/String"` therefore serves both the publisher's explicit type and the subscriber's resolution. See [Interface Types](../foundations/interface-types.md) for how that resolution works, and [Runtime Type Discovery](../advanced/discovery.md) for a recorder that handles any type off the wire.
 
-The default `concurrency = Serial()` delivers messages in order on one task; pass `Parallel(n)` to fan out across threads, and see [Message Delivery](../advanced/delivery.md) for view modes and concurrency in depth. `spin` parks the main task to keep the process alive while the scheduler delivers each message on its own task, and `handle_signals = true` turns Ctrl-C into a graceful drain.
+Concurrency has two modes: the default `concurrency = Serial()` delivers messages in order on one task, while `Parallel(n)` fans out across threads. See [Message Delivery](../advanced/delivery.md) for view modes and concurrency in depth.
 
-`Publisher` and `Subscription` are singleton instances of distinct endpoint kinds. `Publisher` takes `qos`, `congestion_control`, `priority`, and the `warmup` family (`warmup`, `warmup_sync`, `warmup_sample`); `Subscription` takes `qos`, `view`, `concurrency`, `match`, and the same `warmup` family — documented under [`PublisherKind`](@ref ROSNode.PublisherKind) and [`SubscriptionKind`](@ref ROSNode.SubscriptionKind).
+`spin` parks the main task to keep the process alive while the scheduler delivers each message on its own task, and `handle_signals = true` turns Ctrl-C into a graceful drain.
+
+`Publisher` and `Subscription` are singleton instances of distinct endpoint kinds. Each accepts a `qos` and the `warmup` family plus kind-specific options; see [`PublisherKind`](@ref ROSNode.PublisherKind) and [`SubscriptionKind`](@ref ROSNode.SubscriptionKind) for the full argument lists.
 
 To define your own message type directly in Julia, see [Authoring Interfaces in Julia](../advanced/authoring.md). Both halves are wire-compatible with ROS 2 nodes — see [Interoperating with ROS 2](../interop/ros2.md) to echo `/chatter` from a sourced ROS 2 environment, and [Getting Started](../getting-started.md) to start the router these examples point at.
 

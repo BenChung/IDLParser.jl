@@ -22,8 +22,8 @@ using ROSNode
         seq = Int32[0, 1]
         for i in 1:goal.request.order
             push!(seq, seq[end] + seq[end-1])
-            feedback!(goal, Fibonacci.Feedback(partial_sequence = copy(seq)))  # publishes feedback + checkpoints cancellation
-            sleep(0.3)  # simulate work
+            feedback!(goal, Fibonacci.Feedback(partial_sequence = copy(seq)))
+            sleep(0.3)
         end
         Fibonacci.Result(sequence = seq)
     end
@@ -34,7 +34,11 @@ end
 
 The feedback field is `partial_sequence`, matching `action_tutorials_interfaces`. The action is wire-compatible with ROS 2 (see [Interoperating with ROS 2](../interop/ros2.md)).
 
-The client sends a goal, streams feedback until the goal settles, then reads the cached result. `send` blocks on the server's reply and returns a [`ClientGoal`](@ref ROSNode.ClientGoal) handle. The handle reports `:accepted` once the server takes the goal, and `:rejected` for every other outcome alike: the server declined it, no server appeared within the retry window, or a Context drain ended the window.
+The client sends a goal, streams feedback until the goal settles, then reads the cached result. `send` blocks on the server's reply and returns a [`ClientGoal`](@ref ROSNode.ClientGoal) handle. The handle reports `:accepted` once the server takes the goal. It reports `:rejected` for any other outcome:
+
+- the server declined the goal,
+- the retry window expired before a server matched, or
+- a Context drain closed the window.
 
 ```julia
 using ROSNode
@@ -53,7 +57,7 @@ using ROSNode
             @info "feedback" fb.partial_sequence
         end
 
-        result = fetch(gh)               # cached result after settle
+        result = fetch(gh)
         @info "result" sequence = result.sequence
         @info "final state" state = state(gh)   # :succeeded
     end
@@ -61,7 +65,7 @@ using ROSNode
 end
 ```
 
-[`wait_for_action_server`](@ref) returns `true` once a server route-matches within the timeout, gating `send` on a reachable server. The [`feedback`](@ref) loop drives the result protocol behind the scenes, so iterating it is the whole client lifecycle.
+[`wait_for_action_server`](@ref) returns `true` once a server route-matches within the timeout, gating `send` on a reachable server. The [`feedback`](@ref) loop drives the result protocol, so iterating it is the whole client lifecycle.
 
 ## Goal states
 
@@ -71,7 +75,15 @@ end
 <div class="rosnode-statechart" data-machine="goal"></div>
 ```
 
-How the handler ends the goal is the [settlement three-way](services.md) again, specialized: returning a Result settles `:succeeded`, a checkpoint raising [`Cancelled`](@ref) settles `:canceled`, and any other throw settles `:aborted`. `:rejected` is a client-side handle state — the server declined the goal with [`reject`](@ref) and never registered it.
+How the handler ends the goal is the [settlement three-way](services.md) again, specialized:
+
+| Handler ends by | Goal settles |
+|---|---|
+| returning a Result | `:succeeded` |
+| a checkpoint raising [`Cancelled`](@ref) | `:canceled` |
+| any other throw | `:aborted` |
+
+`:rejected` is a client-side handle state, not a settlement: the server declined the goal with [`reject`](@ref), so it stays a client-only state with no server-side goal record.
 
 ## Cancelling a goal
 

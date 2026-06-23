@@ -10,7 +10,13 @@ By default, ROSNode mirrors `rmw_zenoh` on the wire: every topic, service, and a
 - relative `"chatter"` — prepended with the node's namespace.
 - private `"~/chatter"` — prepended with the node's FQN (`namespace` then `name`).
 
-It then normalizes the namespace (a leading slash, no trailing slash; the empty namespace becomes `/`), applies an ordered exact-match `from => to` remap table (empty by default), and validates the result. A valid FQN:
+It then, in order:
+
+1. normalizes the namespace — a leading slash, no trailing slash; the empty namespace becomes `/`;
+2. applies an ordered exact-match `from => to` remap table (empty by default);
+3. validates the result.
+
+A valid FQN:
 
 - is absolute — starts with `/`;
 - contains no empty `//` token;
@@ -19,7 +25,7 @@ It then normalizes the namespace (a leading slash, no trailing slash; the empty 
 
 ## Domain scoping
 
-`domain_id` (the [`Context`](@ref) keyword, falling back to `ROS_DOMAIN_ID`, then `0`) scopes both topic traffic and graph discovery to one domain: two contexts on different domains share a router yet never see each other's endpoints. Under the default `RmwZenoh` dialect it leads every topic keyexpr and liveliness token, so the `@ros2_lv/<domain>/**` discovery subscription itself stays in-domain. Reaching a peer means matching its `domain_id` — including the `ROS_DOMAIN_ID` of stock ROS 2 nodes (see [Interoperating with ROS 2](../interop/ros2.md)).
+`domain_id` (the [`Context`](@ref) keyword, falling back to `ROS_DOMAIN_ID`, then `0`) scopes both topic traffic and graph discovery to one domain: two contexts on different domains share a router but each sees only the endpoints within its own domain. Under the default `RmwZenoh` dialect it leads every topic keyexpr and liveliness token, so the `@ros2_lv/<domain>/**` discovery subscription itself stays in-domain. Reaching a peer means matching its `domain_id` — including the `ROS_DOMAIN_ID` of stock ROS 2 nodes (see [Interoperating with ROS 2](../interop/ros2.md)).
 
 ## Topic key expressions
 
@@ -46,7 +52,7 @@ Every node and endpoint declares a Zenoh liveliness token under the admin space 
 @ros2_lv/<domain>/<zid>/<nid>/<eid>/<kind>/<enclave>/<ns>/<name>/<topic>/<type>/<hash>/<qos>
 ```
 
-The `<enclave>` slot is always `%` (rmw_zenoh does not transmit it), and the QoS profile rides in the final component as a colon-separated field set. ROSNode reads these tokens to answer graph queries — which publishers and subscribers exist on a topic — and to gate type matching.
+The `<enclave>` slot is always the placeholder `%`, because rmw_zenoh omits the enclave from the token, and the QoS profile rides in the final component as a colon-separated field set. ROSNode reads these tokens to answer graph queries — which publishers and subscribers exist on a topic — and to gate type matching.
 
 ## Format dialects
 

@@ -4,16 +4,16 @@ A node kind runs at two scales, and its code is identical at both. Deploy-time w
 
 ## Two scales
 
-Nodes can be run **standalone** or in a **container**. Both support sessions, discovery, and registry, but differ in namespacing. 
+Run a node **standalone** or inside a **container**. Both share sessions, discovery, and registry; they differ only in namespacing: a standalone node exposes its entities under its own name, while a container namespaces each node it holds.
 
-**Standalone** nodes can be ran directly — `run(Vehicle; name = "vehicle")`; a standalone node will directly expose its entities under the given name.
+**Standalone** nodes run directly — `run(Vehicle; name = "vehicle")` — exposing their entities under the given name.
 
 Several nodes can share one process through a **container**. Each [`add!`](@ref) instantiates a node on the container's single Context, so the nodes share one session, discovery, and registry, plus a direct in-process delivery path between them:
 
 ```julia
 container("fleet") do c
     add!(c, Vehicle;       name = "vehicle")
-    add!(c, GroundStation; name = "ground")     # another node(…) schema
+    add!(c, GroundStation; name = "ground")
 end
 ```
 
@@ -30,11 +30,27 @@ container("fleet") do c
 end
 ```
 
-`load_node(c, package, plugin; …)` resolves the kind registered as `plugin` (the `package` scopes the lookup and may be empty), instantiates it on the container, and returns the node with its unique id. `name` sets the instance name (the registered kind name is the default); `parameters` overrides member parameters by their composite `<member>.<field>` names. [`unload_node`](@ref) closes a loaded node and drops it from the container, and [`list_nodes`](@ref) returns the loaded `(id, name)` pairs — the `ros2 component unload` and `ros2 component list` paths.
+`load_node(c, package, plugin; …)` resolves the kind registered as `plugin`, instantiates it on the container, and returns the node with its unique id:
+
+- `package` — scopes the lookup; may be empty.
+- `plugin` — the registered kind name.
+- `name` — instance name; defaults to the registered kind name.
+- `parameters` — overrides member parameters by their composite `<member>.<field>` names.
+
+The three container operations map onto the ROS2 component verbs:
+
+| Function | Behavior | ROS2 path |
+| --- | --- | --- |
+| [`load_node`](@ref) | instantiates a registered kind, returns the node and its id | `ros2 component load` |
+| [`unload_node`](@ref) | closes a loaded node and drops it from the container | `ros2 component unload` |
+| [`list_nodes`](@ref) | returns the loaded `(id, name)` pairs | `ros2 component list` |
 
 ### Registration in a precompiled package
 
-`node(…; name=)` registers the kind immediately in the REPL, a script, or at runtime. Under precompilation it skips the registration — a build-time registration cannot reach the loaded image — so a package re-registers its kinds at load, from its `__init__`:
+`node(…; name=)` registers the kind by one of two paths, because a build-time registration cannot reach the loaded image:
+
+- REPL, script, or runtime: it registers the kind immediately.
+- Precompiled package: it skips registration at build time, so the package re-registers its kinds at load, from its `__init__`:
 
 ```julia
 const Vehicle = node("sensor" => Sensor, "guard" => Guard; name = "Vehicle")

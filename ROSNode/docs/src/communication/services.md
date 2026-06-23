@@ -4,7 +4,7 @@ A service is a request/response call: the client blocks for the reply. The handl
 
 ## Imported interface
 
-`@ros_import` of a fully-qualified service binds the bare `AddTwoInts` namespace, exposing `AddTwoInts.Request` and `AddTwoInts.Response`. Reference the service by its `.Request` type; the Response resolves automatically. See [Interface Types](../foundations/interface-types.md) for how the import binds. The handler receives the decoded request and returns the response message:
+`@ros_import` of a fully-qualified service binds the bare `AddTwoInts` namespace, exposing `AddTwoInts.Request` and `AddTwoInts.Response`. Reference the service by its `.Request` type — the Response resolves automatically (see [Interface Types](../foundations/interface-types.md)). The handler receives the decoded request and returns the response message:
 
 ```julia
 using ROSNode
@@ -18,7 +18,7 @@ using ROSNode
         AddTwoInts.Response(sum = req.a + req.b)
     end
 
-    spin(ctx; handle_signals = true)   # serve until Ctrl-C
+    spin(ctx; handle_signals = true)
 end
 ```
 
@@ -71,7 +71,7 @@ The server settles every request exactly once, and the handler reaches that sett
 | **declines** — `respond!(req, failed, msg)` | a `ServiceError` reply, raised at the client's [`call`](@ref) |
 | **throws** | a synthesized error reply, raised at the client's [`call`](@ref) as a `ServiceError` |
 
-The same three branches drive a [lifecycle transition](../composition/components.md) — land the target state / revert to origin / error processing. An [action goal](actions.md) settles through the same shape, except its `canceled` outcome comes from a thrown [`Cancelled`](@ref) (the *throws* branch), not a decline.
+An [action goal](actions.md)'s `canceled` outcome maps to the *throws* branch of this three-way — a thrown [`Cancelled`](@ref) rather than a decline.
 
 ## Next
 

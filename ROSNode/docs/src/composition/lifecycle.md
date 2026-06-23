@@ -14,13 +14,13 @@ The five hooks are plain methods on the component type, each node-first `(node, 
 | `cleanup` | `Inactive → Unconfigured` | release what `configure` acquired |
 | `on_error` | a thrown transition | recover the state a throwing hook left behind |
 
-The framework brackets the hooks with its own bookkeeping: a member's entities materialise immediately before its `configure`, its (paused) timers start immediately after a successful `activate`, and its entities close immediately after `cleanup`. A hook covers only the state the framework cannot see for you:
+The framework brackets the hooks with its own bookkeeping: a member's entities materialise immediately before its `configure`, its (paused) timers start immediately after a successful `activate`, and its entities close immediately after `cleanup`. A hook covers the resource-level state the framework leaves to you — everything beyond the bracketed bookkeeping above:
 
 ```julia
 import ROSNode: configure, cleanup, member_schema
 
 mutable struct Recorder{Name} <: Component{Name}
-    io::Any                                  # configure opens it, cleanup closes it
+    io::Any                                  # nothing until configure opens it
 end
 Recorder{Name}() where {Name} = Recorder{Name}(nothing)
 @parameters struct RecorderParams
@@ -41,16 +41,16 @@ member_schema(::Type{Recorder}) = component(Recorder, RecorderParams,
 
 `managed` selects who drives the transitions:
 
-- **Unmanaged (the default).** `run` / `add!` brings the node straight up: construction runs every member's `configure`, then every member's `activate`. `cleanup` runs at teardown — an explicit `close(node)`, a container's [`unload_node`](@ref) (see [Containers & Dynamic Composition](containers.md)), or the Context drain when the node's Context closes.
+- **Unmanaged (the default).** `run` / `add!` brings the node straight up: construction runs every member's `configure`, then every member's `activate`. `cleanup` runs at teardown (see [Ordering and idempotent cleanup](#Ordering-and-idempotent-cleanup) for the full trigger set).
 - **Managed (`managed = true`).** The node declares the lifecycle control surface (the five `lifecycle_msgs` services plus the `~/transition_event` topic) and starts `Unconfigured`. An external orchestrator (`ros2 lifecycle set …`) or in-process calls drive the transitions; `autostart = true` runs `configure!` then `activate!` during construction.
 
 ```julia
 vehicle = run(Vehicle; ctx = ctx, name = "vehicle", managed = true, block = false)
 ln = ROSNode.lifecycle(vehicle)
-configure!(ln)      # → Inactive: entities materialise, each member's configure runs
-activate!(ln)       # → Active: timers start, dispatch gating lifts
-deactivate!(ln)     # → Inactive: members deactivate in reverse order, gating drops back
-cleanup!(ln)        # → Unconfigured: each cleanup runs, entities close — a configure! starts fresh
+configure!(ln)      # entities materialise, each member's configure runs
+activate!(ln)       # timers start, dispatch gating lifts
+deactivate!(ln)     # members deactivate in reverse order, gating drops back
+cleanup!(ln)        # each cleanup runs, entities close — a configure! starts fresh
 ```
 
 These calls and a `ros2 lifecycle` orchestrator drive one machine over `~/change_state`. Each transition runs the members' hooks under the [settlement three-way](../communication/services.md). Click a transition to step through it:
@@ -87,7 +87,11 @@ Two ports sit outside the gate:
 
 A hook signals failure two ways:
 
-- **Returning the `failure` token** rolls the transition back to its pre-transition state. The fan-out stops at the failing member, and the members that already ran the forward hook unwind in reverse dependency order: a failed `activate!` deactivates them and lands `Inactive`; a failed `configure!` cleans them up, closes their ports, and lands `Unconfigured`. The transition reports `:failure`, and error processing is left untouched.
+- **Returning the `failure` token** rolls the transition back to its pre-transition state. The fan-out stops at the failing member, and the members that already ran the forward hook unwind in reverse dependency order:
+    - a failed `activate!` deactivates them and lands `Inactive`;
+    - a failed `configure!` cleans them up, closes their ports, and lands `Unconfigured`.
+
+    The transition reports `:failure` and skips error processing entirely — only a thrown hook enters recovery.
 - **Throwing** diverts a managed node into error processing:
 
 ```@raw html
@@ -105,7 +109,7 @@ Error processing then runs the guarded member-cleanup fan-out — each member's 
 
 In a multi-member node the hooks fan out in dependency order: `configure`, `activate`, and `on_error` run providers first; `deactivate` and `cleanup` run in reverse. The `Sensor` in [Components](components.md) configures before the `Guard` it feeds, and cleans up after it.
 
-`cleanup` runs at most once per `configure`. Teardown has several triggers — explicit `close`, `unload_node`, the shutdown transition, the Context drain — and a node can see more than one. The member's materialised entities are the guard: the first trigger runs `cleanup`, later ones are no-ops. The framework logs a throwing `cleanup` and continues, so the member's entities still close and the remaining members still clean up.
+`cleanup` runs at most once per `configure`. Teardown has several triggers — explicit `close`, a container's [`unload_node`](@ref) (see [Containers & Dynamic Composition](containers.md)), the shutdown transition, the Context drain — and a node can see more than one. The member's materialised entities are the guard: the first trigger runs `cleanup`, later ones are no-ops. The framework logs a throwing `cleanup` and continues, so the member's entities still close and the remaining members still clean up.
 
 ## API reference
 

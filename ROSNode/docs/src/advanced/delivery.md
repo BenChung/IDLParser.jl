@@ -4,7 +4,10 @@ When a sample arrives, a subscription decodes it and runs your handler. Two keyw
 
 ## View modes
 
-`view` chooses how your handler receives the message — a ladder from full safety to maximum throughput on `Subscription`. A `Service` takes the two-rung Boolean form: `view = false` (the default) owns the request, `view = true` borrows it zero-copy for the handler's duration.
+`view` chooses how your handler receives the message — a ladder from full safety to maximum throughput on `Subscription`. A `Service` takes a two-rung Boolean form:
+
+- `view = false` (the default) owns the request.
+- `view = true` borrows it zero-copy for the handler's duration.
 
 The snippets below assume a live `node` and the generated message types (`std_msgs.msg.String`, `sensor_msgs.msg.LaserScan`) already in scope.
 
@@ -16,7 +19,7 @@ end
 
 - `Owned()` (the default) decodes a fully-owned message — storable, forwardable to other tasks, spawnable, with no lifetime caveats. Pick this when the message outlives the handler: you keep it, hand it to another task, or `@spawn` work on it.
 - `Checked()` (also written `view = true`) exposes a zero-copy `CDRView` aliasing the payload, valid for the handler's duration, with a runtime guard that throws `BorrowError` when the view escapes the handler. Pick this for high-rate streams you consume in place, while you still want the safety net.
-- `Unchecked()` exposes the same zero-copy view with the guard removed, for maximum throughput. Pick this once `Checked()` has proven the view stays put. An escaping view is undefined behavior.
+- `Unchecked()` exposes the same zero-copy view and runs the handler without the borrow guard, for maximum throughput. Pick this once `Checked()` has proven the view stays put. An escaping view is undefined behavior.
 
 The usual progression is to validate under `Checked()`, then switch to `Unchecked()` for the hot path.
 
@@ -53,7 +56,7 @@ The two options compose. A hot, lock-free fan-out owns its own synchronization a
 ```julia
 Subscription(node, "/scan", sensor_msgs.msg.LaserScan;
              view = Unchecked(), concurrency = Parallel(4)) do msg
-    accumulate!(msg)   # you synchronize shared state across the 4 tasks
+    accumulate!(msg)
 end
 ```
 
@@ -63,7 +66,10 @@ Both `Publisher` and `Subscription` accept a `qos = default_qos()` profile that 
 
 ## Static subscriptions and the fast path
 
-Both subscription flavors take the same `view` modes through the identical delivery leaf. A static typed subscription, `Subscription(node, "/topic", T)`, knows its type at declaration. A dynamic subscription resolves the type per sample; that per-sample resolution is the cost a static subscription avoids — see [Runtime Type Discovery](discovery.md).
+Both subscription flavors take the same `view` modes through the identical delivery leaf; they differ only in when the type is resolved:
+
+- a **static** subscription, `Subscription(node, "/topic", T)`, resolves its type once at declaration, so the delivery leaf carries no per-sample type lookup;
+- a **dynamic** subscription resolves the type per sample — see [Runtime Type Discovery](discovery.md).
 
 ## See also
 

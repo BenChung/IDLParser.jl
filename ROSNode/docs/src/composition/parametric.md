@@ -10,7 +10,7 @@ The injected provider's concrete type varies by composition — a real `Sensor` 
 
 ```julia
 mutable struct Guard{Name, B} <: Component{Name}
-    battery_src::B                          # the injected sibling provider
+    battery_src::B
 end
 ```
 
@@ -24,14 +24,12 @@ The assembler fills `B` from whatever sibling satisfies the `requires`. In `Vehi
 make_guard(node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
 ```
 
-Declare it as either surface — the `ctor =` keyword on `component`, or a [`construct`](@ref)`(::Type{Guard}, …)` method on the bare type (the keyword wins when a component carries both):
+Declare it as either surface — the `ctor =` keyword on `component`, or a [`construct`](@ref)`(::Type{Guard}, …)` method on the bare type. If a component carries both, the `ctor =` keyword wins:
 
 ```julia
-# as a keyword:
 member_schema(::Type{Guard}) = component(Guard, GuardParams, safe;
     requires = (BatterySource,), ctor = make_guard)
 
-# or as the trait method (same signature, no `ctor =`):
 construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
 member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,))
 ```
@@ -54,7 +52,10 @@ rig = node("batt" => MockBattery, "guard" => Guard)     # guard member is Guard{
 
 ## Running a dependent component standalone
 
-`run(S)` promotes a single component to its own node with un-prefixed parameters, constructing it through its zero-dependency constructor. That covers a component declaring no `requires`. A `requires`-bearing component has no sibling to satisfy the dependency on its own, so `run` rejects it and names that reason.
+`run(S)` promotes a single component to its own node with un-prefixed parameters, constructing it through its zero-dependency constructor:
+
+- a component declaring no `requires` — constructed and run;
+- a `requires`-bearing component — rejected (no sibling can satisfy the dependency), with the reason named.
 
 A component you want to run both ways gets a zero-`requires` variant whose constructor injects a **null-object** stand-in — a provider that answers the interface with a safe default:
 

@@ -16,7 +16,12 @@ using ROSNode
 end
 ```
 
-ROSNode also resolves message types at runtime. A type-less subscription reads each sample's `(name, hash)` and resolves the concrete wire type — from the registry, the project cache, ament, or a wire query, in that order — then decodes it on the fly, handing the handler a real typed struct, with no `@ros_import`:
+ROSNode also resolves message types at runtime. A type-less subscription reads each sample's `(name, hash)`, resolves the concrete wire type, decodes it on the fly, and hands the handler a real typed struct — no `@ros_import` needed. It resolves the type from each source in order:
+
+1. the type registry
+2. the project cache
+3. ament
+4. a wire query
 
 ```julia
 using ROSNode
@@ -24,7 +29,6 @@ using ROSNode
 @context(peers = ["tcp/localhost:7447"]) do ctx
     node = Node(ctx, "listener")
 
-    # No @ros_import: the message type is resolved at runtime from discovery.
     Subscription(node, "/chatter") do msg
         @info "heard" msg.data
     end
@@ -33,7 +37,7 @@ using ROSNode
 end
 ```
 
-This powers generic tooling — recorders, bridges, introspection — over types it never imported.
+This powers generic tooling — recorders, bridges, introspection — over any type discovered at runtime.
 
 ## What it provides
 
