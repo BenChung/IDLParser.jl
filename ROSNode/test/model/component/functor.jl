@@ -698,6 +698,39 @@ module CMacro
     mutable struct Guard{Name, B} <: Component{Name}; b::B; end
     mkguard(node, ::Val{N}, src) where {N} = Guard{N, typeof(src)}(src)
     member_schema(::Type{Guard}) = component(Guard; requires = (BatterySource,), ctor = mkguard)
+
+    # DI consumers authored ENTIRELY with @component: `@requires field::Marker` adds the hidden param that
+    # holds the injected sibling + the `construct` that places it — no hand-written parametric struct or ctor.
+    @component mutable struct GuardC{Name} <: Component{Name}        # a concrete sibling dependency
+        @requires src::Batt
+        seen::Int64 = 0
+    end
+    readc(g::GuardC) = batt(g.src)                                   # type-stable: src is the concrete sibling
+
+    @component mutable struct GuardX{Name} <: Component{Name}        # an @interface dependency, same sugar
+        @requires src::BatterySource
+        @param thresh::Float64 = 10.0
+    end
+
+    # a raw parametric holder with NO ctor — the default `construct` builds it from its own type
+    mutable struct HolderC{Name, B} <: Component{Name}; b::B; end
+    member_schema(::Type{HolderC}) = component(HolderC; requires = (BatterySource,))
+
+    # a FIELD-LESS @component provider — its zero-arg ctor must use the implicit inner ctor, not a
+    # self-recursive emitted one. Carries its own interface so it doesn't collide with Batt's BatterySource.
+    @interface Pinger2 png(_)
+    @component mutable struct Stateless{Name} <: Component{Name}
+        @provides Pinger2
+    end
+    png(::Stateless) = 7
+
+    # two dependencies in one @component — an @interface and a concrete component
+    @component mutable struct TwoDep{Name} <: Component{Name}
+        @requires p::Pinger2
+        @requires sib::Batt
+        k::Int64 = 0
+    end
+    twosum(t::TwoDep) = png(t.p) + Int(batt(t.sib))
 end
 
 @testset "functor: @component macro" begin
@@ -734,19 +767,52 @@ end
         close(v)
     end
 
-    # @requires reserved with a clear, forward-looking error
-    err = try
-        @eval module _CMacroBad
-            using ROSNode
-            @component mutable struct NeedsBatt
-                @requires BatterySource
-            end
-        end
-        nothing
-    catch e
-        e
+    # @requires (concrete sibling): the macro adds the hidden param + construct; the field is the concrete
+    # sibling type, so the read is type-stable — no hand-written `GuardC{Name,B}` or ctor.
+    gc = run(node("batt" => CMacro.Batt, "g" => CMacro.GuardC); name = "cmgc", block = false)
+    try
+        @test gc.members.g isa CMacro.GuardC{:g, CMacro.Batt{:batt}}        # hidden param fixed to the sibling
+        @test fieldtype(typeof(gc.members.g), :src) === CMacro.Batt{:batt}
+        @test CMacro.batt(gc.members.g.src) == 88.0
+        @test RNX.requires_of(typeof(RNX.member_schema(CMacro.GuardC))) == (CMacro.Batt,)
+    finally
+        close(gc)
     end
-    @test err !== nothing && occursin("@requires", sprint(showerror, err isa LoadError ? err.error : err))
+    @test isconc(CMacro.readc, (CMacro.GuardC{:g, CMacro.Batt{:batt}},))    # the injected read is type-stable
+
+    # @requires (an @interface): the same sugar, requirement resolved by provision
+    gx = run(node("batt" => CMacro.Batt, "g" => CMacro.GuardX); name = "cmgx", block = false)
+    try
+        @test gx.members.g isa CMacro.GuardX{:g, CMacro.Batt{:batt}}
+        @test RNX.requires_of(typeof(RNX.member_schema(CMacro.GuardX))) == (CMacro.BatterySource,)
+        @test parameters(gx, gx.members.g).thresh == 10.0                   # @param coexists with @requires
+    finally
+        close(gx)
+    end
+
+    # default `construct`: a raw parametric holder with NO ctor builds `HolderC{Name, typeof(dep)}(dep)`
+    hn = RNX.build_members(node("batt" => CMacro.Batt, "h" => CMacro.HolderC), nothing)
+    @test typeof(hn.h) === CMacro.HolderC{:h, CMacro.Batt{:batt}}
+    @test fieldtype(typeof(hn.h), :b) === CMacro.Batt{:batt}
+
+    # a field-less @component builds (the zero-arg ctor uses the implicit inner ctor, no self-recursion)
+    @test CMacro.Stateless{:s}() isa CMacro.Stateless{:s}
+
+    # two @requires in one @component — interface + concrete, both injected and type-stable
+    td = RNX.build_members(node("s" => CMacro.Stateless, "b" => CMacro.Batt, "t" => CMacro.TwoDep), nothing)
+    @test typeof(td.t) === CMacro.TwoDep{:t, CMacro.Stateless{:s}, CMacro.Batt{:b}}
+    @test RNX.requires_of(typeof(RNX.member_schema(CMacro.TwoDep))) == (CMacro.Pinger2, CMacro.Batt)
+    @test isconc(CMacro.twosum, (typeof(td.t),))
+
+    # guards: a bare `@requires Marker` (no field) and `@uses` still error clearly, self-identifying
+    eb = try; @macroexpand(@component mutable struct GBad{Name} <: Component{Name}
+            @requires BatterySource
+        end); nothing; catch e; e; end
+    @test eb !== nothing && occursin("@requires", sprint(showerror, eb)) && occursin("field::Marker", sprint(showerror, eb))
+    eu = try; @macroexpand(@component mutable struct UBad{Name} <: Component{Name}
+            @uses foo
+        end); nothing; catch e; e; end
+    @test eu !== nothing && occursin("@uses", sprint(showerror, eu))
 
     # @param rejects malformed forms at macro-expand, with a self-identifying error
     ep1 = try                                            # > 2 parts (a junk token between doc and field)

@@ -184,13 +184,10 @@ struct DefaultCtor{S} end                                    # non-DI default: b
 
 # DI default when DI is declared via the trait surface (`requires(::Type{S})`/`construct(::Type{S}, …)`)
 # rather than a `ctor=` kwarg: route the frozen-plan ctor call to `construct`, which receives the
-# resolved deps positionally (`construct(::Type{S}, node, ::Val{Name}, deps…)`).
+# resolved deps positionally (`construct(::Type{S}, node, ::Val{Name}, deps…)`). With no user/@component
+# method, this lands on the DEFAULT `construct` that builds `S{Name, typeof.(deps)…}(deps…)` from the type.
 struct ConstructAdapter{S} end
 (::ConstructAdapter{S})(node, args...) where {S} = construct(S, node, args...)
-
-# does `S` have a `construct(::Type{S}, node, ::Val{Name}, deps…)` method of the wanted arity?
-_has_construct_arity(::Type{S}, want::Int) where {S} =
-    any(m -> (m.nargs == want || m.isva), methods(construct, Tuple{Type{S}, Vararg{Any}}))
 
 function _evidence(t::Tuple)
     for x in t
@@ -224,25 +221,17 @@ function _component(::Type{S}, ::Type{P}, ports::Tuple;
     # a malformed entry is the more fundamental error, surfaced before the ctor-arity checks below.
     Req = _evidence(req); Prov = _evidence(prov)
     c = ctor !== nothing ? ctor : (isempty(req) ? DefaultCtor{S}() : ConstructAdapter{S}())
-    # Validate the DI contract WHERE it's declared: a `requires`-bearing member needs a ctor that accepts
-    # (node, ::Val{Name}, deps…) with one dep per required interface — else the mismatch only surfaces
-    # deep inside the @generated build_members at run(). Method.nargs = func + node + ::Val{Name} + deps.
-    if !isempty(req)
-        if ctor !== nothing
-            # arity-only (deps are often typed, e.g. `s::Sensor`, so a typed `hasmethod` probe false-positives).
-            want = 3 + length(req)
-            any(m -> m.nargs == want || m.isva, methods(ctor)) || throw(ArgumentError(
-                "component($(S)): the `ctor` has no (node, ::Val{Name}, $(length(req)) dep(s)) method " *
-                "to match its `requires` ($(length(req))); a DI ctor is `f(node, ::Val{Name}, deps...)`"))
-        else
-            # No `ctor=` → DI rides the `construct(::Type{S}, node, ::Val{Name}, deps…)` trait. Require it
-            # exists (the zero-dep default `construct`/DefaultCtor can't accept deps). nargs = the above + 1
-            # for the leading `::Type{S}`.
-            _has_construct_arity(S, 4 + length(req)) || throw(ArgumentError(
-                "component($(S)): declares `requires` ($(length(req)) interface(s)) but no `ctor`; a DI " *
-                "member needs `ctor = f` where `f(node, ::Val{Name}, deps...)`, or a method " *
-                "`construct(::Type{$(nameof(S))}, node, ::Val{Name}, deps...)` (the default ctor is zero-dep)"))
-        end
+    # Validate an EXPLICIT ctor's arity WHERE it's declared: it must accept (node, ::Val{Name}, deps…), one
+    # dep per requirement — else the mismatch only surfaces deep inside the @generated build_members at run().
+    # No `ctor=` is fine: DI routes through `construct(::Type{S}, node, ::Val{Name}, deps…)` — a user/@component
+    # method if defined, else the default that builds `S{Name, typeof.(deps)…}(deps…)` from the type itself.
+    # Method.nargs = func + node + ::Val{Name} + deps.
+    if !isempty(req) && ctor !== nothing
+        # arity-only (deps are often typed, e.g. `s::Sensor`, so a typed `hasmethod` probe false-positives).
+        want = 3 + length(req)
+        any(m -> m.nargs == want || m.isva, methods(ctor)) || throw(ArgumentError(
+            "component($(S)): the `ctor` has no (node, ::Val{Name}, $(length(req)) dep(s)) method " *
+            "to match its `requires` ($(length(req))); a DI ctor is `f(node, ::Val{Name}, deps...)`"))
     end
     return MemberSchema{S, typeof(ports), P, Req, Prov, typeof(c)}(ports, c)
 end
@@ -793,9 +782,11 @@ function Base.run(schema::NodeSchema; ctx::Union{Context, Nothing} = nothing,
                   localhost_only::Bool = false, managed::Bool = false, autostart::Bool = !managed,
                   log_level::Union{LogLevel, Nothing} = nothing,
                   warmup::Union{Symbol, WarmupMode} = :off, warmup_sync::Bool = false,
+                  on_reaction_error::Union{Symbol, ReactionErrorPolicy} = :shutdown,
                   flat::Bool = false, block::Bool = true)
     owns = ctx === nothing
-    ctx  = owns ? Context(; peers = collect(String, peers), localhost_only = localhost_only) : ctx
+    ctx  = owns ? Context(; peers = collect(String, peers), localhost_only = localhost_only,
+                            on_reaction_error = on_reaction_error) : ctx
     cnode = nothing
     cnref = Ref{Any}(nothing)        # the managed transition callbacks reach the cnode through this
     try

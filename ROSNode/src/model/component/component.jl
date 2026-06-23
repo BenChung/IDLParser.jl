@@ -247,17 +247,25 @@ function parameters end
     construct(::Type{M}, node, ::Val{Name}, deps…) -> M{Name…}
 
 Build a component instance during node assembly. `Name` is the member's path within the node
-(its name in the `node(…)` member list), supplied by the framework as a `Val`. The default
-`construct(::Type{M}, node, ::Val{Name})` returns `M{Name}()` for a non-parametric component
-(every field defaulted). Supply a DI form to inject dependencies one of two ways — a
-`construct(::Type{M}, node, ::Val{Name}, deps…)` method (below), or `member_schema(M)`'s `ctor=`
-keyword (the `ctor=` overrides the method when both are given). A component that `requires`
-interfaces or sibling components receives the resolved providers as `deps…`, positionally in
-`requires` order, and stores them — typically a sibling dep into a field typed by that component
-(whose own `Name` parameter then carries that sibling's path).
+(its name in the `node(…)` member list), supplied by the framework as a `Val`. A component that
+`requires` interfaces or sibling components receives the resolved providers as `deps…`,
+positionally in `requires` order, and stores them — typically a sibling dep into a field typed by
+that component (whose own `Name` parameter then carries that sibling's path).
 
-A **parametric** component (free type parameters beyond `Name`) must define a `ctor` that
-places `Name` explicitly, threading the `Val{Name}` through `where`:
+Two defaults cover the common shapes, so most components define no `construct` at all:
+
+  - **No dependencies** — `construct(::Type{M}, node, ::Val{Name})` returns `M{Name}()`, for a
+    component whose every field past `Name` is defaulted.
+  - **Pure dependency holder** — `construct(::Type{M}, node, ::Val{Name}, deps…)` builds
+    `M{Name, typeof.(deps)…}(deps…)` from the type itself, for a component whose free type
+    parameters past `Name` are exactly the injected deps, in order (the `M{Name, B}; src::B`
+    pattern). The injected types fix those parameters, so the reads stay type-stable.
+
+Override either to do more — store deps into named fields, set non-dep fields, place `Name` in a
+different parameter position. Declare your override as a `construct(::Type{M}, node, ::Val{Name},
+deps…)` method (below), or as `member_schema(M)`'s `ctor=` keyword (the `ctor=` overrides the
+method when both are given). The [`@component`](@ref) macro's `@requires` directive emits the
+override for you, threading the deps after the component's inline field defaults.
 
 `node` is the node-core handle. An injected provider is constructed-but-unconfigured at this
 point (its `configure` runs later, in dependency-first order), so store it and use it from
@@ -265,9 +273,9 @@ point (its `configure` runs later, in dependency-first order), so store it and u
 
 ```julia
 requires(::Type{Detector}) = (PoseSource,)                       # depend on an interface
-construct(::Type{Detector}, node, ::Val{Name}, src) where {Name} = Detector{Name, typeof(src)}(; src)
+# default construct suffices for `Detector{Name, B}; src::B` — no method needed.
 
-requires(::Type{Watch}) = (Sensor,)                              # …or a sibling component directly
+requires(::Type{Watch}) = (Sensor,)                             # …a sibling component, stored in a named field
 construct(::Type{Watch}, node, ::Val{Name}, s::Sensor) where {Name} = Watch{Name}(; sensor = s)
 ```
 """
@@ -277,6 +285,24 @@ function construct(::Type{M}, node, ::Val{Name}) where {M, Name}
     error("$(nameof(M)) has type parameters beyond its member name: define a DI " *
           "`construct(::Type{$(nameof(M))}, node, ::Val{Name}, deps…) where {Name}` that places `Name`, " *
           "or compose it in a `node(…)` so it receives its dependencies.")
+end
+
+# Default DI construction: with no user/`@component`/`ctor=` override, build the component from its own
+# type — `M{Name, typeof.(deps)…}(deps…)`. Fits the pure-holder shape where the free parameters past
+# `Name` are exactly the injected deps, in order, and the fields are those deps. Any other shape (named
+# fields, extra non-dep fields, a different parameter order) defines its own `construct`/`ctor=`.
+function construct(::Type{M}, node, ::Val{Name}, dep, deps...) where {M, Name}
+    args = (dep, deps...)
+    MN = try
+        M{Name, map(typeof, args)...}
+    catch
+        error("$(nameof(M)): the default dependency-injection constructor builds " *
+              "`$(nameof(M)){Name, <dep types>}` from its $(length(args)) injected dependency(ies), but " *
+              "`$(nameof(M))`'s type parameters past `Name` are not one-per-dependency. Define " *
+              "`construct(::Type{$(nameof(M))}, node, ::Val{Name}, deps…) where {Name}`, or " *
+              "`member_schema`'s `ctor=`, for a component with other fields or a different parameter shape.")
+    end
+    return MN(args...)
 end
 
 # ── DI: interfaces, provision, requirements ─────────────────────────────────────

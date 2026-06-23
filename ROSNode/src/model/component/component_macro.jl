@@ -60,6 +60,7 @@ _params_name(base::Symbol) = Symbol(base, :Params)
         field::T = default                       # private state; inline default feeds the zero-arg ctor
         @param  rate::Int64 = 5 ∈ 1..50          # → an emitted `@parameters struct NameParams`
         @provides Iface                          # interface(s) this component provides
+        @requires src::Sensor                    # inject a sibling (a component type or an @interface)
         @publishes out::T on "~/out"             # a publisher port (no handler)
         @hears  function on_msg(node, m, msg::T) … end       # subscription port + handler (bundled)
         @every  :rate function tick(node, m) … end           # timer port + handler (rate = Hz or :param)
@@ -101,6 +102,7 @@ macro component(structexpr)
     fields = Any[]; defaults = Any[]; nodefault = Symbol[]    # struct fields + ctor default exprs
     params = Any[]                                            # @parameters body lines (docs + field stmts)
     provides = Any[]; ports = Any[]; emits = Any[]            # provides ifaces / value-API ports / method defs
+    reqs = Tuple{Symbol, Any, Symbol}[]                      # @requires deps: (field, marker, hidden-param)
 
     for ln in structexpr.args[3].args
         ln isa LineNumberNode && continue
@@ -122,10 +124,22 @@ macro component(structexpr)
                 for r in rest                                # accept `@provides A B` and `@provides (A, B)` alike
                     (r isa Expr && r.head === :tuple) ? append!(provides, r.args) : push!(provides, r)
                 end
-            elseif mname === Symbol("@requires") || mname === Symbol("@uses")
-                error("@component: `$(mname)` is not supported yet — author a DI consumer / client port with the " *
-                      "raw value API for now: `member_schema(::Type{M}) = component(M, …; requires=(I,), ctor=f)` " *
-                      "or a `uses(:name, marker)` port (a planned @component extension).")
+            elseif mname === Symbol("@requires")
+                isempty(rest) && error("@component: `@requires field::Marker [field2::Marker2 …]` — name the " *
+                    "injected field and the component or @interface type to inject into it, e.g. " *
+                    "`@requires battery_src::Sensor`")
+                for r in rest
+                    entries = (r isa Expr && r.head === :tuple) ? r.args : (r,)   # `@requires (a::A, b::B)` too
+                    for e in entries
+                        (e isa Expr && e.head === :(::) && e.args[1] isa Symbol) || error("@component: " *
+                            "`@requires` takes `field::Marker` (got `$(e)`) — name the injected field and its " *
+                            "component/@interface type, e.g. `@requires battery_src::Sensor`")
+                        push!(reqs, (e.args[1]::Symbol, e.args[2], Symbol("__", e.args[1], "_T")))
+                    end
+                end
+            elseif mname === Symbol("@uses")
+                error("@component: `@uses` is not supported yet — author a client port with the raw value API " *
+                      "for now: a `uses(:name, marker)` port in `member_schema(::Type{M}) = component(M, …)`.")
             elseif mname === Symbol("@publishes")
                 isempty(rest) && error("@component: `@publishes name::T [on \"wire\"]`")
                 decl = rest[1]
@@ -191,20 +205,42 @@ macro component(structexpr)
         error("@component: field(s) $(nodefault) need an inline default (e.g. `x::T = …`) so the zero-arg " *
               "`$(base){…}()` ctor can build the component (a value set later still needs a default placeholder)")
 
-    # The zero-arg ctor the functor `DefaultCtor` calls. Type params (and their bounds) ride from `newhead`.
+    # The user authors only the phantom `{Name}` param; the macro OWNS any further params. A DI consumer
+    # declares its deps with `@requires field::Marker` (above): the macro adds one hidden param per dep to
+    # hold the injected sibling type-stably, so a user-written extra param would collide with that scheme.
+    # Reject it here, at the authoring site, pointing at `@requires` and the raw API.
     tvs    = (newhead.args[1] isa Expr && newhead.args[1].head === :curly) ? newhead.args[1].args[2:end] : Any[]
     pnames = map(_param_name, tvs)                                  # bare names for the curly
-    # v1 authors only the single phantom `{Name}` param. Extra type params exist for DI (a `B`-typed
-    # injected field) — which @component defers — and the emitted zero-arg ctor `Base{Name}()` (called by
-    # DefaultCtor on the bare base) could never construct them, surfacing as a MethodError deep in run().
-    # Reject the head here, at the authoring site, pointing at the raw API that does support it.
     length(pnames) == 1 ||
-        error("@component: `$(base)` has type parameter(s) beyond the member-path `Name` " *
-              "($(join(pnames, ", "))). v1 authors only `$(base){Name}`; a parametric (DI) component is " *
-              "authored with the raw value API — `member_schema(::Type{$(base)}) = component($(base), …; " *
-              "requires=(I,), ctor=f)` (a planned @component extension).")
-    curly  = Expr(:curly, base, pnames...)
-    ctor   = Expr(:(=), Expr(:where, Expr(:call, curly), tvs...), Expr(:call, curly, defaults...))
+        error("@component: `$(base)` declares type parameter(s) beyond the member-path `Name` " *
+              "($(join(pnames, ", "))). Author only `$(base){Name}`; inject dependencies with " *
+              "`@requires field::Marker` (the macro adds the parameters that hold them), or drop to the raw " *
+              "value API — `member_schema(::Type{$(base)}) = component($(base), …; requires=(I,), ctor=f)` — " *
+              "for a hand-rolled parametric component.")
+    NM = pnames[1]                                                  # the member-path parameter (any spelling)
+    if isempty(reqs)
+        # No DI: the zero-arg ctor the functor `DefaultCtor` calls — `Base{Name}() = Base{Name}(defaults…)`.
+        # A field-less component already has the implicit inner `Base{Name}()`; emitting an outer one would
+        # call itself (its body is the same zero-arg call) and recurse — so skip it and use the implicit one.
+        curly = Expr(:curly, base, NM)
+        ctor  = isempty(fields) ? nothing :
+                Expr(:(=), Expr(:where, Expr(:call, curly), tvs...), Expr(:call, curly, defaults...))
+    else
+        # DI consumer: add one hidden param per required dep, a field of that param type to hold the injected
+        # sibling (type-stable reads), and a `construct(::Type{base}, node, ::Val{Name}, deps…)` method that
+        # places `Name` and stores them. The resolver injects each dep positionally in `requires` order;
+        # `typeof(dep)` fixes the hidden param to the resolved sibling's concrete type. There is no zero-arg
+        # ctor — a `requires`-bearing component can't run standalone (the default `construct` rejects it).
+        append!(newhead.args[1].args, (psym for (_, _, psym) in reqs))         # base{Name, __a_T, …}
+        for (fld, _, psym) in reqs
+            push!(fields, Expr(:(::), fld, psym))                             # injected field, no default
+        end
+        depsyms = Symbol[fld for (fld, _, _) in reqs]
+        csig = Expr(:where, Expr(:call, GlobalRef(M, :construct),
+                        :(::Type{$base}), :node, Expr(:(::), Expr(:curly, :Val, NM)), depsyms...), NM)
+        cbody = Expr(:call, Expr(:curly, base, NM, (:(typeof($d)) for d in depsyms)...), defaults..., depsyms...)
+        ctor  = Expr(:(=), csig, cbody)
+    end
 
     paramsblock = isempty(params) ? nothing :
         Expr(:macrocall, Symbol("@parameters"), __source__,
@@ -212,13 +248,16 @@ macro component(structexpr)
 
     Pargs = isempty(params) ? () : (_params_name(base),)
     schemacall = Expr(:call, GlobalRef(M, :component), base, Pargs..., ports...)
-    # kwargs (the `; provides=…` clause) ride a `:parameters` node placed right after the function name.
-    isempty(provides) || insert!(schemacall.args, 2, Expr(:parameters, Expr(:kw, :provides, Expr(:tuple, provides...))))
+    # kwargs (`; provides=…, requires=…`) ride a `:parameters` node placed right after the callee.
+    kws = Expr(:parameters)
+    isempty(provides) || push!(kws.args, Expr(:kw, :provides, Expr(:tuple, provides...)))
+    isempty(reqs)     || push!(kws.args, Expr(:kw, :requires, Expr(:tuple, (mk for (_, mk, _) in reqs)...)))
+    isempty(kws.args) || insert!(schemacall.args, 2, kws)
     memberschema = Expr(:(=), Expr(:call, GlobalRef(M, :member_schema), :(::Type{$base})), schemacall)
 
     out = Expr(:block,
                Expr(:struct, true, newhead, Expr(:block, fields...)),   # mutable struct (fields only)
-               ctor,
+               (ctor === nothing ? () : (ctor,))...,
                (paramsblock === nothing ? () : (paramsblock,))...,
                emits...,
                memberschema,

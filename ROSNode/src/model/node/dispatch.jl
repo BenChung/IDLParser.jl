@@ -65,15 +65,18 @@ end
 # worker (wrapped per-type in the `FunctionWrapper` `_mk_fw` builds). Borrows the
 # payload and runs the handler on the decoded message. Monomorphic: `T` is concrete
 # and `decode_view`/`decode_owned` infer one concrete return type.
-# A handler or decode throw is logged and swallowed so one bad message never kills
-# the subscription; only `ShutdownException` propagates.
+# A decode throw is logged (rate-limited) and swallowed so a malformed/off-type wire message never
+# kills the subscription. A HANDLER throw routes through the node's `ReactionErrorPolicy`: by default
+# (`ShutdownOnError`) it drains the node and a `ShutdownException` is raised here to stop this consumer
+# at once (so a fast failing handler can't flood before the drain closes the subscriber); under
+# `ContinueOnError` it logs (rate-limited) and the loop continues. `ShutdownException` always propagates.
 @inline function _dispatch_decoded(e::Entity, sample::AbstractSample, ::Type{T},
                                    handler, view::ViewMode) where {T}
     try
         _run(sample, T, handler, view)
     catch err
         err isa ShutdownException && return
-        @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
+        _handle_reaction_error(e.node.context, err, catch_backtrace(), e.endpoint.topic) && throw(ShutdownException())
     end
     nothing
 end
@@ -115,7 +118,9 @@ function _decode_on_consumer(e::Entity, sample::AbstractSample, ::Type{T}) where
         end
     catch err
         err isa ShutdownException && rethrow()
-        @error "subscription decode failed" topic=e.endpoint.topic exception=(err, catch_backtrace())
+        # A decode failure is bad/foreign wire data, not a reaction bug — log (rate-limited) and drop
+        # the sample so a hostile or mismatched peer can't take the node down or flood the log.
+        @error "subscription decode failed" topic=e.endpoint.topic exception=(err, catch_backtrace()) maxlog=_REACTION_ERROR_MAXLOG
         return nothing
     end
 end
@@ -128,7 +133,10 @@ function _invoke_owned(e::Entity, msg, handler)
         handler(msg)
     catch err
         err isa ShutdownException && return
-        @error "subscription handler threw" topic=e.endpoint.topic exception=(err, catch_backtrace())
+        # Routes through the node's `ReactionErrorPolicy` (default `ShutdownOnError` → drain). This runs
+        # in a spawned task, so on shutdown we just return — the drain closes the subscriber and the
+        # receiver loop ends; no `throw` is needed to unwind a consume loop here.
+        _handle_reaction_error(e.node.context, err, catch_backtrace(), e.endpoint.topic)
     end
     nothing
 end

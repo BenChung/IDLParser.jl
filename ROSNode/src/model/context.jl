@@ -328,6 +328,9 @@ mutable struct Context
     # peer's wire-discovered revision past a pinned mismatch. Orthogonal to the
     # per-subscription `weak` keyexpr flag.
     const weak_types::Bool
+    # How a fire-and-forget reaction's uncaught exception is handled. `ShutdownOnError()` (default)
+    # gracefully drains this Context; `ContinueOnError()` logs (rate-limited) and keeps running.
+    const reaction_error::ReactionErrorPolicy
 end
 
 # Z-ID hex reproduces zenoh's `z_id_to_string`: reverse the LE bytes (MSB first) and
@@ -368,9 +371,10 @@ Context(; domain_id::Union{Integer, Nothing}=nothing,
           drain_timeout::Real=5.0,
           shm_clients=nothing,
           home::Union{Module, Nothing}=nothing,
-          weak_types::Bool=false) =
+          weak_types::Bool=false,
+          on_reaction_error::Union{Symbol, ReactionErrorPolicy}=:shutdown) =
     _open_context(domain_id, namespace, enclave, config, format, localhost_only,
-                  peers, drain_timeout, shm_clients, home, weak_types)
+                  peers, drain_timeout, shm_clients, home, weak_types, on_reaction_error)
 
 # The Context build, behind a `@nospecialize` barrier. Its kwargs (config/domain_id/namespace/
 # peers/…) are user-controlled at an arbitrary `run`/`Context` call we have NO macro visibility
@@ -381,8 +385,8 @@ Context(; domain_id::Union{Integer, Nothing}=nothing,
 # `Context`, so callers stay grounded; the few dynamic dispatches nospecialize leaves
 # (`open`/`convert`) are negligible on this path.
 function _open_context(domain_id, namespace, enclave, config, format, localhost_only,
-                       peers, drain_timeout, shm_clients, home, weak_types)
-    @nospecialize domain_id namespace enclave config format localhost_only peers drain_timeout shm_clients home weak_types
+                       peers, drain_timeout, shm_clients, home, weak_types, on_reaction_error)
+    @nospecialize domain_id namespace enclave config format localhost_only peers drain_timeout shm_clients home weak_types on_reaction_error
     dom = domain_id === nothing ? _env_domain_id() : Int(domain_id)
     ns  = _normalize_namespace(namespace === nothing ? _env_namespace() : String(namespace))
     enc = enclave === nothing ? _env_enclave() : String(enclave)
@@ -401,7 +405,7 @@ function _open_context(domain_id, namespace, enclave, config, format, localhost_
                   nothing, nothing, Set{Any}(), ReentrantLock(),
                   ReentrantLock(), running, Any[], Threads.Condition(),
                   Threads.Condition(), Float64(drain_timeout), Any[], home,
-                  weak_types)
+                  weak_types, _reaction_error_policy(on_reaction_error))
 
     # Register the bootstrap types (type_description_interfaces) so the type-description
     # server can serve them, plus any @ros_import/@ros_cache statically-generated types so
@@ -1049,6 +1053,26 @@ function request_shutdown(ctx::Context; reason::AbstractString="")
     # The drain runs on its own task so a signal/handler caller returns at once;
     # `spin`/`wait`/`close` park on `_shutdown_done` until it finishes.
     @async _drain!(ctx)
+    return true
+end
+
+# Resolve the owning Context of a reaction source: a `Node` exposes it as `.context`; a
+# context-level clock's `node` IS the Context; an orphan is `nothing` (no drain target).
+_reaction_context(c::Context) = c
+_reaction_context(::Nothing) = nothing
+_reaction_context(x) = x.context
+
+# Funnel for a fire-and-forget reaction (subscription handler or timer callback) that threw — the
+# `ShutdownException` must be filtered out by the caller first. Under `ShutdownOnError` (default) it
+# logs once and begins a graceful Context drain, returning `true` so the caller stops dispatching;
+# under `ContinueOnError` it logs (rate-limited per callsite) and returns `false` to keep running.
+function _handle_reaction_error(ctx::Context, err, bt, source::AbstractString)
+    if ctx.reaction_error isa ContinueOnError
+        @error "reaction threw — continuing (on_reaction_error=:continue)" reaction=source exception=(err, bt) maxlog=_REACTION_ERROR_MAXLOG
+        return false
+    end
+    @error "reaction threw — draining the node (set on_reaction_error=:continue to keep running)" reaction=source exception=(err, bt)
+    request_shutdown(ctx; reason="uncaught exception in reaction ($source)")
     return true
 end
 

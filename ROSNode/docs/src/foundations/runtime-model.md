@@ -57,6 +57,15 @@ spin(ctx; handle_signals = true)
 
 `handle_signals = true` turns Ctrl-C into a graceful drain: ROSNode departs liveliness cleanly and closes the session, and background loops observe `isopen(ctx)` flip to `false` so they can stop. Plain `spin(ctx)` parks the task and leaves signal handling to Julia's default SIGINT path.
 
+### Reaction errors
+
+A fire-and-forget reaction — a subscription handler or an [`every`](@ref)/timer callback — runs with no caller to return an error to. When one throws an exception it did not catch, the Context's `on_reaction_error` policy decides what happens:
+
+- [`ShutdownOnError`](@ref ROSNode.ShutdownOnError) (`:shutdown`, the **default**) logs the exception once and gracefully drains the Context — the same drain Ctrl-C runs — so `spin` returns and the process exits cleanly. This stops the failing reaction rather than looping on it: a handler that throws on every message, or a timer that throws every tick, would otherwise flood the log fast enough to starve the interrupt and leave the process effectively unkillable.
+- [`ContinueOnError`](@ref ROSNode.ContinueOnError) (`:continue`) logs the exception (rate-limited so it cannot flood) and keeps the reaction running — for a node that must survive a bad message or tick.
+
+Set it on the Context (`Context(; on_reaction_error = :continue)`) or pass it to `run` (`run(schema; on_reaction_error = :continue)`). Services and actions are unaffected: a throwing request or goal handler replies with an error, it does not bring the node down. A message *decode* failure — malformed or off-type wire data, not your code — is always logged (rate-limited) and dropped, never a shutdown, so a misbehaving peer cannot take the node down.
+
 ## Discovery options
 
 ROSNode mirrors `rmw_zenoh`, whose discovery is router-based. The `peers` keyword on `@context` selects the router to connect to:
@@ -144,6 +153,9 @@ succeeded
 canceled
 aborted
 feedback
+ReactionErrorPolicy
+ShutdownOnError
+ContinueOnError
 ```
 
 ### Lifecycle nodes

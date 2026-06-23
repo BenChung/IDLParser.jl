@@ -229,6 +229,7 @@ The block uses inline directives:
 - `field = default` — a **private** state field (a plain `mutable struct` field), with the default the zero-arg ctor uses.
 - `@param x::T = d ∈ lo..hi` — a **public** parameter; the macro collects these into an emitted `@parameters struct`. Mix the two freely: a block carries any number of each.
 - `@provides Iface` — interface(s) the component provides.
+- `@requires src::Marker` — an injected dependency, where `Marker` is a concrete component type or an `@interface`. The macro adds the type parameter that holds the resolved sibling and the constructor that places it, so the field reads type-stably and you write no parametric struct or ctor by hand.
 - `@publishes out::T on "~/topic"` — a publisher port (the `on` clause **trails** the declaration).
 - `@hears function h(node, m, msg::T) … end` — a subscription port plus its handler (inline-only).
 - `@every :rate function tick(node, m) … end` — a timer port plus its handler (`rate` = Hz or a parameter `Symbol`; inline-only).
@@ -253,7 +254,20 @@ end
 battery(s::Sensor) = s.level
 ```
 
-`@component` v1 covers the DI-free common case plus `@provides`. A DI **consumer** (`@requires` + an injected ctor, see [Parametric Components](parametric.md)) or a client port stays on the raw `component(M, …; requires=(I,), ctor=f)` / `uses(:n, marker)` API — `@requires`/`@uses` in the block error clearly, pointing at the raw form. The two compose seamlessly in the same `node`: the `Sensor` above and a raw-API `Guard` assemble into one node unchanged.
+A DI **consumer** declares its dependencies with `@requires` — the `Guard` from [Dependency injection between components](@ref), authored without the hand-written parametric struct or constructor:
+
+```julia
+@component mutable struct Guard{Name} <: Component{Name}
+    @requires battery_src::BatterySource        # inject the sibling that provides it
+    @param min_battery::Float64 = 20.0
+    @service "~/safe_to_fly" function safe(node, g, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
+        b = battery(g.battery_src)               # type-stable: battery_src is the resolved sibling's type
+        (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
+    end
+end
+```
+
+`@requires battery_src::Marker` adds the type parameter that holds the resolved sibling and the `construct` that places it; `Marker` is an `@interface` (as here) or a concrete component type. A **client** port (`uses`) still uses the raw value API — `@uses` in the block errors clearly, pointing at it. The macro and the raw combinators compose in one `node`: the `@component`-authored `Sensor` and `Guard` above assemble unchanged.
 
 ## Assembling and running the node
 

@@ -18,23 +18,25 @@ The assembler fills `B` from whatever sibling satisfies the `requires`. In `Vehi
 
 ## The `construct` contract
 
-`Name` is a type parameter, so a parametric component supplies its own constructor: `Guard{:guard}()` would still be missing `B`. The constructor places `Name` and stores the resolved dependencies. The framework calls it with the node-core handle, the member name as `Val{Name}`, and one dependency per declared `requires`, in `requires` order:
+`Name` is a type parameter and the injected provider fills `B`, so the framework needs a constructor that places both. It calls `construct` with the node-core handle, the member name as `Val{Name}`, and one dependency per declared `requires`, in `requires` order, and builds `Guard{Name, B}` from them.
+
+A `Guard` whose only fields are its injected deps is a **pure holder**, and the default [`construct`](@ref) builds it from the type — `Guard{Name, typeof(src)}(src)` — so it needs no constructor at all:
 
 ```julia
-make_guard(node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
-```
-
-Declare it as either surface — the `ctor =` keyword on `component`, or a [`construct`](@ref)`(::Type{Guard}, …)` method on the bare type. If a component carries both, the `ctor =` keyword wins:
-
-```julia
-member_schema(::Type{Guard}) = component(Guard, GuardParams, safe;
-    requires = (BatterySource,), ctor = make_guard)
-
-construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
 member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,))
 ```
 
-`component` rejects a `requires` backed by neither a `ctor` nor a matching `construct` method at authoring time: the default zero-dependency constructor has no slot for the injected provider. A component whose every parameter past `Name` is defaulted already has its constructor — the default `M{Name}()` — and supplies none of the above.
+The default fits when the free type parameters past `Name` are exactly the deps, in order, and the struct's fields are those deps. Override it for any other shape — deps stored in named fields, non-dep fields to set, a different parameter order — as either surface: a [`construct`](@ref)`(::Type{Guard}, …)` method on the bare type, or the `ctor =` keyword on `component` (the keyword wins if both are given):
+
+```julia
+construct(::Type{Guard}, node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
+member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,))
+
+make_guard(node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
+member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,), ctor = make_guard)
+```
+
+The [`@component`](@ref) macro's `@requires battery_src::BatterySource` directive emits the parametric struct and this constructor for you (see [The @component macro](@ref)) — the concise form when the component is authored as one block. A component whose every parameter past `Name` is defaulted needs none of this: its constructor is the default `M{Name}()`.
 
 An injected provider arrives **constructed but not yet configured**: the framework configures providers ahead of their consumers (see [Component Lifecycle](lifecycle.md)). Store it from the constructor, then read it through its interface from `configure` onward.
 

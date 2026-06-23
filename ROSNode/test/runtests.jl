@@ -93,6 +93,9 @@ try
         # §14.1 Context drain/shutdown root — hook ordering, bounded slow hook,
         # idempotent request_shutdown, reverse undeclare, wait/spin unblock.
         _section("context_shutdown", "model/context_shutdown.jl")
+        # Reaction-error policy: an uncaught subscription/timer handler throw drains the node by
+        # default (ShutdownOnError, no log flood) or keeps running rate-limited (ContinueOnError).
+        _section("reaction_error", "model/reaction_error.jl")
         # Revise-safety: replaying a declaration macro's expansion (what Revise does on a
         # reaction/struct edit) must not duplicate ports/params or roster entries. Pure-logic.
         _section("component_revise", "model/component_revise.jl")

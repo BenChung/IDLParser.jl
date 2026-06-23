@@ -537,3 +537,50 @@ end
 WarmupPolicy(mode, sync::Bool) = WarmupPolicy(_warmup_mode(mode), sync)
 
 const _DEFAULT_WARMUP = WarmupPolicy(Precompile(), false)
+
+"""
+    abstract type ReactionErrorPolicy end
+
+How a node responds when one of its fire-and-forget reactions — a subscription handler or a
+[`every`](@ref)/timer callback — throws an exception it did not catch. Set per Context with
+`Context(; on_reaction_error = …)` (or `run(…; on_reaction_error = …)`); the default is
+[`ShutdownOnError`](@ref). Services and actions are unaffected — a throwing request/goal handler
+replies with an error, it does not bring the node down.
+"""
+abstract type ReactionErrorPolicy end
+
+"""
+    ShutdownOnError()
+
+The default [`ReactionErrorPolicy`](@ref): an uncaught reaction exception is logged once, then the
+Context is gracefully drained ([`request_shutdown`](@ref)) — running shutdown hooks, closing entities,
+and ending `spin` so the process exits cleanly. This stops the failing reaction instead of looping on
+it (a fast handler or timer would otherwise flood the log and starve the Ctrl-C poll). `:shutdown` is
+shorthand for `ShutdownOnError()`.
+"""
+struct ShutdownOnError <: ReactionErrorPolicy end
+
+"""
+    ContinueOnError()
+
+A [`ReactionErrorPolicy`](@ref) for a node that must survive a bad message or tick: an uncaught
+reaction exception is logged (rate-limited so it cannot flood) and the reaction keeps running.
+`:continue` is shorthand for `ContinueOnError()`.
+"""
+struct ContinueOnError <: ReactionErrorPolicy end
+
+Base.show(io::IO, ::ShutdownOnError) = print(io, "ShutdownOnError()")
+Base.show(io::IO, ::ContinueOnError) = print(io, "ContinueOnError()")
+
+# `on_reaction_error=` accepts the policy structs or the Symbol shorthand.
+_reaction_error_policy(p::ReactionErrorPolicy) = p
+function _reaction_error_policy(p::Symbol)
+    p === :shutdown && return ShutdownOnError()
+    p === :continue && return ContinueOnError()
+    throw(ArgumentError("on_reaction_error must be :shutdown or :continue (or a `ReactionErrorPolicy`), got :$p"))
+end
+
+# Per-callsite cap on reaction/decode error logs in the non-shutdown paths, so a fast failing
+# reaction (ContinueOnError) or a stream of malformed wire data can't flood — the shutdown path
+# logs once, then drains.
+const _REACTION_ERROR_MAXLOG = 20

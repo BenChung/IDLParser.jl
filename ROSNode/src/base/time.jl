@@ -473,7 +473,15 @@ function _fire!(t::Timer)
         t.f()
     catch err
         err isa ShutdownException && return nothing
-        @error "ROSNode.Timer callback threw" exception=(err, catch_backtrace())
+        # Route a callback throw through the owning node's `ReactionErrorPolicy`. Default
+        # (`ShutdownOnError`) drains the Context; close this timer so it stops re-arming during the
+        # drain window. `ContinueOnError` logs (rate-limited) and lets it keep ticking.
+        ctx = _reaction_context(t.clk.node)
+        if ctx !== nothing && _handle_reaction_error(ctx, err, catch_backtrace(), "timer")
+            try; close(t); catch; end
+        elseif ctx === nothing
+            @error "ROSNode.Timer callback threw" exception=(err, catch_backtrace()) maxlog=_REACTION_ERROR_MAXLOG
+        end
     end
     return nothing
 end
