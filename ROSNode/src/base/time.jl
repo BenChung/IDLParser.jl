@@ -169,15 +169,13 @@ rtime(::C, msg) where {C<:ClockSource}       = rtime(C, msg)
 duration(msg) = Duration(_join_ns(msg.sec, msg.nanosec))
 
 # `header.stamp = now(node)` converts at the boundary via the generated kw-ctor's
-# `convert(FieldType, value)`. The `Base.convert` methods belong with the
-# concrete generated `builtin_interfaces` `Time`/`Duration` structs (owned by the
-# message-integration layer): an unconstrained `convert(::Type{T}, ::RTime)`
-# would claim every target and collide with Base methods for `Any`/`Nothing`/etc.
-#
-# TODO(messages): register the narrow methods against the concrete types, e.g.
-#   Base.convert(::Type{builtin_interfaces.msg.Time}, t::RTime)        = to_msg(builtin_interfaces.msg.Time, t)
-#   Base.convert(::Type{builtin_interfaces.msg.Duration}, d::Duration) = to_msg(builtin_interfaces.msg.Duration, d)
-# Meanwhile callers use `to_msg(T, …)` / `rtime` / `duration` explicitly.
+# `convert(FieldType, value)`. The narrow `Base.convert(::Type{Time}, ::RTime)` /
+# `convert(::Type{Duration}, ::Duration)` methods that delegate to `to_msg` live with
+# the concrete `builtin_interfaces` structs in `interfaces/wellknown.jl` (which owns
+# `Interfaces`), narrower than the catch-all convert guard installed there. They must
+# be on the concrete types: an unconstrained `convert(::Type{T}, ::RTime)` would claim
+# every target and collide with Base's `Any`/`Nothing` methods. `to_msg`/`rtime`/
+# `duration` stay available for explicit conversion.
 
 # ── jump callbacks ──────────────────────────────────────────────────────────
 # Let timers recompute their next fire across a clock discontinuity (sim

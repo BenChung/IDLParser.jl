@@ -1216,8 +1216,11 @@ role). Returns once the drain has fully completed.
 | `true` | a Ctrl-C (and, when deployed, SIGTERM) drains gracefully (see below). |
 
 Under `handle_signals=true`, `exit_on_sigint(false)` makes Ctrl-C a catchable
-`InterruptException`, and the spin task catches it: the first interrupt requests a
-graceful drain (and keeps spinning until it finishes), a second forces `exit(130)`. The
+`InterruptException`, and the spin task catches it: an interrupt while the Context is still
+running requests a graceful drain (and keeps spinning until it finishes); an interrupt once a
+drain is already underway forces `exit(130)`. The drain may already be underway from a second
+Ctrl-C, a managed-node shutdown, or a reaction-error shutdown — in every case a further Ctrl-C
+forces exit, so it is always an escape hatch. The
 spin task polls rather than parking, so it is reliably the task Julia delivers the
 interrupt to — the drain therefore runs while the runtime is fully alive (the same way
 in the REPL and deployed), never through process exit, where the teardown scheduler can
@@ -1247,8 +1250,15 @@ function spin(ctx::Context; handle_signals::Bool=false)
     nothing
 end
 
-# Park on the drain, catching Ctrl-C. A first interrupt requests the drain and keeps
-# polling; a second forces `exit(130)`.
+# How a Ctrl-C is handled, keyed on the Context state — NOT a local "have I been interrupted yet"
+# flag. The state is the source of truth for whether a drain is already underway: it may have been
+# started by a reaction-error shutdown, a managed-node shutdown, or a programmatic `request_shutdown`,
+# none of which a spin-local flag can see. While still `running`, the first interrupt asks for a
+# graceful drain; once a drain is in progress, a further interrupt means "out now" → force exit. So a
+# Ctrl-C is always an escape hatch, even when something else already began the shutdown.
+_interrupt_action(state::ShutdownState) = state === running ? :drain : :force
+
+# Park on the drain, catching Ctrl-C (see `_interrupt_action`).
 #
 # We POLL on a short `sleep` rather than parking on `wait(ctx)`. Under
 # `exit_on_sigint(false)` Julia throws the SIGINT `InterruptException` into the task
@@ -1260,18 +1270,16 @@ end
 # scheduler/libuv loop can deadlock. The poll also lets a programmatic `request_shutdown`
 # (or a managed-node shutdown) wake us within one tick.
 function _park_until_drained(ctx::Context)
-    interrupted = false
     while (@atomic ctx._state) !== shutdown_done
         try
             sleep(0.05)
         catch err
             err isa InterruptException || rethrow()
-            if !interrupted
-                interrupted = true
+            if _interrupt_action(@atomic ctx._state) === :drain
                 @info "interrupt — draining; interrupt again to force exit"
                 request_shutdown(ctx; reason="SIGINT")
             else
-                @warn "second interrupt — forcing exit"
+                @warn "interrupt while shutting down — forcing exit"
                 exit(130)
             end
         end

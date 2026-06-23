@@ -23,6 +23,16 @@ _rectx(; on_reaction_error = :shutdown) =
 
 _drains_within(ctx, secs) = Base.timedwait(() -> is_shutdown(ctx), Float64(secs); pollint = 0.02) === :ok
 
+@testset "reaction error: Ctrl-C stays an escape hatch while draining" begin
+    # The regression this guards: a reaction-error (or managed / programmatic) shutdown starts the
+    # drain BEFORE any Ctrl-C, so the spin loop must choose escalate-vs-drain from the Context STATE,
+    # not a spin-local "interrupted yet?" flag — else the user's first Ctrl-C lands on the graceful
+    # branch as a no-op `request_shutdown` and can never force `exit(130)`.
+    @test ROSNode._interrupt_action(ROSNode.running)       === :drain   # nothing underway → graceful
+    @test ROSNode._interrupt_action(ROSNode.shutting_down) === :force   # drain already running → force
+    @test ROSNode._interrupt_action(ROSNode.shutdown_done) === :force
+end
+
 @testset "reaction error: policy plumbing" begin
     @test ROSNode._reaction_error_policy(:shutdown) === ShutdownOnError()
     @test ROSNode._reaction_error_policy(:continue) === ContinueOnError()

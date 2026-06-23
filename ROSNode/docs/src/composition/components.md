@@ -95,7 +95,7 @@ end
 - [`hears`](@ref)`(:odom, Odometry, on_odom; on)` — a subscription running a handler per message.
 - [`serves`](@ref)`(:safe, SafeReq, safe; on)` — a service-server answering a request.
 - [`runs`](@ref)`(:dock, Dock, dock!; on)` — an action-server running each accepted goal.
-- [`every`](@ref)`(:tick, :rate, tick)` — a timer firing a reaction (a frequency in Hz, or a parameter to bind it live).
+- [`every`](@ref)`(:tick, :rate, tick)` — a timer firing a reaction (a frequency in Hz, or a parameter to bind it live); see [Time & Clocks](../foundations/time.md) for the clock it ticks on.
 - [`uses`](@ref)`(:cmd, CmdReq; on)` — a persistent service/action **client** port.
 - [`remap`](@ref)`(Sensor, :telemetry => "…")` — override the names a member's ports resolve to, at `node(…)`.
 

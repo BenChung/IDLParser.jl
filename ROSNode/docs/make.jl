@@ -19,6 +19,7 @@ makedocs(;
         "Getting Started" => "getting-started.md",
         "Foundations" => [
             "The Runtime Model" => "foundations/runtime-model.md",
+            "Time & Clocks" => "foundations/time.md",
             "Interface Types" => "foundations/interface-types.md",
             "Addressing & Key Expressions" => "foundations/addressing.md",
         ],

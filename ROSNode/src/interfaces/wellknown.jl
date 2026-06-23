@@ -374,3 +374,14 @@ for _T in _interface_struct_types()
     @eval Base.convert(::Type{$_T}, x::$_T) = x
     @eval Base.convert(::Type{$_T}, x) = _canonical_convert_guard($_T, x)
 end
+
+# Clock value types stamp message fields at the kw-ctor boundary: `header.stamp =
+# now(node)` and a `builtin_interfaces/Duration` field set from a `Duration` span.
+# Narrower on the value than the `::Any` guard installed above, so they win for
+# these two concrete `builtin_interfaces` structs while every other target still
+# hits the guard. `RTime`/`Duration`/`to_msg` come from base/time.jl.
+let _Time = Interfaces.builtin_interfaces.msg.Time,
+    _WireDuration = Interfaces.builtin_interfaces.msg.Duration
+    @eval Base.convert(::Type{$_Time}, t::RTime)        = to_msg($_Time, t)
+    @eval Base.convert(::Type{$_WireDuration}, d::Duration) = to_msg($_WireDuration, d)
+end
