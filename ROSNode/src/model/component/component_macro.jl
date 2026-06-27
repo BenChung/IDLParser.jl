@@ -55,6 +55,202 @@ end
 # The emitted `@parameters` struct name for component base `M` → `MParams`.
 _params_name(base::Symbol) = Symbol(base, :Params)
 
+# ── shared directive engine ───────────────────────────────────────────────────────────────────────
+# The `@component`/`@schema` port sublanguage. Both front-ends parse the SAME port directives through
+# `parse_port_directive`; they differ only in framing (a struct vs. a `member_schema`-only block) and in
+# the binding directives (`@param`/`@requires`/`@provides`/`@ctor`). Each port nonterminal lowers to one
+# value combinator (functor.jl). The grammar (EBNF):
+#
+#   ⟨port-dir⟩      ::= ⟨publishes⟩ | ⟨hears⟩ | ⟨serves⟩ | ⟨runs⟩ | ⟨every⟩ | ⟨uses⟩
+#   ⟨publishes⟩     ::= "@publishes" ⟨port-decl⟩ [ ⟨trailing-wire⟩ ]            → publishes(:n, T; on)
+#   ⟨uses⟩          ::= "@uses"      ⟨port-decl⟩ [ ⟨trailing-wire⟩ ]            → uses(:n, M; on)
+#   ⟨hears⟩         ::= "@hears"  [ ⟨leading-wire⟩ ] ⟨bound-handler⟩ [ ⟨trailing-wire⟩ ]   → hears(:n, T, h; on)
+#   ⟨serves⟩        ::= "@serves" [ ⟨leading-wire⟩ ] ⟨bound-handler⟩ [ ⟨trailing-wire⟩ ]   → serves(…)
+#   ⟨runs⟩          ::= "@runs"   [ ⟨leading-wire⟩ ] ⟨bound-handler⟩ [ ⟨trailing-wire⟩ ]   → runs(…)
+#   ⟨every⟩         ::= "@every" ⟨bound-handler⟩ "at" ⟨rate⟩          (* canonical *)   → every(:n, rate, h)
+#                     | "@every" ⟨rate⟩ ⟨inline-def⟩                  (* legacy    *)
+#   ⟨bound-handler⟩ ::= [ ⟨port-name⟩ "=>" ] ⟨handler-spec⟩
+#   ⟨handler-spec⟩  ::= Symbol                  (* reference; a trait carries its type/wire *)
+#                     | Symbol "::" ⟨type⟩      (* typed reference — msg/request/action type *)
+#                     | ⟨inline-def⟩            (* a reaction (@hears/@every) or an @service/@action def *)
+#   ⟨port-decl⟩     ::= Symbol "::" ⟨type⟩      ⟨trailing-wire⟩ ::= "on" String     ⟨rate⟩ ::= Real | ":"Symbol
+#   ⟨leading-wire⟩  ::= String                                                       (* @component legacy *)
+#
+# `@service`/`@action` are accepted as legacy aliases of `@serves`/`@runs` with an inline-def spec. The
+# port name defaults to the handler's name (`@component`'s rule); `name =>` overrides it. The wire defaults
+# to the port name; a trailing `on "wire"` (any directive) or a leading `"wire"` string (handler
+# directives, @component legacy) overrides it — at most one.
+
+const _PORT_DIRECTIVES = (Symbol("@publishes"), Symbol("@uses"), Symbol("@hears"),
+                          Symbol("@serves"), Symbol("@runs"), Symbol("@every"),
+                          Symbol("@service"), Symbol("@action"))
+is_port_directive(mname) = mname in _PORT_DIRECTIVES
+
+# a directive's args with LineNumberNodes stripped (args[2] is the directive's own line node).
+_dargs(ln::Expr) = filter(a -> !(a isa LineNumberNode), ln.args[2:end])
+
+# ⟨rate⟩ — a number (Hz) or a `:param` symbol (spliced back as a Symbol literal).
+function _parse_rate(x, who)
+    x isa Real && return x
+    x isa QuoteNode && x.value isa Symbol && return x
+    x isa Expr && x.head === :quote && length(x.args) == 1 && x.args[1] isa Symbol && return QuoteNode(x.args[1])
+    error("$(who): a timer rate must be a number (Hz) or a `:param` symbol, got `$(x)`")
+end
+
+# Split a directive's args into (wire, middle): a leading `"wire"` String and/or a trailing `on "wire"`,
+# at most one of each and never both. `middle` is what remains (the port-decl or bound-handler args).
+# `allow_lead=false` (the decl directives) forbids the leading-string form — only handler directives
+# carry a leading wire (the @component-legacy spelling).
+function _parse_wires(args, who; allow_lead::Bool = true)
+    a = collect(args); lead = nothing; trail = nothing
+    if allow_lead && !isempty(a) && a[1] isa AbstractString
+        lead = String(a[1]); a = a[2:end]
+    end
+    if length(a) >= 2 && a[end-1] === :on
+        a[end] isa AbstractString ||
+            error("$(who): `on` must be followed by a wire string literal, got `$(a[end])`")
+        trail = String(a[end]); a = a[1:end-2]
+    end
+    (lead !== nothing && trail !== nothing) &&
+        error("$(who): give the wire once — a leading \"wire\" string or a trailing `on \"wire\"`, not both")
+    return (lead === nothing ? trail : lead), a
+end
+
+# ⟨bound-handler⟩ → (name_override::Union{Symbol,Nothing}, handler-spec). `name =>` overrides the port name.
+function _parse_bound_handler(x, who)
+    if x isa Expr && x.head === :call && length(x.args) == 3 && x.args[1] === :(=>)
+        x.args[2] isa Symbol ||
+            error("$(who): a port-name override must be a symbol, got `$(x.args[2])` in `$(x)`")
+        return x.args[2]::Symbol, x.args[3]
+    end
+    return nothing, x
+end
+
+# ⟨publishes⟩ / ⟨uses⟩ — a `name::T` decl plus an optional TRAILING wire; no handler. The decl directives
+# name the port from the decl, so the wire is trailing-only (a leading string is a handler-directive form).
+function _parse_decl_port(mname, rest, M, who)
+    isempty(rest) && error("$(who): `$(who) name::T [on \"wire\"]`")
+    rest[1] isa AbstractString && error("$(who): the wire goes in a trailing `on \"wire\"`, not a leading " *
+        "string — write `$(who) name::T on $(repr(String(rest[1])))`")
+    wire, mid = _parse_wires(rest, who; allow_lead = false)
+    length(mid) == 1 || error("$(who): expected `name::T [on \"wire\"]`, got `$(Tuple(rest))`")
+    name, T = _parse_port_decl(mid[1], who)
+    comb = mname === Symbol("@publishes") ? :publishes : :uses
+    return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $T; on = $wire) )
+end
+
+# A handler reference is a bare name (`f`) or a qualified path (`Mod.f`) — the value combinators accept
+# either, and @schema's purpose includes wiring externally-defined handlers. `_ref_name` is the port name
+# such a reference contributes (its final path component).
+_is_ref(x) = x isa Symbol || (x isa Expr && x.head === :. && length(x.args) == 2)
+_ref_name(s::Symbol) = s
+_ref_name(e::Expr) = e.args[2] isa QuoteNode ? e.args[2].value::Symbol :
+    error("@component/@schema: could not read a port name from the handler reference `$(e)`")
+
+# ⟨hears⟩ / ⟨serves⟩ / ⟨runs⟩ — a wired, optionally-renamed handler. `kind ∈ (:hears,:serves,:runs)`.
+# `legacy_author` routes @service/@action's authoring inline-def. Returns (combinator-call, emits).
+function _parse_handler_port(kind::Symbol, rest, base, M, src, who)
+    isempty(rest) && error("$(who): needs a handler — `$(who) [name =>] handler[::T] [on \"wire\"]`")
+    wire, mid = _parse_wires(rest, who)
+    length(mid) == 1 ||
+        error("$(who): expected `[\"wire\"] [name =>] handler[::T] [on \"wire\"]`, got `$(Tuple(rest))`")
+    name_override, spec = _parse_bound_handler(mid[1], who)
+    emits = Any[]
+    if _is_method_def(spec)                                  # ⟨inline-def⟩
+        _component_inject_member!(spec, base)
+        fname = _component_defname(spec)
+        name  = name_override === nothing ? fname : name_override
+        if kind === :hears
+            call = _peel_to_call(spec.args[1])
+            length(call.args) >= 4 || error("$(who): an inline handler needs `(node, m, msg::T)`")
+            msgarg = call.args[4]
+            (msgarg isa Expr && msgarg.head === :(::)) ||
+                error("$(who): the message arg needs a type, `msg::T`, got `$(msgarg)`")
+            T = msgarg.args[2]
+            push!(emits, spec)
+            return :( $(GlobalRef(M, :hears))($(QuoteNode(name)), $T, $fname; on = $wire) ), emits
+        else                                                # :serves/:runs — author the type+impl inline
+            authoring = kind === :serves ? Symbol("@service") : Symbol("@action")
+            margs = wire === nothing ? Any[spec] : Any[wire, spec]   # wire rides the authoring macro
+            push!(emits, Expr(:macrocall, authoring, src, margs...))
+            comb = kind === :serves ? :serves : :runs
+            return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $fname) ), emits   # trait carries the wire
+        end
+    elseif spec isa Expr && spec.head === :(::)             # ⟨typed reference⟩  handler::T  (handler = f or Mod.f)
+        _is_ref(spec.args[1]) ||
+            error("$(who): a typed handler reference must be `handler::T` (`handler` a name or `Mod.name`), got `$(spec)`")
+        h, T = spec.args[1], spec.args[2]
+        name = name_override === nothing ? _ref_name(h) : name_override
+        comb = kind === :hears ? :hears : kind === :serves ? :serves : :runs
+        return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $T, $h; on = $wire) ), emits
+    elseif _is_ref(spec)                                    # ⟨reference⟩ — a trait handler (f or Mod.f)
+        kind === :hears && error("$(who): a subscription needs a message type — write `$(spec)::MsgType` " *
+            "(a bare handler reference has no type to subscribe with)")
+        name = name_override === nothing ? _ref_name(spec) : name_override
+        comb = kind === :serves ? :serves : :runs
+        return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $spec; on = $wire) ), emits
+    else
+        error("$(who): could not parse the handler `$(spec)` — expected `name::T`, a handler reference, " *
+              "or an inline `function f(node, m, …) … end`")
+    end
+end
+
+# ⟨every⟩ — canonical `[name =>] handler at rate`, or legacy `rate function…end` (no `at`).
+function _parse_every(rest, base, M, who)
+    isempty(rest) && error("$(who): `@every [name =>] handler at rate`  (rate = Hz or `:param`)")
+    atpos = findfirst(==(:at), rest)
+    emits = Any[]
+    if atpos !== nothing
+        atpos == lastindex(rest) - 1 ||
+            error("$(who): `at` must be followed by exactly one rate, got `$(Tuple(rest[atpos+1:end]))`")
+        before = rest[1:atpos-1]
+        rate   = _parse_rate(rest[atpos+1], who)
+        length(before) == 1 || error("$(who): expected `[name =>] handler at rate`, got `$(Tuple(rest))`")
+        name_override, spec = _parse_bound_handler(before[1], who)
+        if _is_method_def(spec)
+            _component_inject_member!(spec, base); push!(emits, spec)
+            handler = _component_defname(spec); defname = handler
+        elseif _is_ref(spec)
+            handler = spec; defname = _ref_name(spec)
+        else
+            error("$(who): a timer handler is a reference (a name or `Mod.name`) or an inline " *
+                  "`function f(node, m) … end`, got `$(spec)`")
+        end
+        name = name_override === nothing ? defname : name_override
+        return :( $(GlobalRef(M, :every))($(QuoteNode(name)), $rate, $handler) ), emits
+    else                                                    # legacy: rate, then an inline def
+        length(rest) == 2 || error("$(who): the legacy form is `@every rate function f(node, m) … end`; " *
+            "the canonical form is `@every [name =>] handler at rate`")
+        rate = _parse_rate(rest[1], who)
+        _is_method_def(rest[2]) ||
+            error("$(who): legacy `@every rate function … end` needs an inline handler; " *
+                  "to wire a reference use `@every handler at rate`")
+        _component_inject_member!(rest[2], base); push!(emits, rest[2])
+        fname = _component_defname(rest[2])
+        return :( $(GlobalRef(M, :every))($(QuoteNode(fname)), $rate, $fname) ), emits
+    end
+end
+
+# Parse one ⟨port-dir⟩ into (combinator-call-expr, emits::Vector). `base` types a bare `m`; `M` is ROSNode.
+function parse_port_directive(ln::Expr, base, M)
+    mname = ln.args[1]::Symbol
+    who   = String(mname)
+    src   = ln.args[2]                                       # the directive's LineNumberNode
+    rest  = _dargs(ln)
+    if mname === Symbol("@publishes") || mname === Symbol("@uses")
+        return _parse_decl_port(mname, rest, M, who), Any[]
+    elseif mname === Symbol("@hears")
+        return _parse_handler_port(:hears, rest, base, M, src, who)
+    elseif mname === Symbol("@serves") || mname === Symbol("@service")
+        return _parse_handler_port(:serves, rest, base, M, src, who)
+    elseif mname === Symbol("@runs") || mname === Symbol("@action")
+        return _parse_handler_port(:runs, rest, base, M, src, who)
+    elseif mname === Symbol("@every")
+        return _parse_every(rest, base, M, who)
+    end
+    error("$(who): not a port directive")
+end
+
 """
     @component mutable struct Name{Name} <: Component{Name}
         field::T = default                       # private state; inline default feeds the zero-arg ctor
@@ -75,21 +271,23 @@ defs (a bare `m` annotated as `m::Name`), and `member_schema(::Type{Name}) = com
 BARE base. Editing anything re-runs the whole block, so the struct and every method re-key on the new
 type together.
 
-Conventions:
-- **Wire clause.** The declaration directive `@publishes name::T` takes the trailing `on "wire"` form; the
-  handler directives `@hears`/`@service`/`@action` take a **leading** `"wire"` string (matching the
-  standalone `@service`/`@action` macros). The split follows the name source: `@publishes` names the port,
-  the handler directives derive it from the function.
-- **`@hears`/`@every` are inline-only in v1**: the handler is written in place as `function f(node, m, …) … end`
-  (so a struct edit re-couples it). To wire a port to an externally-defined handler, drop to the raw
-  `hears(:n, T, h)` / `every(:n, rate, h)` combinators.
+Conventions (the port directives are the shared engine, also used by [`@schema`](@ref)):
+- **Handler form.** `@hears`/`@serves`/`@runs`/`@every` take a handler either **inline** —
+  `function f(node, m, …) … end` (so a struct edit re-couples it) — or **by reference** — a name in scope
+  (`@hears f::T`, `@serves f`). `@every` is `handler at rate` (the legacy `@every rate function…end` still
+  works); `@hears` needs a message type (`f::T` or the inline signature).
+- **Port name** defaults to the handler's name; `name => handler` overrides it (e.g. `@serves status => safe`).
+- **Wire** defaults to the port name; override with a trailing `on "wire"` (any directive) or a leading
+  `"wire"` string (handler directives — `@component` legacy), at most one.
+- **`@uses name::Marker`** declares a persistent service/action client port.
 - A reaction/hook/handler is node-first `(node, m, …)`; a non-node-first interface impl (e.g.
   `battery(s::Sensor)`) is defined OUTSIDE the block.
 
 `@component` is sugar over the value API — the raw `component`/`node` combinators remain the primitive
-for dynamic composition. v1 covers the DI-free common case (plus `@provides`); a DI **consumer**
-(`@requires` + an injected ctor) or a client port is authored with the raw `component(M, …; requires=(I,),
-ctor=f)` / `uses(:n, marker)` API. Use it from a module that does `using ROSNode`.
+for dynamic composition. It covers the common case (ports, `@param`, `@provides`, `@requires field::Marker`
+DI consumers); to author a `member_schema` over a hand-written struct (a parametric DI consumer, an
+externally-defined handler, a custom ctor) with the same directives, use [`@schema`](@ref). Use it from a
+module that does `using ROSNode`.
 """
 macro component(structexpr)
     (structexpr isa Expr && structexpr.head === :struct) ||
@@ -137,52 +335,12 @@ macro component(structexpr)
                         push!(reqs, (e.args[1]::Symbol, e.args[2], Symbol("__", e.args[1], "_T")))
                     end
                 end
-            elseif mname === Symbol("@uses")
-                error("@component: `@uses` is not supported yet — author a client port with the raw value API " *
-                      "for now: a `uses(:name, marker)` port in `member_schema(::Type{M}) = component(M, …)`.")
-            elseif mname === Symbol("@publishes")
-                isempty(rest) && error("@component: `@publishes name::T [on \"wire\"]`")
-                decl = rest[1]
-                on   = length(rest) >= 2 ? rest[2] : nothing
-                wire = length(rest) >= 3 ? rest[3] : nothing
-                name, T = _parse_port_decl(decl, "@component")
-                w = _parse_on(on, wire, "@component")
-                push!(ports, :( $(GlobalRef(M, :publishes))($(QuoteNode(name)), $T; on = $w) ))
-            elseif mname === Symbol("@hears")
-                isempty(rest) && error("@component: `@hears [\"wire\"] function f(node, m, msg::T) … end`")
-                if length(rest) == 2
-                    rest[1] isa AbstractString ||
-                        error("@component: `@hears`'s leading wire must be a string literal, got `$(rest[1])`")
-                    wire, fdef = String(rest[1]), rest[2]
-                else
-                    wire, fdef = nothing, rest[1]
-                end
-                _is_method_def(fdef) || error("@component: `@hears [\"wire\"] function f(node, m, msg::T) … end`")
-                _component_inject_member!(fdef, base)
-                fname = _component_defname(fdef)
-                call  = _peel_to_call(fdef.args[1])
-                length(call.args) >= 4 || error("@component: `@hears` handler needs `(node, m, msg::T)`")
-                msgarg = call.args[4]
-                (msgarg isa Expr && msgarg.head === :(::)) || error("@component: `@hears` message arg needs a type, got `$(msgarg)`")
-                T = msgarg.args[2]
-                push!(emits, fdef)
-                push!(ports, :( $(GlobalRef(M, :hears))($(QuoteNode(fname)), $T, $fname; on = $wire) ))
-            elseif mname === Symbol("@every")
-                length(rest) == 2 || error("@component: `@every rate function f(node, m) … end` (rate = Hz or :param)")
-                rate, fdef = rest[1], rest[2]
-                _is_method_def(fdef) || error("@component: `@every rate function f(node, m) … end`")
-                _component_inject_member!(fdef, base)
-                fname = _component_defname(fdef)
-                push!(emits, fdef)
-                push!(ports, :( $(GlobalRef(M, :every))($(QuoteNode(fname)), $rate, $fname) ))
-            elseif mname === Symbol("@service") || mname === Symbol("@action")
-                args = copy(ln.args)
-                i = findlast(a -> _is_method_def(a), args)
-                i === nothing && error("@component: `$(mname)` needs an inline `function … end` handler")
-                _component_inject_member!(args[i], base)
-                fname = _component_defname(args[i])
-                push!(emits, Expr(:macrocall, args...))      # the @service/@action authoring macrocall
-                push!(ports, fname)                          # the trait-bearing handler (→ _to_port converts)
+            elseif is_port_directive(mname)
+                # Shared port sublanguage — @publishes/@hears/@serves/@runs/@every/@uses (+ @service/@action
+                # legacy authoring). `@component` lifts any inline handler into a module-level def (emits) and
+                # the directive lowers to its value combinator; the rest of the block stays struct-specific.
+                call, em = parse_port_directive(ln, base, M)
+                append!(emits, em); push!(ports, call)
             else
                 error("@component: unknown directive `$(mname)` in the body")
             end
@@ -201,9 +359,12 @@ macro component(structexpr)
         end
     end
 
-    isempty(nodefault) ||
-        error("@component: field(s) $(nodefault) need an inline default (e.g. `x::T = …`) so the zero-arg " *
-              "`$(base){…}()` ctor can build the component (a value set later still needs a default placeholder)")
+    isempty(nodefault) || error("@component: field(s) $(nodefault) need an inline default (e.g. `x::T = …`) " *
+        (isempty(reqs) ?
+            "so the zero-arg `$(base){…}()` ctor can build the component" :
+            "so the injected `construct(::Type{$(base)}, node, ::Val{Name}, deps…)` can build the component " *
+            "(it threads the field defaults, then the deps)") *
+        " (a value set later still needs a default placeholder)")
 
     # The user authors only the phantom `{Name}` param; the macro OWNS any further params. A DI consumer
     # declares its deps with `@requires field::Marker` (above): the macro adds one hidden param per dep to
@@ -258,6 +419,152 @@ macro component(structexpr)
     out = Expr(:block,
                Expr(:struct, true, newhead, Expr(:block, fields...)),   # mutable struct (fields only)
                (ctor === nothing ? () : (ctor,))...,
+               (paramsblock === nothing ? () : (paramsblock,))...,
+               emits...,
+               memberschema,
+               base)
+    return esc(out)
+end
+
+export @schema
+
+"""
+    @schema Base [Params] begin
+        @publishes out::T on "~/out"             # a publisher port
+        @hears     on_odom::Odometry             # a subscription bound to the in-scope `on_odom`
+        @hears     odom => on_odom::Odometry      # …under a different port name
+        @serves    safe                          # a pre-authored @service handler, by reference
+        @runs      countup                       # a pre-authored @action handler, by reference
+        @every     tick at :rate                 # a timer bound to the `rate` parameter
+        @uses      cli::AddTwoInts_Request        # a persistent service client
+        @provides  Iface                         # interface(s) this component provides
+        @requires  Sensor                        # DI evidence — the marker type(s) it depends on
+        @ctor      make_component                 # the injected constructor
+    end
+
+Author a component's [`member_schema`](@ref) declaratively — the same port directives as [`@component`](@ref),
+lowered to the `publishes`/`hears`/`serves`/`runs`/`every`/`uses` value combinators. Unlike `@component`,
+`@schema` defines **no struct**: you write the `mutable struct Base{Name} <: Component{Name} … end` and the
+lifecycle hooks as ordinary definitions, and `@schema` wires the ports to your handlers (referenced by
+name, or written inline in a directive). That decoupling is what keeps the representation power the raw
+combinators have — parametric state, externally defined or shared handlers, DI consumers
+(`@requires`/`@ctor`), descriptor reuse — that `@component`'s all-in-one form gives up.
+
+Expands to `member_schema(::Type{Base}) = component(Base, [Params,] ports…; provides, requires, ctor)`
+(plus any inline handler defs). It emits nothing else, so it composes with a hand-written struct:
+
+```julia
+mutable struct Guard{Name, B} <: Component{Name}; battery_src::B; end
+@parameters struct GuardParams; min_battery::Float64 = 20.0; end
+@service "~/safe_to_fly" function safe(node, g::Guard, target::Float64)::@NamedTuple{ok::Bool} … end
+
+@schema Guard GuardParams begin
+    @serves   safe
+    @requires BatterySource    # the default ctor injects it: Guard{Name, typeof(src)}(src)
+end
+```
+
+Forms (shared with `@component`, see its docstring for the full port grammar):
+
+- **Params.** `@schema Base P` references an existing [`@parameters`](@ref) struct `P`; `@schema Base`
+  with `@param` lines authors `BaseParams` inline. The two are mutually exclusive — an explicit `P` with
+  `@param` lines is an error.
+- **Port name** defaults to the handler's name; `name => handler` overrides it.
+- **Wire** defaults to the port name; a trailing `on "wire"` (or a leading `"wire"` string on a handler
+  directive) overrides it.
+- **`@hears`** needs a message type — `handler::T` or an inline `function f(node, m, msg::T) … end` — since
+  a subscription has no trait to carry it. **`@serves`/`@runs`** take a pre-authored handler by reference,
+  a `handler::ReqOrActionType`, or an inline `@service`/`@action`-shaped def. **`@every`** is `handler at rate`.
+- **`@requires`** lists bare marker TYPE(s) (DI evidence only); the injected field lives on your struct.
+  For the holder shape — free type parameters past `Name` are exactly the injected deps, in order — the
+  default [`construct`](@ref) builds `Base{Name, typeof.(deps)…}(deps…)` from the type, so **no `@ctor` is
+  needed**. Add **`@ctor f`** only for a custom shape (named fields, extra state, a reordered parameter).
+
+Use it from a module that does `using ROSNode`.
+"""
+macro schema(args...)
+    length(args) >= 2 || error("@schema: `@schema Base [Params] begin … end`")
+    block = last(args)
+    (block isa Expr && block.head === :block) ||
+        error("@schema: the body must be a `begin … end` block, got `$(block)`")
+    length(args) <= 3 || error("@schema: too many arguments — `@schema Base [Params] begin … end`")
+    base = args[1]
+    base isa Symbol ||
+        error("@schema: the first argument is the component state type (a bare name), got `$(base)`")
+    ptype = length(args) == 3 ? args[2] : nothing
+    ptype === nothing || ptype isa Symbol || (ptype isa Expr && ptype.head === :curly) ||
+        error("@schema: the second argument is the parameters struct TYPE (a `@parameters` name), got " *
+              "`$(ptype)` — for inline parameters drop it and declare them with `@param` lines")
+    M = @__MODULE__
+
+    ports = Any[]; emits = Any[]; provides = Any[]; requires = Any[]; params = Any[]; ctorx = nothing
+
+    for ln in block.args
+        ln isa LineNumberNode && continue
+        (ln isa Expr && ln.head === :macrocall) ||
+            error("@schema: the block holds directives only — define the struct, reactions, and lifecycle " *
+                  "hooks separately. Got `$(ln)`")
+        mname = ln.args[1]
+        rest  = filter(a -> !(a isa LineNumberNode), ln.args[2:end])
+        if mname === Symbol("@param")
+            ptype === nothing || error("@schema: `$(base)` was given an explicit parameters struct " *
+                "`$(ptype)`; remove the `@param` line(s), or drop `$(ptype)` and declare parameters with `@param`")
+            isempty(rest) && error("@schema: `@param [\"doc\"] field::T = default [∈ …] [|> …]`")
+            length(rest) > 2 && error("@schema: `@param` takes an optional leading doc string then ONE " *
+                "`field::T = default [∈ …] [|> …]` statement, got $(length(rest)) parts in `$(ln)`")
+            if length(rest) == 2
+                rest[1] isa AbstractString ||
+                    error("@schema: `@param`'s leading doc must be a string literal, got `$(rest[1])`")
+                push!(params, rest[1])
+            end
+            push!(params, last(rest))
+        elseif mname === Symbol("@provides")
+            isempty(rest) && error("@schema: `@provides Iface [Iface2 …]` needs at least one interface")
+            for r in rest
+                (r isa Expr && r.head === :tuple) ? append!(provides, r.args) : push!(provides, r)
+            end
+        elseif mname === Symbol("@requires")
+            isempty(rest) && error("@schema: `@requires Marker [Marker2 …]` — the @interface/component " *
+                "TYPE(s) this component depends on. Author the injected field + constructor on your struct, " *
+                "and name the constructor with `@ctor`.")
+            for r in rest
+                entries = (r isa Expr && r.head === :tuple) ? r.args : (r,)   # flatten `(A, B)` AND validate each
+                for e in entries
+                    (e isa Expr && e.head === :(::)) &&
+                        error("@schema: `@requires` takes bare marker TYPE(s) here (e.g. `@requires Sensor`), not " *
+                            "`field::Marker` (got `$(e)`) — `@schema` does not author the struct, so declare the " *
+                            "injected field on your `mutable struct` and pass the constructor with `@ctor`. " *
+                            "(`field::Marker` is `@component`'s form.)")
+                    push!(requires, e)
+                end
+            end
+        elseif mname === Symbol("@ctor")
+            length(rest) == 1 || error("@schema: `@ctor f` — name the injected constructor, a callable " *
+                "`(node, ::Val{Name}, deps…) -> Base{Name,…}`")
+            ctorx === nothing || error("@schema: `@ctor` given more than once")
+            ctorx = rest[1]
+        elseif is_port_directive(mname)
+            call, em = parse_port_directive(ln, base, M)
+            append!(emits, em); push!(ports, call)
+        else
+            error("@schema: unknown directive `$(mname)` — expected a port directive " *
+                  "(@publishes/@hears/@serves/@runs/@every/@uses) or @param/@provides/@requires/@ctor")
+        end
+    end
+
+    paramsblock = isempty(params) ? nothing :
+        Expr(:macrocall, Symbol("@parameters"), __source__,
+             Expr(:struct, false, _params_name(base), Expr(:block, params...)))
+    Pargs = ptype !== nothing ? (ptype,) : (isempty(params) ? () : (_params_name(base),))
+    schemacall = Expr(:call, GlobalRef(M, :component), base, Pargs..., ports...)
+    kws = Expr(:parameters)
+    isempty(provides) || push!(kws.args, Expr(:kw, :provides, Expr(:tuple, provides...)))
+    isempty(requires) || push!(kws.args, Expr(:kw, :requires, Expr(:tuple, requires...)))
+    ctorx === nothing || push!(kws.args, Expr(:kw, :ctor, ctorx))
+    isempty(kws.args) || insert!(schemacall.args, 2, kws)
+    memberschema = Expr(:(=), Expr(:call, GlobalRef(M, :member_schema), :(::Type{$base})), schemacall)
+
+    out = Expr(:block,
                (paramsblock === nothing ? () : (paramsblock,))...,
                emits...,
                memberschema,

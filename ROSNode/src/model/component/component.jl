@@ -293,15 +293,19 @@ end
 # fields, extra non-dep fields, a different parameter order) defines its own `construct`/`ctor=`.
 function construct(::Type{M}, node, ::Val{Name}, dep, deps...) where {M, Name}
     args = (dep, deps...)
+    badshape() = error("$(nameof(M)): the default dependency-injection constructor builds " *
+              "`$(nameof(M)){Name, <dep types>}(deps…)` from its $(length(args)) injected dependency(ies), but " *
+              "`$(nameof(M))`'s parameters and fields past `Name` are not one-per-dependency. Define " *
+              "`construct(::Type{$(nameof(M))}, node, ::Val{Name}, deps…) where {Name}`, or " *
+              "`member_schema`'s `ctor=`, for a component with other fields or a different parameter shape.")
     MN = try
         M{Name, map(typeof, args)...}
     catch
-        error("$(nameof(M)): the default dependency-injection constructor builds " *
-              "`$(nameof(M)){Name, <dep types>}` from its $(length(args)) injected dependency(ies), but " *
-              "`$(nameof(M))`'s type parameters past `Name` are not one-per-dependency. Define " *
-              "`construct(::Type{$(nameof(M))}, node, ::Val{Name}, deps…) where {Name}`, or " *
-              "`member_schema`'s `ctor=`, for a component with other fields or a different parameter shape.")
+        badshape()
     end
+    # An extra/missing field makes the type valid but the deps-only call inapplicable; surface the guidance
+    # rather than a raw MethodError. A matching ctor that throws its own error still propagates.
+    applicable(MN, args...) || badshape()
     return MN(args...)
 end
 

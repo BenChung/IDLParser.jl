@@ -1,7 +1,7 @@
 # Components — authoring a node as a typed `node(…)` schema of member components (the functor
 # API; see PLAN-NODE-PLAN.md for the design, DESIGN-COMPONENTS.md for the underlying concepts).
 #
-#     julia --project=. ROSNode/examples/component.jl
+#     julia --project=ROSNode ROSNode/examples/component.jl   # from the workspace root
 #
 # Self-contained: the node and a ground-station client share one process / Context, so
 # no router is needed (add `peers=["tcp/localhost:7447"]` to `@context` + start `zenohd`
@@ -77,9 +77,6 @@ module Drone
     mutable struct Guard{Name, B} <: Component{Name}
         battery_src::B                                      # the injected sibling provider
     end
-    # The functor ctor threads the member name as `Val{Name}` and the resolved deps after it;
-    # the single `BatterySource` dependency arrives as `src`, fixing `Guard{name, Sensor}`.
-    make_guard(node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
     @parameters struct GuardParams
         min_battery::Float64 = 20.0
     end
@@ -92,8 +89,11 @@ module Drone
         b = battery(g.battery_src)
         (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
     end
-    member_schema(::Type{Guard}) = component(Guard, GuardParams, safe;
-        requires = (BatterySource,), ctor = make_guard)
+    # No `ctor=` needed: the holder shape (the free type parameters past `Name` are exactly the injected
+    # deps, in order) is built by the DEFAULT `construct`, which calls the type itself —
+    # `Guard{name, typeof(src)}(src)`, fixing `Guard{name, Sensor}`. The single `BatterySource` dependency
+    # arrives as `src`. (Pass `ctor=` only for a custom shape: named fields, extra state, a reordered param.)
+    member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,))
     # (A standalone load with no Sensor sibling would use a no-`requires` schema + a 0-dep ctor
     #  injecting a null provider; this composition always supplies a real Sensor.)
 end

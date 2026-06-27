@@ -1,20 +1,20 @@
 # Components, the `@component` way — the same Vehicle node as `component.jl`, but authoring its
 # components with the `@component` macro instead of the raw value combinators.
 #
-#     julia --project=. ROSNode/examples/component_macro.jl
+#     julia --project=ROSNode ROSNode/examples/component_macro.jl   # from the workspace root
 #
 # `@component mutable struct … end` is the concise authoring tier: it EMITS the value API
 # (`component(…)` + `member_schema` + the struct + ctor + reaction/hook methods) in ONE expression,
 # so a struct edit re-runs the whole block and re-keys everything together (Revise-friendlier than the
 # separate-definitions form). It is sugar over `component`/`node` — the raw combinators remain the
-# primitive, and the two coexist: here the *provider* `Sensor` is authored with `@component`, while the
-# *DI consumer* `Guard` (which `requires` an injected sibling + a custom ctor) stays on the raw API —
-# `@component` v1 covers the DI-free common case (`@requires` is a planned extension, and errors clearly
-# for now). Compare side-by-side with `component.jl`, which authors both the long way.
+# primitive, and the tiers coexist: here the *provider* `Sensor` is authored with `@component`, while the
+# *DI consumer* `Guard` stays on the raw value API to show the two composing in one `node(…)`. `@component`
+# itself authors DI consumers via `@requires battery_src::BatterySource` (it adds the holding type
+# parameter + the constructor); `Guard` could equally be written that way. Compare side-by-side with
+# `component.jl`, which authors both the long way.
 #
 # Self-contained: the node and a ground-station client share one process / Context, so no router is
-# needed; the message + service types are authored in Julia, so this runs against just a router — no
-# sourced ROS2 install.
+# needed; the message + service types are authored in Julia, so it needs no sourced ROS2 install either.
 
 using ROSNode
 
@@ -60,14 +60,14 @@ module Drone
     battery(s::Sensor) = s.level
 
     # ── Guard (raw value API): depends on a BatterySource; serves "safe to fly?" ───────────────────
-    # A DI CONSUMER — `requires` an injected sibling, stored in the type parameter `B`, built by a
-    # custom ctor that threads the resolved dep. `@component` v1 does not author this yet (`@requires`
-    # is reserved), so it uses the raw `component(…; requires, ctor)` API — which composes seamlessly
-    # with the `@component`'d Sensor in the same `node(…)`.
+    # A DI CONSUMER — `requires` an injected sibling, stored in the type parameter `B`. Shown via the raw
+    # value API to demonstrate it composing with the `@component`'d Sensor in one `node(…)`; it could
+    # equally be authored with `@component`'s own `@requires battery_src::BatterySource`. For this holder
+    # shape (the free type parameters past `Name` are exactly the injected deps, in order) the DEFAULT
+    # constructor builds `Guard{Name, typeof(src)}(src)` from the type itself, so no `ctor=` is needed.
     mutable struct Guard{Name, B} <: Component{Name}
         battery_src::B                                      # the injected sibling provider
     end
-    make_guard(node, ::Val{Name}, src) where {Name} = Guard{Name, typeof(src)}(src)
     @parameters struct GuardParams
         min_battery::Float64 = 20.0
     end
@@ -76,8 +76,7 @@ module Drone
         b = battery(g.battery_src)
         (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
     end
-    member_schema(::Type{Guard}) = component(Guard, GuardParams, safe;
-        requires = (BatterySource,), ctor = make_guard)
+    member_schema(::Type{Guard}) = component(Guard, GuardParams, safe; requires = (BatterySource,))
 end
 using .Drone
 

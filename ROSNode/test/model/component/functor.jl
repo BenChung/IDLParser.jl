@@ -804,7 +804,8 @@ end
     @test RNX.requires_of(typeof(RNX.member_schema(CMacro.TwoDep))) == (CMacro.Pinger2, CMacro.Batt)
     @test isconc(CMacro.twosum, (typeof(td.t),))
 
-    # guards: a bare `@requires Marker` (no field) and `@uses` still error clearly, self-identifying
+    # guards: a bare `@requires Marker` (no field) errors in @component (the field::Marker form is required);
+    # a malformed `@uses` (missing the `name::T` decl) errors naming the directive.
     eb = try; @macroexpand(@component mutable struct GBad{Name} <: Component{Name}
             @requires BatterySource
         end); nothing; catch e; e; end
@@ -879,16 +880,297 @@ end
     e2 = try; @macroexpand(@component struct R2NoMut end); nothing; catch e; e; end
     @test e2 !== nothing && occursin("@component", sprint(showerror, e2))
 
-    # Low — a no-arg directive gives a clear @component error, not a raw BoundsError
+    # Low — a no-arg directive gives a clear, directive-named error, not a raw BoundsError. The shared
+    # engine names the DIRECTIVE (`@publishes`), since the same parser backs `@component` and `@schema`.
     e3 = try
         @macroexpand(@component mutable struct R2B3{Name} <: Component{Name}
             @publishes
         end)
         nothing
     catch e; e; end
-    @test e3 !== nothing && occursin("@component", sprint(showerror, e3)) && !occursin("BoundsError", sprint(showerror, e3))
+    @test e3 !== nothing && occursin("@publishes", sprint(showerror, e3)) && !occursin("BoundsError", sprint(showerror, e3))
 
     # Low — `where`-clause reaction/helper accepted (peeled), member still builds
     @test FxR2.WC{:w}().x == 0
     @test RNX.member_schema(FxR2.WC) isa RNX.MemberSchema
+end
+
+# ── @schema: the member_schema EDSL (shared directive engine with @component, but emits only the
+#    member_schema — the struct/handlers/hooks stay separate, preserving raw-API representation power) ──
+module SchM
+    using ROSNode
+    import ROSNode: member_schema, configure
+    @ros_package "functor_schema_test"
+    const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+
+    @interface BatterySource2 batt2(_)::Float64
+
+    # provider via @schema (explicit Params type); struct + ctor + handler authored separately
+    @parameters struct SenP; rate::Int64 = 5 ∈ 1..50; end
+    mutable struct Sen{Name} <: Component{Name}; level::Float64; end
+    Sen{Name}() where {Name} = Sen{Name}(88.0)
+    batt2(s::Sen) = s.level
+    pubtick(node, s::Sen) = (publish(entities(node, s).out, _T()); nothing)
+    @schema Sen SenP begin
+        @publishes out::_T on "~/telemetry"
+        @every     pubtick at :rate
+        @provides  BatterySource2
+    end
+
+    # DI consumer via @schema, HAPPY PATH: bare-marker @requires (evidence only) and NO @ctor — the
+    # holder shape (free param past Name is the injected dep) is built by the default `construct`, which
+    # calls the type itself: `Grd{Name, typeof(src)}(src)`. The struct + @service handler are hand-written.
+    mutable struct Grd{Name, B} <: Component{Name}; src::B; end
+    @parameters struct GrdP; minb::Float64 = 20.0; end
+    @service "~/safe" function safe2(node, g::Grd, t::Float64)::@NamedTuple{ok::Bool}
+        (ok = batt2(g.src) >= parameters(node, g).minb && t <= 100.0,)
+    end
+    @schema Grd GrdP begin
+        @serves   safe2
+        @requires BatterySource2
+    end
+
+    # DI consumer via @schema with an explicit @ctor — for a CUSTOM shape the default can't build (an
+    # extra non-dep field). The ctor places `Name`, threads the dep, and sets the extra state.
+    mutable struct GrdK{Name, B} <: Component{Name}; src::B; tag::Symbol; end
+    mkgrdk(node, ::Val{N}, src) where {N} = GrdK{N, typeof(src)}(src, :custom)
+    @schema GrdK begin
+        @requires BatterySource2
+        @ctor     mkgrdk
+    end
+
+    # inline @param (no explicit P), a reference @hears, a renamed+retopiced @hears, and a client @uses
+    hear(node, m, msg::_T) = (m.n += 1; nothing)
+    mutable struct Mix{Name} <: Component{Name}; n::Int64; end
+    Mix{Name}() where {Name} = Mix{Name}(0)
+    @schema Mix begin
+        @param gain::Float64 = 1.0
+        @hears hear::_T
+        @hears alt => hear::_T on "/other"
+        @uses  cli::functor_schema_test.srv.safe2_Request on "/svc"   # client port + trailing wire
+    end
+
+    # the SAME new directive forms now available in @component: reference handler, name+topic override,
+    # at-rate timer, @serves/@runs by reference (pre-authored @service/@action handlers), and the legacy
+    # leading-wire inline @hears (a backward-compat spelling).
+    @service "~/qq" function qq(node, m, x::Int64)::@NamedTuple{ok::Bool}; (ok = x > 0,); end
+    @action "~/cnt" function cnt(node, m, target::Int32,
+                                 fb::FeedbackSink{@NamedTuple{cur::Int32}})::@NamedTuple{total::Int32}
+        (total = target,)
+    end
+    whear(node, m, msg::_T) = (m.k += 1; nothing)
+    wtick(node, m) = (m.k += 1; nothing)
+    @component mutable struct Wkr{Name} <: Component{Name}
+        k::Int64 = 0
+        @param  hz::Int64 = 10
+        @hears  whear::_T
+        @hears  alt => whear::_T on "/alt"
+        @hears  "/legacy" function lh(node, m, msg::_T); m.k += 1; nothing; end   # legacy leading-wire inline
+        @every  wtick at :hz
+        @serves qq
+        @runs   cnt
+    end
+end
+
+@testset "functor: @schema + unified directive forms" begin
+    # @schema emits a MemberSchema (not a NodeSchema) on the bare base, with ports in block order.
+    sen = RNX.member_schema(SchM.Sen)
+    @test sen isa RNX.MemberSchema
+    @test RNX.port_names(sen) == [:out, :pubtick]
+    @test RNX.param_names(sen) == [:rate]                              # explicit SenP referenced
+    @test RNX.provides_of(typeof(sen)) == (SchM.BatterySource2,)
+
+    grd = RNX.member_schema(SchM.Grd)
+    @test RNX.port_names(grd) == [:safe2]                             # @serves by reference
+    @test RNX.requires_of(typeof(grd)) == (SchM.BatterySource2,)     # @requires = evidence only
+
+    mix = RNX.member_schema(SchM.Mix)
+    @test RNX.port_names(mix) == [:hear, :alt, :cli]                  # reference, override, client
+    @test RNX.param_names(mix) == [:gain]                             # inline @param → MixParams
+    _mp(nm) = mix.ports[findfirst(p -> RNX.descname(typeof(p)) === nm, mix.ports)]
+    @test _mp(:alt) isa RNX.Sub && _mp(:alt).wire == "/other"        # name + topic override resolved
+    @test _mp(:cli) isa RNX.Use && _mp(:cli).wire == "/svc"          # @uses client port + trailing wire
+    @test RNX.handle_type(typeof(_mp(:cli))) <: RNX.ServiceClient    # marker → concrete service-client handle
+
+    # @schema DI composes. Grd (no @ctor) is built by the DEFAULT construct = the type constructor;
+    # GrdK (@ctor) is built by its custom ctor (which the default can't — it sets the extra `tag` field).
+    m = RNX.build_members(node("sen" => SchM.Sen, "grd" => SchM.Grd, "grdk" => SchM.GrdK), nothing)
+    @test typeof(m.grd) === SchM.Grd{:grd, SchM.Sen{:sen}}              # default ctor: Grd{Name, typeof(src)}(src)
+    @test SchM.batt2(m.grd.src) == 88.0
+    @test typeof(m.grdk) === SchM.GrdK{:grdk, SchM.Sen{:sen}} && m.grdk.tag === :custom   # @ctor override ran
+
+    # a @schema-authored single node runs end-to-end (promote, un-prefixed params).
+    cn = run(SchM.Sen; name = "schsen", block = false)
+    try
+        e = entities(cn, cn.members.sen)
+        @test e.out isa RNX.PublisherHandle && e.pubtick isa RNX.Timer
+        @test parameters(cn, cn.members.sen).rate == 5
+    finally
+        close(cn); close(cn.node.context)
+    end
+
+    # the new directive forms in @component lower the same way: reference @hears, name+topic override,
+    # legacy leading-wire inline @hears, at-rate @every, @serves + @runs by reference.
+    wkr = RNX.member_schema(SchM.Wkr)
+    @test RNX.port_names(wkr) == [:whear, :alt, :lh, :wtick, :qq, :cnt]
+    @test RNX.param_names(wkr) == [:hz]
+    _wp(nm) = wkr.ports[findfirst(p -> RNX.descname(typeof(p)) === nm, wkr.ports)]
+    @test _wp(:alt) isa RNX.Sub && _wp(:alt).wire == "/alt"          # trailing-on override
+    @test _wp(:lh)  isa RNX.Sub && _wp(:lh).wire  == "/legacy"       # legacy leading-wire inline @hears
+    @test _wp(:wtick) isa RNX.Tmr                                    # @every … at :hz
+    @test _wp(:qq)  isa RNX.Srv                                      # @serves by reference
+    @test _wp(:cnt) isa RNX.Act                                      # @runs by reference (action server)
+
+    # @param ⊕ explicit-Params is rejected at macro-expand, self-identifying.
+    ep = try
+        @eval module _SchBadP
+            using ROSNode
+            @parameters struct PP; a::Int = 1; end
+            mutable struct C{Name} <: Component{Name}; end
+            @schema C PP begin
+                @param b::Int = 2
+            end
+        end
+        nothing
+    catch e; e; end
+    @test ep !== nothing && occursin("explicit parameters struct", sprint(showerror, ep isa LoadError ? ep.error : ep))
+
+    # @component's `field::Marker` @requires form is rejected in @schema (which doesn't author the struct).
+    er = try
+        @eval module _SchBadReq
+            using ROSNode
+            mutable struct C2{Name, B} <: Component{Name}; b::B; end
+            @schema C2 begin
+                @requires src::Int
+            end
+        end
+        nothing
+    catch e; e; end
+    @test er !== nothing && occursin("field::Marker", sprint(showerror, er isa LoadError ? er.error : er))
+end
+
+# ── directive-engine guards: the side conditions + the two leading-wire / tuple-requires defects ──────
+const _GT = ROSNode.Interfaces.builtin_interfaces.msg.Time
+_expand_err(ex) = try; Core.eval(@__MODULE__, ex); nothing; catch e; e isa LoadError ? e.error : e; end
+
+@testset "functor: directive-engine guards" begin
+    # SC3 — a bare `@hears` reference has no message type and is rejected (a subscription carries no trait).
+    e_bare = _expand_err(:(@macroexpand @component mutable struct _GBareHears{Name} <: Component{Name}
+        @hears somehandler
+    end))
+    @test e_bare !== nothing && occursin("@hears", sprint(showerror, e_bare)) &&
+          occursin("message type", sprint(showerror, e_bare))
+
+    # SC2 — at most one wire: a leading "wire" string AND a trailing `on "wire"` together is an error.
+    e_two = _expand_err(:(@macroexpand @component mutable struct _GTwoWire{Name} <: Component{Name}
+        @hears "lead" function h(node, m, msg::_GT); nothing; end on "trail"
+    end))
+    @test e_two !== nothing && occursin("not both", sprint(showerror, e_two))
+
+    # SC2 sibling — `on` followed by a non-string literal is rejected.
+    e_onbad = _expand_err(:(@macroexpand @component mutable struct _GOnBad{Name} <: Component{Name}
+        @publishes out::_GT on somewhere
+    end))
+    @test e_onbad !== nothing && occursin("wire string literal", sprint(showerror, e_onbad))
+
+    # Bug B (fixed) — the decl directives take the wire ONLY trailing; a leading string is rejected with a
+    # directive-named pointer (it used to be silently applied as the wire).
+    e_lead = _expand_err(:(@macroexpand @component mutable struct _GLeadPub{Name} <: Component{Name}
+        @publishes "leadwire" out::_GT
+    end))
+    @test e_lead !== nothing && occursin("@publishes", sprint(showerror, e_lead)) &&
+          occursin("trailing", sprint(showerror, e_lead))
+
+    # Bug A (fixed) — @schema's `@requires` validates EACH tuple entry, so a `field::Marker` smuggled inside
+    # a tuple is rejected at macro-expand (it used to slip through to a cryptic late UndefVarError).
+    e_tup = _expand_err(:(module _GTupReq
+        using ROSNode
+        @interface _GS gsens(_)
+        mutable struct C{Name, B} <: Component{Name}; b::B; end
+        gmk(node, ::Val{N}, s) where {N} = C{N, typeof(s)}(s)
+        @schema C begin
+            @requires (_GS, bad::Int)
+            @ctor gmk
+        end
+    end))
+    @test e_tup !== nothing && occursin("field::Marker", sprint(showerror, e_tup))
+end
+
+# ── review-3 fixes: qualified handler refs, @schema arg guards, default-construct guidance, e2e by-ref ──
+module QH                                   # handlers in a SIBLING module — the external-handler case
+    using ROSNode
+    const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+    odom(node, m, msg::_T) = nothing
+    beat(node, m) = nothing
+end
+module QHUse
+    using ROSNode
+    import ..QH
+    const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+    mutable struct W{Name} <: Component{Name}; n::Int; end
+    W{Name}() where {Name} = W{Name}(0)
+    @schema W begin
+        @hears QH.odom::_T              # qualified reference; port name = :odom (final path component)
+        @every QH.beat at 5
+        @hears watch => QH.odom::_T     # qualified ref + name override
+    end
+end
+
+@testset "functor: review-3 fixes" begin
+    # Qualified handler references (Mod.f) lower; the port name defaults to the final path component.
+    w = RNX.member_schema(QHUse.W)
+    @test RNX.port_names(w) == [:odom, :beat, :watch]
+    _qp(nm) = w.ports[findfirst(p -> RNX.descname(typeof(p)) === nm, w.ports)]
+    @test _qp(:odom) isa RNX.Sub && _qp(:beat) isa RNX.Tmr && _qp(:watch) isa RNX.Sub
+
+    # @schema argument-validation guards each error clearly, source-located.
+    _g(ex) = (e = _expand_err(ex); e === nothing ? "NO ERROR" : sprint(showerror, e))
+    @test occursin("the first argument is the component state type", _g(:(@macroexpand @schema 5 begin end)))
+    @test occursin("too many arguments", _g(:(@macroexpand @schema A B C begin end)))
+    @test occursin("must be a `begin", _g(:(@macroexpand @schema A notablock)))
+    @test occursin("parameters struct TYPE", _g(:(@macroexpand @schema A "oops" begin end)))   # non-type Params
+    @test occursin("given more than once", _g(:(@eval module _DupCtor; using ROSNode
+        mutable struct C{N, B} <: Component{N}; b::B; end
+        mk(n, v, d) = C{:x, typeof(d)}(d)
+        @schema C begin @requires Int; @ctor mk; @ctor mk; end; end)))
+    @test occursin("block holds directives only", _g(:(@eval module _Stray; using ROSNode
+        mutable struct C{N} <: Component{N}; end
+        @schema C begin; x = 1; end; end)))
+
+    # Default `construct` gives shape guidance (not a raw MethodError) for an extra-field holder.
+    eA = try
+        @eval module _XField
+            using ROSNode
+            @interface Bs3 bb3(_)::Float64
+            mutable struct Prov{N} <: Component{N}; v::Float64; end
+            Prov{N}() where {N} = Prov{N}(1.0); bb3(p::Prov) = p.v
+            ROSNode.member_schema(::Type{Prov}) = component(Prov; provides = (Bs3,))
+            mutable struct Bad{N, B} <: Component{N}; src::B; tag::Symbol; end   # extra non-dep field, no ctor
+            ROSNode.member_schema(::Type{Bad}) = component(Bad; requires = (Bs3,))
+        end
+        RNX.build_members(node("p" => _XField.Prov, "b" => _XField.Bad), nothing); nothing
+    catch e; e; end
+    @test eA !== nothing && occursin("other fields or a different parameter shape", sprint(showerror, eA))
+
+    # @component nodefault error names the DI `construct`, not a (nonexistent) zero-arg ctor.
+    eC = _expand_err(:(@eval module _NoDefDI; using ROSNode
+        @interface Bs4 bb4(_)
+        @component mutable struct C{Name} <: Component{Name}
+            raw::Int64
+            @requires src::Bs4
+        end; end))
+    @test eC !== nothing && occursin("construct(::Type{C}", sprint(showerror, eC))
+
+    # End-to-end: a @component with @serves/@runs BY REFERENCE materialises a live service + action server,
+    # and an at-rate reference timer fires.
+    cn = run(SchM.Wkr; name = "wkr", block = false)
+    try
+        e = entities(cn, cn.members.wkr)
+        @test e.qq isa RNX.ServiceHandle           # @serves qq (by reference) → live service handle
+        @test e.cnt isa RNX.ActionServer            # @runs cnt (by reference) → live action server
+        sleep(0.4)
+        @test cn.members.wkr.k > 0                   # @every wtick at :hz — the reference timer fired
+    finally
+        close(cn); close(cn.node.context)
+    end
 end
