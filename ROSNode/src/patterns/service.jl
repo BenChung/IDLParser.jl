@@ -140,6 +140,13 @@ function Base.close(w::_ServiceWire)
     # left detached to die with the process rather than hang `close`.
     try
         close(w.queryable)
+        # `close` defers the buffered queryable's ctx teardown to a `@spawn`'d finalizer; during
+        # precompilation (the warm-up bake's inert-session probe node hosts `~/get_type_description`)
+        # no scheduler runs it, leaving the queryable's AsyncCondition open — a "waiting for IO to
+        # finish" precompile hang. Drive it synchronously there (the buffered-sub `_lv_sub` twin of
+        # this, in context.jl's drain). Idempotent: the later finalizer becomes a no-op.
+        ccall(:jl_generating_output, Cint, ()) == 0 ||
+            Zenoh._teardown_buffered_queryable!(w.queryable)
     finally
         t = w.consumer
         w.consumer = nothing
