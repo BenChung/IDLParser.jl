@@ -243,39 +243,44 @@ function parameters end
 # `construct` (`member_schema(M)`'s `ctor=`) that places `Name` itself. DI is resolved/toposorted in functor.jl.
 
 """
-    construct(::Type{M}, node, ::Val{Name}) -> M{Name}
-    construct(::Type{M}, node, ::Val{Name}, deps…) -> M{Name…}
+    construct(::Type{M}, node, ::Val{Name})           -> M{Name}      # no requires
+    construct(::Type{M}, node, ::Val{Name}, deps...)  -> M{Name, …}   # one dep per requires
 
-Build a component instance during node assembly. `Name` is the member's path within the node
-(its name in the `node(…)` member list), supplied by the framework as a `Val`. A component that
-`requires` interfaces or sibling components receives the resolved providers as `deps…`,
-positionally in `requires` order, and stores them — typically a sibling dep into a field typed by
-that component (whose own `Name` parameter then carries that sibling's path).
+The default builder during node assembly, and the hook to override for custom construction. Assembly
+builds a component by calling **its own constructor**, `M(node, ::Val{Name}, deps...)`; a component that
+defines no such inner constructor falls back here. Either way the arguments are, in order:
 
-Two defaults cover the common shapes, so most components define no `construct` at all:
+| Argument | What it is |
+|---|---|
+| `::Type{M}` | the component base type — the dispatch handle |
+| `node` | the node-core handle: the `Node` (or a [`LifecycleNode`](@ref)'s inner node), the same handle reactions get |
+| `::Val{Name}` | the member's path — its `Symbol` key in the `node("name" => M, …)` list, lifted to `Val{Name}` |
+| `deps...` | **exactly `length(`[`requires`](@ref)`(M))` arguments**, one per entry, in `requires` order; each the resolved provider instance |
 
-  - **No dependencies** — `construct(::Type{M}, node, ::Val{Name})` returns `M{Name}()`, for a
-    component whose every field past `Name` is defaulted.
-  - **Pure dependency holder** — `construct(::Type{M}, node, ::Val{Name}, deps…)` builds
-    `M{Name, typeof.(deps)…}(deps…)` from the type itself, for a component whose free type
-    parameters past `Name` are exactly the injected deps, in order (the `M{Name, B}; src::B`
-    pattern). The injected types fix those parameters, so the reads stay type-stable.
+The result is an instance of `M` that places `Name` in `M`'s member-path type parameter — `M{Name, …}` —
+with the remaining parameters fixed (typically by the deps' types) so field reads are type-stable. An
+injected provider arrives **constructed but not yet configured** (its `configure` runs later,
+dependency-first), so store it and read it from `configure` onward.
 
-Override either to do more — store deps into named fields, set non-dep fields, place `Name` in a
-different parameter position. Declare your override as a `construct(::Type{M}, node, ::Val{Name},
-deps…)` method (below), or as `member_schema(M)`'s `ctor=` keyword (the `ctor=` overrides the
-method when both are given). The [`@component`](@ref) macro's `@requires` directive emits the
-override for you, threading the deps after the component's inline field defaults.
+Two defaults cover the common shapes, so most components define no `construct`:
 
-`node` is the node-core handle. An injected provider is constructed-but-unconfigured at this
-point (its `configure` runs later, in dependency-first order), so store it and use it from
-`configure` onward.
+  - **No dependencies** — `M{Name}()`, for a component whose every field past `Name` is defaulted.
+  - **Pure holder** — `M{Name, typeof.(deps)...}(deps...)` from the type itself, when `M`'s free type
+    parameters past `Name` are exactly the injected deps, in order (the `mutable struct M{Name, B}; src::B; end`
+    shape). The injected types fix those parameters, so the reads stay type-stable.
+
+For any other shape — deps in named fields, non-dep fields to set, a reordered parameter — supply the
+constructor, three ways:
+
+  - an **inner constructor** matching the signature, `M(node, ::Val{Name}, deps...) where {Name} = new{Name, …}(…)`
+    — found and called by assembly directly, no `ctor=` (the cohesive form);
+  - a **`construct` method** (below) — also no `ctor=`; [`@component`](@ref)'s `@requires` directive emits one for you;
+  - **`member_schema`'s `ctor=`** (or [`@schema`](@ref)'s `@ctor`) — a callable `f(node, ::Val{Name}, deps...) where {Name} -> M{Name, …}`, for an external constructor; it overrides the other two.
 
 ```julia
-requires(::Type{Detector}) = (PoseSource,)                       # depend on an interface
-# default construct suffices for `Detector{Name, B}; src::B` — no method needed.
-
-requires(::Type{Watch}) = (Sensor,)                             # …a sibling component, stored in a named field
+requires(::Type{Detector}) = (PoseSource,)                       # the pure-holder default suffices for
+                                                                 #   mutable struct Detector{Name, B}; src::B; end
+requires(::Type{Watch}) = (Sensor,)                             # store a sibling in a named field instead:
 construct(::Type{Watch}, node, ::Val{Name}, s::Sensor) where {Name} = Watch{Name}(; sensor = s)
 ```
 """
@@ -287,17 +292,17 @@ function construct(::Type{M}, node, ::Val{Name}) where {M, Name}
           "or compose it in a `node(…)` so it receives its dependencies.")
 end
 
-# Default DI construction: with no user/`@component`/`ctor=` override, build the component from its own
-# type — `M{Name, typeof.(deps)…}(deps…)`. Fits the pure-holder shape where the free parameters past
-# `Name` are exactly the injected deps, in order, and the fields are those deps. Any other shape (named
-# fields, extra non-dep fields, a different parameter order) defines its own `construct`/`ctor=`.
+# The holder fallback for a requires-bearing component that defines no `M(node, ::Val{Name}, deps…)` inner
+# constructor — reached via the generic `Component` constructor below. Builds the pure-holder field form
+# `M{Name, typeof.(deps)…}(deps…)`, for a struct whose free parameters past `Name` are exactly the injected
+# deps, in order. Any other shape defines its own inner ctor, `construct` method, or `ctor=`.
 function construct(::Type{M}, node, ::Val{Name}, dep, deps...) where {M, Name}
     args = (dep, deps...)
-    badshape() = error("$(nameof(M)): the default dependency-injection constructor builds " *
+    badshape() = error("$(nameof(M)): the holder fallback builds " *
               "`$(nameof(M)){Name, <dep types>}(deps…)` from its $(length(args)) injected dependency(ies), but " *
-              "`$(nameof(M))`'s parameters and fields past `Name` are not one-per-dependency. Define " *
-              "`construct(::Type{$(nameof(M))}, node, ::Val{Name}, deps…) where {Name}`, or " *
-              "`member_schema`'s `ctor=`, for a component with other fields or a different parameter shape.")
+              "`$(nameof(M))`'s parameters and fields past `Name` are not one-per-dependency. Give `$(nameof(M))` " *
+              "an inner constructor `$(nameof(M))(node, ::Val{Name}, deps…) where {Name}`, a `construct` method, " *
+              "or `member_schema`'s `ctor=`, for a component with other fields or a different parameter shape.")
     MN = try
         M{Name, map(typeof, args)...}
     catch
@@ -308,6 +313,14 @@ function construct(::Type{M}, node, ::Val{Name}, dep, deps...) where {M, Name}
     applicable(MN, args...) || badshape()
     return MN(args...)
 end
+
+# Assembly builds a requires-bearing component by calling its OWN constructor, `M(node, ::Val{Name}, deps…)`
+# (the schema's default `ctor`). Embed an inner constructor of that shape to own construction with `ctor=`
+# elided; this generic fallback gives every component that constructor when it defines no matching inner
+# one, routing to `construct` (the holder field form, or a user/`@component` `construct` override). A
+# struct's own inner `M(node, ::Val{Name}, deps…)` is more specific and overrides this.
+(::Type{M})(node, ::Val{Name}, dep, deps...) where {M <: Component, Name} =
+    construct(M, node, Val(Name), dep, deps...)
 
 # ── DI: interfaces, provision, requirements ─────────────────────────────────────
 # An interface is a NAME (a marker type) for a set of generic functions; provision is

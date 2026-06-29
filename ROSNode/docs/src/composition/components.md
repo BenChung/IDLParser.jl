@@ -140,7 +140,7 @@ end
 `@schema Base [Params] begin … end` expands to `member_schema(::Type{Base}) = component(Base, [Params,] ports…; provides, requires, ctor)`. Reference an existing [`@parameters`](@ref) type as `Base P`, or declare parameters inline with `@param` (the two are mutually exclusive). The port directives, name override, and wire are exactly those of [`@component`](@ref); the binding directives differ to match the hand-written struct:
 
 - `@requires Marker [Marker2 …]` — dependency evidence only (bare marker types); the injected field lives on your struct.
-- `@ctor f` — the injecting constructor `f(node, ::Val{Name}, deps…)`. For the holder shape — the free type parameters past `Name` are exactly the injected deps, in order — the default constructor builds `Base{Name, typeof.(deps)…}(deps…)` from the type itself, so **`@ctor` is needed only for a custom shape** (see [Dependency injection](@ref)).
+- `@ctor f` — wire an external injecting constructor `f(node, ::Val{Name}, deps...) where {Name} -> Base{Name, …}`, one `dep` per `@requires` (its full contract is [`construct`](@ref)). The holder default builds `Base{Name, typeof.(deps)…}(deps…)` for you, and an inner constructor or [`construct`](@ref) method of that signature is found and called automatically — so **`@ctor` is needed only to wire an external callable or override those** — see [Parametric Components](parametric.md).
 
 The `Guard` written this way keeps its own parametric struct, its `@parameters`, and its [`@service`](@ref) handler; `@schema` only wires them. Its holder shape needs no constructor:
 
@@ -205,7 +205,7 @@ Provision and need are **Holy-trait evidence**, matched at assembly rather than 
 battery(s::Sensor) = s.level
 ```
 
-The consumer receives the resolved provider through its constructor. `Guard` holds it in the type parameter `B`, so reads stay type-stable, and the assembler fixes the member's type to `Guard{:guard, Sensor{:sensor}}`. For that **holder shape** — the free parameters past `Name` are exactly the injected deps — the default [`construct`](@ref) builds the component from its own type, so no constructor is written. Override it for any other shape (named fields, extra state, a different parameter order) with a [`construct`](@ref) method, the `ctor =` keyword, or `@schema`'s `@ctor`. [Parametric Components](parametric.md) covers the constructor contract, mocks, and standalone runs.
+The consumer receives the resolved provider through its constructor. `Guard` holds it in the type parameter `B`, so reads stay type-stable, and the assembler fixes the member's type to `Guard{:guard, Sensor{:sensor}}`. For that **holder shape** — the free parameters past `Name` are exactly the injected deps — the default [`construct`](@ref) builds the component from its own type, so no constructor is written. Override it for any other shape (named fields, extra state, a different parameter order) — most cohesively with an inner constructor `Guard(node, ::Val{Name}, src) = new{…}(…)` matching the contract, which assembly finds and calls automatically (no `ctor =`), or with a [`construct`](@ref) method, or an explicit `ctor =` callable to wire an external builder or override either. [Parametric Components](parametric.md) covers the constructor contract, mocks, and standalone runs.
 
 ## Port names and topics
 

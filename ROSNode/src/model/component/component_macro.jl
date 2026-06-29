@@ -52,27 +52,10 @@ _params_name(base::Symbol) = Symbol(base, :Params)
 # The `@component`/`@schema` port sublanguage. Both front-ends parse the SAME port directives through
 # `parse_port_directive`; they differ only in framing (a struct vs. a `member_schema`-only block) and in
 # the binding directives (`@param`/`@requires`/`@provides`/`@ctor`). Each port nonterminal lowers to one
-# value combinator (functor.jl). The grammar (EBNF):
-#
-#   ⟨port-dir⟩      ::= ⟨publishes⟩ | ⟨hears⟩ | ⟨serves⟩ | ⟨runs⟩ | ⟨every⟩ | ⟨uses⟩
-#   ⟨publishes⟩     ::= "@publishes" ⟨port-decl⟩ [ ⟨trailing-wire⟩ ]            → publishes(:n, T; on)
-#   ⟨uses⟩          ::= "@uses"      ⟨port-decl⟩ [ ⟨trailing-wire⟩ ]            → uses(:n, M; on)
-#   ⟨hears⟩         ::= "@hears"  [ ⟨leading-wire⟩ ] ⟨bound-handler⟩ [ ⟨trailing-wire⟩ ]   → hears(:n, T, h; on)
-#   ⟨serves⟩        ::= "@serves" [ ⟨leading-wire⟩ ] ⟨bound-handler⟩ [ ⟨trailing-wire⟩ ]   → serves(…)
-#   ⟨runs⟩          ::= "@runs"   [ ⟨leading-wire⟩ ] ⟨bound-handler⟩ [ ⟨trailing-wire⟩ ]   → runs(…)
-#   ⟨every⟩         ::= "@every" ⟨bound-handler⟩ "at" ⟨rate⟩          (* canonical *)   → every(:n, rate, h)
-#                     | "@every" ⟨rate⟩ ⟨inline-def⟩                  (* legacy    *)
-#   ⟨bound-handler⟩ ::= [ ⟨port-name⟩ "=>" ] ⟨handler-spec⟩
-#   ⟨handler-spec⟩  ::= Symbol                  (* reference; a trait carries its type/wire *)
-#                     | Symbol "::" ⟨type⟩      (* typed reference — msg/request/action type *)
-#                     | ⟨inline-def⟩            (* a reaction (@hears/@every) or an @service/@action def *)
-#   ⟨port-decl⟩     ::= Symbol "::" ⟨type⟩      ⟨trailing-wire⟩ ::= "on" String     ⟨rate⟩ ::= Real | ":"Symbol
-#   ⟨leading-wire⟩  ::= String                                                       (* @component legacy *)
-#
-# `@service`/`@action` are accepted as legacy aliases of `@serves`/`@runs` with an inline-def spec. The
-# port name defaults to the handler's name (`@component`'s rule); `name =>` overrides it. The wire defaults
-# to the port name; a trailing `on "wire"` (any directive) or a leading `"wire"` string (handler
-# directives, @component legacy) overrides it — at most one.
+# value combinator (functor.jl). The directive forms + combinator mapping are the canonical reference in
+# the `@component` docstring (and `@schema`'s for its framing) — keep them in sync with this parser.
+# Quick map: @publishes/@uses → _parse_decl_port; @hears/@serves/@runs → _parse_handler_port;
+# @every → _parse_every; the `[name =>] handler` split → _parse_bound_handler; wires → _parse_wires.
 
 const _PORT_DIRECTIVES = (Symbol("@publishes"), Symbol("@uses"), Symbol("@hears"),
                           Symbol("@serves"), Symbol("@runs"), Symbol("@every"),
@@ -258,27 +241,113 @@ end
         configure(node, m::Name) = …             # lifecycle hooks live here too (re-coupled on a struct edit)
     end
 
-Author a single component in one expression. Expands to the `mutable struct` (`{Name}` injected if you
-write just `Name`), a zero-arg `Name{Name}()` ctor from the inline field defaults, an
-`@parameters struct NameParams` from the `@param` fields, the reaction/hook/`@service`/`@action` method
-defs verbatim, and `member_schema(::Type{Name}) = component(Name, …)` on the BARE base. Editing anything
-re-runs the whole block, so the struct and every method re-key on the new type together.
+Author a single component in one expression. The block body is a sequence of directives over a grammar
+shared with [`@schema`](@ref); each **port directive** lowers to one value combinator, and `@component`
+additionally emits the `mutable struct` (`{Name}` injected if you write just `Name`), a zero-arg
+`Name{Name}()` ctor from the inline field defaults, an `@parameters struct NameParams` from the `@param`
+fields, the handler/hook defs verbatim, and `member_schema(::Type{Name}) = component(Name, …)` on the bare
+base. Editing anything re-runs the whole block, so the struct and every method re-key together.
 
-Conventions (the port directives are the shared engine, also used by [`@schema`](@ref)):
-- **Member argument.** Type the reaction's second argument with the component — `m::Name` (any name) —
-  yourself; the macro emits the handler verbatim and never inspects or rewrites it. Typing it dispatches the
-  reaction on the component and keeps `entities`/`parameters` type-stable; a bare `m` is an ordinary `::Any`
-  catch-all (valid, but it forgoes both) — the same dispatch rules as any Julia method.
-- **Handler form.** `@hears`/`@serves`/`@runs`/`@every` take a handler either **inline** —
-  `function f(node, m::Name, …) … end` (so a struct edit re-couples it) — or **by reference** — a name in
-  scope (`@hears f::T`, `@serves f`). `@every` is `handler at rate` (the legacy `@every rate function…end`
-  still works); `@hears` needs a message type (`f::T` or the inline signature).
-- **Port name** defaults to the handler's name; `name => handler` overrides it (e.g. `@serves status => safe`).
-- **Wire** defaults to the port name; override with a trailing `on "wire"` (any directive) or a leading
-  `"wire"` string (handler directives — `@component` legacy), at most one.
-- **`@uses name::Marker`** declares a persistent service/action client port.
-- A reaction/hook/handler is node-first `(node, m::Name, …)`; a non-node-first interface impl (e.g.
-  `battery(s::Sensor)`) is defined OUTSIDE the block.
+# Grammar
+
+A `@component` block lowers to the single `component(…)` call the raw API writes by hand. These are equivalent:
+
+```julia
+@component mutable struct Sensor{Name} <: Component{Name}
+    level::Float64 = 100.0
+    @param     rate::Int64 = 5 ∈ 1..50
+    @publishes telemetry::Telemetry on "~/telemetry"
+    @hears     odom::Odometry => on_odom
+    @every     tick at :rate
+    @provides  BatterySource
+end
+# ≡  the raw value API:
+mutable struct Sensor{Name} <: Component{Name}; level::Float64; end
+Sensor{Name}() where {Name} = Sensor{Name}(100.0)
+@parameters struct SensorParams; rate::Int64 = 5 ∈ 1..50; end
+member_schema(::Type{Sensor}) = component(Sensor, SensorParams,
+    publishes(:telemetry, Telemetry; on = "~/telemetry"),
+    hears(:odom, Odometry, on_odom),
+    every(:tick, :rate, tick);
+    provides = (BatterySource,))
+```
+
+Each block line is a directive, a plain field, or a method. What each lowers to (`[…]` optional):
+
+| Block line | Lowers to |
+|---|---|
+| `@publishes name::T [on "wire"]` | `publishes(:name, T; on)` — a publisher |
+| `@hears [name =>] handler [on "wire"]` | `hears(:name, T, handler; on)` — a subscription |
+| `@serves [name =>] handler [on "wire"]` | `serves(:name, [Req,] handler; on)` — a service |
+| `@runs [name =>] exec [on "wire"]` | `runs(:name, [Action,] exec; on)` — an action server |
+| `@every [name =>] handler at rate` | `every(:name, rate, handler)` — a timer |
+| `@uses name::Marker [on "wire"]` | `uses(:name, Marker; on)` — a persistent client |
+| `@param ["doc"] x::T = d [∈ range]` | a field of `@parameters struct NameParams` |
+| `@provides I [I…]` | `provides = (I, …)` |
+| `@requires field::Marker [, …]` | `requires = (Marker, …)`, plus the type parameter, field, and `construct` that inject the sibling |
+| `x::T = default` | a private state field (feeds the zero-arg ctor) |
+| `configure(node, m::Name) = …` | a lifecycle hook, dispatched on the component |
+
+`@param` takes the full [`@parameters`](@ref) field grammar — a default, an `∈` constraint, and `|>` coercion.
+
+**Handlers** (`@hears`/`@serves`/`@runs`/`@every`) bind a handler one of three ways:
+- a **reference** — a name in scope, e.g. `@serves safe` (an `@service`/`@action` handler's trait carries its type and wire);
+- a **typed reference** — `f::T` naming the message / request / action type, e.g. `@hears odom::Odometry`;
+- an **inline definition** — `function f(node, m::Name, …) … end` written in place, re-coupled to the struct on an edit.
+
+`@hears` needs a message type, so it takes a typed reference or an inline signature, never a bare reference.
+`@serves`/`@runs` author the service/action inline; `@service`/`@action` are legacy aliases for that.
+
+**Names & wires.** A port's name defaults to its handler's name; prefix `name =>` to override it
+(`@serves status => safe`). The wire — the topic, or service/action name — defaults to the port name; a
+trailing `on "wire"` overrides it (a leading `"wire"` string is the `@component`-legacy form). Give it at
+most once; a timer addresses no wire.
+
+**Rate.** `@every … at rate` takes a frequency in Hz (a `Real`), or a parameter `:name` that binds the
+period live to that parameter (the legacy spelling is `@every rate function … end`).
+
+**Member argument.** Type a reaction's second argument with the component — `m::Name`, any name — to
+dispatch on it and keep `entities`/`parameters` type-stable. The macro emits the handler verbatim, so a
+bare `m` is an ordinary `::Any` catch-all it leaves untouched. A non-node-first interface impl (e.g.
+`battery(s::Sensor)`) is defined OUTSIDE the block.
+
+# Formal grammar
+
+The authoritative EBNF (`→` names the combinator each port directive lowers to; `[…]` optional, `{…}`
+zero-or-more). The port sublanguage (⟨port-dir⟩) is shared with [`@schema`](@ref).
+
+```
+⟨component⟩  ::= "@component" "mutable" "struct" ⟨head⟩ { ⟨field⟩ | ⟨directive⟩ | ⟨method-def⟩ } "end"
+⟨head⟩       ::= Name                                     macro injects {Name} <: Component{Name}
+              | Name{Name} <: Component{Name}             written explicitly (any spelling of Name)
+⟨field⟩      ::= Symbol "::" ⟨type⟩ "=" ⟨expr⟩            private state + its zero-arg-ctor default
+⟨directive⟩  ::= ⟨port-dir⟩ | ⟨bind-dir⟩
+
+⟨port-dir⟩   ::= ⟨publishes⟩ | ⟨hears⟩ | ⟨serves⟩ | ⟨runs⟩ | ⟨every⟩ | ⟨uses⟩
+⟨publishes⟩  ::= "@publishes" ⟨decl⟩ ["on" String]            → publishes(:n, T; on)
+⟨uses⟩       ::= "@uses"      ⟨decl⟩ ["on" String]            → uses(:n, Marker; on)
+⟨hears⟩      ::= "@hears"  [String] ⟨bound⟩ ["on" String]     → hears(:n, T, h; on)
+⟨serves⟩     ::= "@serves" [String] ⟨bound⟩ ["on" String]    → serves(:n, [Req,] h; on)
+⟨runs⟩       ::= "@runs"   [String] ⟨bound⟩ ["on" String]    → runs(:n, [Action,] exec; on)
+⟨every⟩      ::= "@every" ⟨bound⟩ "at" ⟨rate⟩                 → every(:n, rate, h)
+              | "@every" ⟨rate⟩ ⟨inline⟩                     (legacy, equivalent)
+⟨bound⟩      ::= [Symbol "=>"] ⟨handler⟩                      Symbol "=>" overrides the port name
+⟨handler⟩    ::= Symbol                                       a reference (a trait carries its type/wire)
+              | Symbol "::" ⟨type⟩                            a typed reference: msg / request / action type
+              | ⟨inline⟩                                      a reaction, or an @service/@action def
+⟨inline⟩     ::= "function" ⟨call⟩ ⟨body⟩ "end" | ⟨call⟩ "=" ⟨expr⟩
+⟨decl⟩       ::= Symbol "::" ⟨type⟩
+⟨rate⟩       ::= Real (Hz) | ":" Symbol (a parameter, bound live)
+
+⟨bind-dir⟩   ::= ⟨param⟩ | ⟨provides⟩ | ⟨requires⟩
+⟨param⟩      ::= "@param" [String] Symbol "::" ⟨type⟩ "=" ⟨expr⟩ ["∈" ⟨expr⟩] ["|>" ⟨expr⟩]
+                                                             → a field of `@parameters struct NameParams`
+⟨provides⟩   ::= "@provides" ⟨type⟩ { ⟨type⟩ }               → provides = (…,)
+⟨requires⟩   ::= "@requires" Symbol "::" ⟨marker⟩ { "," … }  → requires = (…,) + a hidden type param, field, `construct`
+```
+
+A wire is given at most once (a leading `String` legacy, or a trailing `on "wire"`); `@service`/`@action`
+are legacy aliases of `@serves`/`@runs` with an inline definition.
 
 `@component` is sugar over the value API — the raw `component`/`node` combinators remain the primitive
 for dynamic composition. It covers the common case (ports, `@param`, `@provides`, `@requires field::Marker`
@@ -436,7 +505,7 @@ export @schema
         @uses      cli::AddTwoInts_Request        # a persistent service client
         @provides  Iface                         # interface(s) this component provides
         @requires  Sensor                        # DI evidence — the marker type(s) it depends on
-        @ctor      make_component                 # the injected constructor
+        @ctor      make_component                 # external injecting constructor (optional)
     end
 
 Author a component's [`member_schema`](@ref) declaratively — the same port directives as [`@component`](@ref),
@@ -461,24 +530,60 @@ mutable struct Guard{Name, B} <: Component{Name}; battery_src::B; end
 end
 ```
 
-Forms (shared with `@component`, see its docstring for the full port grammar):
+# Grammar
 
-- **Params.** `@schema Base P` references an existing [`@parameters`](@ref) struct `P`; `@schema Base`
-  with `@param` lines authors `BaseParams` inline. The two are mutually exclusive — an explicit `P` with
-  `@param` lines is an error.
-- **Port name** defaults to the handler's name; `name => handler` overrides it.
-- **Wire** defaults to the port name; a trailing `on "wire"` (or a leading `"wire"` string on a handler
-  directive) overrides it.
-- **Member argument.** An inline handler is emitted verbatim — type its second argument with the component,
-  `function f(node, m::Base, …) … end` (any name), to dispatch on it and keep the accessors type-stable; a
+The header is `@schema Base [Params] begin … end`, where `Params` is an existing [`@parameters`](@ref)
+struct type. The **port directives** inside (`@publishes`/`@hears`/`@serves`/`@runs`/`@every`/`@uses`,
+their handler/name/wire forms, and the combinator each lowers to) are identical to [`@component`](@ref)'s —
+see its docstring. Where `@schema` parts ways is the binding directives:
+
+| Directive | Lowers to |
+|---|---|
+| `@param ["doc"] x::T = d [∈ range]` | a field of `@parameters struct BaseParams` (when no `Params` is given) |
+| `@provides I [I…]` | `provides = (I, …)` |
+| `@requires Marker [, …]` | `requires = (Marker, …)` — bare marker types, DI evidence only |
+| `@ctor f` | `ctor = f` — an external constructor (optional; see notes) |
+
+`@param` takes the full [`@parameters`](@ref) field grammar (a default, an `∈` constraint, `|>` coercion).
+
+`@requires` lists **bare marker types** (`@requires Sensor`, not `field::Marker`) — the parametric struct,
+its injected field, and its constructor are yours to write. Assembly builds the component by calling
+`Base(node, ::Val{Name}, deps...)`: embed an inner constructor of that shape and it is found automatically,
+or pass `@ctor f` to wire an external callable `f(node, ::Val{Name}, deps...) where {Name} -> Base{Name, …}`
+([`construct`](@ref) is the full contract). That decoupling buys back the representation power `@component`'s
+all-in-one form gives up.
+
+Notes:
+- **Params.** `@schema Base P` references the existing [`@parameters`](@ref) struct `P`; `@schema Base`
+  with `@param` lines authors `BaseParams` inline. The two are mutually exclusive.
+- **`@requires` / `@ctor`.** For the holder shape — the free type parameters past `Name` are exactly the
+  injected deps, in order — the default builds `Base{Name, typeof.(deps)…}(deps…)`, so no constructor is
+  needed. For a custom shape, embed an inner constructor `Base(node, ::Val{Name}, deps…)` (found
+  automatically) or a [`construct`](@ref) method; **`@ctor` is only for an external callable, or to override
+  either.**
+- **Member argument.** An inline handler is emitted verbatim — type its second argument with the component
+  (`function f(node, m::Base, …) … end`, any name) to dispatch on it and keep the accessors type-stable; a
   bare `m` is an ordinary `::Any` catch-all the macro leaves untouched.
-- **`@hears`** needs a message type — `handler::T` or an inline `function f(node, m::Base, msg::T) … end` —
-  since a subscription has no trait to carry it. **`@serves`/`@runs`** take a pre-authored handler by
-  reference, a `handler::ReqOrActionType`, or an inline `@service`/`@action`-shaped def. **`@every`** is `handler at rate`.
-- **`@requires`** lists bare marker TYPE(s) (DI evidence only); the injected field lives on your struct.
-  For the holder shape — free type parameters past `Name` are exactly the injected deps, in order — the
-  default [`construct`](@ref) builds `Base{Name, typeof.(deps)…}(deps…)` from the type, so **no `@ctor` is
-  needed**. Add **`@ctor f`** only for a custom shape (named fields, extra state, a reordered parameter).
+
+# Formal grammar
+
+The authoritative EBNF for `@schema`'s framing; the port sublanguage (⟨port-dir⟩) is shared with
+[`@component`](@ref) — see its grammar.
+
+```
+⟨schema⟩      ::= "@schema" Base [⟨params-type⟩] "begin" { ⟨port-dir⟩ | ⟨bind-dir⟩ } "end"
+⟨params-type⟩ ::= Symbol | ⟨dotted⟩                         an existing `@parameters` struct type
+⟨bind-dir⟩    ::= ⟨param⟩ | ⟨provides⟩ | ⟨requires⟩ | ⟨ctor⟩
+⟨param⟩       ::= "@param" [String] Symbol "::" ⟨type⟩ "=" ⟨expr⟩ ["∈" ⟨expr⟩] ["|>" ⟨expr⟩]
+                                                            → a field of `@parameters struct BaseParams`
+⟨provides⟩    ::= "@provides" ⟨type⟩ { ⟨type⟩ }             → provides = (…,)
+⟨requires⟩    ::= "@requires" ⟨marker⟩ { "," ⟨marker⟩ }     → requires = (…,)   (bare markers, DI evidence)
+⟨ctor⟩        ::= "@ctor" ⟨expr⟩                            → ctor = f, an f(node, ::Val{Name}, deps...)
+```
+
+The `@ctor` callable's full signature is `f(node, ::Val{Name}, deps...) where {Name} -> Base{Name, …}` —
+one `dep` per `@requires`, in order; see [`construct`](@ref). It is usually elided: embed an inner
+constructor of that shape on the struct and assembly finds it.
 
 Use it from a module that does `using ROSNode`.
 """
@@ -539,8 +644,8 @@ macro schema(args...)
                 end
             end
         elseif mname === Symbol("@ctor")
-            length(rest) == 1 || error("@schema: `@ctor f` — name the injected constructor, a callable " *
-                "`(node, ::Val{Name}, deps…) -> Base{Name,…}`")
+            length(rest) == 1 || error("@schema: `@ctor f` — name the injecting constructor, a callable " *
+                "`f(node, ::Val{Name}, deps...) where {Name} -> $(base){Name, …}` (one dep per `@requires`)")
             ctorx === nothing || error("@schema: `@ctor` given more than once")
             ctorx = rest[1]
         elseif is_port_directive(mname)

@@ -182,12 +182,9 @@ end
 struct DefaultCtor{S} end                                    # non-DI default: build S{Name}()
 (::DefaultCtor{S})(node, ::Val{Name}) where {S, Name} = S{Name}()
 
-# DI default when DI is declared via the trait surface (`requires(::Type{S})`/`construct(::Type{S}, …)`)
-# rather than a `ctor=` kwarg: route the frozen-plan ctor call to `construct`, which receives the
-# resolved deps positionally (`construct(::Type{S}, node, ::Val{Name}, deps…)`). With no user/@component
-# method, this lands on the DEFAULT `construct` that builds `S{Name, typeof.(deps)…}(deps…)` from the type.
-struct ConstructAdapter{S} end
-(::ConstructAdapter{S})(node, args...) where {S} = construct(S, node, args...)
+# A requires-bearing component with no `ctor=` defaults to its OWN constructor — the bare type `S`, called
+# `S(node, ::Val{Name}, deps…)`. Embed an inner constructor of that shape to own construction; otherwise the
+# generic `Component` fallback (component.jl) routes to `construct` for the holder field form. `ctor=` overrides.
 
 function _evidence(t::Tuple)
     for x in t
@@ -220,7 +217,7 @@ function _component(::Type{S}, ::Type{P}, ports::Tuple;
     # Validate the `requires`/`provides` ENTRIES first (must be @interface/component TYPEs, no `=>` pins) —
     # a malformed entry is the more fundamental error, surfaced before the ctor-arity checks below.
     Req = _evidence(req); Prov = _evidence(prov)
-    c = ctor !== nothing ? ctor : (isempty(req) ? DefaultCtor{S}() : ConstructAdapter{S}())
+    c = ctor !== nothing ? ctor : (isempty(req) ? DefaultCtor{S}() : S)
     # Validate an EXPLICIT ctor's arity WHERE it's declared: it must accept (node, ::Val{Name}, deps…), one
     # dep per requirement — else the mismatch only surfaces deep inside the @generated build_members at run().
     # No `ctor=` is fine: DI routes through `construct(::Type{S}, node, ::Val{Name}, deps…)` — a user/@component
