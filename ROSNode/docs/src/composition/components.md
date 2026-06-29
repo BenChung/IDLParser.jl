@@ -94,14 +94,14 @@ The block reads as inline directives:
 - `@provides I [I2 …]` — interface(s) the component provides.
 - `@requires field::Marker` — an injected dependency; the macro adds the type parameter that holds the resolved sibling and the constructor that places it (see [Dependency injection](@ref)).
 - `@publishes name::T [on "wire"]` — a publisher port.
-- `@hears [name =>] handler[::T] [on "wire"]` — a subscription; `handler` is an inline `function f(node, m, msg::T) … end` or a reference `f::T` to a handler in scope.
+- `@hears [name =>] handler[::T] [on "wire"]` — a subscription; `handler` is an inline `function f(node, m::Sensor, msg::T) … end` or a reference `f::T` to a handler in scope.
 - `@serves [name =>] handler [on "wire"]` — a service; `handler` is an inline [`@service`](@ref) definition, a reference to a pre-authored `@service` handler, or `f::Req` binding a raw handler to a request type.
 - `@runs [name =>] exec [on "wire"]` — an action, the [`@action`](@ref) analog of `@serves`.
-- `@every [name =>] handler at rate` (or `@every rate function f(node, m) … end` for an inline handler) — a timer; `rate` is a frequency in Hz or a parameter `Symbol`.
+- `@every [name =>] handler at rate` (or `@every rate function f(node, m::Sensor) … end` for an inline handler) — a timer; `rate` is a frequency in Hz or a parameter `Symbol`.
 - `@uses name::Marker [on "wire"]` — a persistent service/action client port.
-- `configure(node, m) = …` — lifecycle hooks live in the block too.
+- `configure(node, m::Sensor) = …` — lifecycle hooks live in the block too.
 
-A bare `m` argument is annotated `m::Base` for you, so reaction bodies stay fully typed. A port name defaults to its handler's name; `name => handler` overrides it. A wire defaults to the port name; a trailing `on "wire"` (or, on a handler directive, a leading `"wire"` string) overrides it.
+You type the reaction's second argument with the component yourself — `m::Sensor`, under any name — and the macro emits the handler verbatim, so dispatch is explicit in the source. Typing it dispatches the reaction on the component and keeps `entities`/`parameters` type-stable; a bare `m` is an ordinary `::Any` catch-all the macro leaves untouched (the same dispatch rules as any Julia method). A port name defaults to its handler's name; `name => handler` overrides it. A wire defaults to the port name; a trailing `on "wire"` (or, on a handler directive, a leading `"wire"` string) overrides it.
 
 The `Sensor` carries both stores — a private `level` and a public `rate` — publishes telemetry on a timer bound to that `rate`, and provides the battery reading:
 
@@ -111,11 +111,11 @@ The `Sensor` carries both stores — a private `level` and a public `rate` — p
     @param rate::Int64 = 5 ∈ 1..50                      # public — Hz, retunable via `ros2 param`
     @provides BatterySource
     @publishes telemetry::Telemetry on "~/telemetry"    # node-private ⇒ /vehicle/telemetry
-    @every :rate function tick(node, m)                 # fires at the live `rate` Hz, only while Active
+    @every :rate function tick(node, m::Sensor)         # fires at the live `rate` Hz, only while Active
         m.level = max(0.0, m.level - 1.0)
         publish(entities(node, m).telemetry, Telemetry(battery = m.level, altitude = 12.0))
     end
-    configure(node, m) = @info "Sensor up" rate = parameters(node, m).rate
+    configure(node, m::Sensor) = @info "Sensor up" rate = parameters(node, m).rate
 end
 battery(s::Sensor) = s.level     # the BatterySource impl — single-arg, so it lives OUTSIDE the block
 ```
@@ -126,7 +126,7 @@ A dependency **consumer** declares its needs with `@requires`. The macro writes 
 @component mutable struct Guard{Name} <: Component{Name}
     @requires battery_src::BatterySource                # inject the sibling that provides it
     @param min_battery::Float64 = 20.0
-    @service "~/safe_to_fly" function safe(node, g, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
+    @service "~/safe_to_fly" function safe(node, g::Guard, target_altitude::Float64)::@NamedTuple{ok::Bool, battery::Float64}
         b = battery(g.battery_src)                      # type-stable: battery_src is the resolved sibling's type
         (ok = b >= parameters(node, g).min_battery && target_altitude <= 100.0, battery = b)
     end

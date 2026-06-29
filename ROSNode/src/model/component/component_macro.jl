@@ -18,24 +18,17 @@ function _peel_to_call(sig)
     return sig
 end
 
-# A bare `m` is annotated `m::Base` (so it dispatches on the component, the functor convention); an
-# explicit `m::T` is left as written. Mutates the def in place and returns it.
-function _component_inject_member!(fdef::Expr, base)
-    call = _peel_to_call(fdef.args[1])
-    (call isa Expr && call.head === :call) ||
-        error("@component: expected a `function f(node, m, …)` reaction/hook, got `$(fdef)`")
-    length(call.args) >= 3 ||
-        error("@component: a reaction/hook is node-first and needs at least `(node, m)`, got `$(call)`")
-    call.args[3] isa Symbol && (call.args[3] = Expr(:(::), call.args[3], base))   # bare `m` → `m::Base`
-    return fdef
-end
+# Reactions/hooks are emitted VERBATIM — the macro reads only the handler name (and, for `@hears`, the
+# message type) and never inspects or rewrites the member argument. You type it yourself: `m::Base` (any
+# name) dispatches the reaction on the component and keeps `entities`/`parameters` type-stable, while a
+# bare `m` is an ordinary `::Any` catch-all — the same dispatch rules as any Julia method.
 
 # Is `x` a method-definition signature (`f(…)`, `f(…)::Ret`, or `f(…) where {…}`)?
 _is_method_sig(x) = (c = _peel_to_call(x); c isa Expr && c.head === :call)
 # Is `ln` a method DEFINITION (`function f … end` or `f(…) = …`)?
 _is_method_def(ln) = ln isa Expr && (ln.head === :function || (ln.head === :(=) && _is_method_sig(ln.args[1])))
 
-# The function name out of a (member-injected) def — used to reference the handler in `component(…)`.
+# The function name out of a reaction/handler def — used to reference the handler in `component(…)`.
 function _component_defname(fdef::Expr)
     n = _peel_to_call(fdef.args[1]).args[1]
     n isa Symbol || error("@component: reaction/handler name must be a plain symbol, got `$(n)`")
@@ -156,16 +149,17 @@ function _parse_handler_port(kind::Symbol, rest, base, M, src, who)
         error("$(who): expected `[\"wire\"] [name =>] handler[::T] [on \"wire\"]`, got `$(Tuple(rest))`")
     name_override, spec = _parse_bound_handler(mid[1], who)
     emits = Any[]
-    if _is_method_def(spec)                                  # ⟨inline-def⟩
-        _component_inject_member!(spec, base)
+    if _is_method_def(spec)                                  # ⟨inline-def⟩ — emitted verbatim
         fname = _component_defname(spec)
         name  = name_override === nothing ? fname : name_override
         if kind === :hears
             call = _peel_to_call(spec.args[1])
-            length(call.args) >= 4 || error("$(who): an inline handler needs `(node, m, msg::T)`")
+            length(call.args) >= 4 ||
+                error("$(who): an inline subscription handler needs a typed message argument — " *
+                      "`function $(fname)(node, m::$(base), msg::T) … end`, got `$(call)`")
             msgarg = call.args[4]
             (msgarg isa Expr && msgarg.head === :(::)) ||
-                error("$(who): the message arg needs a type, `msg::T`, got `$(msgarg)`")
+                error("$(who): the message argument needs a type, `msg::T`, got `$(msgarg)`")
             T = msgarg.args[2]
             push!(emits, spec)
             return :( $(GlobalRef(M, :hears))($(QuoteNode(name)), $T, $fname; on = $wire) ), emits
@@ -191,7 +185,7 @@ function _parse_handler_port(kind::Symbol, rest, base, M, src, who)
         return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $spec; on = $wire) ), emits
     else
         error("$(who): could not parse the handler `$(spec)` — expected `name::T`, a handler reference, " *
-              "or an inline `function f(node, m, …) … end`")
+              "or an inline `function f(node, m::$(base), …) … end`")
     end
 end
 
@@ -208,30 +202,30 @@ function _parse_every(rest, base, M, who)
         length(before) == 1 || error("$(who): expected `[name =>] handler at rate`, got `$(Tuple(rest))`")
         name_override, spec = _parse_bound_handler(before[1], who)
         if _is_method_def(spec)
-            _component_inject_member!(spec, base); push!(emits, spec)
+            push!(emits, spec)
             handler = _component_defname(spec); defname = handler
         elseif _is_ref(spec)
             handler = spec; defname = _ref_name(spec)
         else
             error("$(who): a timer handler is a reference (a name or `Mod.name`) or an inline " *
-                  "`function f(node, m) … end`, got `$(spec)`")
+                  "`function f(node, m::$(base)) … end`, got `$(spec)`")
         end
         name = name_override === nothing ? defname : name_override
         return :( $(GlobalRef(M, :every))($(QuoteNode(name)), $rate, $handler) ), emits
     else                                                    # legacy: rate, then an inline def
         length(rest) == 2 || error("$(who): the legacy form is `@every rate function f(node, m) … end`; " *
-            "the canonical form is `@every [name =>] handler at rate`")
+            "the canonical form is `@every [name =>] handler at rate` (an inline def types its member `m::$(base)`)")
         rate = _parse_rate(rest[1], who)
         _is_method_def(rest[2]) ||
             error("$(who): legacy `@every rate function … end` needs an inline handler; " *
                   "to wire a reference use `@every handler at rate`")
-        _component_inject_member!(rest[2], base); push!(emits, rest[2])
+        push!(emits, rest[2])
         fname = _component_defname(rest[2])
         return :( $(GlobalRef(M, :every))($(QuoteNode(fname)), $rate, $fname) ), emits
     end
 end
 
-# Parse one ⟨port-dir⟩ into (combinator-call-expr, emits::Vector). `base` types a bare `m`; `M` is ROSNode.
+# Parse one ⟨port-dir⟩ into (combinator-call-expr, emits::Vector). `base` names the component for member-arg validation; `M` is ROSNode.
 function parse_port_directive(ln::Expr, base, M)
     mname = ln.args[1]::Symbol
     who   = String(mname)
@@ -258,29 +252,32 @@ end
         @provides Iface                          # interface(s) this component provides
         @requires src::Sensor                    # inject a sibling (a component type or an @interface)
         @publishes out::T on "~/out"             # a publisher port (no handler)
-        @hears  function on_msg(node, m, msg::T) … end       # subscription port + handler (bundled)
-        @every  :rate function tick(node, m) … end           # timer port + handler (rate = Hz or :param)
-        @service "~/srv" function srv(node, m, x::X)::@NamedTuple{…} … end   # inline service authoring
-        configure(node, m) = …                   # lifecycle hooks live here too (re-coupled on a struct edit)
+        @hears  function on_msg(node, m::Name, msg::T) … end   # subscription port + handler (bundled)
+        @every  :rate function tick(node, m::Name) … end       # timer port + handler (rate = Hz or :param)
+        @service "~/srv" function srv(node, m::Name, x::X)::@NamedTuple{…} … end   # inline service authoring
+        configure(node, m::Name) = …             # lifecycle hooks live here too (re-coupled on a struct edit)
     end
 
 Author a single component in one expression. Expands to the `mutable struct` (`{Name}` injected if you
 write just `Name`), a zero-arg `Name{Name}()` ctor from the inline field defaults, an
 `@parameters struct NameParams` from the `@param` fields, the reaction/hook/`@service`/`@action` method
-defs (a bare `m` annotated as `m::Name`), and `member_schema(::Type{Name}) = component(Name, …)` on the
-BARE base. Editing anything re-runs the whole block, so the struct and every method re-key on the new
-type together.
+defs verbatim, and `member_schema(::Type{Name}) = component(Name, …)` on the BARE base. Editing anything
+re-runs the whole block, so the struct and every method re-key on the new type together.
 
 Conventions (the port directives are the shared engine, also used by [`@schema`](@ref)):
+- **Member argument.** Type the reaction's second argument with the component — `m::Name` (any name) —
+  yourself; the macro emits the handler verbatim and never inspects or rewrites it. Typing it dispatches the
+  reaction on the component and keeps `entities`/`parameters` type-stable; a bare `m` is an ordinary `::Any`
+  catch-all (valid, but it forgoes both) — the same dispatch rules as any Julia method.
 - **Handler form.** `@hears`/`@serves`/`@runs`/`@every` take a handler either **inline** —
-  `function f(node, m, …) … end` (so a struct edit re-couples it) — or **by reference** — a name in scope
-  (`@hears f::T`, `@serves f`). `@every` is `handler at rate` (the legacy `@every rate function…end` still
-  works); `@hears` needs a message type (`f::T` or the inline signature).
+  `function f(node, m::Name, …) … end` (so a struct edit re-couples it) — or **by reference** — a name in
+  scope (`@hears f::T`, `@serves f`). `@every` is `handler at rate` (the legacy `@every rate function…end`
+  still works); `@hears` needs a message type (`f::T` or the inline signature).
 - **Port name** defaults to the handler's name; `name => handler` overrides it (e.g. `@serves status => safe`).
 - **Wire** defaults to the port name; override with a trailing `on "wire"` (any directive) or a leading
   `"wire"` string (handler directives — `@component` legacy), at most one.
 - **`@uses name::Marker`** declares a persistent service/action client port.
-- A reaction/hook/handler is node-first `(node, m, …)`; a non-node-first interface impl (e.g.
+- A reaction/hook/handler is node-first `(node, m::Name, …)`; a non-node-first interface impl (e.g.
   `battery(s::Sensor)`) is defined OUTSIDE the block.
 
 `@component` is sugar over the value API — the raw `component`/`node` combinators remain the primitive
@@ -345,11 +342,11 @@ macro component(structexpr)
                 error("@component: unknown directive `$(mname)` in the body")
             end
         elseif _is_method_def(ln)
-            # a standalone method def — must be node-first `(node, m, …)` (its 2nd arg is annotated `m::Base`).
+            # a standalone method def, emitted verbatim — node-first `(node, m::Base, …)`, you type the member.
             # A lifecycle-hook name (configure/activate/…) extends the ROSNode generic (qualified via GlobalRef);
             # any other node-first def stays a module-local function (e.g. a named reaction handler). A
             # non-node-first helper (e.g. an interface impl `f(x)`) belongs OUTSIDE the block.
-            push!(emits, _component_qualify_hook!(_component_inject_member!(ln, base), M))
+            push!(emits, _component_qualify_hook!(ln, M))
         elseif ln isa Expr && ln.head === :(::) && ln.args[1] isa Symbol
             push!(fields, ln); push!(nodefault, ln.args[1])   # struct field, NO default
         elseif ln isa Expr && ln.head === :(=) && ln.args[1] isa Expr && ln.args[1].head === :(::) && ln.args[1].args[1] isa Symbol
@@ -472,9 +469,12 @@ Forms (shared with `@component`, see its docstring for the full port grammar):
 - **Port name** defaults to the handler's name; `name => handler` overrides it.
 - **Wire** defaults to the port name; a trailing `on "wire"` (or a leading `"wire"` string on a handler
   directive) overrides it.
-- **`@hears`** needs a message type — `handler::T` or an inline `function f(node, m, msg::T) … end` — since
-  a subscription has no trait to carry it. **`@serves`/`@runs`** take a pre-authored handler by reference,
-  a `handler::ReqOrActionType`, or an inline `@service`/`@action`-shaped def. **`@every`** is `handler at rate`.
+- **Member argument.** An inline handler is emitted verbatim — type its second argument with the component,
+  `function f(node, m::Base, …) … end` (any name), to dispatch on it and keep the accessors type-stable; a
+  bare `m` is an ordinary `::Any` catch-all the macro leaves untouched.
+- **`@hears`** needs a message type — `handler::T` or an inline `function f(node, m::Base, msg::T) … end` —
+  since a subscription has no trait to carry it. **`@serves`/`@runs`** take a pre-authored handler by
+  reference, a `handler::ReqOrActionType`, or an inline `@service`/`@action`-shaped def. **`@every`** is `handler at rate`.
 - **`@requires`** lists bare marker TYPE(s) (DI evidence only); the injected field lives on your struct.
   For the holder shape — free type parameters past `Name` are exactly the injected deps, in order — the
   default [`construct`](@ref) builds `Base{Name, typeof.(deps)…}(deps…)` from the type, so **no `@ctor` is

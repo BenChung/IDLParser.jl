@@ -38,6 +38,7 @@ function _rbase(@nospecialize(E::Type); name_of)
     E === UInt64  && return IL.RBase.RUInt(64)
     E === Float32 && return IL.RBase.RFloat(32)
     E === Float64 && return IL.RBase.RFloat(64)
+    E === Char    && return IL.RBase.RChar()      # inverse of generation's `char => Char` (gen.jl)
     E === String  && return IL.RBase.RStr(nothing)
     (E <: AbstractArray || E <: Tuple) && error(
         "il reflection: element type $(E) is itself an array/tuple — nested arrays are not a ROS type")

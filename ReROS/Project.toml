@@ -1,0 +1,33 @@
+name = "ReROS"
+uuid = "a5dc07d7-9f0a-4454-a9ad-24692a390e5c"
+version = "0.1.0"
+authors = ["Benjamin Chung <ckfinite@gmail.com>"]
+
+[deps]
+Moshi = "2e0e35c7-a2e4-4343-998d-7ef72827ed2d"
+ROSMessages = "745bd5ac-df70-4edb-8655-498bbbb894cf"
+ROSNode = "bb9e268e-7981-4227-9ebf-b0919ec29e7a"
+ROSReach = "00fce365-27c4-4628-b7b6-1864d312181b"
+Rerun = "1f49d09d-ceb1-46d4-a7f5-ca2a56fa37fd"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+librerun_query_jll = "4b6a62bb-3f1a-52bf-b7aa-9d1aab094d0a"
+
+# ReROS-only in-tree dev-links (no published Julia Rerun SDK). Paths are relative to THIS
+# file. Test by ACTIVATING ReROS — `cd ReROS && julia --project=. -e 'using Pkg; Pkg.test()'`
+# — so the test sandbox anchors these paths at ReROS. (`Pkg.test("ReROS")` from the workspace
+# root anchors [sources] at the root instead and fails to find the dev-link.)
+[sources]
+Rerun = {path = "dev/Rerun"}
+librerun_query_jll = {path = "dev/Rerun/native/librerun_query_jll"}
+
+[compat]
+julia = "1.11"
+
+# Zenohd_jll (the router binary) is test-only: it backs the live integration tests
+# (test/integration.jl), which skip gracefully when it isn't on the load path.
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Zenohd_jll = "60fe4315-4d9d-51d2-90b3-f4c2062225d6"
+
+[targets]
+test = ["Test", "Zenohd_jll"]

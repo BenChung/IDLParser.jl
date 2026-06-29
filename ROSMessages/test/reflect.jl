@@ -22,6 +22,8 @@ struct TimeMsg;     sec::Int32; nanosec::UInt32;                 end
 struct Header;      stamp::TimeMsg; frame_id::String;            end
 struct PoseStamped; header::Header; pose::Pose;                  end
 struct EmptyAuthored;                                            end   # a fieldless authored type
+struct CharMsg;     c::Char; gid::NTuple{16,Char};               end   # ROS `char` → Julia `Char`
+struct WCharMsg;    w::Cwchar_t;                                 end   # ROS `wchar` → Julia `Cwchar_t`
 
 const _NAMES = IdDict{Any,String}(
     Point       => "geometry_msgs/msg/Point",
@@ -114,6 +116,20 @@ _td(S, fqn) = type_description_from_struct(_ast(S), fqn; package=String(split(fq
         struct_local = il_from_fields("X", [(:fixed, ROSMessages.SVector{3,Float64}),
                                             (:seq, Vector{Int32}), (:flag, Bool), (:raw, UInt8)])
         @test ROSMessages.IL.unparse(struct_local) == "float64[3] fixed\nint32[] seq\nbool flag\nuint8 raw"
+    end
+
+    # Generation maps ROS `char` → Julia `Char`; reflection now inverts that to `RChar`
+    # (before, a `Char` field made `il_from_type` throw). A `.msg` `char` is a uint8 alias, so
+    # the IL keeps `char` for unparse fidelity while the wire/RIHS treats it as uint8 — hence the
+    # reflected hash equals the text path's. `wchar` can't be reflected: it generates to `Cwchar_t`,
+    # a platform integer indistinguishable from a real `int32`, so reflection sees an integer.
+    @testset "char reflects to RChar and hashes like the text path; wchar does not" begin
+        @test ROSMessages.IL.unparse(il_from_type(CharMsg; name_of=NAMEOF)) == "char c\nchar[16] gid"
+        h_reflect = rihs01_hash(_ast(CharMsg), "p/msg/CharMsg")
+        h_text    = rihs01_hash(parse_msg("char c\nchar[16] gid"; name="CharMsg")[1], "p/msg/CharMsg")
+        @test h_reflect == h_text
+        # documented limitation: wchar is lost (reflects as an integer, never "wchar")
+        @test !occursin("wchar", ROSMessages.IL.unparse(il_from_type(WCharMsg; name_of=NAMEOF)))
     end
 
     @testset "il_from_type rejects @NamedTuple; il_from_fields takes it via nt_pairs" begin

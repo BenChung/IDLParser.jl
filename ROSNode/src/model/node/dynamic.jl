@@ -72,6 +72,10 @@ function declare_subscription!(e::Entity, handler;
     ctx = e.node.context
     ke = _wildcard_data_keyexpr(ctx.format, e.endpoint)
     cap = _fifo_capacity(e.endpoint.qos)
+    # A dynamic sub's keyexpr is a type-wildcard (`<domain>/<topic>/**`), so it can't use the
+    # advanced-pubsub history query (which recovers latched state only over a concrete keyexpr).
+    # transient_local latched capture therefore needs the TYPED subscription path (entity.jl);
+    # a consumer that wants latched delivery resolves the type and uses `Subscription(node, topic, T)`.
     sub = Base.open(ctx.session, Keyexpr(ke); channel=:fifo, capacity=cap)
     e._route = sub
     e._consumer = _spawn_dynamic_consumer(e, handler, view, concurrency, warmup)

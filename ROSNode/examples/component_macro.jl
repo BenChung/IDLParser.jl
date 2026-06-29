@@ -43,17 +43,18 @@ module Drone
     # One block authors the struct, the zero-arg ctor (from the inline `level` default), the
     # `@parameters struct SensorParams` (from `@param`), the `tick` timer + handler, the `configure`
     # hook, and `member_schema(::Type{Sensor})` on the bare base. Reactions/hooks are node-first
-    # `(node, m, …)`; a bare `m` is annotated `m::Sensor` for you, so the body stays fully typed.
+    # `(node, m::Sensor, …)`; you type the member argument with the component (any name), so dispatch is
+    # explicit and the body stays fully typed.
     @component mutable struct Sensor{Name} <: Component{Name}
         level::Float64 = 100.0                              # private state (simulated battery %)
         @param rate::Int64 = 5 ∈ 1..50                      # Hz — read live; driveable by `ros2 param`
         @provides BatterySource                             # this component satisfies the BatterySource contract
         @publishes telemetry::Telemetry on "~/telemetry"    # node-private ⇒ /vehicle/telemetry
-        @every :rate function tick(node, m)                 # fires at the live `rate` Hz, only while Active
+        @every :rate function tick(node, m::Sensor)         # fires at the live `rate` Hz, only while Active
             m.level = max(0.0, m.level - 1.0)               # drain a little each tick
             publish(entities(node, m).telemetry, Telemetry(battery = m.level, altitude = 12.0))
         end
-        configure(node, m) = @info "Sensor up" rate = parameters(node, m).rate
+        configure(node, m::Sensor) = @info "Sensor up" rate = parameters(node, m).rate
     end
     # The BatterySource contract impl. Single-arg (not node-first), so it lives OUTSIDE the @component
     # block — a struct edit would orphan it (the documented limit for externally-defined methods).

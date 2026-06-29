@@ -675,16 +675,16 @@ module CMacro
         @param rate::Int64 = 5 ∈ 1..50
         @param "gain doc" gain::Float64 = 1.0
         @publishes out::_T on "~/telemetry"
-        @hears function ingest(node, m, msg::_T)
+        @hears function ingest(node, m::Sensor, msg::_T)
             m.n += 1
         end
-        @every :rate function tick(node, m)
+        @every :rate function tick(node, m::Sensor)
             m.last += 1.0
         end
-        @service "~/q" function q(node, m, x::Int64)::@NamedTuple{ok::Bool}
+        @service "~/q" function q(node, m::Sensor, x::Int64)::@NamedTuple{ok::Bool}
             (ok = x > 0,)
         end
-        configure(node, m) = (m.n = 100; nothing)         # hook → extends ROSNode.configure (not a shadow)
+        configure(node, m::Sensor) = (m.n = 100; nothing)   # hook → extends ROSNode.configure (not a shadow)
     end
 
     @interface BatterySource batt(_)
@@ -850,10 +850,10 @@ module FxR2
     end
     member_schema(::Type{Svc}) = component(Svc, boom)
 
-    # a `where`-clause def in a @component block must not crash the macro (peel :where before injecting m::Base)
+    # a `where`-clause def in a @component block must not crash the macro (peel :where before the member check)
     @component mutable struct WC{Name} <: Component{Name}
         x::Int64 = 0
-        bump(node, m, y::T) where {T} = (m.x += 1; nothing)
+        bump(node, m::WC, y::T) where {T} = (m.x += 1; nothing)
     end
 end
 
@@ -965,7 +965,7 @@ module SchM
         @param  hz::Int64 = 10
         @hears  whear::_T
         @hears  alt => whear::_T on "/alt"
-        @hears  "/legacy" function lh(node, m, msg::_T); m.k += 1; nothing; end   # legacy leading-wire inline
+        @hears  "/legacy" function lh(node, m::Wkr, msg::_T); m.k += 1; nothing; end   # legacy leading-wire inline
         @every  wtick at :hz
         @serves qq
         @runs   cnt
@@ -1115,6 +1115,17 @@ module QHUse
         @hears watch => QH.odom::_T     # qualified ref + name override
     end
 end
+module NM                              # the member arg is typed BY THE USER (any name); the macro never rewrites it
+    using ROSNode
+    @component mutable struct Probe{Name} <: Component{Name}
+        x::Int64 = 0
+        @param rate::Int64 = 1
+        @every :rate function step(node, self::Probe)     # typed, NOT named `m`
+            self.x += 1
+        end
+        configure(node, comp::Probe) = (comp.x = 7; nothing)   # typed, named `comp`
+    end
+end
 
 @testset "functor: review-3 fixes" begin
     # Qualified handler references (Mod.f) lower; the port name defaults to the final path component.
@@ -1122,6 +1133,20 @@ end
     @test RNX.port_names(w) == [:odom, :beat, :watch]
     _qp(nm) = w.ports[findfirst(p -> RNX.descname(typeof(p)) === nm, w.ports)]
     @test _qp(:odom) isa RNX.Sub && _qp(:beat) isa RNX.Tmr && _qp(:watch) isa RNX.Sub
+
+    # The member argument is emitted VERBATIM (any name, by position) — the macro neither rewrites nor
+    # judges it: a typed arg keeps its type, a bare arg stays an ordinary `::Any` catch-all (no error).
+    @test only(methods(NM.step)).sig.parameters[3] === NM.Probe       # `step(node, self::Probe)` — as written
+    @test which(ROSNode.configure, (Any, NM.Probe{:p})).sig.parameters[3] === NM.Probe   # `configure(node, comp::Probe)`
+    @eval module _BareMember                                         # a bare member arg compiles — left ::Any
+        using ROSNode
+        @component mutable struct B{Name} <: Component{Name}
+            x::Int64 = 0
+            @param rate::Int64 = 1
+            @every :rate function step(node, m); m.x += 1; end       # bare `m` — not rewritten, not rejected
+        end
+    end
+    @test only(methods(_BareMember.step)).sig.parameters[3] === Any   # the macro left the signature untouched
 
     # @schema argument-validation guards each error clearly, source-located.
     _g(ex) = (e = _expand_err(ex); e === nothing ? "NO ERROR" : sprint(showerror, e))
