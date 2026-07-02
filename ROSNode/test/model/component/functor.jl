@@ -1096,6 +1096,58 @@ _expand_err(ex) = try; Core.eval(@__MODULE__, ex); nothing; catch e; e isa LoadE
     @test e_tup !== nothing && occursin("field::Marker", sprint(showerror, e_tup))
 end
 
+# ── port-typed handlers: the message/request type may ride the PORT (`name::T =>`), not the handler ────
+module PT
+    using ROSNode
+    const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+    pref(node, m, msg) = nothing                         # untyped msg — the type comes from the port
+    @component mutable struct PCC{Name} <: Component{Name}
+        n::Int64 = 0
+        @hears odom::_T => function oin(node, m::PCC, msg); m.n += 1; nothing; end  # port type + inline, UNTYPED msg
+        @hears track::_T => pref                                                     # port type + reference
+        @hears "/lead" wired::_T => function win(node, m::PCC, msg); nothing; end    # leading wire + port-typed inline
+        @hears plain => pref::_T                                                     # handler-typed reference (rename)
+        @hears ::_T => function noname(node, m::PCC, msg); nothing; end              # type-only port, default name → :noname
+        @hears ::_T => pref                                                          # type-only port, reference → :pref
+    end
+end
+
+@testset "functor: port-typed handlers" begin
+    s = RNX.member_schema(PT.PCC)
+    @test RNX.port_names(s) == [:odom, :track, :wired, :plain, :noname, :pref]
+    _p(nm) = s.ports[findfirst(p -> RNX.descname(typeof(p)) === nm, s.ports)]
+    # the type rode the PORT (left of `=>`) and threaded to `Sub{Name, T, F}` — even though inline `oin`'s
+    # msg arg is UNTYPED: the macro emitted the handler verbatim and never read its signature.
+    @test _p(:odom)  isa RNX.Sub && typeof(_p(:odom)).parameters[2]  === PT._T
+    @test _p(:track) isa RNX.Sub && typeof(_p(:track)).parameters[2] === PT._T   # port type + reference
+    @test _p(:wired) isa RNX.Sub && _p(:wired).wire == "/lead"                   # leading wire honoured
+    @test typeof(_p(:wired)).parameters[2] === PT._T
+    @test typeof(_p(:plain)).parameters[2] === PT._T   # `name::T => h` ≡ `name => h::T` — same Sub
+    # `::T =>` states the type only and keeps the default port name (the handler's).
+    @test _p(:noname) isa RNX.Sub && typeof(_p(:noname)).parameters[2] === PT._T   # inline, default name :noname
+    @test _p(:pref)   isa RNX.Sub && typeof(_p(:pref)).parameters[2]   === PT._T   # reference, default name :pref
+    @test only(methods(PT.oin)).sig.parameters[4] === Any   # untyped msg left untouched
+
+    # guards: the type stated twice, on a timer, or on an inline service, and a malformed port LHS.
+    g(ex) = (e = _expand_err(ex); e === nothing ? "NO ERROR" : sprint(showerror, e))
+    @test occursin("given twice", g(:(@macroexpand @component mutable struct _GBoth{Name} <: Component{Name}
+        @hears a::_GT => h::_GT
+    end)))
+    @test occursin("timer carries no message type", g(:(@macroexpand @component mutable struct _GTmr{Name} <: Component{Name}
+        @every a::_GT => tick at :hz
+    end)))
+    @test occursin("derives its type", g(:(@macroexpand @component mutable struct _GSrv{Name} <: Component{Name}
+        @serves s::_GT => function srv(node, m, x::Int64)::@NamedTuple{ok::Bool}; (ok = true,); end
+    end)))
+    @test occursin("port override is", g(:(@macroexpand @component mutable struct _GBadL{Name} <: Component{Name}
+        @hears (a + b) => h::_GT
+    end)))
+    # a leading wire + type-only port collide in the parser (`"w" ::T` → `("w")::T`) — targeted hint.
+    @test occursin("leading wire binds to the type", g(:(@macroexpand @component mutable struct _GWT{Name} <: Component{Name}
+        @hears "/w" ::_GT => function h(node, m, msg); nothing; end
+    end)))
+end
+
 # ── review-3 fixes: qualified handler refs, @schema arg guards, default-construct guidance, e2e by-ref ──
 module QH                                   # handlers in a SIBLING module — the external-handler case
     using ROSNode

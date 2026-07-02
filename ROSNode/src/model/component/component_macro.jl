@@ -92,14 +92,26 @@ function _parse_wires(args, who; allow_lead::Bool = true)
     return (lead === nothing ? trail : lead), a
 end
 
-# ⟨bound-handler⟩ → (name_override::Union{Symbol,Nothing}, handler-spec). `name =>` overrides the port name.
+# ⟨bound⟩ → (name_override, port_type, handler-spec). The `port =>` prefix sets the port. `name =>`
+# renames it; `name::T =>` also states the message/request/action type ON THE PORT; `::T =>` states just
+# the type and keeps the default name (the handler's) — so an inline handler is typed without the macro
+# reading its signature. The type may instead ride the handler (`handler::T`); `_parse_handler_port`
+# enforces it appears on exactly one side. No `=>` ⇒ no override, no port type.
 function _parse_bound_handler(x, who)
     if x isa Expr && x.head === :call && length(x.args) == 3 && x.args[1] === :(=>)
-        x.args[2] isa Symbol ||
-            error("$(who): a port-name override must be a symbol, got `$(x.args[2])` in `$(x)`")
-        return x.args[2]::Symbol, x.args[3]
+        lhs = x.args[2]
+        lhs isa Symbol && return lhs, nothing, x.args[3]                        # name =>
+        if lhs isa Expr && lhs.head === :(::)
+            length(lhs.args) == 1 && return nothing, lhs.args[1], x.args[3]     # ::T =>  (default the name)
+            length(lhs.args) == 2 && lhs.args[1] isa Symbol &&
+                return lhs.args[1]::Symbol, lhs.args[2], x.args[3]              # name::T =>
+            lhs.args[1] isa AbstractString && error("$(who): a leading wire binds to the type — " *
+                "`\"wire\" ::T` parses as `(\"wire\")::T`. Name the port (`\"wire\" name::T => …`) or put " *
+                "the wire in a trailing `on \"wire\"`.")
+        end
+        error("$(who): a port override is `name =>`, `name::Type =>`, or `::Type =>`, got `$(lhs)` in `$(x)`")
     end
-    return nothing, x
+    return nothing, nothing, x
 end
 
 # ⟨publishes⟩ / ⟨uses⟩ — a `name::T` decl plus an optional TRAILING wire; no handler. The decl directives
@@ -126,45 +138,59 @@ _ref_name(e::Expr) = e.args[2] isa QuoteNode ? e.args[2].value::Symbol :
 # ⟨hears⟩ / ⟨serves⟩ / ⟨runs⟩ — a wired, optionally-renamed handler. `kind ∈ (:hears,:serves,:runs)`.
 # `legacy_author` routes @service/@action's authoring inline-def. Returns (combinator-call, emits).
 function _parse_handler_port(kind::Symbol, rest, base, M, src, who)
-    isempty(rest) && error("$(who): needs a handler — `$(who) [name =>] handler[::T] [on \"wire\"]`")
+    isempty(rest) && error("$(who): needs a handler — `$(who) [name[::T] =>] handler[::T] [on \"wire\"]`")
     wire, mid = _parse_wires(rest, who)
     length(mid) == 1 ||
-        error("$(who): expected `[\"wire\"] [name =>] handler[::T] [on \"wire\"]`, got `$(Tuple(rest))`")
-    name_override, spec = _parse_bound_handler(mid[1], who)
+        error("$(who): expected `[\"wire\"] [name[::T] =>] handler[::T] [on \"wire\"]`, got `$(Tuple(rest))`")
+    name_override, port_type, spec = _parse_bound_handler(mid[1], who)
+    comb = kind === :hears ? :hears : kind === :serves ? :serves : :runs
     emits = Any[]
     if _is_method_def(spec)                                  # ⟨inline-def⟩ — emitted verbatim
         fname = _component_defname(spec)
         name  = name_override === nothing ? fname : name_override
         if kind === :hears
-            call = _peel_to_call(spec.args[1])
-            length(call.args) >= 4 ||
-                error("$(who): an inline subscription handler needs a typed message argument — " *
-                      "`function $(fname)(node, m::$(base), msg::T) … end`, got `$(call)`")
-            msgarg = call.args[4]
-            (msgarg isa Expr && msgarg.head === :(::)) ||
-                error("$(who): the message argument needs a type, `msg::T`, got `$(msgarg)`")
-            T = msgarg.args[2]
+            if port_type === nothing                         # no port-stated type — read `msg::T` off the signature
+                call = _peel_to_call(spec.args[1])
+                length(call.args) >= 4 ||
+                    error("$(who): an inline subscription handler needs a typed message argument — " *
+                          "`function $(fname)(node, m::$(base), msg::T) … end`, or state the type on the port " *
+                          "(`$(who) $(name)::T => function …`), got `$(call)`")
+                msgarg = call.args[4]
+                (msgarg isa Expr && msgarg.head === :(::)) ||
+                    error("$(who): the message argument needs a type, `msg::T` — or state it on the port " *
+                          "(`$(who) $(name)::T => …`), got `$(msgarg)`")
+                T = msgarg.args[2]
+            else                                             # port-stated type — emit verbatim, never peek the signature
+                T = port_type
+            end
             push!(emits, spec)
             return :( $(GlobalRef(M, :hears))($(QuoteNode(name)), $T, $fname; on = $wire) ), emits
         else                                                # :serves/:runs — author the type+impl inline
+            port_type === nothing ||
+                error("$(who): an inline $(kind === :serves ? "service" : "action") derives its type from the " *
+                      "definition — drop the `::$(port_type)` on the port (state a type only with a handler reference)")
             authoring = kind === :serves ? Symbol("@service") : Symbol("@action")
             margs = wire === nothing ? Any[spec] : Any[wire, spec]   # wire rides the authoring macro
             push!(emits, Expr(:macrocall, authoring, src, margs...))
-            comb = kind === :serves ? :serves : :runs
             return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $fname) ), emits   # trait carries the wire
         end
     elseif spec isa Expr && spec.head === :(::)             # ⟨typed reference⟩  handler::T  (handler = f or Mod.f)
         _is_ref(spec.args[1]) ||
             error("$(who): a typed handler reference must be `handler::T` (`handler` a name or `Mod.name`), got `$(spec)`")
+        port_type === nothing ||
+            error("$(who): the type is given twice — on the port (`::$(port_type)`) and the handler " *
+                  "(`::$(spec.args[2])`); state it once")
         h, T = spec.args[1], spec.args[2]
         name = name_override === nothing ? _ref_name(h) : name_override
-        comb = kind === :hears ? :hears : kind === :serves ? :serves : :runs
         return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $T, $h; on = $wire) ), emits
-    elseif _is_ref(spec)                                    # ⟨reference⟩ — a trait handler (f or Mod.f)
-        kind === :hears && error("$(who): a subscription needs a message type — write `$(spec)::MsgType` " *
-            "(a bare handler reference has no type to subscribe with)")
+    elseif _is_ref(spec)                                    # ⟨reference⟩ — a trait handler, or port-typed (f or Mod.f)
+        if port_type !== nothing                             # `[name]::T => handler` — the type rides the port
+            name = name_override === nothing ? _ref_name(spec) : name_override
+            return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $port_type, $spec; on = $wire) ), emits
+        end
+        kind === :hears && error("$(who): a subscription needs a message type — write `$(spec)::MsgType`, " *
+            "or state it on the port (`$(who) name::MsgType => $(spec)`)")
         name = name_override === nothing ? _ref_name(spec) : name_override
-        comb = kind === :serves ? :serves : :runs
         return :( $(GlobalRef(M, comb))($(QuoteNode(name)), $spec; on = $wire) ), emits
     else
         error("$(who): could not parse the handler `$(spec)` — expected `name::T`, a handler reference, " *
@@ -183,7 +209,9 @@ function _parse_every(rest, base, M, who)
         before = rest[1:atpos-1]
         rate   = _parse_rate(rest[atpos+1], who)
         length(before) == 1 || error("$(who): expected `[name =>] handler at rate`, got `$(Tuple(rest))`")
-        name_override, spec = _parse_bound_handler(before[1], who)
+        name_override, port_type, spec = _parse_bound_handler(before[1], who)
+        port_type === nothing || error("$(who): a timer carries no message type — drop the `::$(port_type)` " *
+            "(write `@every [name =>] handler at rate`)")
         if _is_method_def(spec)
             push!(emits, spec)
             handler = _component_defname(spec); defname = handler
@@ -277,9 +305,9 @@ Each block line is a directive, a plain field, or a method. What each lowers to 
 | Block line | Lowers to |
 |---|---|
 | `@publishes name::T [on "wire"]` | `publishes(:name, T; on)` — a publisher |
-| `@hears [name =>] handler [on "wire"]` | `hears(:name, T, handler; on)` — a subscription |
-| `@serves [name =>] handler [on "wire"]` | `serves(:name, [Req,] handler; on)` — a service |
-| `@runs [name =>] exec [on "wire"]` | `runs(:name, [Action,] exec; on)` — an action server |
+| `@hears [name[::T] =>] handler[::T] [on "wire"]` | `hears(:name, T, handler; on)` — a subscription (`T` on the port or the handler) |
+| `@serves [name[::T] =>] handler[::T] [on "wire"]` | `serves(:name, [Req,] handler; on)` — a service |
+| `@runs [name[::T] =>] exec[::T] [on "wire"]` | `runs(:name, [Action,] exec; on)` — an action server |
 | `@every [name =>] handler at rate` | `every(:name, rate, handler)` — a timer |
 | `@uses name::Marker [on "wire"]` | `uses(:name, Marker; on)` — a persistent client |
 | `@param ["doc"] x::T = d [∈ range]` | a field of `@parameters struct NameParams` |
@@ -292,16 +320,23 @@ Each block line is a directive, a plain field, or a method. What each lowers to 
 
 **Handlers** (`@hears`/`@serves`/`@runs`/`@every`) bind a handler one of three ways:
 - a **reference** — a name in scope, e.g. `@serves safe` (an `@service`/`@action` handler's trait carries its type and wire);
-- a **typed reference** — `f::T` naming the message / request / action type, e.g. `@hears odom::Odometry`;
+- a **typed reference** — `handler::T` naming the message / request / action type, e.g. `@hears on_odom::Odometry`;
 - an **inline definition** — `function f(node, m::Name, …) … end` written in place, re-coupled to the struct on an edit.
 
-`@hears` needs a message type, so it takes a typed reference or an inline signature, never a bare reference.
-`@serves`/`@runs` author the service/action inline; `@service`/`@action` are legacy aliases for that.
+**The type.** `@hears` needs a message type (`@serves`/`@runs` a request/action type, unless authored
+inline). State it on the **handler** (`handler::T`) or on the **port** (`name::T =>`, left of `=>`) — once,
+either side. The port form types an inline `@hears` handler *without* the macro reading its signature:
+`@hears odom::Odometry => function on_odom(node, m, msg) … end` subscribes `:odom` to `Odometry` and emits
+the handler verbatim. Drop the name (`::T =>`) to keep the default port name (the handler's) —
+`@hears ::Odometry => function on_odom(…) … end` gives port `:on_odom`. An inline `@hears` with no stated
+type falls back to reading `msg::T` off the signature; an inline `@serves`/`@runs` derives its type from
+the definition (state none on the port).
 
-**Names & wires.** A port's name defaults to its handler's name; prefix `name =>` to override it
-(`@serves status => safe`). The wire — the topic, or service/action name — defaults to the port name; a
-trailing `on "wire"` overrides it (a leading `"wire"` string is the `@component`-legacy form). Give it at
-most once; a timer addresses no wire.
+**Names & wires.** A port's name defaults to its handler's name; prefix `name =>` (or `name::T =>`) to
+override it (`@serves status => safe`). The wire — the topic, or service/action name — defaults to the port
+name; override it with a trailing `on "wire"`, or — handy when an inline handler would bury a trailing
+clause after `end` — a **leading `"wire"` string** (`@hears "~/odom" function on_odom(…) … end`). Give the
+wire at most once; a timer addresses no wire.
 
 **Rate.** `@every … at rate` takes a frequency in Hz (a `Real`), or a parameter `:name` that binds the
 period live to that parameter (the legacy spelling is `@every rate function … end`).
@@ -331,7 +366,8 @@ zero-or-more). The port sublanguage (⟨port-dir⟩) is shared with [`@schema`](
 ⟨runs⟩       ::= "@runs"   [String] ⟨bound⟩ ["on" String]    → runs(:n, [Action,] exec; on)
 ⟨every⟩      ::= "@every" ⟨bound⟩ "at" ⟨rate⟩                 → every(:n, rate, h)
               | "@every" ⟨rate⟩ ⟨inline⟩                     (legacy, equivalent)
-⟨bound⟩      ::= [Symbol "=>"] ⟨handler⟩                      Symbol "=>" overrides the port name
+⟨bound⟩      ::= [⟨port⟩ "=>"] ⟨handler⟩                      ⟨port⟩ overrides the name; `::T` types the port
+⟨port⟩       ::= Symbol | [Symbol] "::" ⟨type⟩                a port name and/or its type (drop the name to default it)
 ⟨handler⟩    ::= Symbol                                       a reference (a trait carries its type/wire)
               | Symbol "::" ⟨type⟩                            a typed reference: msg / request / action type
               | ⟨inline⟩                                      a reaction, or an @service/@action def
@@ -346,8 +382,10 @@ zero-or-more). The port sublanguage (⟨port-dir⟩) is shared with [`@schema`](
 ⟨requires⟩   ::= "@requires" Symbol "::" ⟨marker⟩ { "," … }  → requires = (…,) + a hidden type param, field, `construct`
 ```
 
-A wire is given at most once (a leading `String` legacy, or a trailing `on "wire"`); `@service`/`@action`
-are legacy aliases of `@serves`/`@runs` with an inline definition.
+Side conditions: the message/request/action type is stated once — on the port (`name::T =>`) or the
+handler (`handler::T`); a timer takes none, and an inline `@serves`/`@runs` derives it from the definition.
+The wire is given at most once, a leading `String` or a trailing `on "wire"`. `@service`/`@action` are
+legacy aliases of `@serves`/`@runs` with an inline definition.
 
 `@component` is sugar over the value API — the raw `component`/`node` combinators remain the primitive
 for dynamic composition. It covers the common case (ports, `@param`, `@provides`, `@requires field::Marker`
